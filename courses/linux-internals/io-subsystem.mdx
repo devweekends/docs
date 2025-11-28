@@ -1,0 +1,720 @@
+---
+title: "I/O Subsystem"
+sidebarTitle: "I/O Subsystem"
+description: "Master Linux I/O internals: block layer, schedulers, and io_uring for high-performance applications"
+icon: "hard-drive"
+---
+
+# I/O Subsystem
+
+The Linux I/O subsystem handles all storage operations. Understanding the block layer, I/O schedulers, and modern async I/O with io_uring is essential for building and debugging high-performance systems.
+
+<Info>
+**Prerequisites**: Filesystem fundamentals, system calls  
+**Interview Focus**: I/O schedulers, async I/O, io_uring  
+**Time to Master**: 4-5 hours
+</Info>
+
+---
+
+## Block Layer Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                      LINUX BLOCK LAYER                               │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                      │
+│  Filesystem                                                          │
+│  ┌─────────────────────────────────────────────────────────────────┐│
+│  │  VFS: read(), write(), fsync()                                  ││
+│  │    └─ Filesystem: ext4, XFS, Btrfs                              ││
+│  │        └─ Page cache                                            ││
+│  └─────────────────────────────────────────────────────────────────┘│
+│                              │                                       │
+│                              ▼                                       │
+│  Block Layer                                                         │
+│  ┌─────────────────────────────────────────────────────────────────┐│
+│  │                                                                  ││
+│  │  ┌────────────────┐    ┌────────────────────────────────────┐  ││
+│  │  │ bio structure  │───▶│         Block I/O Layer           │  ││
+│  │  │ (I/O request)  │    │  - Submit requests                 │  ││
+│  │  └────────────────┘    │  - Split large I/Os                │  ││
+│  │                        │  - Merge adjacent I/Os              │  ││
+│  │                        └────────────────────────────────────┘  ││
+│  │                                     │                           ││
+│  │                                     ▼                           ││
+│  │                        ┌────────────────────────────────────┐  ││
+│  │                        │         Request Queue              │  ││
+│  │                        │  ┌──────────────────────────────┐  │  ││
+│  │                        │  │      I/O Scheduler           │  │  ││
+│  │                        │  │  - mq-deadline               │  │  ││
+│  │                        │  │  - bfq                       │  │  ││
+│  │                        │  │  - kyber                     │  │  ││
+│  │                        │  │  - none                      │  │  ││
+│  │                        │  └──────────────────────────────┘  │  ││
+│  │                        └────────────────────────────────────┘  ││
+│  │                                     │                           ││
+│  └─────────────────────────────────────│───────────────────────────┘│
+│                                        ▼                            │
+│  Device Driver                                                       │
+│  ┌─────────────────────────────────────────────────────────────────┐│
+│  │  NVMe Driver / SCSI Driver / virtio-blk                        ││
+│  └─────────────────────────────────────────────────────────────────┘│
+│                                        │                            │
+│                                        ▼                            │
+│  ┌─────────────────────────────────────────────────────────────────┐│
+│  │                    Hardware (SSD/HDD/NVMe)                      ││
+│  └─────────────────────────────────────────────────────────────────┘│
+│                                                                      │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## bio and request Structures
+
+### The bio Structure
+
+```c
+struct bio {
+    struct block_device *bi_bdev;    // Target device
+    unsigned int        bi_opf;       // Operation and flags
+    unsigned short      bi_vcnt;      // Number of bio_vecs
+    unsigned short      bi_max_vecs;  // Max bio_vecs
+    atomic_t            bi_cnt;       // Reference count
+    struct bio_vec      *bi_io_vec;   // Vector of pages
+    sector_t            bi_iter.bi_sector;  // Start sector
+    unsigned int        bi_iter.bi_size;    // Remaining bytes
+    bio_end_io_t        *bi_end_io;   // Completion callback
+    void                *bi_private;  // Private data
+};
+
+struct bio_vec {
+    struct page *bv_page;    // Page containing data
+    unsigned int bv_len;     // Length of data
+    unsigned int bv_offset;  // Offset within page
+};
+```
+
+### bio Lifecycle
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                        BIO LIFECYCLE                                 │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                      │
+│  1. Allocate bio                                                     │
+│     bio = bio_alloc(GFP_KERNEL, nr_pages);                          │
+│                                                                      │
+│  2. Set up bio                                                       │
+│     bio->bi_bdev = block_device;                                    │
+│     bio->bi_iter.bi_sector = start_sector;                          │
+│     bio->bi_opf = REQ_OP_READ;                                      │
+│     bio->bi_end_io = my_completion_handler;                         │
+│                                                                      │
+│  3. Add pages                                                        │
+│     bio_add_page(bio, page, len, offset);                           │
+│                                                                      │
+│  4. Submit bio                                                       │
+│     submit_bio(bio);                                                │
+│         │                                                            │
+│         ├─▶ Block layer merges with other bios                      │
+│         ├─▶ I/O scheduler reorders                                  │
+│         └─▶ Driver dispatches to hardware                           │
+│                                                                      │
+│  5. Completion (interrupt context)                                   │
+│     bi_end_io(bio);                                                 │
+│         └─▶ bio_put(bio);                                           │
+│                                                                      │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## I/O Schedulers
+
+### Multi-Queue Architecture (blk-mq)
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                    MULTI-QUEUE BLOCK LAYER (blk-mq)                  │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                      │
+│  Applications submitting I/O (multiple threads)                      │
+│  ┌─────────┐ ┌─────────┐ ┌─────────┐ ┌─────────┐                   │
+│  │ Thread 1│ │ Thread 2│ │ Thread 3│ │ Thread 4│                   │
+│  └────┬────┘ └────┬────┘ └────┬────┘ └────┬────┘                   │
+│       │          │          │          │                            │
+│       ▼          ▼          ▼          ▼                            │
+│  ┌──────────────────────────────────────────────────────────────┐  │
+│  │              Software Staging Queues (per CPU)               │  │
+│  │  ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────┐        │  │
+│  │  │ CPU 0    │ │ CPU 1    │ │ CPU 2    │ │ CPU 3    │        │  │
+│  │  │ sw queue │ │ sw queue │ │ sw queue │ │ sw queue │        │  │
+│  │  └────┬─────┘ └────┬─────┘ └────┬─────┘ └────┬─────┘        │  │
+│  └───────│────────────│────────────│────────────│───────────────┘  │
+│          │            │            │            │                   │
+│          └──────┬─────┴─────┬──────┴─────┬──────┘                  │
+│                 │           │            │                          │
+│                 ▼           ▼            ▼                          │
+│  ┌──────────────────────────────────────────────────────────────┐  │
+│  │                Hardware Dispatch Queues                       │  │
+│  │  ┌─────────────────┐  ┌─────────────────┐                    │  │
+│  │  │  hw queue 0     │  │  hw queue 1     │  ← maps to NVMe   │  │
+│  │  │  (NVMe sq 0)    │  │  (NVMe sq 1)    │    submission     │  │
+│  │  └────────┬────────┘  └────────┬────────┘    queues         │  │
+│  └───────────│─────────────────────│────────────────────────────┘  │
+│              ▼                     ▼                                │
+│  ┌─────────────────────────────────────────────────────────────────┐│
+│  │                        NVMe SSD                                 ││
+│  │           (multiple submission/completion queues)               ││
+│  └─────────────────────────────────────────────────────────────────┘│
+│                                                                      │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+### Scheduler Comparison
+
+<Tabs>
+  <Tab title="mq-deadline">
+    **Best for**: Latency-sensitive workloads, databases
+    
+    **Characteristics**:
+    - Read and write request deadlines
+    - Read priority over writes (reads typically blocking)
+    - Batch dispatch for efficiency
+    
+    **Configuration**:
+    ```bash
+    echo mq-deadline > /sys/block/sda/queue/scheduler
+    
+    # Tune deadlines (milliseconds)
+    cat /sys/block/sda/queue/iosched/read_expire    # 500
+    cat /sys/block/sda/queue/iosched/write_expire   # 5000
+    
+    # Batch size
+    cat /sys/block/sda/queue/iosched/fifo_batch     # 16
+    ```
+  </Tab>
+  
+  <Tab title="bfq">
+    **Best for**: Interactive desktops, mixed workloads, fairness
+    
+    **Characteristics**:
+    - Budget Fair Queueing (per-process fairness)
+    - Low latency guarantee for interactive processes
+    - I/O cgroups integration
+    - Higher CPU overhead
+    
+    **Configuration**:
+    ```bash
+    echo bfq > /sys/block/sda/queue/scheduler
+    
+    # Check per-process settings
+    cat /sys/block/sda/queue/iosched/low_latency  # 1 = enabled
+    
+    # Tune slice duration
+    cat /sys/block/sda/queue/iosched/slice_idle  # 8 (ms)
+    ```
+  </Tab>
+  
+  <Tab title="kyber">
+    **Best for**: High-IOPS NVMe devices, scale-out workloads
+    
+    **Characteristics**:
+    - Token-based throttling
+    - Separate read/write queues
+    - Low CPU overhead
+    - Target latency-based
+    
+    **Configuration**:
+    ```bash
+    echo kyber > /sys/block/nvme0n1/queue/scheduler
+    
+    # Target latencies (microseconds)
+    cat /sys/block/nvme0n1/queue/iosched/read_lat_nsec   # 2000000
+    cat /sys/block/nvme0n1/queue/iosched/write_lat_nsec  # 10000000
+    ```
+  </Tab>
+  
+  <Tab title="none">
+    **Best for**: NVMe devices with internal scheduling
+    
+    **Characteristics**:
+    - No software scheduling
+    - Lowest CPU overhead
+    - Relies on device-level scheduling
+    - Best for high-end SSDs/NVMe
+    
+    **Configuration**:
+    ```bash
+    echo none > /sys/block/nvme0n1/queue/scheduler
+    
+    # Verify
+    cat /sys/block/nvme0n1/queue/scheduler
+    # [none] mq-deadline kyber bfq
+    ```
+  </Tab>
+</Tabs>
+
+---
+
+## Asynchronous I/O
+
+### Traditional AIO (libaio)
+
+```c
+#include <libaio.h>
+
+io_context_t ctx;
+struct iocb cb;
+struct iocb *cbs[1] = {&cb};
+struct io_event events[1];
+
+// Initialize
+io_setup(128, &ctx);
+
+// Prepare read
+io_prep_pread(&cb, fd, buffer, 4096, 0);
+
+// Submit
+io_submit(ctx, 1, cbs);
+
+// Wait for completion
+int n = io_getevents(ctx, 1, 1, events, NULL);
+
+// Cleanup
+io_destroy(ctx);
+```
+
+**Limitations of libaio**:
+- Only supports O_DIRECT
+- Limited to block I/O
+- System call per submit/complete
+
+---
+
+## io_uring: Modern Async I/O
+
+### io_uring Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                         io_uring ARCHITECTURE                        │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                      │
+│  User Space                     Kernel Space                         │
+│  ┌────────────────────────────┐ ┌────────────────────────────────┐  │
+│  │                            │ │                                │  │
+│  │    Application             │ │                                │  │
+│  │                            │ │                                │  │
+│  │    ┌──────────────────┐    │ │                                │  │
+│  │    │                  │    │ │                                │  │
+│  │    │  SQE Pool        │    │ │    ┌──────────────────────┐   │  │
+│  │    │  (submissions)   │────┼─┼───▶│   Submission Queue   │   │  │
+│  │    │                  │    │ │    │   (SQ) Ring Buffer   │   │  │
+│  │    └──────────────────┘    │ │    └──────────┬───────────┘   │  │
+│  │                            │ │               │                │  │
+│  │                            │ │               ▼                │  │
+│  │                            │ │    ┌──────────────────────┐   │  │
+│  │                            │ │    │   Kernel Processing  │   │  │
+│  │                            │ │    │   - Syscall handler  │   │  │
+│  │                            │ │    │   - Async workers    │   │  │
+│  │                            │ │    └──────────┬───────────┘   │  │
+│  │                            │ │               │                │  │
+│  │    ┌──────────────────┐    │ │               ▼                │  │
+│  │    │                  │◀───┼─┼────┌──────────────────────┐   │  │
+│  │    │  CQE Pool        │    │ │    │   Completion Queue   │   │  │
+│  │    │  (completions)   │    │ │    │   (CQ) Ring Buffer   │   │  │
+│  │    │                  │    │ │    └──────────────────────┘   │  │
+│  │    └──────────────────┘    │ │                                │  │
+│  │                            │ │                                │  │
+│  └────────────────────────────┘ └────────────────────────────────┘  │
+│                                                                      │
+│  Zero-copy: SQ and CQ are mmap'd shared memory                      │
+│  No syscall needed for submit (SQPOLL mode)                         │
+│                                                                      │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+### io_uring Example
+
+```c
+#include <liburing.h>
+#include <fcntl.h>
+#include <stdio.h>
+#include <string.h>
+
+#define QUEUE_DEPTH 32
+#define BLOCK_SIZE 4096
+
+int main() {
+    struct io_uring ring;
+    struct io_uring_sqe *sqe;
+    struct io_uring_cqe *cqe;
+    
+    // Initialize io_uring
+    int ret = io_uring_queue_init(QUEUE_DEPTH, &ring, 0);
+    if (ret < 0) {
+        perror("io_uring_queue_init");
+        return 1;
+    }
+    
+    // Open file
+    int fd = open("test.txt", O_RDONLY);
+    char buffer[BLOCK_SIZE];
+    
+    // Get a submission queue entry
+    sqe = io_uring_get_sqe(&ring);
+    
+    // Prepare a read operation
+    io_uring_prep_read(sqe, fd, buffer, BLOCK_SIZE, 0);
+    
+    // Set user data for identifying this request
+    io_uring_sqe_set_data(sqe, (void*)123);
+    
+    // Submit the request
+    io_uring_submit(&ring);
+    
+    // Wait for completion
+    ret = io_uring_wait_cqe(&ring, &cqe);
+    if (ret < 0) {
+        perror("io_uring_wait_cqe");
+        return 1;
+    }
+    
+    // Check result
+    if (cqe->res < 0) {
+        printf("Read failed: %s\n", strerror(-cqe->res));
+    } else {
+        printf("Read %d bytes\n", cqe->res);
+    }
+    
+    // Mark CQE as consumed
+    io_uring_cqe_seen(&ring, cqe);
+    
+    // Cleanup
+    close(fd);
+    io_uring_queue_exit(&ring);
+    
+    return 0;
+}
+```
+
+### io_uring Advanced Features
+
+```c
+// Registered files (avoid fd lookup per operation)
+int fds[10];
+io_uring_register_files(&ring, fds, 10);
+// Use fixed file index instead of fd
+sqe->flags |= IOSQE_FIXED_FILE;
+sqe->fd = 0;  // Index into registered array
+
+// Registered buffers (avoid page pinning per operation)
+struct iovec iovecs[10];
+io_uring_register_buffers(&ring, iovecs, 10);
+io_uring_prep_read_fixed(sqe, fd, buffer, len, offset, buf_index);
+
+// SQPOLL: Kernel polls SQ, no submit syscall needed
+struct io_uring_params params = {
+    .flags = IORING_SETUP_SQPOLL,
+    .sq_thread_idle = 2000,  // ms before thread sleeps
+};
+io_uring_queue_init_params(QUEUE_DEPTH, &ring, &params);
+
+// Linked operations (dependent I/Os)
+sqe1 = io_uring_get_sqe(&ring);
+io_uring_prep_read(sqe1, fd, buf1, len, 0);
+sqe1->flags |= IOSQE_IO_LINK;  // Next SQE depends on this
+
+sqe2 = io_uring_get_sqe(&ring);
+io_uring_prep_write(sqe2, fd, buf2, len, 0);  // Only runs if read succeeds
+```
+
+### io_uring Supported Operations
+
+| Category | Operations |
+|----------|------------|
+| **File I/O** | read, write, readv, writev, fsync, sync_file_range |
+| **Network** | accept, connect, send, recv, sendmsg, recvmsg |
+| **Other** | openat, close, statx, poll, timeout, cancel |
+| **Advanced** | splice, tee, provide_buffers, multishot accept |
+
+---
+
+## Direct I/O and O_DIRECT
+
+```c
+// Open with O_DIRECT
+int fd = open("/path/to/file", O_RDWR | O_DIRECT);
+
+// Buffer must be aligned
+void *buffer;
+posix_memalign(&buffer, 512, 4096);  // 512-byte alignment
+
+// Offset and size must be aligned to logical block size
+pread(fd, buffer, 4096, 0);  // Read 4KB at offset 0
+
+// Get required alignment
+#include <linux/fs.h>
+unsigned int logical_block_size;
+ioctl(fd, BLKSSZGET, &logical_block_size);
+```
+
+### When to Use O_DIRECT
+
+| Use O_DIRECT | Don't Use O_DIRECT |
+|--------------|-------------------|
+| Database engines | General applications |
+| Application manages cache | Benefit from page cache |
+| Predictable latency needed | Small, random reads |
+| Very large sequential I/O | Typical file access |
+
+---
+
+## I/O Profiling and Debugging
+
+### blktrace and blkparse
+
+```bash
+# Start tracing
+blktrace -d /dev/sda -o - | blkparse -i -
+
+# Output interpretation:
+#   8,0    3        1     0.000000000  1234  Q  WS 1000 + 8 [myapp]
+#   │      │        │     │            │     │  │  │      │  │
+#   │      │        │     │            │     │  │  │      │  └─ Process
+#   │      │        │     │            │     │  │  │      └─ Length (sectors)
+#   │      │        │     │            │     │  │  └─ Start sector
+#   │      │        │     │            │     │  └─ Write, Sync
+#   │      │        │     │            │     └─ Action (Q=queued, C=complete)
+#   │      │        │     │            └─ PID
+#   │      │        │     └─ Timestamp
+#   │      │        └─ Sequence
+#   │      └─ CPU
+#   └─ Major,minor
+
+# Generate I/O stats
+blktrace -d /dev/sda -w 10 -o trace
+blkparse -i trace.blktrace.0 -d trace.bin
+btt -i trace.bin
+
+# Actions:
+# Q = Queued
+# G = Get request
+# I = Inserted
+# D = Dispatched
+# C = Completed
+```
+
+### BPF-based Tools
+
+```bash
+# I/O latency histogram
+sudo biolatency-bpfcc 10
+
+# Slow I/O (> threshold)
+sudo biosnoop-bpfcc
+
+# Random vs sequential I/O
+sudo bitesize-bpfcc
+
+# I/O by process
+sudo biotop-bpfcc
+
+# Trace specific file
+sudo fileslower-bpfcc 10 -p $(pidof myapp)
+```
+
+### iostat Analysis
+
+```bash
+# Extended statistics
+iostat -xz 1
+
+# Key metrics:
+# r/s, w/s     - Reads/writes per second
+# rkB/s, wkB/s - Throughput
+# await        - Average I/O time (includes queue)
+# svctm        - Service time (deprecated, removed in newer)
+# %util        - Device utilization
+
+# Example output:
+# Device  r/s    w/s   rkB/s   wkB/s  await  %util
+# sda    100.0  50.0  1024.0   512.0   2.5   15.0
+
+# Watch for:
+# - High await with low %util = queue congestion
+# - %util = 100% doesn't mean saturated (parallel I/O)
+```
+
+---
+
+## Interview Deep Dives
+
+<AccordionGroup>
+  <Accordion title="Q: Explain the journey of a write() call from application to disk" icon="question">
+    **Complete flow**:
+    
+    1. **Application**: `write(fd, buf, len)`
+    
+    2. **VFS Layer**:
+       - Find inode from fd
+       - Call filesystem's write_iter
+    
+    3. **Page Cache** (buffered write):
+       - Find/create page in cache
+       - Copy data from user space
+       - Mark page dirty
+       - Return to application (write "complete")
+    
+    4. **Writeback** (background or sync):
+       - pdflush/writeback worker wakes
+       - Allocates bio for dirty pages
+       - Submits bio to block layer
+    
+    5. **Block Layer**:
+       - bio enters request queue
+       - Scheduler may merge/reorder
+       - Dispatch to driver
+    
+    6. **Device Driver**:
+       - Translate to device commands
+       - DMA data to device
+    
+    7. **Hardware**:
+       - Device writes to persistent storage
+       - Interrupt on completion
+    
+    8. **Completion**:
+       - Driver handles interrupt
+       - bio completion callback
+       - Page marked clean
+  </Accordion>
+  
+  <Accordion title="Q: What's the difference between sync, fsync, and fdatasync?" icon="question">
+    **sync()**:
+    - Triggers writeback for ALL dirty data
+    - Doesn't wait for completion
+    - System-wide operation
+    
+    **fsync(fd)**:
+    - Flushes data AND metadata for specific file
+    - Waits for completion
+    - Includes directory entry if new file
+    
+    **fdatasync(fd)**:
+    - Flushes data for specific file
+    - Only flushes metadata if required for data retrieval
+    - Skips non-essential metadata (atime, mtime)
+    
+    **Performance comparison**:
+    ```
+    Append 1 byte to file:
+    - fdatasync: Write data + update size = 2 writes
+    - fsync: Write data + update all metadata = 2+ writes
+    
+    Update 1 byte in existing file:
+    - fdatasync: Just write data = 1 write
+    - fsync: Write data + update mtime = 2 writes
+    ```
+  </Accordion>
+  
+  <Accordion title="Q: When would you use io_uring over regular syscalls?" icon="question">
+    **Use io_uring when**:
+    
+    1. **High I/O rate**: Thousands of IOPS
+       - Syscall overhead becomes significant
+       - Batching amortizes overhead
+    
+    2. **Network servers**: Accept/read/write patterns
+       - Single interface for all I/O
+       - Async accept with multishot
+    
+    3. **Low latency requirements**:
+       - SQPOLL avoids syscall entirely
+       - Registered files/buffers reduce overhead
+    
+    4. **Mixed I/O workloads**:
+       - File + network in same ring
+       - Unified completion handling
+    
+    **Don't use io_uring for**:
+    - Simple applications (complexity not worth it)
+    - Few I/O operations (no benefit)
+    - Portability required (Linux-specific)
+  </Accordion>
+  
+  <Accordion title="Q: How would you debug slow disk I/O?" icon="question">
+    **Systematic approach**:
+    
+    1. **Identify the bottleneck**:
+       ```bash
+       iostat -xz 1  # Check device metrics
+       # High await + low %util = queueing issue
+       # High %util = device saturation
+       ```
+    
+    2. **Check for throttling**:
+       ```bash
+       # I/O cgroup throttling
+       cat /sys/fs/cgroup/<path>/io.stat
+       cat /sys/fs/cgroup/<path>/io.pressure
+       ```
+    
+    3. **Profile I/O patterns**:
+       ```bash
+       sudo biosnoop-bpfcc -d sda  # Per-I/O latency
+       sudo bitesize-bpfcc         # I/O size distribution
+       ```
+    
+    4. **Check scheduler**:
+       ```bash
+       cat /sys/block/sda/queue/scheduler
+       # Try different scheduler
+       echo mq-deadline > /sys/block/sda/queue/scheduler
+       ```
+    
+    5. **Application level**:
+       ```bash
+       strace -e trace=read,write,fsync -p <pid>
+       # Look for sync patterns
+       ```
+  </Accordion>
+</AccordionGroup>
+
+---
+
+## NVMe Specifics
+
+```bash
+# NVMe device information
+nvme list
+nvme id-ctrl /dev/nvme0
+
+# Queue depth and namespaces
+nvme list-ns /dev/nvme0
+cat /sys/block/nvme0n1/queue/nr_requests
+
+# NVMe specific stats
+cat /sys/block/nvme0n1/device/device/iostats
+
+# Temperature and health
+nvme smart-log /dev/nvme0
+```
+
+### NVMe vs SATA SSD
+
+| Aspect | SATA SSD | NVMe SSD |
+|--------|----------|----------|
+| Interface | SATA (AHCI) | PCIe |
+| Queue depth | 32 | 65535 per queue |
+| Queues | 1 | Up to 65535 |
+| Latency | ~100μs | ~10-20μs |
+| Throughput | ~550 MB/s | ~3000+ MB/s |
+| Best scheduler | mq-deadline | none |
+
+---
+
+Next: [Networking Stack →](/courses/linux-internals/networking-stack)

@@ -1,0 +1,878 @@
+---
+title: "Project: HTTP Server"
+sidebarTitle: "Project: HTTP Server"
+description: "Build a concurrent HTTP/1.1 server with epoll"
+icon: "server"
+---
+
+# Project: HTTP Server
+
+Build a production-grade HTTP server that handles thousands of concurrent connections. You'll implement the HTTP protocol, connection management, and high-performance I/O.
+
+---
+
+## Architecture
+
+<Steps>
+  <Step title="Event Loop">
+    epoll-based I/O multiplexing
+  </Step>
+  <Step title="Connection Pool">
+    Pre-allocated connection objects
+  </Step>
+  <Step title="HTTP Parser">
+    RFC-compliant request parsing
+  </Step>
+  <Step title="Request Router">
+    URL routing and handlers
+  </Step>
+</Steps>
+
+---
+
+## Core Structures
+
+```c
+// httpd.h
+#ifndef HTTPD_H
+#define HTTPD_H
+
+#include <stdint.h>
+#include <stdbool.h>
+#include <sys/epoll.h>
+
+#define MAX_HEADERS 50
+#define MAX_HEADER_SIZE 8192
+#define MAX_BODY_SIZE (1024 * 1024)  // 1MB
+#define MAX_PATH 2048
+#define MAX_METHOD 16
+
+// HTTP Methods
+typedef enum {
+    HTTP_GET,
+    HTTP_POST,
+    HTTP_PUT,
+    HTTP_DELETE,
+    HTTP_HEAD,
+    HTTP_OPTIONS,
+    HTTP_UNKNOWN
+} http_method_t;
+
+// HTTP Status Codes
+typedef enum {
+    HTTP_200_OK = 200,
+    HTTP_201_CREATED = 201,
+    HTTP_204_NO_CONTENT = 204,
+    HTTP_301_MOVED = 301,
+    HTTP_302_FOUND = 302,
+    HTTP_304_NOT_MODIFIED = 304,
+    HTTP_400_BAD_REQUEST = 400,
+    HTTP_403_FORBIDDEN = 403,
+    HTTP_404_NOT_FOUND = 404,
+    HTTP_405_NOT_ALLOWED = 405,
+    HTTP_413_TOO_LARGE = 413,
+    HTTP_500_ERROR = 500,
+    HTTP_501_NOT_IMPLEMENTED = 501
+} http_status_t;
+
+// HTTP Header
+typedef struct {
+    char *name;
+    char *value;
+} http_header_t;
+
+// HTTP Request
+typedef struct {
+    http_method_t method;
+    char path[MAX_PATH];
+    char query[MAX_PATH];        // Query string
+    int version_major;
+    int version_minor;
+    
+    http_header_t headers[MAX_HEADERS];
+    int header_count;
+    
+    char *body;
+    size_t body_length;
+    size_t content_length;       // From Content-Length header
+    
+    bool keep_alive;
+} http_request_t;
+
+// HTTP Response
+typedef struct {
+    http_status_t status;
+    http_header_t headers[MAX_HEADERS];
+    int header_count;
+    
+    char *body;
+    size_t body_length;
+    
+    bool chunked;
+} http_response_t;
+
+// Connection state
+typedef enum {
+    CONN_STATE_READING,
+    CONN_STATE_WRITING,
+    CONN_STATE_CLOSED
+} conn_state_t;
+
+// Connection
+typedef struct connection {
+    int fd;
+    conn_state_t state;
+    
+    // Read buffer
+    char *read_buf;
+    size_t read_pos;
+    size_t read_capacity;
+    
+    // Write buffer  
+    char *write_buf;
+    size_t write_pos;
+    size_t write_length;
+    
+    // Parsed request
+    http_request_t request;
+    http_response_t response;
+    
+    // Timing
+    time_t last_active;
+    
+    // For pool management
+    struct connection *next;
+} connection_t;
+
+// Request handler callback
+typedef void (*request_handler_t)(connection_t *conn);
+
+// Route
+typedef struct route {
+    http_method_t method;
+    char path[MAX_PATH];
+    request_handler_t handler;
+    struct route *next;
+} route_t;
+
+// Server
+typedef struct {
+    int listen_fd;
+    int epoll_fd;
+    
+    connection_t *connections;   // Array of all connections
+    connection_t *free_list;     // Free connection pool
+    int max_connections;
+    
+    route_t *routes;             // Request routes
+    char *document_root;         // For static files
+    
+    bool running;
+} http_server_t;
+
+// API
+http_server_t *server_create(int port, int max_connections);
+void server_destroy(http_server_t *server);
+int server_run(http_server_t *server);
+void server_stop(http_server_t *server);
+
+// Routing
+void server_route(http_server_t *server, http_method_t method, 
+                  const char *path, request_handler_t handler);
+void server_static(http_server_t *server, const char *document_root);
+
+// Response helpers
+void response_set_status(http_response_t *resp, http_status_t status);
+void response_set_header(http_response_t *resp, const char *name, const char *value);
+void response_set_body(http_response_t *resp, const char *body, size_t length);
+void response_send_file(connection_t *conn, const char *path);
+void response_json(http_response_t *resp, const char *json);
+
+// Request helpers
+const char *request_header(http_request_t *req, const char *name);
+
+#endif
+```
+
+---
+
+## Event Loop with epoll
+
+```c
+// server.c
+#include "httpd.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <errno.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+
+#define MAX_EVENTS 1024
+
+static int set_nonblocking(int fd) {
+    int flags = fcntl(fd, F_GETFL, 0);
+    if (flags == -1) return -1;
+    return fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+}
+
+http_server_t *server_create(int port, int max_connections) {
+    http_server_t *server = calloc(1, sizeof(http_server_t));
+    if (!server) return NULL;
+    
+    server->max_connections = max_connections;
+    
+    // Pre-allocate connection pool
+    server->connections = calloc(max_connections, sizeof(connection_t));
+    for (int i = 0; i < max_connections - 1; i++) {
+        server->connections[i].next = &server->connections[i + 1];
+        server->connections[i].fd = -1;
+        server->connections[i].read_buf = malloc(MAX_HEADER_SIZE);
+        server->connections[i].read_capacity = MAX_HEADER_SIZE;
+        server->connections[i].write_buf = malloc(MAX_HEADER_SIZE);
+    }
+    server->connections[max_connections - 1].fd = -1;
+    server->connections[max_connections - 1].read_buf = malloc(MAX_HEADER_SIZE);
+    server->connections[max_connections - 1].read_capacity = MAX_HEADER_SIZE;
+    server->connections[max_connections - 1].write_buf = malloc(MAX_HEADER_SIZE);
+    server->free_list = &server->connections[0];
+    
+    // Create listening socket
+    server->listen_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (server->listen_fd < 0) {
+        perror("socket");
+        goto error;
+    }
+    
+    // Socket options
+    int opt = 1;
+    setsockopt(server->listen_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+    setsockopt(server->listen_fd, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt));
+    setsockopt(server->listen_fd, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt));
+    
+    set_nonblocking(server->listen_fd);
+    
+    // Bind
+    struct sockaddr_in addr = {
+        .sin_family = AF_INET,
+        .sin_port = htons(port),
+        .sin_addr.s_addr = INADDR_ANY
+    };
+    
+    if (bind(server->listen_fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+        perror("bind");
+        goto error;
+    }
+    
+    // Listen
+    if (listen(server->listen_fd, SOMAXCONN) < 0) {
+        perror("listen");
+        goto error;
+    }
+    
+    // Create epoll
+    server->epoll_fd = epoll_create1(0);
+    if (server->epoll_fd < 0) {
+        perror("epoll_create1");
+        goto error;
+    }
+    
+    // Add listening socket to epoll
+    struct epoll_event ev = {
+        .events = EPOLLIN | EPOLLET,  // Edge-triggered
+        .data.ptr = NULL              // NULL indicates listener
+    };
+    epoll_ctl(server->epoll_fd, EPOLL_CTL_ADD, server->listen_fd, &ev);
+    
+    printf("Server listening on port %d\n", port);
+    return server;
+    
+error:
+    server_destroy(server);
+    return NULL;
+}
+
+static connection_t *connection_acquire(http_server_t *server) {
+    if (!server->free_list) return NULL;
+    
+    connection_t *conn = server->free_list;
+    server->free_list = conn->next;
+    conn->next = NULL;
+    
+    // Reset connection state
+    conn->state = CONN_STATE_READING;
+    conn->read_pos = 0;
+    conn->write_pos = 0;
+    conn->write_length = 0;
+    conn->last_active = time(NULL);
+    
+    memset(&conn->request, 0, sizeof(http_request_t));
+    memset(&conn->response, 0, sizeof(http_response_t));
+    
+    return conn;
+}
+
+static void connection_release(http_server_t *server, connection_t *conn) {
+    if (conn->fd >= 0) {
+        epoll_ctl(server->epoll_fd, EPOLL_CTL_DEL, conn->fd, NULL);
+        close(conn->fd);
+        conn->fd = -1;
+    }
+    
+    // Free request body if allocated
+    if (conn->request.body) {
+        free(conn->request.body);
+        conn->request.body = NULL;
+    }
+    
+    // Free response body if allocated
+    if (conn->response.body) {
+        free(conn->response.body);
+        conn->response.body = NULL;
+    }
+    
+    conn->state = CONN_STATE_CLOSED;
+    conn->next = server->free_list;
+    server->free_list = conn;
+}
+
+static void accept_connections(http_server_t *server) {
+    while (1) {
+        struct sockaddr_in client_addr;
+        socklen_t addr_len = sizeof(client_addr);
+        
+        int client_fd = accept(server->listen_fd, 
+                               (struct sockaddr*)&client_addr, &addr_len);
+        
+        if (client_fd < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                break;  // No more connections
+            }
+            perror("accept");
+            break;
+        }
+        
+        connection_t *conn = connection_acquire(server);
+        if (!conn) {
+            fprintf(stderr, "Connection pool exhausted\n");
+            close(client_fd);
+            continue;
+        }
+        
+        set_nonblocking(client_fd);
+        conn->fd = client_fd;
+        
+        // Add to epoll
+        struct epoll_event ev = {
+            .events = EPOLLIN | EPOLLET | EPOLLRDHUP,
+            .data.ptr = conn
+        };
+        epoll_ctl(server->epoll_fd, EPOLL_CTL_ADD, client_fd, &ev);
+    }
+}
+
+int server_run(http_server_t *server) {
+    struct epoll_event events[MAX_EVENTS];
+    server->running = true;
+    
+    while (server->running) {
+        int nfds = epoll_wait(server->epoll_fd, events, MAX_EVENTS, 1000);
+        
+        if (nfds < 0) {
+            if (errno == EINTR) continue;
+            perror("epoll_wait");
+            return -1;
+        }
+        
+        for (int i = 0; i < nfds; i++) {
+            if (events[i].data.ptr == NULL) {
+                // Listener socket
+                accept_connections(server);
+            } else {
+                connection_t *conn = events[i].data.ptr;
+                
+                if (events[i].events & (EPOLLERR | EPOLLHUP | EPOLLRDHUP)) {
+                    connection_release(server, conn);
+                    continue;
+                }
+                
+                if (events[i].events & EPOLLIN) {
+                    handle_read(server, conn);
+                }
+                
+                if (events[i].events & EPOLLOUT) {
+                    handle_write(server, conn);
+                }
+            }
+        }
+    }
+    
+    return 0;
+}
+```
+
+---
+
+## HTTP Parser
+
+```c
+// parser.c
+#include "httpd.h"
+#include <ctype.h>
+
+static http_method_t parse_method(const char *method) {
+    if (strcmp(method, "GET") == 0) return HTTP_GET;
+    if (strcmp(method, "POST") == 0) return HTTP_POST;
+    if (strcmp(method, "PUT") == 0) return HTTP_PUT;
+    if (strcmp(method, "DELETE") == 0) return HTTP_DELETE;
+    if (strcmp(method, "HEAD") == 0) return HTTP_HEAD;
+    if (strcmp(method, "OPTIONS") == 0) return HTTP_OPTIONS;
+    return HTTP_UNKNOWN;
+}
+
+// Parse HTTP request
+// Returns: 0 = need more data, 1 = complete, -1 = error
+int parse_request(connection_t *conn) {
+    char *buf = conn->read_buf;
+    size_t len = conn->read_pos;
+    http_request_t *req = &conn->request;
+    
+    // Find end of headers
+    char *header_end = strstr(buf, "\r\n\r\n");
+    if (!header_end) {
+        if (len >= MAX_HEADER_SIZE) return -1;  // Headers too large
+        return 0;  // Need more data
+    }
+    
+    // Parse request line: METHOD PATH HTTP/x.x
+    char method[MAX_METHOD];
+    char path[MAX_PATH];
+    int major, minor;
+    
+    char *line_end = strstr(buf, "\r\n");
+    *line_end = '\0';
+    
+    if (sscanf(buf, "%15s %2047s HTTP/%d.%d", 
+               method, path, &major, &minor) != 4) {
+        return -1;
+    }
+    
+    req->method = parse_method(method);
+    req->version_major = major;
+    req->version_minor = minor;
+    
+    // Parse path and query string
+    char *query = strchr(path, '?');
+    if (query) {
+        *query = '\0';
+        strncpy(req->query, query + 1, MAX_PATH - 1);
+    }
+    strncpy(req->path, path, MAX_PATH - 1);
+    
+    // URL decode path
+    url_decode(req->path);
+    
+    // Parse headers
+    char *header_line = line_end + 2;
+    while (header_line < header_end) {
+        line_end = strstr(header_line, "\r\n");
+        *line_end = '\0';
+        
+        if (header_line[0] == '\0') break;  // Empty line
+        
+        char *colon = strchr(header_line, ':');
+        if (!colon) {
+            header_line = line_end + 2;
+            continue;
+        }
+        
+        *colon = '\0';
+        char *name = header_line;
+        char *value = colon + 1;
+        
+        // Skip whitespace
+        while (*value == ' ') value++;
+        
+        if (req->header_count < MAX_HEADERS) {
+            req->headers[req->header_count].name = strdup(name);
+            req->headers[req->header_count].value = strdup(value);
+            req->header_count++;
+        }
+        
+        // Handle special headers
+        if (strcasecmp(name, "Content-Length") == 0) {
+            req->content_length = atol(value);
+        } else if (strcasecmp(name, "Connection") == 0) {
+            req->keep_alive = (strcasecmp(value, "keep-alive") == 0);
+        }
+        
+        header_line = line_end + 2;
+    }
+    
+    // Default keep-alive for HTTP/1.1
+    if (major == 1 && minor == 1) {
+        req->keep_alive = true;
+    }
+    
+    // Handle body
+    size_t header_size = (header_end + 4) - buf;
+    size_t body_received = len - header_size;
+    
+    if (req->content_length > 0) {
+        if (req->content_length > MAX_BODY_SIZE) {
+            return -1;  // Body too large
+        }
+        
+        if (body_received < req->content_length) {
+            return 0;  // Need more data
+        }
+        
+        req->body = malloc(req->content_length + 1);
+        memcpy(req->body, header_end + 4, req->content_length);
+        req->body[req->content_length] = '\0';
+        req->body_length = req->content_length;
+    }
+    
+    return 1;  // Complete
+}
+
+const char *request_header(http_request_t *req, const char *name) {
+    for (int i = 0; i < req->header_count; i++) {
+        if (strcasecmp(req->headers[i].name, name) == 0) {
+            return req->headers[i].value;
+        }
+    }
+    return NULL;
+}
+```
+
+---
+
+## Response Builder
+
+```c
+// response.c
+#include "httpd.h"
+#include <stdio.h>
+#include <sys/stat.h>
+
+static const char *status_text(http_status_t status) {
+    switch (status) {
+        case HTTP_200_OK: return "OK";
+        case HTTP_201_CREATED: return "Created";
+        case HTTP_204_NO_CONTENT: return "No Content";
+        case HTTP_301_MOVED: return "Moved Permanently";
+        case HTTP_302_FOUND: return "Found";
+        case HTTP_304_NOT_MODIFIED: return "Not Modified";
+        case HTTP_400_BAD_REQUEST: return "Bad Request";
+        case HTTP_403_FORBIDDEN: return "Forbidden";
+        case HTTP_404_NOT_FOUND: return "Not Found";
+        case HTTP_405_NOT_ALLOWED: return "Method Not Allowed";
+        case HTTP_413_TOO_LARGE: return "Payload Too Large";
+        case HTTP_500_ERROR: return "Internal Server Error";
+        case HTTP_501_NOT_IMPLEMENTED: return "Not Implemented";
+        default: return "Unknown";
+    }
+}
+
+static const char *mime_type(const char *path) {
+    const char *ext = strrchr(path, '.');
+    if (!ext) return "application/octet-stream";
+    
+    if (strcmp(ext, ".html") == 0) return "text/html";
+    if (strcmp(ext, ".css") == 0) return "text/css";
+    if (strcmp(ext, ".js") == 0) return "application/javascript";
+    if (strcmp(ext, ".json") == 0) return "application/json";
+    if (strcmp(ext, ".png") == 0) return "image/png";
+    if (strcmp(ext, ".jpg") == 0) return "image/jpeg";
+    if (strcmp(ext, ".gif") == 0) return "image/gif";
+    if (strcmp(ext, ".svg") == 0) return "image/svg+xml";
+    if (strcmp(ext, ".ico") == 0) return "image/x-icon";
+    if (strcmp(ext, ".txt") == 0) return "text/plain";
+    
+    return "application/octet-stream";
+}
+
+void response_set_status(http_response_t *resp, http_status_t status) {
+    resp->status = status;
+}
+
+void response_set_header(http_response_t *resp, const char *name, const char *value) {
+    if (resp->header_count >= MAX_HEADERS) return;
+    
+    resp->headers[resp->header_count].name = strdup(name);
+    resp->headers[resp->header_count].value = strdup(value);
+    resp->header_count++;
+}
+
+void response_set_body(http_response_t *resp, const char *body, size_t length) {
+    resp->body = malloc(length);
+    memcpy(resp->body, body, length);
+    resp->body_length = length;
+}
+
+void response_json(http_response_t *resp, const char *json) {
+    response_set_header(resp, "Content-Type", "application/json");
+    response_set_body(resp, json, strlen(json));
+}
+
+// Build HTTP response into connection's write buffer
+void build_response(connection_t *conn) {
+    http_response_t *resp = &conn->response;
+    char *buf = conn->write_buf;
+    size_t pos = 0;
+    size_t cap = MAX_HEADER_SIZE;
+    
+    // Status line
+    pos += snprintf(buf + pos, cap - pos, "HTTP/1.1 %d %s\r\n",
+                    resp->status, status_text(resp->status));
+    
+    // Standard headers
+    pos += snprintf(buf + pos, cap - pos, "Server: SimpleHTTP/1.0\r\n");
+    pos += snprintf(buf + pos, cap - pos, "Content-Length: %zu\r\n", 
+                    resp->body_length);
+    
+    if (conn->request.keep_alive) {
+        pos += snprintf(buf + pos, cap - pos, "Connection: keep-alive\r\n");
+    } else {
+        pos += snprintf(buf + pos, cap - pos, "Connection: close\r\n");
+    }
+    
+    // Custom headers
+    for (int i = 0; i < resp->header_count; i++) {
+        pos += snprintf(buf + pos, cap - pos, "%s: %s\r\n",
+                        resp->headers[i].name, resp->headers[i].value);
+    }
+    
+    // End of headers
+    pos += snprintf(buf + pos, cap - pos, "\r\n");
+    
+    // Body (if fits in buffer)
+    if (resp->body && resp->body_length <= cap - pos) {
+        memcpy(buf + pos, resp->body, resp->body_length);
+        pos += resp->body_length;
+    }
+    
+    conn->write_length = pos;
+    conn->write_pos = 0;
+}
+```
+
+---
+
+## Request Router
+
+```c
+// router.c
+#include "httpd.h"
+#include <fnmatch.h>
+
+void server_route(http_server_t *server, http_method_t method,
+                  const char *path, request_handler_t handler) {
+    route_t *route = calloc(1, sizeof(route_t));
+    route->method = method;
+    strncpy(route->path, path, MAX_PATH - 1);
+    route->handler = handler;
+    
+    // Add to front of list
+    route->next = server->routes;
+    server->routes = route;
+}
+
+static route_t *find_route(http_server_t *server, http_request_t *req) {
+    route_t *route = server->routes;
+    
+    while (route) {
+        if (route->method == req->method || route->method == HTTP_UNKNOWN) {
+            // Support wildcards in path
+            if (fnmatch(route->path, req->path, 0) == 0) {
+                return route;
+            }
+        }
+        route = route->next;
+    }
+    
+    return NULL;
+}
+
+void dispatch_request(http_server_t *server, connection_t *conn) {
+    route_t *route = find_route(server, &conn->request);
+    
+    if (route) {
+        route->handler(conn);
+    } else if (server->document_root) {
+        // Try static file
+        serve_static_file(server, conn);
+    } else {
+        response_set_status(&conn->response, HTTP_404_NOT_FOUND);
+        response_set_body(&conn->response, "Not Found", 9);
+    }
+    
+    build_response(conn);
+    conn->state = CONN_STATE_WRITING;
+    
+    // Update epoll for writing
+    struct epoll_event ev = {
+        .events = EPOLLOUT | EPOLLET | EPOLLRDHUP,
+        .data.ptr = conn
+    };
+    epoll_ctl(server->epoll_fd, EPOLL_CTL_MOD, conn->fd, &ev);
+}
+```
+
+---
+
+## Example Usage
+
+```c
+// main.c
+#include "httpd.h"
+#include <signal.h>
+
+http_server_t *g_server = NULL;
+
+void handle_signal(int sig) {
+    if (g_server) server_stop(g_server);
+}
+
+void handle_index(connection_t *conn) {
+    const char *html = 
+        "<!DOCTYPE html>\n"
+        "<html><head><title>Welcome</title></head>\n"
+        "<body><h1>Hello, World!</h1></body></html>\n";
+    
+    response_set_status(&conn->response, HTTP_200_OK);
+    response_set_header(&conn->response, "Content-Type", "text/html");
+    response_set_body(&conn->response, html, strlen(html));
+}
+
+void handle_api_users(connection_t *conn) {
+    const char *json = "{\"users\": [{\"id\": 1, \"name\": \"Alice\"}]}";
+    
+    response_set_status(&conn->response, HTTP_200_OK);
+    response_json(&conn->response, json);
+}
+
+void handle_api_echo(connection_t *conn) {
+    http_request_t *req = &conn->request;
+    
+    if (req->body) {
+        response_set_status(&conn->response, HTTP_200_OK);
+        response_json(&conn->response, req->body);
+    } else {
+        response_set_status(&conn->response, HTTP_400_BAD_REQUEST);
+        response_json(&conn->response, "{\"error\": \"No body\"}");
+    }
+}
+
+int main(int argc, char *argv[]) {
+    int port = argc > 1 ? atoi(argv[1]) : 8080;
+    
+    signal(SIGINT, handle_signal);
+    signal(SIGTERM, handle_signal);
+    signal(SIGPIPE, SIG_IGN);
+    
+    g_server = server_create(port, 10000);
+    if (!g_server) {
+        fprintf(stderr, "Failed to create server\n");
+        return 1;
+    }
+    
+    // Register routes
+    server_route(g_server, HTTP_GET, "/", handle_index);
+    server_route(g_server, HTTP_GET, "/api/users", handle_api_users);
+    server_route(g_server, HTTP_POST, "/api/echo", handle_api_echo);
+    
+    // Serve static files from ./public
+    server_static(g_server, "./public");
+    
+    printf("Server running on http://localhost:%d\n", port);
+    
+    server_run(g_server);
+    server_destroy(g_server);
+    
+    return 0;
+}
+```
+
+---
+
+## Makefile
+
+```makefile
+CC = gcc
+CFLAGS = -Wall -Wextra -O2 -g -pthread
+LDFLAGS = -pthread
+
+SRCS = main.c server.c parser.c response.c router.c static.c
+OBJS = $(SRCS:.c=.o)
+TARGET = httpd
+
+all: $(TARGET)
+
+$(TARGET): $(OBJS)
+	$(CC) $(OBJS) -o $@ $(LDFLAGS)
+
+%.o: %.c httpd.h
+	$(CC) $(CFLAGS) -c $< -o $@
+
+clean:
+	rm -f $(OBJS) $(TARGET)
+
+run: $(TARGET)
+	./$(TARGET) 8080
+
+.PHONY: all clean run
+```
+
+---
+
+## Benchmarking
+
+```bash
+# Install wrk
+sudo apt install wrk
+
+# Test with 12 threads, 400 connections, 30 seconds
+wrk -t12 -c400 -d30s http://localhost:8080/
+
+# Expected output on decent hardware:
+# Requests/sec: 100,000+
+# Latency: < 1ms average
+```
+
+---
+
+## Extensions
+
+<CardGroup cols={2}>
+  <Card title="HTTPS/TLS" icon="lock">
+    Add SSL/TLS with OpenSSL
+  </Card>
+  <Card title="HTTP/2" icon="bolt">
+    Implement HTTP/2 protocol
+  </Card>
+  <Card title="WebSockets" icon="plug">
+    Add WebSocket support
+  </Card>
+  <Card title="Reverse Proxy" icon="shuffle">
+    Load balancing and proxying
+  </Card>
+  <Card title="Rate Limiting" icon="gauge">
+    Token bucket rate limiting
+  </Card>
+  <Card title="Caching" icon="database">
+    Response caching layer
+  </Card>
+</CardGroup>
+
+---
+
+## Next Up
+
+<Card title="Performance Optimization" icon="arrow-right" href="/courses/c-programming/performance">
+  Learn advanced performance tuning techniques
+</Card>
