@@ -1,0 +1,1368 @@
+---
+title: "Query Engine Deep Dive"
+sidebarTitle: "Query Engine Internals"
+description: "Production-grade understanding of PostgreSQL's query engine for distributed database engineers"
+icon: "microchip"
+---
+
+# Query Engine Deep Dive
+
+This module provides the depth required to work on query engines at companies like PlanetScale, Vitess, CockroachDB, or Supabase. We go beyond EXPLAIN ANALYZE into the actual implementation details.
+
+<Info>
+**Target Audience**: Engineers aiming for query engine teams  
+**Prerequisites**: Completed Query Processing module  
+**Depth Level**: Source code + implementation details  
+**Interview Relevance**: Staff+ at database companies
+</Info>
+
+---
+
+## Part 1: Lexer & Parser Internals
+
+### 1.1 The Lexical Analyzer (scan.l)
+
+PostgreSQL's lexer is implemented in Flex. Located at `src/backend/parser/scan.l`.
+
+```c
+/* Key token definitions from scan.l */
+
+/* Keywords (converted from identifiers) */
+{keyword}   {
+    const ScanKeyword *keyword;
+    keyword = ScanKeywordLookup(yytext);
+    if (keyword != NULL)
+        return keyword->value;
+    /* Not a keyword - it's an identifier */
+    yylval.str = pstrdup(yytext);
+    return IDENT;
+}
+
+/* String constants - complex due to escape handling */
+{xqstart}   {
+    /* Start of single-quoted string */
+    SET_YYLLOC();
+    BEGIN(xq);
+    startlit();
+}
+<xq>{xqdouble}  { addlitchar('\''); }  /* '' escape */
+<xq>{xqinside}  { addlit(yytext, yyleng); }
+<xq>{xqstop}    {
+    BEGIN(INITIAL);
+    yylval.str = litbufdup();
+    return SCONST;
+}
+
+/* Operators - requires special lookahead */
+{operator}  {
+    /*
+     * Check for "special" operators: 
+     * - Is this the start of a comment?
+     * - Is this a multi-character operator?
+     */
+    return process_operator(yytext);
+}
+```
+
+### 1.2 Token Categories
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         TOKEN CATEGORIES                                     │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│   Category        Examples                    Notes                          │
+│   ─────────────────────────────────────────────────────────────────────────  │
+│   Keywords        SELECT, FROM, WHERE         ~450 reserved/unreserved       │
+│   Identifiers     users, my_table            Max 63 chars (NAMEDATALEN-1)   │
+│   Operators       =, <>, @>, &&              Custom operators possible       │
+│   Constants       'hello', 42, 3.14          SCONST, ICONST, FCONST         │
+│   Special         (, ), [, ], ::             Type cast, array subscript     │
+│                                                                              │
+│   Keyword Classification (important for parser):                             │
+│   • RESERVED: Cannot be used as identifiers (SELECT, FROM)                  │
+│   • TYPE_FUNC_NAME: Reserved except as function/type name                   │
+│   • COL_NAME_KEYWORD: Reserved except as column name                        │
+│   • UNRESERVED: Can be used as identifier (ABORT, ANALYZE)                  │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### 1.3 The Parser (gram.y)
+
+PostgreSQL's parser is a Bison LALR(1) grammar with ~15,000 lines.
+
+```c
+/* From gram.y - simplified SELECT statement rule */
+
+simple_select:
+    SELECT opt_all_clause opt_target_list
+    into_clause from_clause where_clause
+    group_clause having_clause window_clause
+    {
+        SelectStmt *n = makeNode(SelectStmt);
+        n->targetList = $3;
+        n->intoClause = $4;
+        n->fromClause = $5;
+        n->whereClause = $6;
+        n->groupClause = $7;
+        n->havingClause = $8;
+        n->windowClause = $9;
+        $$ = (Node *)n;
+    }
+    | SELECT distinct_clause target_list
+    /* ... more variants ... */
+    ;
+
+/* Target list (SELECT columns) */
+target_list:
+    target_el                       { $$ = list_make1($1); }
+    | target_list ',' target_el     { $$ = lappend($1, $3); }
+    ;
+
+target_el:
+    a_expr AS ColLabel
+    {
+        $$ = makeNode(ResTarget);
+        $$->name = $3;
+        $$->val = (Node *)$1;
+        $$->location = @1;
+    }
+    | a_expr
+    {
+        $$ = makeNode(ResTarget);
+        $$->name = NULL;
+        $$->val = (Node *)$1;
+        $$->location = @1;
+    }
+    | '*'
+    {
+        ColumnRef *n = makeNode(ColumnRef);
+        n->fields = list_make1(makeNode(A_Star));
+        n->location = @1;
+        $$ = makeNode(ResTarget);
+        $$->val = (Node *)n;
+        $$->location = @1;
+    }
+    ;
+```
+
+### 1.4 Expression Parsing & Precedence
+
+```c
+/* Operator precedence (from gram.y) - CRITICAL for correctness */
+
+%left      OR
+%left      AND
+%right     NOT
+%nonassoc  IS ISNULL NOTNULL
+%nonassoc  '<' '>' '=' LESS_EQUALS GREATER_EQUALS NOT_EQUALS
+%nonassoc  BETWEEN IN_P LIKE ILIKE SIMILAR NOT_LA
+%nonassoc  ESCAPE
+%left      POSTFIXOP
+%nonassoc  UNBOUNDED
+%nonassoc  IDENT
+%left      Op OPERATOR
+%left      '+' '-'
+%left      '*' '/' '%'
+%left      '^'
+%left      AT
+%left      COLLATE
+%right     UMINUS
+%left      '[' ']'
+%left      '(' ')'
+%left      TYPECAST
+%left      '.'
+
+/* This precedence hierarchy means:
+   1 + 2 * 3       → 1 + (2 * 3)        -- * before +
+   a AND b OR c    → (a AND b) OR c     -- AND before OR
+   a = b AND c = d → (a = b) AND (c = d) -- = before AND
+*/
+```
+
+### 1.5 Parse Tree Node Types
+
+```c
+/* src/include/nodes/parsenodes.h */
+
+/* All parse nodes start with NodeTag for runtime type identification */
+typedef struct SelectStmt
+{
+    NodeTag     type;           /* T_SelectStmt */
+    
+    /*
+     * These fields are used only in "leaf" SelectStmts
+     */
+    List       *distinctClause; /* NULL, DISTINCT ON list, or lcons(NIL,NIL) */
+    IntoClause *intoClause;     /* target for SELECT INTO */
+    List       *targetList;     /* the target list (of ResTarget) */
+    List       *fromClause;     /* the FROM clause */
+    Node       *whereClause;    /* WHERE qualification */
+    List       *groupClause;    /* GROUP BY clauses */
+    bool        groupDistinct;  /* is the GROUP BY DISTINCT? */
+    Node       *havingClause;   /* HAVING conditional-expression */
+    List       *windowClause;   /* WINDOW window_name AS (...), ... */
+    
+    /*
+     * In a "leaf" node these are all NIL/0; in a UNION/INTERSECT/EXCEPT
+     * node, these are set
+     */
+    List       *valuesLists;    /* untransformed list of expression lists */
+    List       *sortClause;     /* sort clause (a list of SortBy's) */
+    Node       *limitOffset;    /* # of result tuples to skip */
+    Node       *limitCount;     /* # of result tuples to return */
+    LimitOption limitOption;    /* FETCH FIRST or LIMIT? */
+    List       *lockingClause;  /* FOR UPDATE/SHARE clauses */
+    WithClause *withClause;     /* WITH clause */
+    
+    /*
+     * For UNION/INTERSECT/EXCEPT
+     */
+    SetOperation op;            /* type of set op */
+    bool        all;            /* ALL specified? */
+    struct SelectStmt *larg;    /* left child */
+    struct SelectStmt *rarg;    /* right child */
+} SelectStmt;
+```
+
+---
+
+## Part 2: Semantic Analysis Deep Dive
+
+### 2.1 The Analysis Pipeline
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                      SEMANTIC ANALYSIS PIPELINE                              │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│   Raw Parse Tree (SelectStmt)                                               │
+│           │                                                                  │
+│           ▼                                                                  │
+│   ┌───────────────────────────────────────────────────────────────────────┐ │
+│   │ transformStmt() - src/backend/parser/analyze.c                        │ │
+│   │                                                                        │ │
+│   │  switch (nodeTag(parseTree)) {                                        │ │
+│   │    case T_SelectStmt:                                                 │ │
+│   │      result = transformSelectStmt(pstate, stmt);                      │ │
+│   │      break;                                                           │ │
+│   │    case T_InsertStmt: ...                                             │ │
+│   │    case T_UpdateStmt: ...                                             │ │
+│   │    case T_DeleteStmt: ...                                             │ │
+│   │  }                                                                    │ │
+│   └───────────────────────────────────────────────────────────────────────┘ │
+│           │                                                                  │
+│           ▼                                                                  │
+│   ┌───────────────────────────────────────────────────────────────────────┐ │
+│   │ transformSelectStmt()                                                  │ │
+│   │                                                                        │ │
+│   │  1. transformFromClause()  → Build range table                        │ │
+│   │  2. transformTargetList()  → Resolve SELECT columns                   │ │
+│   │  3. transformWhereClause() → Type-check WHERE                         │ │
+│   │  4. transformSortClause()  → Validate ORDER BY                        │ │
+│   │  5. transformGroupClause() → Validate GROUP BY                        │ │
+│   │  6. transformLimitOffset() → Check LIMIT/OFFSET                       │ │
+│   └───────────────────────────────────────────────────────────────────────┘ │
+│           │                                                                  │
+│           ▼                                                                  │
+│   Query Tree (struct Query)                                                 │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### 2.2 Name Resolution
+
+```c
+/* Parse state tracks naming context */
+typedef struct ParseState
+{
+    ParseState *parentParseState;   /* For subqueries */
+    List       *p_rtable;           /* Range table (RangeTblEntry list) */
+    List       *p_joinexprs;        /* JoinExpr nodes */
+    List       *p_namespace;        /* Currently active namespace */
+    bool        p_lateral_active;   /* Lateral reference allowed? */
+    List       *p_ctenamespace;     /* CTE name lookup */
+    List       *p_future_ctes;      /* CTEs not yet analyzed */
+    CommonTableExpr *p_parent_cte;  /* Current CTE being analyzed */
+    
+    /* For expression type resolution */
+    Oid         p_expr_kind;        /* What context we're in */
+    int         p_next_resno;       /* Next result column number */
+    
+    /* Aggregate/window function tracking */
+    List       *p_aggs;             /* Aggregate functions in expressions */
+    List       *p_windowfuncs;      /* Window functions */
+    ParseExprKind p_expr_kind;      /* Kind of expr being parsed */
+} ParseState;
+
+/* Range table entry - one per table/subquery/join/values */
+typedef struct RangeTblEntry
+{
+    NodeTag     type;
+    RTEKind     rtekind;        /* RTE_RELATION, RTE_SUBQUERY, etc. */
+    
+    /* For RTE_RELATION */
+    Oid         relid;          /* OID of the relation */
+    char        relkind;        /* relation kind (r/v/m/f/p) */
+    
+    /* For RTE_SUBQUERY */
+    Query      *subquery;       /* the sub-query */
+    
+    /* For RTE_JOIN */
+    JoinType    jointype;       /* type of join */
+    List       *joinaliasvars;  /* columns of join result */
+    
+    /* Common fields */
+    Alias      *alias;          /* user-written alias clause */
+    Alias      *eref;           /* expanded reference names */
+    bool        lateral;        /* is this a LATERAL RTE? */
+    bool        inh;            /* inheritance requested? */
+    bool        inFromCl;       /* in FROM clause? */
+    AclMode     requiredPerms;  /* permissions needed */
+    Oid         checkAsUser;    /* user to check perms as */
+} RangeTblEntry;
+```
+
+### 2.3 Type Coercion System
+
+```c
+/* Type coercion is handled by coerce_to_target_type() */
+
+/* Coercion contexts (increasing permissiveness) */
+typedef enum CoercionContext
+{
+    COERCION_IMPLICIT,      /* Implicit coercion only */
+    COERCION_ASSIGNMENT,    /* Implicit + assignment coercions */
+    COERCION_PLPGSQL,       /* PL/pgSQL's relaxed rules */
+    COERCION_EXPLICIT       /* All coercions allowed */
+} CoercionContext;
+
+/* Example: WHERE id = '5' */
+/*
+ * 1. Left side: id has type int4
+ * 2. Right side: '5' has type unknown (untyped literal)
+ * 3. coerce_to_target_type('5', unknown, int4, COERCION_IMPLICIT)
+ * 4. Finds cast: unknown -> int4 via int4in()
+ * 5. Result: FuncExpr(int4in, Const('5'))
+ */
+
+/* The pg_cast catalog controls what coercions exist */
+-- SELECT castsource::regtype, casttarget::regtype, castcontext 
+-- FROM pg_cast WHERE casttarget = 'integer'::regtype;
+--
+--  castsource  | casttarget | castcontext
+-- -------------+------------+-------------
+--  smallint    | integer    | i           (implicit)
+--  bigint      | integer    | a           (assignment)
+--  real        | integer    | a
+--  numeric     | integer    | a
+--  text        | integer    | e           (explicit only)
+```
+
+### 2.4 Function Resolution
+
+```c
+/* Function lookup with overload resolution */
+
+/* Step 1: Find all functions with matching name */
+FuncCandidateList func_candidates = FuncnameGetCandidates(
+    funcname,       /* function name (possibly qualified) */
+    nargs,          /* number of arguments */
+    argtypes,       /* argument type OIDs */
+    false,          /* expand variadic? */
+    false,          /* expand defaults? */
+    false,          /* include out params? */
+    false           /* missing_ok? */
+);
+
+/* Step 2: Exact match check */
+for (cand = candidates; cand; cand = cand->next)
+{
+    if (exact_match(cand->args, argtypes, nargs))
+        return cand;  /* Found exact match */
+}
+
+/* Step 3: Coercion-based matching */
+/* Find candidates reachable via implicit coercion */
+ncandidates = 0;
+for (cand = candidates; cand; cand = cand->next)
+{
+    if (can_coerce_args(argtypes, cand->args, nargs))
+    {
+        last_candidate = cand;
+        ncandidates++;
+    }
+}
+
+/* Step 4: If multiple matches, apply "best match" algorithm */
+if (ncandidates > 1)
+{
+    /* Prefer:
+     * 1. Exact domain matches over base type
+     * 2. Fewer coercions
+     * 3. Preferred types (int4 > int2, text > varchar)
+     */
+    best = select_best_candidate(candidates, argtypes, nargs);
+}
+```
+
+---
+
+## Part 3: Planner Cost Model Internals
+
+### 3.1 Statistics System
+
+```c
+/* pg_statistic stores column statistics */
+typedef struct FormData_pg_statistic
+{
+    Oid         starelid;       /* Table OID */
+    int16       staattnum;      /* Column number */
+    bool        stainherit;     /* Include child tables? */
+    
+    float4      stanullfrac;    /* Fraction of nulls */
+    int32       stawidth;       /* Average stored width */
+    float4      stadistinct;    /* # distinct values (negative = fraction) */
+    
+    /* Up to STATISTIC_NUM_SLOTS (5) kinds of stats */
+    int16       stakind1;       /* Kind of slot 1 */
+    Oid         staop1;         /* Operator for slot 1 */
+    Oid         stacoll1;       /* Collation for slot 1 */
+    /* ... repeated for slots 2-5 ... */
+    
+    /* Actual data stored as arrays */
+    anyarray    stanumbers1;    /* Float4 array of statistics */
+    anyarray    stavalues1;     /* Array of common values */
+    /* ... repeated for slots 2-5 ... */
+} FormData_pg_statistic;
+
+/* Statistics kinds */
+#define STATISTIC_KIND_MCV      1   /* Most common values */
+#define STATISTIC_KIND_HISTOGRAM 2  /* Histogram (equi-depth) */
+#define STATISTIC_KIND_CORRELATION 3 /* Correlation with physical order */
+#define STATISTIC_KIND_MCELEM   4   /* MCV for array elements */
+#define STATISTIC_KIND_DECHIST  5   /* Histogram for array cardinality */
+#define STATISTIC_KIND_RANGE_LENGTH_HISTOGRAM 6
+#define STATISTIC_KIND_BOUNDS_HISTOGRAM 7
+```
+
+### 3.2 Selectivity Estimation
+
+```c
+/* Core selectivity functions in src/backend/optimizer/path/clausesel.c */
+
+/*
+ * Estimate selectivity of "column = constant"
+ */
+Selectivity
+eqsel(PlannerInfo *root, Oid operatorid,
+      List *args, Oid inputcollid, int varRelid)
+{
+    VariableStatData vardata;
+    Node       *other;
+    Selectivity selec;
+    
+    /* Get variable and constant from expression */
+    if (!get_restriction_variable(root, args, varRelid,
+                                   &vardata, &other))
+        return DEFAULT_EQ_SEL;
+    
+    /* If we have MCV stats and constant is in MCV list */
+    if (vardata.statsTuple != NULL)
+    {
+        /* Check if constant matches an MCV */
+        selec = mcv_selectivity(&vardata, constval);
+        if (selec >= 0)
+            return selec;  /* Found in MCV, use stored frequency */
+        
+        /* Not in MCV - estimate from histogram or default */
+        selec = histogram_selectivity(&vardata);
+        if (selec < 0)
+            selec = 1.0 / get_variable_numdistinct(&vardata);
+    }
+    else
+    {
+        /* No stats - use default */
+        selec = DEFAULT_EQ_SEL;  /* 0.005 */
+    }
+    
+    return selec;
+}
+
+/*
+ * Range selectivity for "column > constant"
+ */
+Selectivity
+scalarineqsel(PlannerInfo *root, ...)
+{
+    /* Use histogram to estimate fraction of values in range */
+    Selectivity selec;
+    
+    for (i = 0; i < nhistogram; i++)
+    {
+        if (histogram[i] >= constval)
+        {
+            /* Interpolate within bucket */
+            selec = (i + fraction) / nhistogram;
+            break;
+        }
+    }
+    
+    return selec;
+}
+```
+
+### 3.3 Row Count Estimation
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                      ROW COUNT ESTIMATION                                    │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│   Base Table:                                                                │
+│   ───────────                                                                │
+│   rows = pg_class.reltuples                                                  │
+│                                                                              │
+│   After WHERE:                                                               │
+│   ───────────                                                                │
+│   rows = base_rows × selectivity(where_clause)                              │
+│                                                                              │
+│   Selectivity Combination:                                                   │
+│   ───────────────────────                                                    │
+│   • AND: sel(a AND b) = sel(a) × sel(b)     [independence assumption]       │
+│   • OR:  sel(a OR b) = sel(a) + sel(b) - sel(a)×sel(b)                     │
+│   • NOT: sel(NOT a) = 1 - sel(a)                                            │
+│                                                                              │
+│   Join Cardinality:                                                          │
+│   ─────────────────                                                          │
+│   rows = outer_rows × inner_rows × join_selectivity                         │
+│                                                                              │
+│   For equijoin on key columns:                                               │
+│   join_sel = 1 / MAX(ndistinct_outer, ndistinct_inner)                      │
+│                                                                              │
+│   Example:                                                                   │
+│   SELECT * FROM orders o JOIN customers c ON o.customer_id = c.id           │
+│                                                                              │
+│   orders: 1,000,000 rows, customer_id has 50,000 distinct values            │
+│   customers: 100,000 rows, id has 100,000 distinct values                   │
+│   join_sel = 1/MAX(50000, 100000) = 1/100000 = 0.00001                      │
+│   result_rows = 1,000,000 × 100,000 × 0.00001 = 1,000,000                  │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### 3.4 Cost Calculation Functions
+
+```c
+/* From src/backend/optimizer/path/costsize.c */
+
+/*
+ * cost_seqscan - cost of sequential scan
+ */
+void
+cost_seqscan(Path *path, PlannerInfo *root,
+             RelOptInfo *baserel, ParamPathInfo *param_info)
+{
+    Cost        startup_cost = 0;
+    Cost        cpu_per_tuple;
+    Cost        run_cost;
+    double      spc_seq_page_cost;
+    
+    /* Disk costs */
+    spc_seq_page_cost = seq_page_cost;  /* default 1.0 */
+    run_cost = spc_seq_page_cost * baserel->pages;
+    
+    /* CPU costs */
+    cpu_per_tuple = cpu_tuple_cost + baserel->baserestrictcost.per_tuple;
+    run_cost += cpu_per_tuple * baserel->tuples;
+    
+    /* Apply selectivity to get expected output rows */
+    path->rows = clamp_row_est(baserel->tuples * 
+                               baserel->baserestrictcost.selectivity);
+    
+    path->startup_cost = startup_cost;
+    path->total_cost = startup_cost + run_cost;
+}
+
+/*
+ * cost_index - cost of index scan
+ */
+void
+cost_index(IndexPath *path, PlannerInfo *root, ...)
+{
+    Cost        startup_cost = 0;
+    Cost        run_cost = 0;
+    
+    /* Index access costs */
+    /* Estimate pages fetched using Mackert-Lohman formula */
+    pages_fetched = index_pages_fetched(tuples_fetched, 
+                                         baserel->pages,
+                                         index->pages,
+                                         root);
+    
+    /* Random I/O for index and table */
+    run_cost += random_page_cost * pages_fetched;
+    
+    /* For each tuple: index tuple cost + heap tuple cost */
+    run_cost += (cpu_index_tuple_cost + cpu_tuple_cost) * tuples_fetched;
+    
+    /* Index-only scan: skip heap access if visibility map says all-visible */
+    if (index_only_scan)
+    {
+        /* Reduce heap page fetches by visibility fraction */
+        heap_pages = pages_fetched * (1 - visibility_fraction);
+        run_cost = random_page_cost * heap_pages + 
+                   cpu_index_tuple_cost * tuples_fetched;
+    }
+}
+
+/*
+ * cost_hashjoin - cost of hash join
+ */
+void
+cost_hashjoin(HashPath *path, ...)
+{
+    /* Startup cost: build hash table on inner relation */
+    startup_cost = inner_startup + cpu_operator_cost * inner_rows;
+    
+    /* Need to fit hash table in work_mem */
+    inner_bytes = inner_width * inner_rows;
+    if (inner_bytes > work_mem * 1024)
+    {
+        /* Multi-batch hash join - much more expensive */
+        nbatch = (inner_bytes / (work_mem * 1024)) + 1;
+        startup_cost += seq_page_cost * inner_pages * 2; /* write & read */
+    }
+    
+    /* Run cost: probe hash table for each outer tuple */
+    run_cost = cpu_tuple_cost * outer_rows +
+               cpu_operator_cost * outer_rows * bucket_size;
+}
+```
+
+### 3.5 Cost Parameters Deep Dive
+
+```sql
+-- Key cost parameters and when to tune them
+
+-- Sequential vs Random I/O (SSD vs HDD)
+SET random_page_cost = 4.0;    -- Default: HDD assumption (random 4x slower)
+SET random_page_cost = 1.1;    -- For SSD: random nearly as fast as sequential
+SET seq_page_cost = 1.0;       -- Baseline for all costs
+
+-- Effective cache size (tell planner how much is cached)
+SET effective_cache_size = '4GB';   -- Total OS + PG cache
+-- Higher value = planner expects less random I/O
+
+-- CPU costs (rarely need tuning)
+SET cpu_tuple_cost = 0.01;          -- Process each row
+SET cpu_index_tuple_cost = 0.005;   -- Process index entry
+SET cpu_operator_cost = 0.0025;     -- Apply operator/function
+
+-- Parallel query costs
+SET parallel_tuple_cost = 0.1;      -- Per-tuple overhead of parallelism
+SET parallel_setup_cost = 1000;     -- Fixed parallel startup cost
+
+-- Join behavior
+SET geqo_threshold = 12;            -- Switch to genetic optimizer
+SET from_collapse_limit = 8;        -- Limit explicit join reordering
+SET join_collapse_limit = 8;        -- Limit subquery flattening
+```
+
+---
+
+## Part 4: Join Algorithms Deep Dive
+
+### 4.1 Nested Loop Join
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                      NESTED LOOP JOIN                                        │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│   Algorithm:                                                                 │
+│   for each tuple r in outer:                                                │
+│       for each tuple s in inner:                                            │
+│           if join_condition(r, s):                                          │
+│               emit (r, s)                                                   │
+│                                                                              │
+│   Cost: O(N × M) where N = outer rows, M = inner rows                       │
+│                                                                              │
+│   Variants:                                                                  │
+│   ┌───────────────────────────────────────────────────────────────────────┐ │
+│   │ NESTED LOOP                                                            │ │
+│   │   • Plain nested loop (inner rescanned for each outer)                │ │
+│   │   • Good when: inner is small or indexed                              │ │
+│   └───────────────────────────────────────────────────────────────────────┘ │
+│   ┌───────────────────────────────────────────────────────────────────────┐ │
+│   │ NESTED LOOP with INNER INDEX SCAN                                     │ │
+│   │   • Uses index to find matching inner tuples                          │ │
+│   │   • Parameterized inner path                                          │ │
+│   │   • Good when: highly selective, small outer                          │ │
+│   └───────────────────────────────────────────────────────────────────────┘ │
+│   ┌───────────────────────────────────────────────────────────────────────┐ │
+│   │ MATERIALIZED NESTED LOOP                                               │ │
+│   │   • Materializes inner result once                                     │ │
+│   │   • Rescans from memory                                                │ │
+│   │   • Good when: inner is complex subquery                               │ │
+│   └───────────────────────────────────────────────────────────────────────┘ │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### 4.2 Hash Join
+
+```c
+/* Hash join implementation from nodeHashjoin.c */
+
+/*
+ * Phase 1: Build hash table on inner relation
+ */
+ExecHashTableCreate()
+{
+    /* Calculate optimal bucket count */
+    nbuckets = ExecChooseHashTableSize(inner_rows, inner_width, work_mem);
+    
+    /* Determine if we need batches (doesn't fit in memory) */
+    if (total_size > work_mem)
+        nbatch = next_power_2(total_size / work_mem);
+    
+    /* Create hash table structure */
+    hashtable = palloc(sizeof(HashJoinTableData));
+    hashtable->buckets = palloc0(nbuckets * sizeof(HashJoinTuple));
+    hashtable->nbuckets = nbuckets;
+    hashtable->nbatch = nbatch;
+}
+
+/*
+ * Phase 2: Insert inner tuples into hash table
+ */
+ExecHashTableInsert()
+{
+    /* Hash the join key */
+    hashvalue = ExecHashGetHashValue(hashtable, econtext, hashkeys);
+    
+    /* Determine which bucket */
+    bucket_no = hashvalue % hashtable->nbuckets;
+    
+    /* Determine which batch (for multi-batch) */
+    batch_no = (hashvalue / nbuckets) % nbatch;
+    
+    if (batch_no == 0)
+    {
+        /* Insert into in-memory hash table */
+        HashJoinTuple tuple = ExecHashGetBucketAndBatch(hashtable, 
+                                                         hashvalue,
+                                                         &bucket_no);
+        /* Link into bucket chain */
+        tuple->next = hashtable->buckets[bucket_no];
+        hashtable->buckets[bucket_no] = tuple;
+    }
+    else
+    {
+        /* Write to batch file for later */
+        ExecHashJoinSaveTuple(tuple, batch_no, hashtable);
+    }
+}
+
+/*
+ * Phase 3: Probe hash table with outer tuples
+ */
+ExecHashJoin()
+{
+    for (;;)
+    {
+        /* Get next outer tuple */
+        outer_tuple = ExecProcNode(outer_plan);
+        
+        /* Hash the join key */
+        hashvalue = ExecHashGetHashValue(hashtable, econtext, hashkeys);
+        bucket_no = hashvalue % hashtable->nbuckets;
+        
+        /* Search bucket for matches */
+        for (tuple = hashtable->buckets[bucket_no];
+             tuple != NULL;
+             tuple = tuple->next)
+        {
+            if (ExecQual(join_qual, econtext))
+                return ExecProject(proj_info);  /* Found match */
+        }
+    }
+}
+```
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                      HASH JOIN VISUALIZATION                                 │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│   Inner Relation (customers)        Hash Table (in work_mem)                │
+│   ┌────────────────────────┐       ┌─────────────────────────────────┐      │
+│   │ id=1, name='Alice'     │ ──┐   │ Bucket 0: → {id=3} → {id=6}    │      │
+│   │ id=2, name='Bob'       │   │   │ Bucket 1: → {id=1} → {id=4}    │      │
+│   │ id=3, name='Carol'     │ ──┼─► │ Bucket 2: → {id=2} → {id=5}    │      │
+│   │ id=4, name='Dave'      │   │   │ Bucket 3: (empty)              │      │
+│   │ id=5, name='Eve'       │   │   │ ...                            │      │
+│   │ id=6, name='Frank'     │ ──┘   └─────────────────────────────────┘      │
+│   └────────────────────────┘                                                 │
+│                                                                              │
+│   Outer Relation (orders)          Probe Phase                              │
+│   ┌────────────────────────┐       ┌─────────────────────────────────┐      │
+│   │ order=101, cust_id=2   │ ────► │ hash(2) % 4 = 2                 │      │
+│   │ order=102, cust_id=1   │       │ Check bucket 2: found id=2! ✓  │      │
+│   │ order=103, cust_id=3   │       │ Output: (order=101, 'Bob')      │      │
+│   │ ...                    │       └─────────────────────────────────┘      │
+│   └────────────────────────┘                                                 │
+│                                                                              │
+│   Multi-Batch (when inner > work_mem):                                      │
+│   • Partition both relations by hash value                                  │
+│   • Process one batch at a time                                             │
+│   • Batch files written to temp_tablespaces                                 │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### 4.3 Merge Join
+
+```c
+/* Merge join requires sorted inputs */
+
+ExecMergeJoin()
+{
+    /* Both inputs must be sorted on join keys */
+    outer_tuple = ExecProcNode(outer_plan);  /* Already sorted */
+    inner_tuple = ExecProcNode(inner_plan);  /* Already sorted */
+    
+    while (outer_tuple && inner_tuple)
+    {
+        cmp = compare_join_keys(outer_tuple, inner_tuple);
+        
+        if (cmp < 0)
+        {
+            /* Outer key smaller - advance outer */
+            outer_tuple = ExecProcNode(outer_plan);
+        }
+        else if (cmp > 0)
+        {
+            /* Inner key smaller - advance inner */
+            inner_tuple = ExecProcNode(inner_plan);
+        }
+        else
+        {
+            /* Keys equal - emit match(es) */
+            /* Handle duplicates: mark position, scan all matches */
+            mark_inner_position();
+            
+            while (keys_equal(outer_tuple, inner_tuple))
+            {
+                emit_result(outer_tuple, inner_tuple);
+                inner_tuple = ExecProcNode(inner_plan);
+            }
+            
+            /* Move to next outer, restore inner to mark */
+            outer_tuple = ExecProcNode(outer_plan);
+            restore_inner_position();
+        }
+    }
+}
+```
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                      JOIN ALGORITHM COMPARISON                               │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│   Algorithm    Best For                    Cost          Memory             │
+│   ─────────────────────────────────────────────────────────────────────────  │
+│   Nested Loop  • Small outer relation      O(N × M)      O(1)               │
+│   (+ Index)    • Highly selective joins    O(N × logM)   O(1)               │
+│                • LIMIT queries                                              │
+│                • Non-equijoins (>, <, etc)                                  │
+│                                                                              │
+│   Hash Join    • Large relations           O(N + M)      O(min(N,M))        │
+│                • Equality joins only                                        │
+│                • No pre-sorted data                                         │
+│                • No need for order                                          │
+│                                                                              │
+│   Merge Join   • Pre-sorted inputs         O(N + M)      O(1)               │
+│                • Output needs order                      (just cursors)     │
+│                • Index provides order                                       │
+│                • Many duplicates OK                                         │
+│                                                                              │
+│   Decision Flow:                                                             │
+│   1. If very small outer + indexed inner → Nested Loop                      │
+│   2. If both sorted on join key → Merge Join                                │
+│   3. If equijoin + one fits in work_mem → Hash Join                         │
+│   4. Otherwise → Hash Join (with batching) or Nested Loop                   │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Part 5: Parallel Query Deep Dive
+
+### 5.1 Parallel Query Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                      PARALLEL QUERY ARCHITECTURE                             │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│   Leader Process                                                             │
+│   ┌─────────────────────────────────────────────────────────────┐           │
+│   │  • Spawns worker processes                                   │           │
+│   │  • Coordinates via shared memory (dsm)                       │           │
+│   │  • Collects results via tuple queues                         │           │
+│   └─────────────────────────────────────────────────────────────┘           │
+│              │                                                               │
+│              ▼ Shared Memory                                                 │
+│   ┌──────────┴──────────┬──────────┬──────────┐                            │
+│   │                     │          │          │                             │
+│   ▼                     ▼          ▼          ▼                             │
+│ ┌───────────┐    ┌───────────┐  ┌───────────┐  ┌───────────┐              │
+│ │  Worker 1 │    │  Worker 2 │  │  Worker 3 │  │  Worker N │              │
+│ │           │    │           │  │           │  │           │              │
+│ │ Parallel  │    │ Parallel  │  │ Parallel  │  │ Parallel  │              │
+│ │ SeqScan   │    │ SeqScan   │  │ SeqScan   │  │ SeqScan   │              │
+│ │ blocks    │    │ blocks    │  │ blocks    │  │ blocks    │              │
+│ │ 0,4,8,... │    │ 1,5,9,... │  │ 2,6,10... │  │ 3,7,11... │              │
+│ └─────┬─────┘    └─────┬─────┘  └─────┬─────┘  └─────┬─────┘              │
+│       │                │              │              │                      │
+│       └────────────────┴──────────────┴──────────────┘                      │
+│                        │                                                     │
+│                        ▼ Tuple Queues                                        │
+│              ┌─────────────────────┐                                        │
+│              │    Gather Node      │                                        │
+│              │  (Leader process)   │                                        │
+│              └─────────────────────┘                                        │
+│                        │                                                     │
+│                        ▼                                                     │
+│                   Final Result                                               │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### 5.2 Parallel-Safe Operations
+
+```sql
+-- Parallel-safe: Can run in workers
+-- Parallel-unsafe: Must run in leader only
+-- Parallel-restricted: Can run in worker but with restrictions
+
+-- Parallel scan types
+EXPLAIN SELECT * FROM large_table;
+-- Parallel Seq Scan on large_table (parallel workers: 4)
+
+-- Parallel aggregation
+EXPLAIN SELECT count(*) FROM large_table;
+/*
+ Finalize Aggregate
+   ->  Gather
+         Workers Planned: 4
+         ->  Partial Aggregate
+               ->  Parallel Seq Scan on large_table
+*/
+
+-- Parallel hash join
+EXPLAIN SELECT * FROM large1 JOIN large2 ON large1.id = large2.id;
+/*
+ Gather
+   Workers Planned: 4
+   ->  Parallel Hash Join
+         ->  Parallel Seq Scan on large1
+         ->  Parallel Hash
+               ->  Parallel Seq Scan on large2
+*/
+
+-- Configuration parameters
+SET max_parallel_workers_per_gather = 4;   -- Max workers per query
+SET max_parallel_workers = 8;              -- Total worker pool
+SET min_parallel_table_scan_size = '8MB';  -- Min table size for parallel
+SET min_parallel_index_scan_size = '512kB';
+SET parallel_leader_participation = on;    -- Leader does work too
+```
+
+### 5.3 Parallel-Unsafe Functions
+
+```sql
+-- Functions marked parallel-unsafe prevent parallelism
+-- Check with:
+SELECT proname, proparallel 
+FROM pg_proc 
+WHERE proname = 'your_function';
+
+-- proparallel values:
+-- 's' = safe (can run in any worker)
+-- 'r' = restricted (can run in worker, no parallel-unsafe calls)
+-- 'u' = unsafe (must run in leader)
+
+-- Common parallel-unsafe operations:
+-- • Writing to tables (INSERT/UPDATE/DELETE)
+-- • Sequence manipulation (nextval, setval)
+-- • Transaction control
+-- • Advisory locks
+-- • User-defined C functions by default
+
+-- Mark your function as parallel-safe:
+CREATE OR REPLACE FUNCTION my_pure_function(x int) 
+RETURNS int AS $$
+    SELECT x * 2;
+$$ LANGUAGE sql PARALLEL SAFE;
+```
+
+---
+
+## Part 6: JIT Compilation Deep Dive
+
+### 6.1 JIT Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                      JIT COMPILATION PIPELINE                                │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│   Plan Tree                                                                  │
+│       │                                                                      │
+│       ▼                                                                      │
+│   ┌─────────────────────────────────────────────────────────────────────┐   │
+│   │ JIT Cost Threshold Check                                             │   │
+│   │ • total_cost > jit_above_cost (100000)                              │   │
+│   │ • If yes, enable JIT compilation                                     │   │
+│   └─────────────────────────────────────────────────────────────────────┘   │
+│       │                                                                      │
+│       ▼                                                                      │
+│   ┌─────────────────────────────────────────────────────────────────────┐   │
+│   │ Expression Compilation (LLVM)                                        │   │
+│   │                                                                      │   │
+│   │ • WHERE clause expressions                                          │   │
+│   │ • Target list (SELECT) expressions                                  │   │
+│   │ • Aggregate transition functions                                    │   │
+│   │ • Tuple deforming (column extraction)                               │   │
+│   └─────────────────────────────────────────────────────────────────────┘   │
+│       │                                                                      │
+│       ▼ (if cost > jit_inline_above_cost)                                   │
+│   ┌─────────────────────────────────────────────────────────────────────┐   │
+│   │ Function Inlining                                                    │   │
+│   │ • Inline operator functions (int4eq, float8mul, etc.)               │   │
+│   │ • Reduces function call overhead                                     │   │
+│   └─────────────────────────────────────────────────────────────────────┘   │
+│       │                                                                      │
+│       ▼ (if cost > jit_optimize_above_cost)                                 │
+│   ┌─────────────────────────────────────────────────────────────────────┐   │
+│   │ LLVM Optimization Passes                                             │   │
+│   │ • -O3 level optimizations                                           │   │
+│   │ • Dead code elimination, constant folding, etc.                     │   │
+│   └─────────────────────────────────────────────────────────────────────┘   │
+│       │                                                                      │
+│       ▼                                                                      │
+│   Native Machine Code (executed by CPU)                                     │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### 6.2 What Gets JIT Compiled
+
+```sql
+-- See JIT details in EXPLAIN
+EXPLAIN (ANALYZE, VERBOSE, BUFFERS) 
+SELECT sum(quantity * price) FROM orders WHERE status = 'completed';
+
+/*
+ Finalize Aggregate  (cost=245912.00..245912.01 rows=1 width=8)
+   ->  Gather  (cost=245911.88..245912.00 rows=2 width=8)
+         Workers Planned: 2
+         ->  Partial Aggregate  (cost=244911.88..244911.89 rows=1 width=8)
+               ->  Parallel Seq Scan on orders  (cost=0.00..223289.75 rows=4324425 width=12)
+                     Filter: (status = 'completed'::text)
+ 
+ JIT:
+   Functions: 12                  ← 12 functions compiled
+   Options: Inlining true, Optimization true, Expressions true, Deforming true
+   Timing: Generation 2.345 ms, Inlining 15.678 ms, Optimization 45.123 ms, 
+           Emission 23.456 ms, Total 86.602 ms
+*/
+
+-- JIT-compiled components:
+-- 1. ExecEvalExpr for: quantity * price
+-- 2. ExecEvalExpr for: status = 'completed'
+-- 3. Transition function for sum()
+-- 4. Tuple deform for extracting columns
+```
+
+### 6.3 JIT Tuning
+
+```sql
+-- When to use JIT (rules of thumb):
+-- ✅ Queries processing millions of rows
+-- ✅ Complex expressions evaluated per-row
+-- ✅ Aggregations over large datasets
+-- ❌ OLTP queries (compile time > execution time)
+-- ❌ Simple queries (SELECT * FROM users WHERE id = 5)
+
+-- Default thresholds (tune for your workload)
+SET jit = on;                           -- Master switch
+SET jit_above_cost = 100000;            -- When to enable JIT
+SET jit_inline_above_cost = 500000;     -- When to inline functions
+SET jit_optimize_above_cost = 500000;   -- When to run LLVM optimizer
+
+-- For OLAP workloads - lower thresholds
+SET jit_above_cost = 10000;
+SET jit_inline_above_cost = 50000;
+SET jit_optimize_above_cost = 50000;
+
+-- For OLTP workloads - disable or very high thresholds
+SET jit = off;  -- Safest for OLTP
+-- Or:
+SET jit_above_cost = 1000000;
+```
+
+---
+
+## Part 7: Extended Statistics
+
+### 7.1 Correlation and Multi-Column Statistics
+
+```sql
+-- Problem: Planner assumes column independence
+-- Example: city and country are highly correlated
+
+-- Without extended stats:
+EXPLAIN SELECT * FROM addresses 
+WHERE city = 'Paris' AND country = 'France';
+-- Estimate: 100 rows (assumes: P(Paris) × P(France) = 0.01 × 0.05)
+-- Actual: 5000 rows (Paris is mostly in France!)
+
+-- Create extended statistics
+CREATE STATISTICS addr_city_country ON city, country FROM addresses;
+ANALYZE addresses;
+
+-- Now planner knows correlation
+EXPLAIN SELECT * FROM addresses 
+WHERE city = 'Paris' AND country = 'France';
+-- Estimate: 4800 rows (much closer to actual 5000)
+```
+
+### 7.2 Types of Extended Statistics
+
+```sql
+-- 1. N-distinct: Joint distinct count
+CREATE STATISTICS stat_ndistinct (ndistinct) 
+ON column1, column2 FROM table1;
+-- Useful for: GROUP BY column1, column2
+
+-- 2. Dependencies: Functional dependencies
+CREATE STATISTICS stat_dependencies (dependencies) 
+ON zip_code, city, state FROM addresses;
+-- Useful for: WHERE zip_code = '10001' AND city = 'New York'
+-- If zip_code → city, knowing zip_code tells us city
+
+-- 3. MCV (Most Common Values): Combined value frequencies
+CREATE STATISTICS stat_mcv (mcv) 
+ON column1, column2 FROM table1;
+-- Stores actual common (column1, column2) pairs and frequencies
+
+-- Combined (default includes all):
+CREATE STATISTICS all_stats 
+ON city, state, zip_code FROM addresses;
+
+-- View statistics:
+SELECT stxname, stxkeys, stxkind, 
+       pg_get_statisticsobjdef(oid) as definition
+FROM pg_statistic_ext;
+```
+
+---
+
+## Part 8: Query Engine Interview Questions
+
+### Senior/Staff Level Questions
+
+<AccordionGroup>
+  <Accordion title="Q: Design a query planner for a distributed database like CockroachDB">
+    **Answer Framework**:
+    
+    1. **Local vs Distributed Planning**
+       - Parse and analyze locally
+       - Generate distributed plan with data placement awareness
+       - Consider network costs in cost model
+    
+    2. **Data Placement Awareness**
+       - Track which nodes have which ranges/shards
+       - Prefer reading from local replicas
+       - Push predicates down to reduce data transfer
+    
+    3. **Distributed Join Strategies**
+       - Lookup join: For highly selective joins
+       - Hash join: Partition both sides by join key
+       - Merge join: If data co-located and sorted
+       - Broadcast join: When one side is small
+    
+    4. **Gateway Routing**
+       - Plan can be executed partially at gateway
+       - Parallel scatter to leaf nodes
+       - Gather and merge at gateway
+    
+    5. **Transaction Considerations**
+       - Read timestamp selection
+       - Write intent placement
+       - Conflict resolution
+  </Accordion>
+  
+  <Accordion title="Q: How would you implement adaptive query execution?">
+    **Answer Framework**:
+    
+    1. **Runtime Statistics Collection**
+       - Track actual row counts at each node
+       - Compare with estimates during execution
+       
+    2. **Trigger Points**
+       - Cardinality much higher than expected (10x)
+       - Memory pressure (hash table exceeds work_mem)
+       - Skewed data distribution
+    
+    3. **Adaptations**
+       - Switch join algorithm mid-execution
+       - Increase parallelism
+       - Change join order for remaining tables
+       - Switch from hash join to nested loop
+    
+    4. **Implementation Approach**
+       - Checkpoint plan execution state
+       - Re-plan remaining work
+       - Resume with new plan
+       - Cache runtime statistics for future queries
+  </Accordion>
+  
+  <Accordion title="Q: How does Vitess route queries to the right shards?">
+    **Answer Framework**:
+    
+    1. **VSchema (Vitess Schema)**
+       - Declares sharding key per table
+       - Vindexes map column values to keyspace IDs
+    
+    2. **Query Parsing**
+       - Parse SQL in VTGate
+       - Extract sharding key from WHERE clause
+    
+    3. **Vindex Lookup**
+       - Compute keyspace ID from sharding key value
+       - Map keyspace ID to target shard(s)
+    
+    4. **Scatter-Gather for Cross-Shard**
+       - If query spans shards, send to all
+       - Merge results at VTGate
+       - Handle ordering, aggregation at VTGate
+    
+    5. **Optimizations**
+       - Prepared statement caching
+       - Connection pooling per shard
+       - Query de-duplication
+  </Accordion>
+  
+  <Accordion title="Q: Explain PostgreSQL's genetic query optimizer (GEQO)">
+    **Answer Framework**:
+    
+    1. **Why Genetic Algorithm**
+       - Join order optimization is O(n!)
+       - For 12+ tables, exhaustive search impractical
+       - Genetic algo provides "good enough" in reasonable time
+    
+    2. **Representation**
+       - Each chromosome = join order permutation
+       - Gene = table position in join sequence
+    
+    3. **Operators**
+       - Selection: Tournament selection of fittest
+       - Crossover: Edge recombination (preserves edge relationships)
+       - Mutation: Random swap of gene positions
+    
+    4. **Fitness Function**
+       - Cost of resulting join plan
+       - Evaluated using standard cost model
+    
+    5. **Parameters**
+       - geqo_threshold (default 12): When to switch from DP
+       - geqo_effort (default 5): 1-10, higher = more generations
+       - geqo_generations: Number of evolutionary cycles
+  </Accordion>
+</AccordionGroup>
+
+---
+
+## Part 9: Source Code Exercises
+
+### Exercise 1: Trace a Query Through the System
+
+```c
+/* 
+ * Trace: SELECT name FROM users WHERE id = 5;
+ *
+ * Add breakpoints in gdb at these functions:
+ */
+
+// 1. Parser entry
+b pg_parse_query           // src/backend/tcop/postgres.c
+b base_yyparse             // src/backend/parser/gram.y
+
+// 2. Analyzer entry
+b transformStmt            // src/backend/parser/analyze.c
+b transformSelectStmt
+
+// 3. Planner entry
+b planner                  // src/backend/optimizer/plan/planner.c
+b standard_planner
+b create_plan              // Where path → plan conversion
+
+// 4. Executor entry
+b ExecutorStart            // src/backend/executor/execMain.c
+b ExecutorRun
+b ExecSeqScan              // Or ExecIndexScan
+
+// Then run:
+// (gdb) run -D /path/to/data
+// In psql: SELECT name FROM users WHERE id = 5;
+```
+
+### Exercise 2: Add a Custom Operator
+
+```sql
+-- Create a custom "approximately equals" operator for floats
+-- Step 1: Create the function
+CREATE OR REPLACE FUNCTION float_approx_eq(a float8, b float8)
+RETURNS boolean AS $$
+    SELECT abs(a - b) < 0.0001
+$$ LANGUAGE sql IMMUTABLE STRICT PARALLEL SAFE;
+
+-- Step 2: Create the operator
+CREATE OPERATOR ~= (
+    LEFTARG = float8,
+    RIGHTARG = float8,
+    FUNCTION = float_approx_eq,
+    COMMUTATOR = ~=
+);
+
+-- Step 3: Tell the planner about selectivity
+CREATE OR REPLACE FUNCTION float_approx_eq_sel(internal, oid, internal, integer)
+RETURNS float8 AS 'eqsel' LANGUAGE internal STABLE STRICT;
+
+-- Step 4: Create operator class for indexing (optional)
+-- (Would require B-tree support functions)
+
+-- Usage:
+SELECT * FROM measurements WHERE value ~= 3.14159;
+```
+
+---
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Performance Engineering" icon="gauge-high" href="/courses/database-engineering/performance-engineering">
+    Profiling, benchmarking, and optimization at scale
+  </Card>
+  <Card title="Storage Engine Deep Dive" icon="hard-drive" href="/courses/database-engineering/storage-deep-dive">
+    MVCC, vacuum, WAL internals
+  </Card>
+</CardGroup>
