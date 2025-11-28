@@ -1,0 +1,578 @@
+---
+title: "Design: Rate Limiter"
+description: "System design for distributed rate limiting"
+icon: "gauge"
+---
+
+## Problem Statement
+
+Design a rate limiter that:
+- Limits requests per user/API key to prevent abuse
+- Works across multiple servers (distributed)
+- Has minimal latency impact
+- Supports different rate limits per tier
+
+<Note>
+This is a **medium** difficulty problem but very important! Rate limiting is asked frequently because it touches on distributed systems concepts. Know the algorithms well!
+</Note>
+
+## Step 1: Requirements
+
+### Functional Requirements
+
+- Limit requests per user/IP/API key
+- Different limits for different endpoints
+- Different tiers (free: 100/hour, paid: 10,000/hour)
+- Return appropriate error when limit exceeded
+
+### Non-Functional Requirements
+
+- **Low Latency**: < 10ms overhead per request
+- **Accurate**: No significant over-limiting or under-limiting
+- **Distributed**: Work across multiple servers
+- **Fault Tolerant**: Fail open if rate limiter is down
+
+### Quick Estimation
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                     Scale Estimation                            │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  API Traffic:                                                   │
+│  • 10 million API calls per hour (peak)                        │
+│  • 10M / 3600 = ~2,800 requests per second                     │
+│                                                                 │
+│  Users:                                                         │
+│  • 1 million unique users/API keys                             │
+│                                                                 │
+│  Storage per user (sliding window):                            │
+│  • User ID: 16 bytes                                           │
+│  • Counter: 8 bytes                                            │
+│  • Window timestamp: 8 bytes                                   │
+│  • ~32 bytes per user                                          │
+│  • 1M users × 32 bytes = 32 MB                                 │
+│                                                                 │
+│  Very lightweight! Redis can handle this easily                │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+## Step 2: Rate Limiting Algorithms
+
+### Algorithm 1: Token Bucket ⭐ (Most Common)
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                     Token Bucket                                │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  Concept: Bucket holds tokens, requests consume tokens          │
+│  Tokens are added at a fixed rate                              │
+│                                                                 │
+│  Parameters:                                                    │
+│  • bucket_capacity = 10 tokens (max burst)                     │
+│  • refill_rate = 1 token/second                                │
+│                                                                 │
+│    Time 0s    Time 1s    Time 2s    Time 3s                   │
+│    ┌─────┐    ┌─────┐    ┌─────┐    ┌─────┐                   │
+│    │█████│    │████ │    │███  │    │████ │                   │
+│    │█████│    │████ │    │███  │    │████ │                   │
+│    │     │    │     │    │     │    │     │                   │
+│    │     │    │     │    │     │    │     │                   │
+│    └─────┘    └─────┘    └─────┘    └─────┘                   │
+│     10/10      8/10       6/10       7/10                      │
+│                                                                 │
+│    t=0: Start with 10 tokens                                   │
+│    t=1: 2 requests used 2 tokens, 1 refilled → 9 tokens       │
+│         Wait... 2-1=8 tokens                                   │
+│    t=2: 3 requests, 1 refilled → 8-3+1 = 6 tokens             │
+│    t=3: 0 requests, 1 refilled → 7 tokens                     │
+│                                                                 │
+│  Pros: Simple, allows bursts, smooth rate                      │
+│  Cons: Need to track per-user bucket state                     │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+```python
+class TokenBucket:
+    def __init__(self, capacity: int, refill_rate: float):
+        self.capacity = capacity        # Max tokens
+        self.refill_rate = refill_rate  # Tokens per second
+        self.tokens = capacity
+        self.last_refill = time.time()
+    
+    def allow_request(self) -> bool:
+        # Refill tokens based on time elapsed
+        now = time.time()
+        time_elapsed = now - self.last_refill
+        new_tokens = time_elapsed * self.refill_rate
+        self.tokens = min(self.capacity, self.tokens + new_tokens)
+        self.last_refill = now
+        
+        # Check if we have tokens
+        if self.tokens >= 1:
+            self.tokens -= 1
+            return True
+        return False
+```
+
+### Algorithm 2: Sliding Window Log
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                  Sliding Window Log                             │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  Concept: Store timestamp of each request, count in window     │
+│                                                                 │
+│  Limit: 5 requests per minute                                  │
+│                                                                 │
+│  Timeline:                                                      │
+│  ──────────────────────────────────────────────────────►       │
+│  |   10s  |   20s  |   30s  |   40s  |   50s  |   60s  |      │
+│      ●        ●        ●        ●        ●                     │
+│     req1    req2     req3     req4     req5                    │
+│                                                                 │
+│  At t=65s, new request comes:                                  │
+│  • Window: [5s, 65s]                                           │
+│  • Remove req1 (at 10s, outside window)                        │
+│  • Count remaining: 4 requests                                 │
+│  • 4 < 5, so ALLOW                                             │
+│                                                                 │
+│  Storage: Redis Sorted Set                                     │
+│  ZADD rate:user123 <timestamp> <request_id>                    │
+│  ZREMRANGEBYSCORE rate:user123 0 <window_start>               │
+│  ZCARD rate:user123                                            │
+│                                                                 │
+│  Pros: Very accurate                                           │
+│  Cons: Memory intensive (stores every request)                 │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### Algorithm 3: Sliding Window Counter (Recommended)
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│               Sliding Window Counter                            │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  Concept: Combine fixed window with weighted average           │
+│                                                                 │
+│  Limit: 100 requests per minute                                │
+│                                                                 │
+│  Previous window     Current window                            │
+│  ┌─────────────────┬─────────────────┐                         │
+│  │                 │       ●         │                         │
+│  │      84 req     │      15 req     │                         │
+│  │                 │    (so far)     │                         │
+│  └─────────────────┴─────────────────┘                         │
+│                    ▲                                            │
+│               Current time                                      │
+│               (25% into current window)                         │
+│                                                                 │
+│  Weighted count = prev × (1 - position) + current              │
+│                 = 84 × 0.75 + 15                               │
+│                 = 63 + 15                                       │
+│                 = 78                                            │
+│                                                                 │
+│  78 < 100, so ALLOW                                            │
+│                                                                 │
+│  Pros: Memory efficient (just 2 counters), accurate enough    │
+│  Cons: Slight approximation                                    │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+```python
+class SlidingWindowCounter:
+    """
+    Memory-efficient sliding window using two fixed windows
+    """
+    
+    def __init__(self, redis, limit: int, window_seconds: int):
+        self.redis = redis
+        self.limit = limit
+        self.window_seconds = window_seconds
+    
+    def allow_request(self, user_id: str) -> bool:
+        now = time.time()
+        current_window = int(now // self.window_seconds)
+        previous_window = current_window - 1
+        
+        # Position within current window (0.0 to 1.0)
+        position = (now % self.window_seconds) / self.window_seconds
+        
+        # Get counts from Redis
+        current_key = f"rate:{user_id}:{current_window}"
+        previous_key = f"rate:{user_id}:{previous_window}"
+        
+        current_count = int(self.redis.get(current_key) or 0)
+        previous_count = int(self.redis.get(previous_key) or 0)
+        
+        # Weighted average
+        estimated_count = previous_count * (1 - position) + current_count
+        
+        if estimated_count >= self.limit:
+            return False
+        
+        # Increment current window counter
+        pipe = self.redis.pipeline()
+        pipe.incr(current_key)
+        pipe.expire(current_key, self.window_seconds * 2)
+        pipe.execute()
+        
+        return True
+```
+
+## Step 3: Algorithm Comparison
+
+| Algorithm | Memory | Accuracy | Complexity | Best For |
+|-----------|--------|----------|------------|----------|
+| **Token Bucket** | O(1) per user | Good | Simple | General use, allows bursts |
+| **Leaky Bucket** | O(1) per user | Good | Simple | Smooth output rate |
+| **Fixed Window** | O(1) per user | Poor at edges | Very simple | When accuracy less important |
+| **Sliding Log** | O(N) per user | Perfect | Medium | When accuracy critical |
+| **Sliding Counter** | O(1) per user | Very good | Medium | Best balance ⭐ |
+
+## Step 4: High-Level Design
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                Rate Limiter Architecture                        │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│          ┌─────────┐                                           │
+│          │  Client │                                           │
+│          └────┬────┘                                           │
+│               │                                                 │
+│               ▼                                                 │
+│         ┌──────────┐                                           │
+│         │   API    │                                           │
+│         │ Gateway  │                                           │
+│         └────┬─────┘                                           │
+│              │                                                  │
+│              ▼                                                  │
+│     ┌─────────────────┐                                        │
+│     │  Rate Limiter   │◄──── Where to put it?                  │
+│     │   Middleware    │      • API Gateway (recommended)       │
+│     └────────┬────────┘      • Application layer               │
+│              │               • Separate service                 │
+│              │                                                  │
+│    ┌─────────▼─────────┐                                       │
+│    │    Redis Cluster  │                                       │
+│    │   (Rate Counter)  │                                       │
+│    └───────────────────┘                                       │
+│              │                                                  │
+│      ┌───────┴───────┐                                         │
+│      │               │                                          │
+│   ALLOWED         REJECTED                                      │
+│      │               │                                          │
+│      ▼               ▼                                          │
+│  ┌────────┐     ┌────────┐                                     │
+│  │ Process │     │  429   │                                    │
+│  │ Request │     │ Error  │                                    │
+│  └────────┘     └────────┘                                     │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### Response Headers
+
+```http
+HTTP/1.1 200 OK
+X-RateLimit-Limit: 100
+X-RateLimit-Remaining: 45
+X-RateLimit-Reset: 1640000000
+
+# When rate limited:
+HTTP/1.1 429 Too Many Requests
+Retry-After: 30
+X-RateLimit-Limit: 100
+X-RateLimit-Remaining: 0
+X-RateLimit-Reset: 1640000000
+```
+
+## Step 5: Distributed Rate Limiting
+
+### Challenge: Multiple Servers
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                 Distributed Challenge                           │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  Problem: User requests hit different servers                  │
+│                                                                 │
+│           User A (limit: 10/min)                               │
+│                 │                                               │
+│         ┌───────┼───────┐                                      │
+│         │       │       │                                       │
+│         ▼       ▼       ▼                                       │
+│     ┌──────┐┌──────┐┌──────┐                                   │
+│     │Srv 1 ││Srv 2 ││Srv 3 │                                   │
+│     │ 3req ││ 4req ││ 5req │                                   │
+│     └──────┘└──────┘└──────┘                                   │
+│                                                                 │
+│  Each server thinks: "Only a few requests, allow!"             │
+│  Total: 12 requests (exceeded limit!)                          │
+│                                                                 │
+│  Solutions:                                                     │
+│  ──────────                                                     │
+│  1. Centralized counter (Redis) ← Recommended                 │
+│  2. Sticky sessions (same user → same server)                  │
+│  3. Sync counters between servers (complex)                    │
+│  4. Split limit across servers (10/3 ≈ 3 per server)           │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### Redis-Based Solution
+
+```python
+class DistributedRateLimiter:
+    """
+    Uses Redis for distributed rate limiting with Lua script
+    for atomic check-and-increment
+    """
+    
+    SLIDING_WINDOW_SCRIPT = """
+    local key = KEYS[1]
+    local window_size = tonumber(ARGV[1])
+    local limit = tonumber(ARGV[2])
+    local now = tonumber(ARGV[3])
+    local window_start = now - window_size
+    
+    -- Remove old entries
+    redis.call('ZREMRANGEBYSCORE', key, 0, window_start)
+    
+    -- Count current entries
+    local count = redis.call('ZCARD', key)
+    
+    if count < limit then
+        -- Add new request
+        redis.call('ZADD', key, now, now .. ':' .. math.random())
+        redis.call('EXPIRE', key, window_size)
+        return {1, limit - count - 1}  -- allowed, remaining
+    else
+        return {0, 0}  -- rejected, 0 remaining
+    end
+    """
+    
+    def __init__(self, redis_client, limit: int, window_seconds: int):
+        self.redis = redis_client
+        self.limit = limit
+        self.window_seconds = window_seconds
+        self.script = self.redis.register_script(self.SLIDING_WINDOW_SCRIPT)
+    
+    def allow_request(self, user_id: str) -> Tuple[bool, int]:
+        key = f"rate:{user_id}"
+        now = time.time()
+        
+        result = self.script(
+            keys=[key],
+            args=[self.window_seconds, self.limit, now]
+        )
+        
+        allowed = result[0] == 1
+        remaining = result[1]
+        
+        return allowed, remaining
+```
+
+## Step 6: Rate Limiting by Tier
+
+```python
+class TieredRateLimiter:
+    """
+    Different rate limits for different user tiers
+    """
+    
+    TIER_LIMITS = {
+        "free": {
+            "requests_per_minute": 60,
+            "requests_per_day": 1000,
+        },
+        "basic": {
+            "requests_per_minute": 600,
+            "requests_per_day": 10000,
+        },
+        "pro": {
+            "requests_per_minute": 6000,
+            "requests_per_day": 100000,
+        },
+        "enterprise": {
+            "requests_per_minute": 60000,
+            "requests_per_day": 1000000,
+        }
+    }
+    
+    def check_rate_limit(self, user_id: str, tier: str) -> RateLimitResult:
+        limits = self.TIER_LIMITS[tier]
+        
+        # Check minute limit
+        minute_key = f"rate:{user_id}:minute"
+        minute_count = self.redis.incr(minute_key)
+        if minute_count == 1:
+            self.redis.expire(minute_key, 60)
+        
+        if minute_count > limits["requests_per_minute"]:
+            return RateLimitResult(
+                allowed=False,
+                reason="minute_limit",
+                retry_after=self.redis.ttl(minute_key)
+            )
+        
+        # Check daily limit
+        day_key = f"rate:{user_id}:day:{date.today()}"
+        day_count = self.redis.incr(day_key)
+        if day_count == 1:
+            self.redis.expire(day_key, 86400)
+        
+        if day_count > limits["requests_per_day"]:
+            return RateLimitResult(
+                allowed=False,
+                reason="daily_limit",
+                retry_after=self.redis.ttl(day_key)
+            )
+        
+        return RateLimitResult(
+            allowed=True,
+            remaining_minute=limits["requests_per_minute"] - minute_count,
+            remaining_day=limits["requests_per_day"] - day_count
+        )
+```
+
+## Step 7: Complete Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│             Complete Rate Limiter System                        │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│      ┌─────────────────────────────────────────┐               │
+│      │              API Gateway                 │               │
+│      │  ┌───────────────────────────────────┐  │               │
+│      │  │      Rate Limiter Middleware      │  │               │
+│      │  └───────────────┬───────────────────┘  │               │
+│      └──────────────────┼──────────────────────┘               │
+│                         │                                       │
+│         ┌───────────────┼───────────────┐                      │
+│         │               │               │                       │
+│         ▼               ▼               ▼                       │
+│    ┌─────────┐    ┌─────────┐    ┌─────────┐                  │
+│    │  Redis  │    │  Redis  │    │  Redis  │                  │
+│    │ Primary │◄──►│ Replica │◄──►│ Replica │                  │
+│    └─────────┘    └─────────┘    └─────────┘                  │
+│                                                                 │
+│    Config Store (Rules):                                       │
+│    ┌─────────────────────────────────────────────────────────┐│
+│    │  /api/v1/*     → 100 req/min (default)                  ││
+│    │  /api/v1/auth  → 10 req/min (stricter)                  ││
+│    │  /api/v1/data  → 1000 req/min (relaxed)                 ││
+│    │  tier:free     → 60 req/min                             ││
+│    │  tier:pro      → 6000 req/min                           ││
+│    └─────────────────────────────────────────────────────────┘│
+│                                                                 │
+│    Monitoring:                                                  │
+│    • Rate limited requests per endpoint                        │
+│    • Users hitting limits frequently                           │
+│    • Redis latency metrics                                     │
+│    • Alert when rejection rate > threshold                     │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+## Key Design Decisions
+
+| Decision | Choice | Reasoning |
+|----------|--------|-----------|
+| **Algorithm** | Sliding Window Counter | Best memory/accuracy trade-off |
+| **Storage** | Redis | Fast, atomic operations, built-in expiry |
+| **Location** | API Gateway | Catch early, reduce backend load |
+| **Failure Mode** | Fail open | Availability over protection |
+| **Atomicity** | Lua scripts | Avoid race conditions |
+
+## Common Interview Questions
+
+<Accordion title="What if Redis is down?">
+**Fail open strategy**:
+1. If Redis unavailable, allow all requests
+2. Log warning for monitoring
+3. Availability > perfect rate limiting
+4. Have backup local rate limiter (approximate)
+
+**Alternative**: Fail closed for critical endpoints (auth, payments)
+</Accordion>
+
+<Accordion title="How to handle distributed clock skew?">
+1. Use Redis server time, not client time
+2. Redis `TIME` command for consistency
+3. NTP sync on all servers
+4. Allow small tolerance in window boundaries
+</Accordion>
+
+<Accordion title="How to rate limit by IP vs API key?">
+**Layer the limits**:
+```
+1. IP-based limit (rough, for unauthenticated)
+2. API key limit (main rate limit)
+3. User account limit (cross all keys)
+
+Check all three, reject if any exceeded
+```
+</Accordion>
+
+<Accordion title="How to prevent race conditions?">
+Use atomic operations:
+1. Redis Lua scripts (atomic execution)
+2. INCR command (atomic increment)
+3. WATCH/MULTI/EXEC (optimistic locking)
+
+```lua
+-- Atomic check and increment
+local count = redis.call('INCR', key)
+if count == 1 then
+    redis.call('EXPIRE', key, window)
+end
+return count
+```
+</Accordion>
+
+<Accordion title="How to handle burst traffic?">
+1. Token bucket naturally allows bursts up to capacity
+2. Use higher limit with shorter window
+3. Queue excess requests instead of rejecting
+4. Implement retry with exponential backoff on client
+5. Consider adaptive rate limiting based on system load
+</Accordion>
+
+## Quick Reference Card
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                 Rate Limiter Cheat Sheet                        │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  When asked about rate limiter, mention:                       │
+│                                                                 │
+│  1. Algorithm choice (usually sliding window counter)          │
+│  2. Redis for distributed counter                              │
+│  3. Lua script for atomicity                                   │
+│  4. Put in API Gateway layer                                   │
+│  5. Different limits per tier                                  │
+│  6. Fail open strategy                                         │
+│  7. Return headers: X-RateLimit-Remaining, Retry-After        │
+│  8. Monitor: rejection rate, users hitting limits              │
+│                                                                 │
+│  Redis commands:                                                │
+│  • INCR key          - increment counter                       │
+│  • EXPIRE key sec    - set TTL                                 │
+│  • ZADD set score    - sorted set (sliding log)                │
+│  • ZREMRANGEBYSCORE  - clean old entries                       │
+│  • ZCARD set         - count entries                           │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
