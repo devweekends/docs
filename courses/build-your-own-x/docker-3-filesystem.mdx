@@ -1,0 +1,810 @@
+---
+title: "Chapter 3: Filesystem Isolation"
+sidebarTitle: "3. Filesystem"
+description: "Implement overlay filesystems and copy-on-write for efficient container storage"
+icon: "folder-tree"
+---
+
+# Chapter 3: Filesystem Isolation
+
+Containers need their own filesystem - but copying gigabytes for each container would be wasteful. Enter **overlay filesystems** and **copy-on-write**!
+
+<Info>
+**Prerequisites**: [Chapter 2: Cgroups](/courses/build-your-own-x/docker-2-cgroups)  
+**Further Reading**: [Operating Systems: File Systems](/operating-systems/file-systems)  
+**Time**: 3-4 hours  
+**Outcome**: Efficient layered filesystem for containers
+</Info>
+
+---
+
+## The Storage Challenge
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                        THE PROBLEM                                           │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│   WITHOUT LAYERED FS:                                                       │
+│                                                                              │
+│   Container 1        Container 2        Container 3                         │
+│   ┌──────────┐       ┌──────────┐       ┌──────────┐                       │
+│   │ Ubuntu   │       │ Ubuntu   │       │ Ubuntu   │                       │
+│   │ 500 MB   │       │ 500 MB   │       │ 500 MB   │                       │
+│   │          │       │          │       │          │                       │
+│   │ + App    │       │ + App    │       │ + App    │                       │
+│   │ 100 MB   │       │ 100 MB   │       │ 100 MB   │                       │
+│   └──────────┘       └──────────┘       └──────────┘                       │
+│                                                                              │
+│   Total: 1.8 GB  (600 MB × 3)  ← Wasteful!                                 │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                        THE SOLUTION                                          │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│   WITH OVERLAY FS:                                                          │
+│                                                                              │
+│   Shared Base Layer (read-only)                                             │
+│   ┌─────────────────────────────────────────────────────────────┐          │
+│   │                    Ubuntu Base (500 MB)                      │          │
+│   │                    Shared by ALL containers                  │          │
+│   └─────────────────────────────────────────────────────────────┘          │
+│                           ▲    ▲    ▲                                       │
+│                           │    │    │                                       │
+│   Container Layers (read-write)                                             │
+│   ┌─────────┐       ┌─────────┐       ┌─────────┐                          │
+│   │ App 1   │       │ App 2   │       │ App 3   │                          │
+│   │ 100 MB  │       │ 100 MB  │       │ 100 MB  │                          │
+│   └─────────┘       └─────────┘       └─────────┘                          │
+│                                                                              │
+│   Total: 800 MB  (500 + 100×3)  ← 55% savings!                             │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## How OverlayFS Works
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                        OVERLAYFS LAYERS                                      │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│                        MERGED VIEW (what container sees)                    │
+│   ┌─────────────────────────────────────────────────────────────────────┐  │
+│   │  /                                                                   │  │
+│   │  ├── bin/        (from lower)                                       │  │
+│   │  ├── etc/        (some from lower, some from upper)                 │  │
+│   │  ├── home/       (from upper - container created this)              │  │
+│   │  ├── usr/        (from lower)                                       │  │
+│   │  └── tmp/        (from upper)                                       │  │
+│   └─────────────────────────────────────────────────────────────────────┘  │
+│                              ▲                                              │
+│                              │                                              │
+│         ┌────────────────────┴────────────────────┐                        │
+│         │                                         │                        │
+│   UPPER LAYER (read-write)               LOWER LAYER (read-only)           │
+│   ┌─────────────────────┐                ┌─────────────────────┐           │
+│   │  Container changes  │                │  Base image         │           │
+│   │  ├── etc/           │                │  ├── bin/           │           │
+│   │  │   └── hosts      │ (modified)     │  │   ├── bash       │           │
+│   │  ├── home/          │                │  │   └── ls         │           │
+│   │  │   └── user/      │ (created)      │  ├── etc/           │           │
+│   │  └── tmp/           │                │  │   └── passwd     │           │
+│   │      └── file.txt   │ (created)      │  └── usr/           │           │
+│   └─────────────────────┘                │      └── lib/       │           │
+│                                          └─────────────────────┘           │
+│                                                                              │
+│   WORK DIRECTORY (internal scratch space for atomic operations)            │
+│   ┌─────────────────────┐                                                   │
+│   │  .wh.deleted_file   │  ← "Whiteout" files mark deletions               │
+│   └─────────────────────┘                                                   │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Part 1: Filesystem Manager
+
+```java src/main/java/com/minidocker/fs/FilesystemManager.java
+package com.minidocker.fs;
+
+import com.minidocker.linux.LibC;
+
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.List;
+
+/**
+ * Manages container filesystem using OverlayFS.
+ * 
+ * OverlayFS combines multiple directory layers into a unified view:
+ * - Lower layers: Read-only base image
+ * - Upper layer: Read-write container changes
+ * - Work directory: Internal scratch space
+ * - Merged: Combined view exposed to container
+ */
+public class FilesystemManager {
+    
+    private final LibC libc = LibC.INSTANCE;
+    private final Path baseDir;
+    
+    public FilesystemManager(Path baseDir) {
+        this.baseDir = baseDir;
+    }
+    
+    /**
+     * Prepares the container filesystem.
+     * 
+     * @param containerId Container identifier
+     * @param imageLayers List of image layer paths (bottom to top)
+     * @return Path to the merged filesystem
+     */
+    public Path prepareRootfs(String containerId, List<Path> imageLayers) throws IOException {
+        Path containerDir = baseDir.resolve("containers").resolve(containerId);
+        
+        // Create directories
+        Path upperDir = containerDir.resolve("upper");
+        Path workDir = containerDir.resolve("work");
+        Path mergedDir = containerDir.resolve("merged");
+        
+        Files.createDirectories(upperDir);
+        Files.createDirectories(workDir);
+        Files.createDirectories(mergedDir);
+        
+        // Mount overlay filesystem
+        mountOverlay(imageLayers, upperDir, workDir, mergedDir);
+        
+        // Setup essential mounts
+        setupProcfs(mergedDir);
+        setupSysfs(mergedDir);
+        setupDevfs(mergedDir);
+        
+        return mergedDir;
+    }
+    
+    /**
+     * Mounts overlay filesystem.
+     */
+    private void mountOverlay(List<Path> lowerDirs, Path upperDir, 
+                              Path workDir, Path mergedDir) throws IOException {
+        // Build lowerdir option (colon-separated, top layer first)
+        StringBuilder lowerOption = new StringBuilder();
+        for (int i = lowerDirs.size() - 1; i >= 0; i--) {
+            if (lowerOption.length() > 0) {
+                lowerOption.append(":");
+            }
+            lowerOption.append(lowerDirs.get(i).toAbsolutePath());
+        }
+        
+        String options = String.format(
+            "lowerdir=%s,upperdir=%s,workdir=%s",
+            lowerOption,
+            upperDir.toAbsolutePath(),
+            workDir.toAbsolutePath()
+        );
+        
+        System.out.println("Mounting overlay: " + options);
+        
+        int result = libc.mount("overlay", mergedDir.toString(), "overlay", 0, 
+                                Pointer.createConstant(options.getBytes()));
+        
+        if (result != 0) {
+            throw new IOException("Failed to mount overlay: error " + 
+                Native.getLastError());
+        }
+        
+        System.out.println("✓ Overlay mounted at: " + mergedDir);
+    }
+    
+    /**
+     * Mounts /proc inside container.
+     * 
+     * /proc provides process information and kernel tunables.
+     */
+    private void setupProcfs(Path rootfs) throws IOException {
+        Path procDir = rootfs.resolve("proc");
+        Files.createDirectories(procDir);
+        
+        int result = libc.mount("proc", procDir.toString(), "proc", 
+                               LibC.MS_NOSUID | LibC.MS_NOEXEC | LibC.MS_NODEV, null);
+        
+        if (result != 0) {
+            throw new IOException("Failed to mount /proc");
+        }
+        
+        System.out.println("✓ Mounted /proc");
+    }
+    
+    /**
+     * Mounts /sys inside container.
+     * 
+     * /sys provides access to kernel objects (devices, drivers, etc).
+     */
+    private void setupSysfs(Path rootfs) throws IOException {
+        Path sysDir = rootfs.resolve("sys");
+        Files.createDirectories(sysDir);
+        
+        int result = libc.mount("sysfs", sysDir.toString(), "sysfs",
+                               LibC.MS_NOSUID | LibC.MS_NOEXEC | LibC.MS_NODEV, null);
+        
+        if (result != 0) {
+            throw new IOException("Failed to mount /sys");
+        }
+        
+        System.out.println("✓ Mounted /sys");
+    }
+    
+    /**
+     * Creates /dev with essential devices.
+     */
+    private void setupDevfs(Path rootfs) throws IOException {
+        Path devDir = rootfs.resolve("dev");
+        Files.createDirectories(devDir);
+        
+        // Mount tmpfs for /dev
+        int result = libc.mount("tmpfs", devDir.toString(), "tmpfs",
+                               LibC.MS_NOSUID, null);
+        
+        if (result != 0) {
+            throw new IOException("Failed to mount /dev");
+        }
+        
+        // Create essential device nodes
+        createDeviceNode(devDir.resolve("null"), 1, 3);
+        createDeviceNode(devDir.resolve("zero"), 1, 5);
+        createDeviceNode(devDir.resolve("random"), 1, 8);
+        createDeviceNode(devDir.resolve("urandom"), 1, 9);
+        
+        // Create symlinks
+        Files.createSymbolicLink(devDir.resolve("stdin"), Path.of("/proc/self/fd/0"));
+        Files.createSymbolicLink(devDir.resolve("stdout"), Path.of("/proc/self/fd/1"));
+        Files.createSymbolicLink(devDir.resolve("stderr"), Path.of("/proc/self/fd/2"));
+        
+        // Create pts for pseudo-terminals
+        Path ptsDir = devDir.resolve("pts");
+        Files.createDirectories(ptsDir);
+        libc.mount("devpts", ptsDir.toString(), "devpts", 0, null);
+        
+        System.out.println("✓ Created /dev with essential devices");
+    }
+    
+    /**
+     * Creates a device node.
+     */
+    private void createDeviceNode(Path path, int major, int minor) throws IOException {
+        // mknod requires native call
+        // For simplicity, we'll use bind mounts from host
+        libc.mount("/dev/" + path.getFileName(), path.toString(), null,
+                   LibC.MS_BIND, null);
+    }
+    
+    /**
+     * Performs pivot_root to change root filesystem.
+     * 
+     * Unlike chroot, pivot_root atomically swaps root directories
+     * and is more secure.
+     */
+    public void pivotRoot(Path newRoot) throws IOException {
+        Path putOld = newRoot.resolve("oldroot");
+        Files.createDirectories(putOld);
+        
+        // Bind mount newRoot to itself (required for pivot_root)
+        libc.mount(newRoot.toString(), newRoot.toString(), null, LibC.MS_BIND, null);
+        
+        // Change to new root
+        libc.chdir(newRoot.toString());
+        
+        // Pivot: swap current root with new root
+        int result = libc.pivot_root(".", "oldroot");
+        if (result != 0) {
+            throw new IOException("pivot_root failed: " + Native.getLastError());
+        }
+        
+        // Unmount and remove old root
+        libc.umount2("/oldroot", 0);
+        Files.delete(Path.of("/oldroot"));
+        
+        System.out.println("✓ Pivoted root filesystem");
+    }
+    
+    /**
+     * Cleans up container filesystem.
+     */
+    public void cleanup(String containerId) throws IOException {
+        Path containerDir = baseDir.resolve("containers").resolve(containerId);
+        Path mergedDir = containerDir.resolve("merged");
+        
+        // Unmount
+        libc.umount2(mergedDir.toString(), 0);
+        
+        // Remove directories
+        deleteRecursively(containerDir);
+        
+        System.out.println("✓ Cleaned up filesystem for: " + containerId);
+    }
+    
+    private void deleteRecursively(Path path) throws IOException {
+        if (Files.isDirectory(path)) {
+            try (var stream = Files.list(path)) {
+                stream.forEach(p -> {
+                    try {
+                        deleteRecursively(p);
+                    } catch (IOException e) {
+                        throw new RuntimeException(e);
+                    }
+                });
+            }
+        }
+        Files.deleteIfExists(path);
+    }
+}
+```
+
+---
+
+## Part 2: Image Layer Manager
+
+```java src/main/java/com/minidocker/image/ImageManager.java
+package com.minidocker.image;
+
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+
+/**
+ * Manages container images and their layers.
+ * 
+ * Images are composed of stacked layers:
+ * - Each layer contains files that were added/modified
+ * - Layers are identified by content hash (SHA256)
+ * - Layers can be shared between images
+ */
+public class ImageManager {
+    
+    private final Path imagesDir;
+    private final Path layersDir;
+    
+    // Cache of extracted layers
+    private final Map<String, Path> layerCache = new ConcurrentHashMap<>();
+    
+    public ImageManager(Path storageDir) {
+        this.imagesDir = storageDir.resolve("images");
+        this.layersDir = storageDir.resolve("layers");
+    }
+    
+    /**
+     * Gets the layers for an image (in order from bottom to top).
+     */
+    public List<Path> getImageLayers(String imageName) throws IOException {
+        Path manifestPath = imagesDir.resolve(imageName).resolve("manifest.json");
+        
+        if (!Files.exists(manifestPath)) {
+            throw new IOException("Image not found: " + imageName);
+        }
+        
+        // Parse manifest to get layer digests
+        List<String> layerDigests = parseManifestLayers(manifestPath);
+        
+        List<Path> layers = new ArrayList<>();
+        for (String digest : layerDigests) {
+            Path layerPath = getOrExtractLayer(digest);
+            layers.add(layerPath);
+        }
+        
+        return layers;
+    }
+    
+    /**
+     * Gets a layer path, extracting if necessary.
+     */
+    private Path getOrExtractLayer(String digest) throws IOException {
+        if (layerCache.containsKey(digest)) {
+            return layerCache.get(digest);
+        }
+        
+        Path layerPath = layersDir.resolve(digest);
+        
+        if (!Files.exists(layerPath)) {
+            // Extract layer tarball
+            Path tarball = layersDir.resolve(digest + ".tar.gz");
+            extractTarball(tarball, layerPath);
+        }
+        
+        layerCache.put(digest, layerPath);
+        return layerPath;
+    }
+    
+    /**
+     * Extracts a tarball to a directory.
+     */
+    private void extractTarball(Path tarball, Path destination) throws IOException {
+        Files.createDirectories(destination);
+        
+        // Use tar command for extraction
+        ProcessBuilder pb = new ProcessBuilder(
+            "tar", "-xzf", tarball.toString(),
+            "-C", destination.toString()
+        );
+        pb.inheritIO();
+        
+        try {
+            Process p = pb.start();
+            int exitCode = p.waitFor();
+            if (exitCode != 0) {
+                throw new IOException("tar extraction failed with code: " + exitCode);
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new IOException("Extraction interrupted", e);
+        }
+    }
+    
+    /**
+     * Creates a minimal base image for testing.
+     */
+    public void createMinimalImage(String name) throws IOException {
+        Path imageDir = imagesDir.resolve(name);
+        Files.createDirectories(imageDir);
+        
+        Path rootfs = imageDir.resolve("rootfs");
+        Files.createDirectories(rootfs);
+        
+        // Create minimal filesystem structure
+        Files.createDirectories(rootfs.resolve("bin"));
+        Files.createDirectories(rootfs.resolve("lib"));
+        Files.createDirectories(rootfs.resolve("lib64"));
+        Files.createDirectories(rootfs.resolve("usr/bin"));
+        Files.createDirectories(rootfs.resolve("usr/lib"));
+        Files.createDirectories(rootfs.resolve("etc"));
+        Files.createDirectories(rootfs.resolve("tmp"));
+        Files.createDirectories(rootfs.resolve("var"));
+        Files.createDirectories(rootfs.resolve("home"));
+        Files.createDirectories(rootfs.resolve("root"));
+        Files.createDirectories(rootfs.resolve("proc"));
+        Files.createDirectories(rootfs.resolve("sys"));
+        Files.createDirectories(rootfs.resolve("dev"));
+        
+        // Copy essential binaries from host (for testing)
+        copyBinary("/bin/sh", rootfs);
+        copyBinary("/bin/bash", rootfs);
+        copyBinary("/bin/ls", rootfs);
+        copyBinary("/bin/cat", rootfs);
+        copyBinary("/bin/echo", rootfs);
+        
+        // Copy necessary libraries
+        copyLibraries(rootfs);
+        
+        // Create basic /etc files
+        Files.writeString(rootfs.resolve("etc/passwd"), 
+            "root:x:0:0:root:/root:/bin/sh\n");
+        Files.writeString(rootfs.resolve("etc/group"),
+            "root:x:0:\n");
+        Files.writeString(rootfs.resolve("etc/hosts"),
+            "127.0.0.1 localhost\n");
+        
+        System.out.println("✓ Created minimal image: " + name);
+    }
+    
+    private void copyBinary(String path, Path rootfs) throws IOException {
+        Path source = Path.of(path);
+        Path dest = rootfs.resolve(path.substring(1));  // Remove leading /
+        
+        if (Files.exists(source)) {
+            Files.createDirectories(dest.getParent());
+            Files.copy(source, dest);
+            // Make executable
+            dest.toFile().setExecutable(true);
+        }
+    }
+    
+    private void copyLibraries(Path rootfs) throws IOException {
+        // Copy libc and other essential libraries
+        // This is a simplified version - real implementation would use ldd
+        
+        Path[] essentialLibs = {
+            Path.of("/lib64/ld-linux-x86-64.so.2"),
+            Path.of("/lib/x86_64-linux-gnu/libc.so.6"),
+            Path.of("/lib/x86_64-linux-gnu/libpthread.so.0"),
+            Path.of("/lib/x86_64-linux-gnu/libdl.so.2"),
+        };
+        
+        for (Path lib : essentialLibs) {
+            if (Files.exists(lib)) {
+                Path dest = rootfs.resolve(lib.toString().substring(1));
+                Files.createDirectories(dest.getParent());
+                Files.copy(lib, dest);
+            }
+        }
+    }
+    
+    private List<String> parseManifestLayers(Path manifest) throws IOException {
+        // Simplified - real implementation would parse JSON
+        return List.of("layer1", "layer2");
+    }
+}
+```
+
+---
+
+## Part 3: Copy-on-Write Demonstration
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                      COPY-ON-WRITE IN ACTION                                 │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│   INITIAL STATE:                                                            │
+│                                                                              │
+│   Lower (base image):     Upper (empty):      Merged (container view):     │
+│   ┌────────────────┐      ┌─────────────┐     ┌────────────────┐           │
+│   │ /etc/hosts     │      │             │     │ /etc/hosts  →  │ lower     │
+│   │ /bin/sh        │      │ (empty)     │     │ /bin/sh     →  │ lower     │
+│   │ /usr/lib/...   │      │             │     │ /usr/lib/   →  │ lower     │
+│   └────────────────┘      └─────────────┘     └────────────────┘           │
+│                                                                              │
+│   AFTER: Container modifies /etc/hosts                                      │
+│                                                                              │
+│   Lower (unchanged):      Upper (has copy):   Merged (sees upper):         │
+│   ┌────────────────┐      ┌─────────────┐     ┌────────────────┐           │
+│   │ /etc/hosts     │      │ /etc/hosts  │     │ /etc/hosts  →  │ UPPER    │
+│   │ /bin/sh        │      │ (modified)  │     │ /bin/sh     →  │ lower     │
+│   │ /usr/lib/...   │      │             │     │ /usr/lib/   →  │ lower     │
+│   └────────────────┘      └─────────────┘     └────────────────┘           │
+│                                                                              │
+│   The lower layer is NEVER modified!                                        │
+│   Other containers sharing this base are unaffected.                        │
+│                                                                              │
+│   AFTER: Container deletes /bin/sh                                          │
+│                                                                              │
+│   Lower (unchanged):      Upper (whiteout):   Merged (file gone):          │
+│   ┌────────────────┐      ┌─────────────┐     ┌────────────────┐           │
+│   │ /etc/hosts     │      │ /etc/hosts  │     │ /etc/hosts  →  │ upper     │
+│   │ /bin/sh        │      │ .wh.sh  ◀───│────── WHITEOUT FILE │           │
+│   │ /usr/lib/...   │      │             │     │ /usr/lib/   →  │ lower     │
+│   └────────────────┘      └─────────────┘     └────────────────┘           │
+│                                                                              │
+│   Whiteout files (.wh.*) mark deletions without modifying lower layer      │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Part 4: Integrated Container
+
+```java src/main/java/com/minidocker/Container.java
+package com.minidocker;
+
+import com.minidocker.cgroup.CgroupManager;
+import com.minidocker.cgroup.ResourceLimits;
+import com.minidocker.fs.FilesystemManager;
+import com.minidocker.image.ImageManager;
+import com.minidocker.linux.LibC;
+import com.minidocker.namespace.NamespaceManager;
+import com.minidocker.namespace.NamespaceOptions;
+
+import java.nio.file.Path;
+import java.util.List;
+import java.util.UUID;
+
+/**
+ * Full container implementation with isolation, limits, and filesystem.
+ */
+public class Container {
+    
+    private final LibC libc = LibC.INSTANCE;
+    private final NamespaceManager namespaces = new NamespaceManager();
+    private final FilesystemManager filesystem;
+    private final ImageManager images;
+    
+    private final String id;
+    private final String imageName;
+    private final String hostname;
+    private final String[] command;
+    private final ResourceLimits limits;
+    
+    private CgroupManager cgroup;
+    private Path rootfs;
+    
+    public Container(String imageName, String hostname, String[] command,
+                     ResourceLimits limits, Path storageDir) {
+        this.id = UUID.randomUUID().toString().substring(0, 12);
+        this.imageName = imageName;
+        this.hostname = hostname;
+        this.command = command;
+        this.limits = limits;
+        this.filesystem = new FilesystemManager(storageDir);
+        this.images = new ImageManager(storageDir);
+    }
+    
+    public void run() throws Exception {
+        System.out.println("=== Starting Container " + id + " ===");
+        System.out.println("Image: " + imageName);
+        System.out.println("Hostname: " + hostname);
+        System.out.println("Limits: " + limits);
+        System.out.println();
+        
+        try {
+            // Step 1: Setup cgroup
+            cgroup = new CgroupManager(id);
+            cgroup.create();
+            cgroup.setCpuLimit(limits.getCpuPercent());
+            cgroup.setMemoryLimit(limits.getMemoryBytes());
+            cgroup.setPidsLimit(limits.getMaxPids());
+            
+            // Step 2: Prepare filesystem
+            List<Path> imageLayers = images.getImageLayers(imageName);
+            rootfs = filesystem.prepareRootfs(id, imageLayers);
+            
+            System.out.println("✓ Container rootfs ready at: " + rootfs);
+            
+            // Step 3: Create namespaces
+            NamespaceOptions nsOptions = NamespaceOptions.builder()
+                .withPid()
+                .withMount()
+                .withUts()
+                .withIpc()
+                .withNet()
+                .build();
+            
+            namespaces.createNamespaces(nsOptions);
+            namespaces.setHostname(hostname);
+            
+            // Step 4: Fork
+            int pid = libc.fork();
+            
+            if (pid == 0) {
+                runContainerInit();
+            } else if (pid > 0) {
+                waitForContainer(pid);
+            } else {
+                throw new RuntimeException("Fork failed");
+            }
+            
+        } finally {
+            cleanup();
+        }
+    }
+    
+    private void runContainerInit() throws Exception {
+        // Add to cgroup
+        cgroup.addCurrentProcess();
+        
+        // Pivot to container rootfs
+        filesystem.pivotRoot(rootfs);
+        
+        // Change to root directory
+        libc.chdir("/");
+        
+        // Set up environment
+        System.setProperty("HOME", "/root");
+        System.setProperty("TERM", "xterm");
+        System.setProperty("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin");
+        
+        System.out.println("=== Container Started ===");
+        System.out.println("PID: " + libc.getpid());
+        System.out.println("Hostname: " + hostname);
+        System.out.println();
+        
+        // Execute command
+        if (command.length > 0) {
+            String[] argv = new String[command.length + 1];
+            System.arraycopy(command, 0, argv, 0, command.length);
+            argv[command.length] = null;
+            
+            libc.execv(command[0], argv);
+            
+            System.err.println("Failed to execute: " + command[0]);
+            System.exit(127);
+        }
+    }
+    
+    private void waitForContainer(int pid) {
+        int[] status = new int[1];
+        libc.waitpid(pid, status, 0);
+        
+        int exitCode = (status[0] >> 8) & 0xFF;
+        System.out.println("Container exited with code: " + exitCode);
+    }
+    
+    private void cleanup() {
+        try {
+            if (cgroup != null) {
+                cgroup.destroy();
+            }
+            if (rootfs != null) {
+                filesystem.cleanup(id);
+            }
+        } catch (Exception e) {
+            System.err.println("Cleanup failed: " + e.getMessage());
+        }
+    }
+}
+```
+
+---
+
+## Exercises
+
+<Accordion title="Exercise 1: Implement Layer Caching" icon="layer-group">
+Implement efficient layer caching:
+
+```java
+// 1. Hash layer contents (SHA256)
+// 2. Check cache before extracting
+// 3. Reference count layers (cleanup when unused)
+// 4. Implement garbage collection for unused layers
+```
+</Accordion>
+
+<Accordion title="Exercise 2: Add Volume Mounts" icon="hard-drive">
+Support mounting host directories:
+
+```java
+// --volume /host/path:/container/path
+// 
+// 1. Create mount point in merged dir
+// 2. Bind mount host directory
+// 3. Support read-only mounts (:ro)
+// 4. Handle SELinux labels if applicable
+```
+</Accordion>
+
+<Accordion title="Exercise 3: Implement Image Building" icon="hammer">
+Create a simple Dockerfile-like builder:
+
+```java
+// FROM ubuntu:22.04
+// RUN apt-get update
+// COPY app /app
+// CMD ["/app/start.sh"]
+//
+// 1. Start from base image
+// 2. Execute each instruction in container
+// 3. Commit changes as new layer
+// 4. Stack layers to form new image
+```
+</Accordion>
+
+---
+
+## Key Takeaways
+
+<CardGroup cols={2}>
+  <Card title="Overlay FS" icon="layer-group">
+    Combines multiple directories into unified view
+  </Card>
+  <Card title="Copy-on-Write" icon="copy">
+    Changes are written to upper layer, lower layers unchanged
+  </Card>
+  <Card title="Layer Sharing" icon="share-nodes">
+    Base layers shared between containers saves space
+  </Card>
+  <Card title="Whiteouts" icon="eye-slash">
+    Special files mark deletions without modifying lower layers
+  </Card>
+</CardGroup>
+
+---
+
+## What's Next?
+
+In [Chapter 4: Networking](/courses/build-your-own-x/docker-4-networking), we'll implement:
+- Virtual ethernet pairs (veth)
+- Bridge networking
+- Port forwarding
+- Container-to-container communication
+
+<Card title="Next: Networking" icon="arrow-right" href="/courses/build-your-own-x/docker-4-networking">
+  Connect your containers to the network
+</Card>
