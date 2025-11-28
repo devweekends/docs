@@ -1,0 +1,1129 @@
+---
+title: "Storage Engine Deep Dive"
+sidebarTitle: "Storage Engine Internals"
+description: "MVCC, Vacuum, WAL, and Recovery internals for database engineers"
+icon: "hard-drive"
+---
+
+# Storage Engine Deep Dive
+
+This module provides the internals knowledge required to work on storage engines at companies building database infrastructure. We cover PostgreSQL's MVCC, vacuum, WAL, and recovery systems in production-level depth.
+
+<Info>
+**Target Audience**: Storage engine and infrastructure engineers  
+**Prerequisites**: Data Structures, Query Processing modules  
+**Source Directories**: `src/backend/storage/`, `src/backend/access/`  
+**Interview Relevance**: Staff+ database infrastructure roles
+</Info>
+
+---
+
+## Part 1: MVCC Implementation
+
+### 1.1 Transaction ID System
+
+```c
+/* Transaction ID (XID) - 32-bit wraparound counter */
+typedef uint32 TransactionId;
+
+/* Special transaction IDs */
+#define InvalidTransactionId        ((TransactionId) 0)
+#define BootstrapTransactionId      ((TransactionId) 1)
+#define FrozenTransactionId         ((TransactionId) 2)
+#define FirstNormalTransactionId    ((TransactionId) 3)
+
+/* XID comparison (handles wraparound) */
+/*
+ * TransactionIdPrecedes(a, b):
+ * Returns true if a < b in circular XID space
+ *
+ * Example with 32-bit wraparound:
+ * If current XID = 100:
+ *   XID 50 is in the past
+ *   XID 150 is in the future
+ *   XID 2^31 + 100 = 2147483748 is "past" (wraparound danger!)
+ */
+bool
+TransactionIdPrecedes(TransactionId id1, TransactionId id2)
+{
+    /* If id1 and id2 differ by more than 2^31, one has wrapped */
+    int32 diff = (int32) (id1 - id2);
+    return diff < 0;
+}
+```
+
+### 1.2 Tuple Visibility Rules
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                      MVCC VISIBILITY RULES                                   │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│   Tuple is VISIBLE if:                                                       │
+│   ─────────────────────────────────────────────────────────────────────────  │
+│                                                                              │
+│   1. xmin is committed AND                                                   │
+│   2. xmin was committed before my snapshot AND                              │
+│   3. (xmax is invalid OR                                                     │
+│       xmax is aborted OR                                                     │
+│       xmax was not committed before my snapshot OR                          │
+│       xmax is my own transaction)                                           │
+│                                                                              │
+│   Snapshot contains:                                                         │
+│   • xmin: Oldest active transaction ID                                      │
+│   • xmax: One past newest transaction ID                                    │
+│   • xip[]: Array of in-progress transaction IDs                             │
+│                                                                              │
+│   Visibility Example:                                                        │
+│   ─────────────────────────────────────────────────────────────────────────  │
+│                                                                              │
+│   My Transaction ID: 105                                                     │
+│   My Snapshot: xmin=100, xmax=107, xip=[101, 103, 104]                      │
+│                                                                              │
+│   Tuple A: xmin=95, xmax=0      → VISIBLE (committed, not deleted)          │
+│   Tuple B: xmin=101, xmax=0     → INVISIBLE (101 in xip, not committed)     │
+│   Tuple C: xmin=90, xmax=102    → VISIBLE (102 not in xip, committed)       │
+│   Tuple D: xmin=90, xmax=103    → VISIBLE (103 in xip, not committed yet)   │
+│   Tuple E: xmin=90, xmax=105    → VISIBLE (105 is my own xact)              │
+│   Tuple F: xmin=108, xmax=0     → INVISIBLE (108 >= snapshot xmax)          │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### 1.3 Hint Bits
+
+```c
+/* Hint bits in t_infomask - avoid repeated CLOG lookups */
+
+#define HEAP_XMIN_COMMITTED     0x0100  /* xmin transaction committed */
+#define HEAP_XMIN_INVALID       0x0200  /* xmin transaction aborted */
+#define HEAP_XMAX_COMMITTED     0x0400  /* xmax transaction committed */
+#define HEAP_XMAX_INVALID       0x0800  /* xmax transaction aborted/invalid */
+
+/*
+ * Hint bit flow:
+ *
+ * 1. First read of tuple: No hint bits set
+ *    → Must check CLOG for xmin/xmax status
+ *
+ * 2. After CLOG lookup:
+ *    → Set hint bits based on transaction status
+ *    → Tuple page becomes dirty (will be written back)
+ *
+ * 3. Subsequent reads:
+ *    → Hint bits checked first
+ *    → Skip CLOG lookup if hints present
+ *
+ * Impact:
+ * - First read after checkpoint may set hints
+ * - Causes unexpected dirty pages
+ * - Can affect I/O patterns
+ */
+
+/* Example visibility check with hint bits */
+bool
+HeapTupleSatisfiesMVCC(HeapTuple htup, Snapshot snapshot)
+{
+    HeapTupleHeader tuple = htup->t_data;
+    
+    if (!(tuple->t_infomask & HEAP_XMIN_COMMITTED))
+    {
+        if (tuple->t_infomask & HEAP_XMIN_INVALID)
+            return false;  /* Aborted, definitely not visible */
+        
+        /* No hint bit - check CLOG */
+        if (TransactionIdDidCommit(HeapTupleHeaderGetRawXmin(tuple)))
+        {
+            /* Set hint bit for future reads */
+            tuple->t_infomask |= HEAP_XMIN_COMMITTED;
+            /* Page is now dirty */
+        }
+        else if (TransactionIdDidAbort(HeapTupleHeaderGetRawXmin(tuple)))
+        {
+            tuple->t_infomask |= HEAP_XMIN_INVALID;
+            return false;
+        }
+        else
+        {
+            /* Transaction still in progress */
+            return false;  /* My snapshot doesn't see it */
+        }
+    }
+    
+    /* Continue checking xmax... */
+}
+```
+
+### 1.4 CLOG (Commit Log)
+
+```c
+/* CLOG stores 2 bits per transaction */
+typedef enum TransactionStatus
+{
+    TRANSACTION_STATUS_IN_PROGRESS = 0x00,
+    TRANSACTION_STATUS_COMMITTED = 0x01,
+    TRANSACTION_STATUS_ABORTED = 0x02,
+    TRANSACTION_STATUS_SUB_COMMITTED = 0x03  /* Subtransaction committed */
+} TransactionStatus;
+
+/* CLOG page layout */
+/*
+ * Each page: 8KB = 8192 bytes = 65536 bits
+ * 2 bits per transaction = 32768 transactions per page
+ * 
+ * CLOG file segments: pg_xact/0000, 0001, 0002...
+ * Each segment: 256KB = 32 pages = ~1M transactions
+ *
+ * XID to CLOG location:
+ * page = xid / 32768
+ * byte = (xid % 32768) / 4
+ * bit = (xid % 4) * 2
+ */
+
+/* Setting transaction status */
+void
+TransactionIdCommit(TransactionId xid)
+{
+    int pageno = TransactionIdToPage(xid);
+    int byteno = TransactionIdToPgIndex(xid);
+    int bshift = TransactionIdToBIndex(xid) * 2;
+    char *byteptr;
+    
+    /* Lock CLOG page in buffer */
+    LWLockAcquire(XactSLRULock, LW_EXCLUSIVE);
+    
+    byteptr = SimpleLruReadPage(XactCtl, pageno, true, xid);
+    byteptr += byteno;
+    
+    /* Set status bits */
+    *byteptr = (*byteptr & ~(3 << bshift)) | (TRANSACTION_STATUS_COMMITTED << bshift);
+    
+    LWLockRelease(XactSLRULock);
+}
+```
+
+---
+
+## Part 2: Vacuum Deep Dive
+
+### 2.1 Why Vacuum Exists
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                      THE DEAD TUPLE PROBLEM                                  │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│   Without Vacuum:                                                            │
+│   ─────────────────────────────────────────────────────────────────────────  │
+│                                                                              │
+│   Time T1: INSERT user (id=1, name='Alice')                                 │
+│            → Tuple version V1 created, xmin=100                             │
+│                                                                              │
+│   Time T2: UPDATE users SET name='Alicia' WHERE id=1                        │
+│            → V1 marked deleted: xmax=200                                    │
+│            → Tuple version V2 created: xmin=200                             │
+│                                                                              │
+│   Time T3: UPDATE users SET name='Alison' WHERE id=1                        │
+│            → V2 marked deleted: xmax=300                                    │
+│            → Tuple version V3 created: xmin=300                             │
+│                                                                              │
+│   Table now contains: V1 (dead), V2 (dead), V3 (live)                       │
+│   3x the storage for 1 logical row!                                         │
+│                                                                              │
+│   Problems:                                                                  │
+│   1. Table bloat → slower scans, more I/O                                   │
+│   2. Index bloat → indexes point to dead tuples                             │
+│   3. Transaction ID wraparound → database shutdown                          │
+│                                                                              │
+│   Vacuum's Job:                                                              │
+│   1. Identify dead tuples (no active transaction can see them)              │
+│   2. Mark space as reusable in FSM (Free Space Map)                         │
+│   3. Update visibility map                                                  │
+│   4. Freeze old tuples (prevent XID wraparound)                             │
+│   5. Update statistics                                                      │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### 2.2 Vacuum Algorithm
+
+```c
+/* Main vacuum flow from src/backend/commands/vacuumlazy.c */
+
+/* Phase 1: Scan heap, identify dead tuples */
+void
+lazy_scan_heap(LVRelState *vacrel)
+{
+    BlockNumber blkno;
+    TidStore *dead_items = TidStoreCreate(...);
+    
+    for (blkno = 0; blkno < nblocks; blkno++)
+    {
+        Buffer buf = ReadBuffer(rel, blkno);
+        Page page = BufferGetPage(buf);
+        
+        /* Check each tuple on page */
+        for (offnum = FirstOffsetNumber; 
+             offnum <= maxoff; 
+             offnum++)
+        {
+            ItemId itemid = PageGetItemId(page, offnum);
+            HeapTupleHeader tuple = (HeapTupleHeader) PageGetItem(page, itemid);
+            
+            /* Check if tuple is dead to all transactions */
+            if (HeapTupleSatisfiesVacuum(tuple, OldestXmin))
+            {
+                /* Dead tuple - record its TID */
+                TidStoreSetBlockOffsets(dead_items, blkno, &offnum, 1);
+            }
+            else if (should_freeze(tuple))
+            {
+                /* Old tuple - needs freezing */
+                heap_freeze_tuple(tuple, ...);
+            }
+        }
+        
+        /* If page is now all-visible, update visibility map */
+        if (all_tuples_visible(page))
+            visibilitymap_set(rel, blkno, VM_ALL_VISIBLE);
+    }
+}
+
+/* Phase 2: Remove index entries pointing to dead tuples */
+void
+lazy_vacuum_index(Relation irel, TidStore *dead_items)
+{
+    IndexVacuumInfo ivinfo;
+    
+    /* For each index on the table */
+    ivinfo.strategy = vac_strategy;
+    ivinfo.num_heap_tuples = reltuples;
+    
+    /* Bulk delete - index AM removes dead entries */
+    index_bulk_delete(&ivinfo, dead_items, ...);
+}
+
+/* Phase 3: Remove dead tuples from heap */
+void
+lazy_vacuum_heap_page(LVRelState *vacrel, BlockNumber blkno, ...)
+{
+    Buffer buf = ReadBuffer(rel, blkno);
+    Page page = BufferGetPage(buf);
+    
+    /* Mark dead tuple slots as unused */
+    for each dead_offset in dead_items_on_page
+    {
+        ItemId itemid = PageGetItemId(page, dead_offset);
+        ItemIdSetUnused(itemid);
+    }
+    
+    /* Compact page - defragment */
+    PageRepairFragmentation(page);
+    
+    /* Update FSM with free space */
+    fsm_space = PageGetHeapFreeSpace(page);
+    RecordPageWithFreeSpace(rel, blkno, fsm_space);
+}
+```
+
+### 2.3 Visibility Map
+
+```c
+/* Visibility Map: 2 bits per heap page */
+
+/* Bit meanings */
+#define VISIBILITYMAP_ALL_VISIBLE   0x01  /* All tuples visible to all */
+#define VISIBILITYMAP_ALL_FROZEN    0x02  /* All tuples frozen */
+
+/*
+ * VM file: <table_oid>_vm
+ *
+ * Benefits of ALL_VISIBLE:
+ * 1. Index-only scans skip heap fetch
+ * 2. Vacuum can skip page
+ * 3. HOT chain pruning optimization
+ *
+ * Benefits of ALL_FROZEN:
+ * 1. Vacuum can skip page entirely
+ * 2. No XID wraparound danger
+ * 3. Most aggressive skip possible
+ */
+
+/* VM structure */
+/*
+ * Each VM page covers 32K heap pages (2 bits each)
+ * 1 GB heap = ~131K pages = ~5 VM pages
+ *
+ * Layout:
+ * Page 0: bits for heap pages 0-32767
+ * Page 1: bits for heap pages 32768-65535
+ * ...
+ */
+
+/* Setting visibility bit */
+void
+visibilitymap_set(Relation rel, BlockNumber heapBlk, Buffer vmbuf, 
+                  TransactionId cutoff_xid, uint8 flags)
+{
+    BlockNumber mapBlock = HEAPBLK_TO_MAPBLOCK(heapBlk);
+    uint32 mapByte = HEAPBLK_TO_MAPBYTE(heapBlk);
+    uint8 mapOffset = HEAPBLK_TO_OFFSET(heapBlk);
+    Page page = BufferGetPage(vmbuf);
+    char *map = PageGetContents(page);
+    
+    /* Set the bits */
+    map[mapByte] |= (flags << mapOffset);
+    
+    /* Mark VM page dirty */
+    MarkBufferDirty(vmbuf);
+}
+```
+
+### 2.4 XID Wraparound Prevention
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                      XID WRAPAROUND PROBLEM                                  │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│   XID Space (32-bit circular):                                               │
+│                                                                              │
+│                    ┌──────────────────────────────────────┐                 │
+│                    │                                      │                 │
+│          ┌─────────┴─────────┐          ┌─────────────────┴──────┐         │
+│          │  PAST (invisible) │          │  FUTURE (not yet used)  │         │
+│          └─────────┬─────────┘          └─────────────────┬──────┘         │
+│                    │                                      │                 │
+│                    │         Current XID                  │                 │
+│                    │              ↓                       │                 │
+│   ─────────────────┼──────────────●───────────────────────┼─────────────── │
+│   0         ~2^31 past      current XID        ~2^31 future      4 billion │
+│                                                                              │
+│   Problem:                                                                   │
+│   After 2^31 new transactions, "past" wraps to "future"                     │
+│   Old committed data suddenly appears to be from the future = invisible!    │
+│                                                                              │
+│   Solution: Freezing                                                         │
+│   ─────────────────────────────────────────────────────────────────────────  │
+│                                                                              │
+│   Instead of xmin=<real_xid>, set xmin=FrozenTransactionId (2)              │
+│   FrozenXID is ALWAYS in the past = tuple always visible                    │
+│                                                                              │
+│   Vacuum sets xmin=FrozenXID when:                                          │
+│   • Tuple is old enough (vacuum_freeze_min_age transactions old)            │
+│   • Force freeze near wraparound danger                                     │
+│                                                                              │
+│   Key Settings:                                                              │
+│   • vacuum_freeze_min_age = 50,000,000 (age to start freezing)              │
+│   • autovacuum_freeze_max_age = 200,000,000 (force vacuum before this)      │
+│   • vacuum_freeze_table_age = 150,000,000 (aggressive freeze)               │
+│                                                                              │
+│   Monitoring:                                                                │
+│   SELECT datname, age(datfrozenxid) FROM pg_database;                       │
+│   -- Should stay well below 2 billion                                       │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### 2.5 Autovacuum Tuning
+
+```sql
+-- Key autovacuum parameters
+
+-- When to trigger (per table)
+autovacuum_vacuum_threshold = 50         -- Min dead tuples to trigger
+autovacuum_vacuum_scale_factor = 0.2     -- + 20% of table size
+-- Trigger when: dead_tuples > threshold + scale_factor * table_rows
+
+-- For analyze (stats update)
+autovacuum_analyze_threshold = 50
+autovacuum_analyze_scale_factor = 0.1    -- 10% of table
+
+-- Resource limits
+autovacuum_vacuum_cost_delay = 2ms       -- Pause between batches
+autovacuum_vacuum_cost_limit = 200       -- Cost limit before pause
+-- Higher limit = faster vacuum but more resource usage
+
+-- Per-table overrides for hot tables
+ALTER TABLE hot_table SET (
+    autovacuum_vacuum_threshold = 1000,
+    autovacuum_vacuum_scale_factor = 0.01,  -- 1% instead of 20%
+    autovacuum_vacuum_cost_limit = 1000     -- More aggressive
+);
+
+-- For tables with heavy updates
+ALTER TABLE order_items SET (
+    autovacuum_vacuum_scale_factor = 0.02,
+    fillfactor = 70  -- Leave room for HOT updates
+);
+
+-- Monitoring autovacuum
+SELECT 
+    schemaname,
+    relname,
+    last_autovacuum,
+    last_autoanalyze,
+    autovacuum_count,
+    autoanalyze_count
+FROM pg_stat_user_tables
+ORDER BY n_dead_tup DESC;
+
+-- Check autovacuum workers
+SELECT * FROM pg_stat_progress_vacuum;
+```
+
+---
+
+## Part 3: WAL (Write-Ahead Log) Deep Dive
+
+### 3.1 WAL Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                      WAL ARCHITECTURE                                        │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│   Backend Process                                                            │
+│   ┌─────────────────────────────────────────────────────────────────────┐   │
+│   │  1. Modify data page in shared buffers                               │   │
+│   │  2. Generate WAL record describing the change                        │   │
+│   │  3. Write WAL record to WAL buffers                                  │   │
+│   │  4. WAL record assigned LSN (Log Sequence Number)                    │   │
+│   │  5. At COMMIT: ensure WAL up to commit LSN is on disk                │   │
+│   └─────────────────────────────────────────────────────────────────────┘   │
+│                     │                                                        │
+│                     ▼                                                        │
+│   WAL Buffers (shared memory)                                               │
+│   ┌─────────────────────────────────────────────────────────────────────┐   │
+│   │  ┌─────┐┌─────┐┌─────┐┌─────┐┌─────┐                                │   │
+│   │  │ rec ││ rec ││ rec ││ rec ││ rec │ ...                            │   │
+│   │  └─────┘└─────┘└─────┘└─────┘└─────┘                                │   │
+│   │  LSN: 0/1A2B3C4D ──────────────────► 0/1A2B4000                     │   │
+│   └─────────────────────────────────────────────────────────────────────┘   │
+│                     │                                                        │
+│                     │ WAL Writer / Backend flush                             │
+│                     ▼                                                        │
+│   WAL Segment Files (pg_wal/)                                               │
+│   ┌─────────────────────────────────────────────────────────────────────┐   │
+│   │  000000010000000000000001  (16MB)                                    │   │
+│   │  000000010000000000000002  (16MB)                                    │   │
+│   │  000000010000000000000003  (16MB)  ← Current write position          │   │
+│   │  ...                                                                 │   │
+│   └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                              │
+│   LSN Format: XXXXXXXX/YYYYYYYY                                             │
+│   • XXXXXXXX: Logical segment number                                        │
+│   • YYYYYYYY: Offset within 4GB logical file                                │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### 3.2 WAL Record Format
+
+```c
+/* WAL record structure from src/include/access/xlogrecord.h */
+
+typedef struct XLogRecord
+{
+    uint32      xl_tot_len;      /* Total record length */
+    TransactionId xl_xid;        /* Transaction ID */
+    XLogRecPtr  xl_prev;         /* LSN of previous record */
+    uint8       xl_info;         /* Resource manager flags */
+    RmgrId      xl_rmid;         /* Resource manager ID */
+    pg_crc32c   xl_crc;          /* CRC of this record */
+    /* XLogRecordBlockHeader(s) and data follow */
+} XLogRecord;
+
+/* Resource managers (xl_rmid) */
+typedef enum RmgrIds
+{
+    RM_XLOG_ID = 0,      /* Checkpoint, etc. */
+    RM_XACT_ID = 1,      /* Transaction operations */
+    RM_SMGR_ID = 2,      /* Storage manager */
+    RM_CLOG_ID = 3,      /* Commit log */
+    RM_HEAP_ID = 10,     /* Heap operations */
+    RM_HEAP2_ID = 11,    /* More heap operations */
+    RM_BTREE_ID = 12,    /* B-tree operations */
+    RM_HASH_ID = 13,     /* Hash index */
+    RM_GIN_ID = 14,      /* GIN index */
+    RM_GIST_ID = 15,     /* GiST index */
+    /* ... more ... */
+} RmgrIds;
+
+/* Example: Heap insert record */
+/*
+ * XLogRecord header (24 bytes)
+ * ├── xl_tot_len = 156
+ * ├── xl_xid = 12345
+ * ├── xl_prev = 0/1A2B3C00
+ * ├── xl_info = XLOG_HEAP_INSERT
+ * ├── xl_rmid = RM_HEAP_ID
+ * └── xl_crc = 0xABCD1234
+ *
+ * XLogRecordBlockHeader (for the heap page)
+ * ├── Block ID = 0
+ * ├── fork = MAIN_FORKNUM
+ * ├── flags = BKPBLOCK_HAS_DATA
+ * └── Block reference (rel OID, block number)
+ *
+ * xl_heap_insert structure
+ * ├── offnum = 5 (offset on page)
+ * └── flags
+ *
+ * Tuple data (actual inserted row)
+ */
+```
+
+### 3.3 Full Page Writes
+
+```c
+/* Full Page Writes (FPW) - protection against torn pages */
+
+/*
+ * Problem: Partial page write
+ * ───────────────────────────────────────────────────
+ * PostgreSQL page: 8KB
+ * Disk sector: 512B or 4KB
+ * 
+ * If crash during page write:
+ * - Some sectors written, some not
+ * - Page is corrupted (torn page)
+ * - Can't apply WAL to corrupted page!
+ *
+ * Solution: Full Page Image (FPI)
+ * ───────────────────────────────────────────────────
+ * First modification after checkpoint: write entire page to WAL
+ * Recovery: restore page from FPI, then apply subsequent WAL
+ */
+
+typedef struct XLogRecordBlockHeader
+{
+    uint8       id;             /* Block ID (for multi-block records) */
+    uint8       fork_flags;     /* Fork number + flags */
+    uint16      data_length;    /* Length of block-specific data */
+    
+    /* If BKPBLOCK_HAS_IMAGE flag set: */
+    uint16      bimg_len;       /* Length of page image */
+    uint16      hole_offset;    /* Offset of hole (if any) */
+    uint8       bimg_info;      /* Compression, etc. */
+    
+    /* Block reference follows... */
+} XLogRecordBlockHeader;
+
+/* FPW behavior */
+/*
+ * Checkpoint at LSN 0/10000000
+ * 
+ * WAL record at 0/10000100: UPDATE page 42
+ *   → First change to page 42 since checkpoint
+ *   → Include full 8KB page image
+ *   → xl_info includes XLR_BKP_BLOCK flag
+ *
+ * WAL record at 0/10001000: UPDATE page 42 (same page again)
+ *   → Not first change since checkpoint
+ *   → Only include delta (changed bytes)
+ *   → Much smaller record
+ *
+ * Next checkpoint at 0/20000000
+ *   → Page 42 modifications reset
+ *   → Next change will be FPW again
+ */
+```
+
+### 3.4 Checkpoints
+
+```c
+/* Checkpoint: Sync point for recovery */
+
+typedef struct CheckPoint
+{
+    XLogRecPtr  redo;           /* Recovery starts here */
+    TimeLineID  ThisTimeLineID; /* Current timeline */
+    TimeLineID  PrevTimeLineID; /* Previous timeline */
+    bool        fullPageWrites; /* FPW enabled? */
+    uint32      nextXidEpoch;   /* Epoch for XID wraparound */
+    TransactionId nextXid;      /* Next XID to assign */
+    Oid         nextOid;        /* Next OID to assign */
+    MultiXactId nextMulti;      /* Next MultiXactId */
+    MultiXactOffset nextMultiOffset;
+    TransactionId oldestXid;    /* Oldest XID still in CLOG */
+    Oid         oldestXidDB;    /* DB containing oldestXid */
+    MultiXactId oldestMulti;    /* Oldest MultiXactId */
+    Oid         oldestMultiDB;
+    pg_time_t   time;           /* Checkpoint time */
+    TransactionId oldestCommitTsXid;
+    TransactionId newestCommitTsXid;
+    TransactionId oldestActiveXid;
+} CheckPoint;
+
+/*
+ * Checkpoint process:
+ * ───────────────────────────────────────────────────
+ *
+ * 1. Checkpointer wakes up (timer or forced)
+ *
+ * 2. Write CHECKPOINT_START record to WAL
+ *    → Marks beginning of checkpoint
+ *
+ * 3. Flush all dirty buffers to disk
+ *    → Uses checkpoint_completion_target to spread I/O
+ *    → BufferSync() writes modified pages
+ *
+ * 4. Fsync all files
+ *    → Ensure data is on persistent storage
+ *
+ * 5. Write CHECKPOINT record to WAL
+ *    → Contains redo point (where recovery should start)
+ *
+ * 6. Update pg_control
+ *    → Stores current checkpoint location
+ *    → Crash recovery reads this first
+ *
+ * 7. Remove old WAL segments
+ *    → Segments before redo point not needed
+ *    → Unless needed for replication/archiving
+ */
+```
+
+### 3.5 Checkpoint Tuning
+
+```sql
+-- Checkpoint configuration
+
+-- How often to checkpoint (at minimum)
+checkpoint_timeout = '5min'      -- Default: every 5 minutes
+
+-- Or when this much WAL generated
+max_wal_size = '1GB'             -- Default: ~64 WAL segments
+min_wal_size = '80MB'            -- Keep at least this much
+
+-- Spread checkpoint I/O over time
+checkpoint_completion_target = 0.9  -- Use 90% of interval
+
+-- Example with completion_target:
+/*
+ * checkpoint_timeout = 5min = 300s
+ * checkpoint_completion_target = 0.9
+ * 
+ * Target completion time = 300 × 0.9 = 270s
+ * 
+ * If we have 1000 dirty buffers:
+ * Rate = 1000 / 270 = ~3.7 buffers/second
+ * 
+ * Spreads I/O instead of burst at checkpoint start
+ */
+
+-- Monitoring checkpoints
+SELECT 
+    checkpoints_timed,        -- By timeout
+    checkpoints_req,          -- Forced (WAL full, manual)
+    checkpoint_write_time,    -- Time writing buffers (ms)
+    checkpoint_sync_time,     -- Time fsync'ing (ms)
+    buffers_checkpoint,       -- Buffers written in checkpoints
+    buffers_backend           -- Emergency backend writes (BAD)
+FROM pg_stat_bgwriter;
+
+-- buffers_backend should be 0 or very low
+-- If high: shared_buffers too small or checkpoint too infrequent
+```
+
+---
+
+## Part 4: Recovery Process
+
+### 4.1 Crash Recovery
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                      CRASH RECOVERY PROCESS                                  │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│   Startup after crash:                                                       │
+│                                                                              │
+│   1. Read pg_control                                                         │
+│      ├── State = "in production" → needs recovery                           │
+│      ├── Last checkpoint location                                           │
+│      └── Last known timeline                                                │
+│                                                                              │
+│   2. Read checkpoint record                                                  │
+│      └── Get REDO point (where to start replay)                             │
+│                                                                              │
+│   3. REDO Phase (replay WAL from checkpoint)                                │
+│      for each WAL record from REDO point to end:                            │
+│          ├── Read record                                                    │
+│          ├── Check if page needs record applied                             │
+│          │   (compare page LSN to record LSN)                               │
+│          ├── If FPI: restore full page image                                │
+│          ├── Else: apply redo function                                      │
+│          └── Continue until end of valid WAL                                │
+│                                                                              │
+│   4. Mark recovery complete                                                  │
+│      ├── Update pg_control state = "normal"                                 │
+│      ├── Write end-of-recovery checkpoint                                   │
+│      └── Open for connections                                               │
+│                                                                              │
+│   Timeline:                                                                  │
+│   ─────────────────────────────────────────────────────────────────────────  │
+│                                                                              │
+│   |←─── already on disk ───→|←─ in WAL buffers ─→|                          │
+│   |                         |     (lost)         |                          │
+│   ──────────●───────────────●────────────────────●                          │
+│         Checkpoint        Crash                Now                          │
+│             ↑                                                               │
+│         REDO point                                                          │
+│             |←─────── REDO phase replays these records ─────→|              │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### 4.2 LSN Tracking
+
+```c
+/* Page LSN - tracks last WAL record applied to page */
+
+/* Every PostgreSQL page has a header */
+typedef struct PageHeaderData
+{
+    PageXLogRecPtr pd_lsn;      /* LSN of last change to this page */
+    uint16      pd_checksum;    /* Page checksum if enabled */
+    uint16      pd_flags;       /* Flag bits */
+    LocationIndex pd_lower;     /* Offset to start of free space */
+    LocationIndex pd_upper;     /* Offset to end of free space */
+    LocationIndex pd_special;   /* Offset to start of special space */
+    uint16      pd_pagesize_version;
+    TransactionId pd_prune_xid; /* Hint for when to prune */
+} PageHeaderData;
+
+/* 
+ * Recovery logic using page LSN:
+ *
+ * for each WAL record with LSN X:
+ *     page = read_page(record->block_ref)
+ *     page_lsn = PageGetLSN(page)
+ *     
+ *     if (X <= page_lsn)
+ *         // Record already applied (page was flushed after this record)
+ *         skip record
+ *     else
+ *         // Page is older than record
+ *         apply record to page
+ *         PageSetLSN(page, X)
+ *
+ * This handles the case where:
+ * 1. WAL record written at LSN X
+ * 2. Page flushed to disk (has LSN X)
+ * 3. Crash before checkpoint
+ * 4. Recovery replays from before X
+ * 5. Record at X is skipped because page already has it
+ */
+```
+
+### 4.3 PITR (Point-In-Time Recovery)
+
+```sql
+-- Point-In-Time Recovery configuration
+
+-- Step 1: Enable archiving (postgresql.conf)
+archive_mode = on
+archive_command = 'cp %p /archive/%f'
+-- Or use pg_receivewal for continuous archiving
+
+-- Step 2: Take base backup
+pg_basebackup -D /backup/base -Fp -Xs -P
+
+-- Step 3: After disaster, create recovery.signal
+-- And set recovery target in postgresql.conf:
+
+restore_command = 'cp /archive/%f %p'
+
+-- Recovery targets (choose one):
+recovery_target_time = '2024-01-15 14:30:00 UTC'
+-- OR
+recovery_target_xid = '12345678'
+-- OR
+recovery_target_lsn = '0/1A2B3C4D'
+-- OR
+recovery_target_name = 'before_migration'  -- Created with pg_create_restore_point()
+
+-- Stop before or after target
+recovery_target_inclusive = true  -- Include target transaction
+
+-- What to do after reaching target
+recovery_target_action = 'pause'  -- pause, promote, or shutdown
+
+-- Step 4: Start PostgreSQL
+-- It will replay WAL until target, then pause/promote
+```
+
+---
+
+## Part 5: Logical Decoding
+
+### 5.1 Logical Replication Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                      LOGICAL DECODING ARCHITECTURE                           │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│   Publisher (Primary)                                                        │
+│   ┌─────────────────────────────────────────────────────────────────────┐   │
+│   │                         WAL                                          │   │
+│   │   ┌─────┬─────┬─────┬─────┬─────┬─────┬─────┐                        │   │
+│   │   │ rec │ rec │ rec │ rec │ rec │ rec │ rec │                        │   │
+│   │   └──┬──┴──┬──┴──┬──┴──┬──┴──┬──┴──┬──┴──┬──┘                        │   │
+│   │      │     │     │     │     │     │     │                           │   │
+│   │      ▼     ▼     ▼     ▼     ▼     ▼     ▼                           │   │
+│   │   ┌────────────────────────────────────────┐                         │   │
+│   │   │         Logical Decoding               │                         │   │
+│   │   │  • Decode WAL to logical changes       │                         │   │
+│   │   │  • Apply output plugin (pgoutput)      │                         │   │
+│   │   │  • Convert to INSERT/UPDATE/DELETE     │                         │   │
+│   │   └────────────────────────────────────────┘                         │   │
+│   │                      │                                                │   │
+│   │                      ▼                                                │   │
+│   │   ┌────────────────────────────────────────┐                         │   │
+│   │   │    Replication Slot                    │                         │   │
+│   │   │    (tracks subscriber position)        │                         │   │
+│   │   └────────────────────────────────────────┘                         │   │
+│   └─────────────────────────────────────────────────────────────────────┘   │
+│                           │                                                  │
+│                           │ Logical changes over network                     │
+│                           ▼                                                  │
+│   Subscriber (Replica)                                                       │
+│   ┌─────────────────────────────────────────────────────────────────────┐   │
+│   │   ┌────────────────────────────────────────┐                         │   │
+│   │   │    Logical Replication Worker          │                         │   │
+│   │   │    • Receive changes                   │                         │   │
+│   │   │    • Apply as SQL commands             │                         │   │
+│   │   │    • Handle conflicts                  │                         │   │
+│   │   └────────────────────────────────────────┘                         │   │
+│   │                      │                                                │   │
+│   │                      ▼                                                │   │
+│   │   ┌────────────────────────────────────────┐                         │   │
+│   │   │           Target Tables                │                         │   │
+│   │   │   (can have different schema!)         │                         │   │
+│   │   └────────────────────────────────────────┘                         │   │
+│   └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                              │
+│   Key Differences from Physical Replication:                                │
+│   • Logical: row changes → can have different schema, indexes              │
+│   • Physical: byte-for-byte WAL copy → must be identical                   │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### 5.2 Output Plugins
+
+```c
+/* Output plugin interface */
+
+/* Plugin initialization */
+void
+_PG_output_plugin_init(OutputPluginCallbacks *cb)
+{
+    cb->startup_cb = my_startup;
+    cb->begin_cb = my_begin;
+    cb->change_cb = my_change;
+    cb->truncate_cb = my_truncate;
+    cb->commit_cb = my_commit;
+    cb->shutdown_cb = my_shutdown;
+}
+
+/* Called for each change (INSERT/UPDATE/DELETE) */
+void
+my_change(LogicalDecodingContext *ctx,
+          ReorderBufferTXN *txn,
+          Relation relation,
+          ReorderBufferChange *change)
+{
+    /* Output in your custom format */
+    switch (change->action)
+    {
+        case REORDER_BUFFER_CHANGE_INSERT:
+            /* Emit INSERT data */
+            appendStringInfo(ctx->out, "INSERT INTO %s VALUES (...)",
+                           RelationGetRelationName(relation));
+            break;
+            
+        case REORDER_BUFFER_CHANGE_UPDATE:
+            /* Emit UPDATE with old and new tuple */
+            break;
+            
+        case REORDER_BUFFER_CHANGE_DELETE:
+            /* Emit DELETE with key columns */
+            break;
+    }
+    
+    OutputPluginWrite(ctx, true);
+}
+
+/* Built-in plugins:
+ * - pgoutput: Native logical replication protocol
+ * - test_decoding: Simple text output for testing
+ *
+ * Third-party plugins:
+ * - wal2json: JSON output
+ * - decoderbufs: Protocol Buffers
+ * - pglogical: Extended logical replication
+ */
+```
+
+### 5.3 Change Data Capture (CDC)
+
+```sql
+-- Create a replication slot for CDC
+SELECT pg_create_logical_replication_slot('my_cdc_slot', 'wal2json');
+
+-- Consume changes
+SELECT * FROM pg_logical_slot_get_changes('my_cdc_slot', NULL, NULL);
+
+-- Example output (wal2json format):
+/*
+{
+  "change": [
+    {
+      "kind": "insert",
+      "schema": "public",
+      "table": "orders",
+      "columnnames": ["id", "customer_id", "total"],
+      "columntypes": ["integer", "integer", "numeric"],
+      "columnvalues": [1001, 42, 99.99]
+    }
+  ]
+}
+*/
+
+-- Peek without consuming (for debugging)
+SELECT * FROM pg_logical_slot_peek_changes('my_cdc_slot', NULL, NULL);
+
+-- Monitor slot lag
+SELECT 
+    slot_name,
+    pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)) as lag
+FROM pg_replication_slots;
+```
+
+---
+
+## Part 6: Interview Questions
+
+### Storage Engine Deep Dive
+
+<AccordionGroup>
+  <Accordion title="Q: Explain how PostgreSQL prevents torn pages during writes">
+    **Answer**:
+    
+    PostgreSQL uses **Full Page Writes (FPW)** to prevent torn page corruption:
+    
+    1. **The Problem**
+       - PostgreSQL pages are 8KB
+       - Disk sectors are 512B or 4KB
+       - If crash during write: some sectors written, some not
+       - Page becomes corrupted (torn)
+    
+    2. **The Solution**
+       - First modification to a page after checkpoint: write entire 8KB page to WAL
+       - This is called a Full Page Image (FPI)
+       - Subsequent changes to same page: only write delta
+    
+    3. **Recovery Process**
+       - Find last checkpoint
+       - If page is torn: restore from FPI in WAL
+       - Then apply subsequent WAL records
+    
+    4. **Trade-offs**
+       - FPW increases WAL volume significantly
+       - Especially after checkpoint (many FPIs)
+       - Can be disabled with `full_page_writes=off` if hardware/filesystem guarantees atomic 8KB writes
+       - Some use checksums + ZFS for detection without FPW
+  </Accordion>
+  
+  <Accordion title="Q: Why does PostgreSQL need VACUUM? How would you redesign it?">
+    **Answer**:
+    
+    **Why VACUUM exists:**
+    1. MVCC creates multiple tuple versions
+    2. Old versions must be preserved until no transaction needs them
+    3. Dead tuples accumulate, causing bloat
+    4. XID wraparound must be prevented (32-bit counter)
+    
+    **Problems with current design:**
+    - Table bloat grows between vacuums
+    - Can cause significant I/O
+    - Must track all dead tuples in memory (TidStore)
+    - Index vacuuming can be expensive
+    
+    **Alternative designs (how others solve it):**
+    
+    1. **Undo logs (Oracle, MySQL InnoDB)**
+       - Store old versions in separate undo space
+       - Main table always has latest version
+       - No need to vacuum table (just undo log)
+       - Trade-off: Longer transactions = longer undo retention
+    
+    2. **Append-only with compaction (RocksDB, Cassandra)**
+       - Never update in place
+       - Background compaction merges and removes old versions
+       - Trade-off: Write amplification
+    
+    3. **Garbage collection (CockroachDB)**
+       - Similar to VACUUM but distributed
+       - Each range tracks its own garbage
+       - GC based on TTL, not transaction visibility
+    
+    **What I might change:**
+    - Inline microvacuum on UPDATE (like HOT but for dead tuples)
+    - Incremental index vacuum (don't scan whole index)
+    - Better parallelization of vacuum
+  </Accordion>
+  
+  <Accordion title="Q: How does PostgreSQL ensure durability without syncing every commit?">
+    **Answer**:
+    
+    **Group Commit optimization:**
+    
+    1. **Basic durability requirement:**
+       - Transaction durability: once COMMIT returns, data survives crash
+       - Requires: WAL on persistent storage before ACK
+    
+    2. **Naive approach (slow):**
+       - Each commit: write WAL, fsync, return
+       - Fsync is expensive (~1-10ms)
+       - Limits to ~100-1000 commits/sec
+    
+    3. **Group commit (what PostgreSQL does):**
+       - Multiple backends write to WAL buffer
+       - One backend does fsync
+       - Fsync covers ALL pending commits
+       - All waiting backends released together
+    
+    4. **Configuration:**
+       ```sql
+       commit_delay = 10       -- Microseconds to wait for more commits
+       commit_siblings = 5     -- Min concurrent transactions to wait
+       ```
+       - Wait briefly for more transactions to batch
+    
+    5. **Async commit option:**
+       ```sql
+       synchronous_commit = off  -- Don't wait for WAL sync
+       ```
+       - Very fast (no fsync wait)
+       - Risk: Lose last few milliseconds of commits on crash
+       - Acceptable for many workloads (analytics, logging)
+  </Accordion>
+</AccordionGroup>
+
+---
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Distributed Systems" icon="network-wired" href="/courses/database-engineering/distributed-systems">
+    Replication, consensus, and distributed transactions
+  </Card>
+  <Card title="Contributing to PostgreSQL" icon="code-pull-request" href="/courses/database-engineering/contributing">
+    Submit your first patch to PostgreSQL
+  </Card>
+</CardGroup>
