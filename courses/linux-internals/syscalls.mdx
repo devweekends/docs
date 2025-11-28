@@ -1,0 +1,806 @@
+---
+title: "System Call Interface"
+sidebarTitle: "System Calls"
+description: "Deep dive into syscall mechanism, vDSO, seccomp, and the user-kernel boundary"
+icon: "terminal"
+---
+
+# System Call Interface
+
+System calls are the **only legitimate way** for user-space programs to request services from the kernel. Understanding syscalls deeply is essential for observability engineers who trace application behavior and infrastructure engineers who debug performance issues.
+
+<Info>
+**Interview Frequency**: Very High (especially at observability companies)  
+**Key Topics**: syscall mechanism, vDSO, seccomp, overhead analysis  
+**Time to Master**: 12-14 hours
+</Info>
+
+---
+
+## What Are System Calls?
+
+System calls are the interface between user-space applications and the kernel:
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                     USER SPACE TO KERNEL TRANSITION                          │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│   USER SPACE                                                                 │
+│   ──────────                                                                │
+│   ┌─────────────────────────────────────────────────────────────────────┐   │
+│   │  Application                                                         │   │
+│   │       ↓                                                              │   │
+│   │  libc wrapper (e.g., read())                                        │   │
+│   │       ↓                                                              │   │
+│   │  Set up registers: syscall number, arguments                        │   │
+│   │       ↓                                                              │   │
+│   │  SYSCALL instruction                                                │   │
+│   └─────────────────────────────────────────────────────────────────────┘   │
+│                              │                                               │
+│   ═══════════════════════════╪═══════════════════════════════════════════   │
+│                              │ CPU switches to ring 0                        │
+│   ═══════════════════════════╪═══════════════════════════════════════════   │
+│                              ↓                                               │
+│   KERNEL SPACE                                                               │
+│   ────────────                                                              │
+│   ┌─────────────────────────────────────────────────────────────────────┐   │
+│   │  entry_SYSCALL_64 (arch/x86/entry/entry_64.S)                       │   │
+│   │       ↓                                                              │   │
+│   │  Save user registers, switch to kernel stack                        │   │
+│   │       ↓                                                              │   │
+│   │  Look up syscall in sys_call_table                                  │   │
+│   │       ↓                                                              │   │
+│   │  Call syscall handler (e.g., ksys_read)                            │   │
+│   │       ↓                                                              │   │
+│   │  Return to user space via SYSRET/IRET                               │   │
+│   └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## x86-64 Syscall Mechanism
+
+### The SYSCALL Instruction
+
+On x86-64, the `syscall` instruction is the fast path for entering the kernel:
+
+```asm
+; User space syscall invocation
+mov    rax, 0       ; syscall number (0 = read)
+mov    rdi, 0       ; arg1: fd (stdin)
+mov    rsi, buffer  ; arg2: buffer pointer
+mov    rdx, 100     ; arg3: count
+syscall             ; Enter kernel
+; Return value in rax
+```
+
+### Register Convention
+
+| Register | Purpose |
+|----------|---------|
+| `rax` | Syscall number (input), return value (output) |
+| `rdi` | Argument 1 |
+| `rsi` | Argument 2 |
+| `rdx` | Argument 3 |
+| `r10` | Argument 4 (not rcx, which is used by syscall) |
+| `r8` | Argument 5 |
+| `r9` | Argument 6 |
+
+### MSR Configuration
+
+The CPU needs to know where to jump on syscall:
+
+```c
+// These MSRs are set during boot:
+// MSR_LSTAR (0xC0000082) - Syscall entry point address
+wrmsrl(MSR_LSTAR, (unsigned long)entry_SYSCALL_64);
+
+// MSR_STAR - Segment selectors for syscall/sysret
+// MSR_SYSCALL_MASK - Flags to clear on syscall
+```
+
+---
+
+## Syscall Entry Point Deep Dive
+
+The syscall entry point is one of the most critical pieces of kernel code:
+
+```asm
+// Simplified from arch/x86/entry/entry_64.S
+SYM_CODE_START(entry_SYSCALL_64)
+    // User RSP is in per-CPU storage, kernel RSP loaded
+    swapgs                      // Switch GS base to kernel
+    movq    %rsp, PER_CPU_VAR(cpu_tss_rw + TSS_sp2)
+    movq    PER_CPU_VAR(cpu_current_top_of_stack), %rsp
+    
+    // Push user registers onto kernel stack
+    pushq   $__USER_DS          // SS
+    pushq   PER_CPU_VAR(...)    // RSP
+    pushq   %r11                // RFLAGS (saved by syscall)
+    pushq   $__USER_CS          // CS
+    pushq   %rcx                // RIP (saved by syscall)
+    
+    // Save remaining registers
+    PUSH_AND_CLEAR_REGS
+    
+    // Call C handler
+    movq    %rsp, %rdi          // pt_regs pointer
+    call    do_syscall_64
+    
+    // Return to user space
+    ...
+    sysretq
+SYM_CODE_END(entry_SYSCALL_64)
+```
+
+### do_syscall_64 - The C Entry Point
+
+```c
+// arch/x86/entry/common.c
+__visible noinstr void do_syscall_64(struct pt_regs *regs, int nr)
+{
+    add_random_kstack_offset();  // Security: randomize stack
+    nr = syscall_enter_from_user_mode(regs, nr);
+    
+    if (likely(nr < NR_syscalls)) {
+        nr = array_index_nospec(nr, NR_syscalls);  // Spectre mitigation
+        regs->ax = sys_call_table[nr](regs);      // Call handler!
+    }
+    
+    syscall_exit_to_user_mode(regs);
+}
+```
+
+---
+
+## System Call Table
+
+The syscall table maps syscall numbers to handler functions:
+
+```c
+// arch/x86/entry/syscall_64.c
+const sys_call_ptr_t sys_call_table[] = {
+    [0]   = __x64_sys_read,
+    [1]   = __x64_sys_write,
+    [2]   = __x64_sys_open,
+    [3]   = __x64_sys_close,
+    [9]   = __x64_sys_mmap,
+    [56]  = __x64_sys_clone,
+    [57]  = __x64_sys_fork,
+    [59]  = __x64_sys_execve,
+    [60]  = __x64_sys_exit,
+    ...
+};
+```
+
+### Finding Syscall Numbers
+
+```bash
+# Method 1: Header files
+grep -E "^#define __NR_" /usr/include/asm/unistd_64.h | head -20
+
+# Method 2: ausyscall tool
+ausyscall --dump | head -20
+
+# Method 3: Python
+python3 -c "import os; print(os.SYS_read, os.SYS_write)"
+```
+
+---
+
+## vDSO - Virtual Dynamic Shared Object
+
+**vDSO** is a kernel optimization that provides certain syscalls without entering kernel mode:
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                            vDSO MECHANISM                                    │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│   Without vDSO (slow):                                                       │
+│   ┌────────────┐     syscall     ┌────────────┐                             │
+│   │ User Space │ ──────────────→ │   Kernel   │                             │
+│   │            │ ←────────────── │            │                             │
+│   └────────────┘     return      └────────────┘                             │
+│        ~100-200 cycles overhead                                              │
+│                                                                              │
+│   With vDSO (fast):                                                          │
+│   ┌────────────┐  function call  ┌────────────┐                             │
+│   │ User Space │ ──────────────→ │   vDSO     │  (still user space!)        │
+│   │            │ ←────────────── │  (shared)  │                             │
+│   └────────────┘     return      └────────────┘                             │
+│        ~10-20 cycles (no mode switch)                                        │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### vDSO Functions
+
+| Function | What it does |
+|----------|--------------|
+| `__vdso_clock_gettime` | Get current time (most common) |
+| `__vdso_gettimeofday` | Legacy time function |
+| `__vdso_time` | Simple seconds since epoch |
+| `__vdso_getcpu` | Get current CPU/NUMA node |
+
+### How vDSO Works
+
+1. Kernel maps a special page into every process
+2. Page contains code that can read kernel data (time, CPU)
+3. Kernel updates shared data (timekeeping) periodically
+4. User-space reads data without entering kernel
+
+```bash
+# Find vDSO mapping
+cat /proc/self/maps | grep vdso
+# 7fff12345000-7fff12346000 r-xp 00000000 00:00 0 [vdso]
+
+# Dump vDSO contents
+dd if=/proc/self/mem bs=4096 skip=$((0x7fff12345)) count=1 2>/dev/null | xxd | head
+```
+
+### vDSO Performance Impact
+
+```c
+// Benchmark: clock_gettime performance
+#include <time.h>
+
+void benchmark() {
+    struct timespec ts;
+    
+    // This uses vDSO (~20ns)
+    for (int i = 0; i < 1000000; i++) {
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+    }
+}
+```
+
+<Note>
+**Interview Insight**: "gettimeofday/clock_gettime are the most frequently called syscalls in many applications. vDSO makes them essentially free, which is why you rarely see them in syscall traces as performance problems."
+</Note>
+
+---
+
+## Syscall Overhead Analysis
+
+Understanding syscall overhead is crucial for performance:
+
+### Cost Breakdown
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                      SYSCALL OVERHEAD BREAKDOWN                              │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  1. Mode Switch (~50-100 cycles)                                            │
+│     - SYSCALL instruction                                                    │
+│     - Save user registers                                                    │
+│     - Load kernel stack                                                      │
+│                                                                              │
+│  2. Kernel Entry Work (~50-100 cycles)                                      │
+│     - Entry tracing (if enabled)                                            │
+│     - Audit logging (if enabled)                                            │
+│     - seccomp check (if enabled)                                            │
+│                                                                              │
+│  3. Actual Syscall Work (varies)                                            │
+│     - Read: depends on data availability                                    │
+│     - Write: depends on buffer state                                        │
+│     - Memory operations: page faults, allocation                            │
+│                                                                              │
+│  4. Return Path (~50-100 cycles)                                            │
+│     - Signal checking                                                        │
+│     - Rescheduling if needed                                                │
+│     - Exit tracing                                                          │
+│     - SYSRET/IRET                                                           │
+│                                                                              │
+│  Minimum overhead: ~200-500 cycles (trivial syscall)                        │
+│  Typical overhead: 1000+ cycles (with I/O)                                  │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Measuring Syscall Overhead
+
+```c
+// Measure getpid() overhead (does almost nothing)
+#include <sys/syscall.h>
+#include <time.h>
+
+long measure_syscall_overhead(int iterations) {
+    struct timespec start, end;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    
+    for (int i = 0; i < iterations; i++) {
+        syscall(SYS_getpid);
+    }
+    
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    return (end.tv_nsec - start.tv_nsec) / iterations;
+}
+// Typical result: ~200-400ns per syscall
+```
+
+### Spectre Mitigations Impact
+
+After Spectre/Meltdown, syscall overhead increased:
+
+```bash
+# Check for mitigations
+cat /sys/devices/system/cpu/vulnerabilities/*
+
+# Mitigations that affect syscall performance:
+# - KPTI (Kernel Page Table Isolation): ~100-400 cycles
+# - Retpoline: ~10-50 cycles on indirect calls
+# - IBRS: ~30-100 cycles
+```
+
+---
+
+## seccomp - Syscall Filtering
+
+**seccomp-BPF** allows filtering syscalls for security:
+
+### seccomp Modes
+
+| Mode | Description | Use Case |
+|------|-------------|----------|
+| `SECCOMP_MODE_STRICT` | Allow only read, write, exit, sigreturn | Maximum security |
+| `SECCOMP_MODE_FILTER` | BPF program filters syscalls | Container sandboxing |
+
+### How seccomp-BPF Works
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                        SECCOMP-BPF FILTERING                                 │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│   Syscall Entry                                                              │
+│        ↓                                                                     │
+│   ┌─────────────────────────────────────────────────────────────────┐       │
+│   │  seccomp BPF filter (runs before syscall)                       │       │
+│   │                                                                  │       │
+│   │  Input: struct seccomp_data {                                   │       │
+│   │           int   nr;          // syscall number                  │       │
+│   │           __u32 arch;        // architecture                    │       │
+│   │           __u64 instruction_pointer;                            │       │
+│   │           __u64 args[6];     // syscall arguments               │       │
+│   │         };                                                       │       │
+│   │                                                                  │       │
+│   │  Output: action                                                  │       │
+│   │    SECCOMP_RET_ALLOW  - Allow syscall                           │       │
+│   │    SECCOMP_RET_KILL   - Kill process                            │       │
+│   │    SECCOMP_RET_ERRNO  - Return error                            │       │
+│   │    SECCOMP_RET_TRACE  - Notify tracer (ptrace)                  │       │
+│   │    SECCOMP_RET_LOG    - Allow but log                           │       │
+│   └─────────────────────────────────────────────────────────────────┘       │
+│        ↓                                                                     │
+│   If allowed: proceed to syscall handler                                    │
+│   If denied: return error or kill process                                   │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### seccomp Example
+
+```c
+#include <seccomp.h>
+
+void apply_seccomp_filter() {
+    // Create filter context (default: allow all)
+    scmp_filter_ctx ctx = seccomp_init(SCMP_ACT_ALLOW);
+    
+    // Block specific syscalls
+    seccomp_rule_add(ctx, SCMP_ACT_ERRNO(EPERM), SCMP_SYS(ptrace), 0);
+    seccomp_rule_add(ctx, SCMP_ACT_ERRNO(EPERM), SCMP_SYS(kexec_load), 0);
+    
+    // Apply filter
+    seccomp_load(ctx);
+    seccomp_release(ctx);
+}
+```
+
+### seccomp in Containers
+
+Docker uses seccomp to restrict container syscalls:
+
+```bash
+# View Docker's default seccomp profile
+docker info --format '{{ .SecurityOptions }}'
+
+# Run container with custom seccomp profile
+docker run --security-opt seccomp=profile.json myimage
+
+# Run without seccomp (less secure)
+docker run --security-opt seccomp=unconfined myimage
+```
+
+---
+
+## System Call Tracing
+
+Essential skill for observability engineering:
+
+### strace - User-Space Tracer
+
+```bash
+# Basic syscall tracing
+strace ls
+
+# Trace specific syscalls
+strace -e read,write cat /etc/passwd
+
+# With timing information
+strace -T ls
+
+# Count syscalls
+strace -c ls
+
+# Trace child processes too
+strace -f ./multi_threaded_app
+
+# Output to file
+strace -o trace.log ls
+
+# Attach to running process
+strace -p 1234
+```
+
+### strace Output Analysis
+
+```bash
+$ strace -T cat /etc/passwd 2>&1 | head -20
+execve("/usr/bin/cat", ["cat", "/etc/passwd"], ...) = 0 <0.000892>
+brk(NULL)                               = 0x5555557c3000 <0.000012>
+mmap(NULL, 8192, PROT_READ|PROT_WRITE, ...) = 0x7ffff7fc5000 <0.000023>
+access("/etc/ld.so.preload", R_OK)      = -1 ENOENT <0.000015>
+openat(AT_FDCWD, "/etc/passwd", O_RDONLY) = 3 <0.000021>
+fstat(3, {st_mode=S_IFREG|0644, st_size=2773, ...}) = 0 <0.000011>
+read(3, "root:x:0:0:root:/root:/bin/bash\n"..., 131072) = 2773 <0.000018>
+write(1, "root:x:0:0:root:/root:/bin/bash\n"..., 2773) = 2773 <0.000042>
+close(3)                                = 0 <0.000010>
+```
+
+### ltrace - Library Call Tracer
+
+```bash
+# Trace library calls
+ltrace ls
+
+# Trace specific library
+ltrace -l libc.so.6 ls
+```
+
+### Kernel-Level Tracing
+
+For production, use eBPF-based tracing (covered in Track 5):
+
+```bash
+# Using bpftrace
+sudo bpftrace -e 'tracepoint:syscalls:sys_enter_openat { 
+    printf("%s opened %s\n", comm, str(args->filename)); 
+}'
+
+# Using perf
+sudo perf trace ls
+```
+
+---
+
+## Adding a Custom Syscall (Lab)
+
+Understanding by implementation:
+
+### Step 1: Define the Syscall
+
+```c
+// Add to include/linux/syscalls.h
+asmlinkage long sys_hello(const char __user *name);
+```
+
+### Step 2: Implement the Handler
+
+```c
+// Create kernel/hello.c
+#include <linux/syscalls.h>
+#include <linux/uaccess.h>
+
+SYSCALL_DEFINE1(hello, const char __user *, name)
+{
+    char buf[64];
+    
+    if (copy_from_user(buf, name, sizeof(buf) - 1))
+        return -EFAULT;
+    
+    buf[sizeof(buf) - 1] = '\0';
+    pr_info("Hello, %s! (from syscall)\n", buf);
+    
+    return 0;
+}
+```
+
+### Step 3: Add to Syscall Table
+
+```c
+// arch/x86/entry/syscalls/syscall_64.tbl
+# Add line:
+451    common    hello    sys_hello
+```
+
+### Step 4: Test from User Space
+
+```c
+#include <sys/syscall.h>
+#include <unistd.h>
+
+#define SYS_hello 451
+
+int main() {
+    syscall(SYS_hello, "World");
+    return 0;
+}
+```
+
+---
+
+## Compatibility and ABI
+
+### 32-bit Compatibility on 64-bit
+
+```c
+// Different syscall tables for different ABIs
+// arch/x86/entry/syscall_64.c - 64-bit
+// arch/x86/entry/syscall_32.c - 32-bit compat
+
+// Check ABI in seccomp
+struct seccomp_data {
+    __u32 arch;  // AUDIT_ARCH_X86_64 or AUDIT_ARCH_I386
+    ...
+};
+```
+
+### Syscall Number Differences
+
+```bash
+# Same syscall, different numbers
+# 64-bit: read = 0, write = 1
+# 32-bit: read = 3, write = 4
+
+# View 32-bit syscall numbers
+cat /usr/include/asm/unistd_32.h
+```
+
+---
+
+## Lab Exercises
+
+<AccordionGroup>
+  <Accordion title="Lab 1: Syscall Overhead Measurement" icon="gauge-high">
+    **Objective**: Measure and compare syscall overhead
+    
+    ```c
+    // syscall_bench.c
+    #define _GNU_SOURCE
+    #include <stdio.h>
+    #include <time.h>
+    #include <sys/syscall.h>
+    #include <unistd.h>
+    
+    #define ITERATIONS 10000000
+    
+    double measure(void (*func)(void)) {
+        struct timespec start, end;
+        clock_gettime(CLOCK_MONOTONIC, &start);
+        for (int i = 0; i < ITERATIONS; i++) func();
+        clock_gettime(CLOCK_MONOTONIC, &end);
+        return (end.tv_sec - start.tv_sec) * 1e9 + 
+               (end.tv_nsec - start.tv_nsec);
+    }
+    
+    void test_getpid() { syscall(SYS_getpid); }
+    void test_gettid() { syscall(SYS_gettid); }
+    void test_getuid() { syscall(SYS_getuid); }
+    
+    int main() {
+        printf("getpid: %.1f ns\n", measure(test_getpid) / ITERATIONS);
+        printf("gettid: %.1f ns\n", measure(test_gettid) / ITERATIONS);
+        printf("getuid: %.1f ns\n", measure(test_getuid) / ITERATIONS);
+        return 0;
+    }
+    ```
+    
+    ```bash
+    gcc -O2 syscall_bench.c -o syscall_bench
+    ./syscall_bench
+    ```
+  </Accordion>
+  
+  <Accordion title="Lab 2: strace Deep Analysis" icon="magnifying-glass">
+    **Objective**: Analyze real application syscall patterns
+    
+    ```bash
+    # 1. Compare static vs dynamic linking
+    strace -c /bin/ls -la
+    strace -c /bin/busybox ls -la
+    
+    # 2. Analyze a web server
+    strace -c -f python3 -m http.server 8000 &
+    curl http://localhost:8000/
+    kill %1
+    
+    # 3. Find slowest syscalls
+    strace -T -o trace.log dd if=/dev/zero of=/tmp/test bs=1M count=100
+    sort -t'<' -k2 -n trace.log | tail -20
+    ```
+  </Accordion>
+  
+  <Accordion title="Lab 3: seccomp Filter Implementation" icon="shield">
+    **Objective**: Create a sandboxed execution environment
+    
+    ```c
+    // sandbox.c
+    #include <stdio.h>
+    #include <stdlib.h>
+    #include <seccomp.h>
+    #include <unistd.h>
+    #include <sys/wait.h>
+    
+    void apply_sandbox() {
+        scmp_filter_ctx ctx = seccomp_init(SCMP_ACT_KILL);
+        
+        // Allow only essential syscalls
+        seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(read), 0);
+        seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(write), 0);
+        seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(exit_group), 0);
+        seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(brk), 0);
+        seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(mmap), 0);
+        
+        seccomp_load(ctx);
+        seccomp_release(ctx);
+    }
+    
+    int main() {
+        printf("Before sandbox\n");
+        apply_sandbox();
+        printf("After sandbox\n");
+        
+        // This will fail (open not allowed)
+        FILE *f = fopen("/etc/passwd", "r");
+        if (!f) printf("fopen blocked by seccomp!\n");
+        
+        return 0;
+    }
+    ```
+    
+    ```bash
+    gcc sandbox.c -o sandbox -lseccomp
+    ./sandbox
+    ```
+  </Accordion>
+</AccordionGroup>
+
+---
+
+## Interview Questions
+
+<AccordionGroup>
+  <Accordion title="Q1: Walk through what happens during a read() syscall" icon="question">
+    **Answer**:
+    
+    1. **User space**:
+       - Application calls `read(fd, buf, count)`
+       - libc sets up registers: rax=0 (SYS_read), rdi=fd, rsi=buf, rdx=count
+       - Executes `syscall` instruction
+    
+    2. **Kernel entry**:
+       - CPU switches to ring 0, loads kernel stack
+       - `entry_SYSCALL_64` saves registers
+       - `do_syscall_64` looks up `sys_read` in syscall table
+    
+    3. **Syscall handler** (`ksys_read`):
+       - Validates fd, gets `struct file *`
+       - Calls file's `read` operation (via `file->f_op->read`)
+       - For regular files: checks page cache, reads from disk if needed
+       - Copies data to user buffer via `copy_to_user`
+    
+    4. **Return**:
+       - Returns bytes read (or error)
+       - `syscall_exit_to_user_mode`: check signals, scheduling
+       - `sysretq`: return to user mode
+  </Accordion>
+  
+  <Accordion title="Q2: How does vDSO improve performance? What syscalls use it?" icon="question">
+    **Answer**:
+    
+    **How it works**:
+    - Kernel maps a special page into every process's address space
+    - Page contains code that reads kernel-maintained data
+    - No mode switch needed — runs entirely in user space
+    
+    **Performance improvement**:
+    - Regular syscall: ~200-500 cycles (mode switch overhead)
+    - vDSO call: ~10-20 cycles (just a function call)
+    
+    **Functions provided**:
+    - `gettimeofday()`, `clock_gettime()` — most important
+    - `time()`, `getcpu()`
+    
+    **Why limited**:
+    - Only works for read-only data
+    - Kernel maintains shared data (timekeeping)
+    - Can't be used for anything requiring kernel intervention
+    
+    **Impact**: Applications doing millions of time queries (monitoring, logging) would be ~10-50x slower without vDSO.
+  </Accordion>
+  
+  <Accordion title="Q3: How does seccomp protect containers?" icon="question">
+    **Answer**:
+    
+    **Protection mechanism**:
+    - BPF program runs on every syscall entry
+    - Blocks dangerous syscalls before they execute
+    - Defense in depth — even if container escapes, syscalls limited
+    
+    **Commonly blocked syscalls**:
+    - `mount`, `umount` — prevent filesystem manipulation
+    - `reboot`, `kexec_load` — prevent system disruption
+    - `ptrace` — prevent debugging/injection
+    - `init_module`, `delete_module` — prevent kernel modification
+    - `clock_settime` — prevent time manipulation
+    
+    **Docker default profile**: Blocks ~44 syscalls out of ~300+
+    
+    **Example attack prevention**:
+    - Container exploit tries `ptrace` to escape → blocked
+    - Malware tries `kexec_load` → blocked
+    - Process tries to load kernel module → blocked
+  </Accordion>
+  
+  <Accordion title="Q4: What's the overhead of enabling seccomp?" icon="question">
+    **Answer**:
+    
+    **Overhead sources**:
+    - BPF filter runs on every syscall entry
+    - Constant-time operations for simple filters
+    - More complex filters = higher overhead
+    
+    **Typical overhead**:
+    - Simple whitelist: ~20-50 nanoseconds per syscall
+    - Complex filters with argument checking: 100-200 ns
+    
+    **Why it's acceptable**:
+    - Syscalls already cost 200-500ns minimum
+    - 20-50ns is <25% additional overhead
+    - Security benefit outweighs cost
+    
+    **Optimization tips**:
+    - Put common allowed syscalls first in filter
+    - Use SECCOMP_RET_ALLOW as default if mostly allowing
+    - Profile with `perf` to measure actual impact
+  </Accordion>
+</AccordionGroup>
+
+---
+
+## Key Takeaways
+
+<CardGroup cols={2}>
+  <Card title="Syscall Mechanism" icon="terminal">
+    SYSCALL instruction, register convention, and kernel entry path are fundamental knowledge
+  </Card>
+  <Card title="vDSO Optimization" icon="gauge-high">
+    Critical for understanding why some "syscalls" have nearly zero overhead
+  </Card>
+  <Card title="seccomp Security" icon="shield">
+    BPF-based syscall filtering is the foundation of container security
+  </Card>
+  <Card title="Tracing Skills" icon="magnifying-glass">
+    strace and understanding syscall patterns are essential for debugging
+  </Card>
+</CardGroup>
+
+---
+
+Next: [Kernel Data Structures →](/courses/linux-internals/data-structures)

@@ -1,0 +1,945 @@
+---
+title: "Memory Management Internals"
+sidebarTitle: "Memory Management"
+description: "Deep dive into Linux memory management: zones, buddy allocator, slab, NUMA, and memory cgroups"
+icon: "memory"
+---
+
+# Memory Management Internals
+
+Memory management is one of the most complex subsystems in the Linux kernel. Understanding it deeply is crucial for infrastructure engineers debugging OOM issues, optimizing container resource limits, and understanding application performance.
+
+<Info>
+**Interview Frequency**: Very High (especially at observability/infrastructure companies)  
+**Key Topics**: Buddy allocator, slab, zones, OOM killer, cgroups  
+**Time to Master**: 16-18 hours
+</Info>
+
+---
+
+## Physical Memory Organization
+
+### Memory Zones
+
+Linux organizes physical memory into zones based on addressing constraints:
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                        PHYSICAL MEMORY ZONES (x86-64)                        │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  High Memory (beyond direct mapping)                                         │
+│  ┌─────────────────────────────────────────────────────────────────────┐    │
+│  │                    ZONE_MOVABLE (optional)                           │    │
+│  │                    For memory hotplug/migration                      │    │
+│  └─────────────────────────────────────────────────────────────────────┘    │
+│                                                                              │
+│  Normal Memory                                                               │
+│  ┌─────────────────────────────────────────────────────────────────────┐    │
+│  │                    ZONE_NORMAL                                       │    │
+│  │                    Regular memory, most allocations                  │    │
+│  │                    (above 4GB on x86-64)                             │    │
+│  └─────────────────────────────────────────────────────────────────────┘    │
+│                                                                              │
+│  ┌─────────────────────────────────────────────────────────────────────┐    │
+│  │                    ZONE_DMA32                                        │    │
+│  │                    0 - 4GB                                           │    │
+│  │                    For 32-bit DMA devices                            │    │
+│  └─────────────────────────────────────────────────────────────────────┘    │
+│                                                                              │
+│  ┌─────────────────────────────────────────────────────────────────────┐    │
+│  │                    ZONE_DMA                                          │    │
+│  │                    0 - 16MB                                          │    │
+│  │                    For legacy ISA DMA                                │    │
+│  └─────────────────────────────────────────────────────────────────────┘    │
+│                                                                              │
+│  0x00000000                                                                  │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Viewing Zone Information
+
+```bash
+# View zone details
+cat /proc/zoneinfo
+
+# Summary
+cat /proc/buddyinfo
+
+# Example output:
+# Node 0, zone   Normal 1234  876  432  210  105   52   26   13    6    3    1
+#                        2^0  2^1 2^2  2^3  2^4  2^5  2^6  2^7  2^8  2^9 2^10
+```
+
+---
+
+## Buddy Allocator
+
+The buddy system manages physical page allocation.
+
+### How Buddy Allocation Works
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                        BUDDY ALLOCATOR CONCEPT                               │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  Free lists organized by order (power of 2 pages):                          │
+│                                                                              │
+│  Order 0 (1 page):    [■] → [■] → [■] → NULL                               │
+│  Order 1 (2 pages):   [■■] → [■■] → NULL                                   │
+│  Order 2 (4 pages):   [■■■■] → NULL                                        │
+│  Order 3 (8 pages):   [■■■■■■■■] → NULL                                    │
+│  ...                                                                        │
+│  Order 10 (1024 pages = 4MB): [████████████████] → NULL                    │
+│                                                                              │
+│  ─────────────────────────────────────────────────────────────────────────  │
+│                                                                              │
+│  Allocation (request 4 pages = order 2):                                    │
+│                                                                              │
+│  1. Check order 2 list → empty                                              │
+│  2. Check order 3 list → has one block                                      │
+│  3. Split order 3: [■■■■■■■■] → [■■■■] + [■■■■]                            │
+│  4. Return one [■■■■], add other to order 2 list                           │
+│                                                                              │
+│  ─────────────────────────────────────────────────────────────────────────  │
+│                                                                              │
+│  Deallocation (free 4 pages):                                               │
+│                                                                              │
+│  1. Check if "buddy" block is free                                          │
+│  2. Buddy = block at address XOR (block_size)                               │
+│  3. If buddy free: coalesce → [■■■■] + [■■■■] = [■■■■■■■■]                 │
+│  4. Repeat until no more coalescing possible                                │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Buddy Allocator Code
+
+```c
+// mm/page_alloc.c (simplified)
+
+// Allocate 2^order contiguous pages
+struct page *__alloc_pages(gfp_t gfp, unsigned int order, int preferred_nid)
+{
+    struct page *page;
+    
+    // Try to get from free list
+    page = get_page_from_freelist(gfp, order, alloc_flags);
+    if (page)
+        return page;
+    
+    // Slow path: reclaim, compact, OOM
+    page = __alloc_pages_slowpath(gfp, order, &ac);
+    return page;
+}
+
+// Free pages back to buddy
+void __free_pages(struct page *page, unsigned int order)
+{
+    // Try to coalesce with buddy
+    while (order < MAX_ORDER - 1) {
+        struct page *buddy = find_buddy(page, order);
+        if (!page_is_buddy(buddy, order))
+            break;
+        
+        // Coalesce
+        list_del(&buddy->lru);
+        order++;
+        page = min(page, buddy);  // Use lower address
+    }
+    
+    // Add to free list
+    list_add(&page->lru, &zone->free_area[order].free_list);
+}
+```
+
+### Fragmentation Problem
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                        MEMORY FRAGMENTATION                                  │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  Initial state: One large free region                                       │
+│  [                          FREE                                      ]     │
+│                                                                              │
+│  After allocations/frees (fragmented):                                      │
+│  [USED][FREE][USED][FREE][USED][FREE][USED][FREE][USED][FREE][USED]        │
+│                                                                              │
+│  Problem: Lots of free memory, but can't allocate large contiguous block!  │
+│                                                                              │
+│  Solutions:                                                                  │
+│  1. Memory compaction: Move pages to create contiguous free space           │
+│  2. Huge pages: Reduce fragmentation by using larger pages                  │
+│  3. ZONE_MOVABLE: Put movable pages in separate zone                       │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+```bash
+# Check fragmentation
+cat /proc/buddyinfo
+# Low numbers at high orders = fragmentation
+
+# Trigger compaction
+echo 1 > /proc/sys/vm/compact_memory
+
+# Check compaction stats
+cat /proc/vmstat | grep compact
+```
+
+---
+
+## Slab Allocator (SLUB)
+
+For small object allocations (smaller than a page).
+
+### SLUB Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                          SLUB ALLOCATOR STRUCTURE                            │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  kmem_cache for "task_struct"                                               │
+│  ┌────────────────────────────────────────────────────────────────────┐     │
+│  │  object_size = 2688                                                 │     │
+│  │  objects_per_slab = 12                                              │     │
+│  │                                                                     │     │
+│  │  ┌─────────────────────────────────────────────────────────────┐   │     │
+│  │  │ Per-CPU cache (lockless fast path)                          │   │     │
+│  │  │                                                              │   │     │
+│  │  │ CPU 0: freelist → [obj] → [obj] → [obj] → NULL             │   │     │
+│  │  │ CPU 1: freelist → [obj] → [obj] → NULL                     │   │     │
+│  │  │ CPU 2: freelist → [obj] → NULL                             │   │     │
+│  │  └─────────────────────────────────────────────────────────────┘   │     │
+│  │                                                                     │     │
+│  │  ┌─────────────────────────────────────────────────────────────┐   │     │
+│  │  │ Partial slabs (shared, needs lock)                          │   │     │
+│  │  │                                                              │   │     │
+│  │  │ ┌────────────────┐  ┌────────────────┐                      │   │     │
+│  │  │ │ Slab (8/12)    │  │ Slab (3/12)    │                      │   │     │
+│  │  │ │ [X][X][X][ ]   │  │ [X][ ][ ][ ]   │                      │   │     │
+│  │  │ │ [X][X][X][ ]   │  │ [X][ ][ ][ ]   │                      │   │     │
+│  │  │ │ [X][X][ ][ ]   │  │ [X][ ][ ][ ]   │                      │   │     │
+│  │  │ └────────────────┘  └────────────────┘                      │   │     │
+│  │  └─────────────────────────────────────────────────────────────┘   │     │
+│  │                                                                     │     │
+│  │  Full slabs: Not tracked (no free objects)                        │     │
+│  │  Empty slabs: Returned to buddy allocator                          │     │
+│  │                                                                     │     │
+│  └────────────────────────────────────────────────────────────────────┘     │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### SLUB Fast Path
+
+```c
+// mm/slub.c (simplified)
+static void *___slab_alloc(struct kmem_cache *s, gfp_t gfpflags)
+{
+    void *object;
+    struct kmem_cache_cpu *c;
+    
+    c = this_cpu_ptr(s->cpu_slab);
+    
+    // Fast path: get from per-CPU freelist
+    object = c->freelist;
+    if (likely(object)) {
+        c->freelist = get_freepointer(s, object);
+        return object;
+    }
+    
+    // Slow path: get new slab from partial list or allocate
+    return __slab_alloc(s, gfpflags, node);
+}
+```
+
+### Viewing Slab Information
+
+```bash
+# View all slab caches
+cat /proc/slabinfo
+
+# Interactive slab viewer
+sudo slabtop
+
+# Memory usage by cache
+sudo slabtop -o | head -20
+
+# Detailed stats
+cat /sys/kernel/slab/task_struct/object_size
+cat /sys/kernel/slab/task_struct/objs_per_slab
+cat /sys/kernel/slab/task_struct/total_objects
+```
+
+---
+
+## Page Tables and Virtual Memory
+
+### 4-Level Page Tables (x86-64)
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    x86-64 PAGE TABLE WALK (4-level)                          │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  Virtual Address (48 bits used):                                             │
+│  ┌─────┬─────┬─────┬─────┬─────┬────────────┐                               │
+│  │ PML4│ PDP │ PD  │ PT  │Offset│   (unused) │                              │
+│  │ 9b  │ 9b  │ 9b  │ 9b  │ 12b │   16 bits  │                               │
+│  └──┬──┴──┬──┴──┬──┴──┬──┴──┬──┴────────────┘                               │
+│     │     │     │     │     │                                                │
+│     ▼     │     │     │     │                                                │
+│  ┌─────────┐   │     │     │                                                │
+│  │CR3 (PML4│   │     │     │                                                │
+│  │ base)   │   │     │     │                                                │
+│  └────┬────┘   │     │     │                                                │
+│       │        │     │     │                                                │
+│       ▼        ▼     │     │                                                │
+│  ┌─────────┐ ┌─────────┐   │     │                                          │
+│  │ PML4    │→│  PDP    │   │     │                                          │
+│  │ Table   │ │  Table  │   │     │                                          │
+│  └─────────┘ └────┬────┘   │     │                                          │
+│                   │        ▼     │                                          │
+│                   │  ┌─────────┐ │                                          │
+│                   └→ │  Page   │ │                                          │
+│                      │Directory│ │                                          │
+│                      └────┬────┘ │                                          │
+│                           │      ▼                                          │
+│                           │ ┌─────────┐                                     │
+│                           └→│  Page   │                                     │
+│                             │  Table  │                                     │
+│                             └────┬────┘                                     │
+│                                  │ + Offset                                  │
+│                                  ▼                                          │
+│                           ┌───────────────┐                                 │
+│                           │ Physical Page │                                 │
+│                           └───────────────┘                                 │
+│                                                                              │
+│  Each level: 512 entries × 8 bytes = 4KB (one page)                         │
+│  Total addressable: 2^48 = 256 TB                                           │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### TLB (Translation Lookaside Buffer)
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                           TLB CACHING                                        │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  Without TLB: Every memory access requires 4 table lookups!                 │
+│  With TLB: Cache recent translations                                         │
+│                                                                              │
+│  ┌────────────────────────────────────────────────────────────────────┐     │
+│  │                       TLB                                          │     │
+│  │  ┌──────────────────┬──────────────────┬──────┐                   │     │
+│  │  │ Virtual Page     │ Physical Frame   │ Flags│                   │     │
+│  │  ├──────────────────┼──────────────────┼──────┤                   │     │
+│  │  │ 0x7fff12340      │ 0x1a2b3          │ R/W  │                   │     │
+│  │  │ 0x7fff12341      │ 0x1a2b4          │ R/W  │                   │     │
+│  │  │ 0x555555554      │ 0x8c9d0          │ R    │                   │     │
+│  │  │ ...              │ ...              │ ...  │                   │     │
+│  │  └──────────────────┴──────────────────┴──────┘                   │     │
+│  └────────────────────────────────────────────────────────────────────┘     │
+│                                                                              │
+│  TLB Miss Handling:                                                          │
+│  1. Hardware walks page tables (x86)                                        │
+│  2. Fills TLB entry                                                          │
+│  3. Retries memory access                                                    │
+│                                                                              │
+│  TLB Shootdown (expensive!):                                                 │
+│  - Required when page tables change                                          │
+│  - Must invalidate TLB on all CPUs                                          │
+│  - Inter-processor interrupt (IPI)                                          │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Page Fault Handling
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                        PAGE FAULT TYPES                                      │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  1. MINOR FAULT (no disk I/O)                                               │
+│     ─────────────────────────                                               │
+│     - Page is in memory but not mapped                                      │
+│     - Demand paging: first access to mapped region                          │
+│     - Copy-on-write: first write after fork                                 │
+│     - Cost: ~1-10 μs                                                        │
+│                                                                              │
+│  2. MAJOR FAULT (disk I/O required)                                         │
+│     ─────────────────────────────                                           │
+│     - Page not in memory, must read from disk                               │
+│     - Swap-in: page was swapped out                                         │
+│     - File-backed: reading mapped file                                      │
+│     - Cost: ~1-10 ms (1000x more!)                                          │
+│                                                                              │
+│  3. INVALID FAULT (segmentation fault)                                      │
+│     ────────────────────────────────                                        │
+│     - Access to unmapped address                                            │
+│     - Permission violation (write to read-only)                             │
+│     - Result: SIGSEGV                                                       │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Page Fault Handler Flow
+
+```c
+// arch/x86/mm/fault.c (simplified)
+static void handle_page_fault(struct pt_regs *regs, unsigned long error_code,
+                              unsigned long address)
+{
+    struct vm_area_struct *vma;
+    struct mm_struct *mm = current->mm;
+    vm_fault_t fault;
+    
+    // Find VMA containing the address
+    vma = find_vma(mm, address);
+    
+    if (!vma || address < vma->vm_start) {
+        // No VMA - invalid access
+        bad_area(regs, error_code, address);
+        return;
+    }
+    
+    // Check permissions
+    if (unlikely(access_error(error_code, vma))) {
+        bad_area_access_error(regs, error_code, address, vma);
+        return;
+    }
+    
+    // Handle the fault
+    fault = handle_mm_fault(vma, address, flags, regs);
+    
+    // Check result
+    if (fault & VM_FAULT_OOM)
+        out_of_memory();
+    if (fault & VM_FAULT_SIGSEGV)
+        bad_area_nosemaphore(regs, error_code, address);
+}
+```
+
+### Monitoring Page Faults
+
+```bash
+# View page fault stats
+cat /proc/vmstat | grep pgfault
+# pgfault = total faults, pgmajfault = major faults
+
+# Per-process faults
+cat /proc/<pid>/stat | awk '{print "Minor:", $10, "Major:", $12}'
+
+# Real-time monitoring with perf
+sudo perf stat -e page-faults,minor-faults,major-faults ./myprogram
+```
+
+---
+
+## Memory Reclaim
+
+### kswapd and Direct Reclaim
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                        MEMORY RECLAIM PATHS                                  │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  Memory Watermarks:                                                          │
+│                                                                              │
+│  HIGH  ──────────────────────────────────────────────────────              │
+│        │                                                                     │
+│        │  Comfortable zone: kswapd sleeps                                   │
+│        │                                                                     │
+│  LOW   ──────────────────────────────────────────────────────              │
+│        │                                                                     │
+│        │  kswapd wakes up, background reclaim                               │
+│        │                                                                     │
+│  MIN   ──────────────────────────────────────────────────────              │
+│        │                                                                     │
+│        │  DANGER: Direct reclaim (allocating process blocked)              │
+│        │  Last resort before OOM                                            │
+│        │                                                                     │
+│  ZERO  ──────────────────────────────────────────────────────              │
+│                                                                              │
+│  Reclaim targets:                                                            │
+│  1. Page cache (clean pages, file-backed)                                   │
+│  2. Anonymous pages (swap out)                                              │
+│  3. Slab caches (shrinkable)                                                │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### LRU Lists
+
+```c
+// Pages organized in LRU lists
+enum lru_list {
+    LRU_INACTIVE_ANON,   // Anonymous, not recently used
+    LRU_ACTIVE_ANON,     // Anonymous, recently used
+    LRU_INACTIVE_FILE,   // File-backed, not recently used
+    LRU_ACTIVE_FILE,     // File-backed, recently used
+    LRU_UNEVICTABLE,     // Locked pages, mlocked
+    NR_LRU_LISTS
+};
+```
+
+```bash
+# View LRU stats
+cat /proc/meminfo | grep -E "Active|Inactive"
+# Active(anon):     2048000 kB
+# Inactive(anon):   1024000 kB
+# Active(file):     4096000 kB
+# Inactive(file):   2048000 kB
+```
+
+---
+
+## OOM Killer
+
+### OOM Score Calculation
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                          OOM KILLER SCORING                                  │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  Score = (process_memory / total_memory) × 1000 + oom_score_adj             │
+│                                                                              │
+│  Factors that increase score (more likely to kill):                         │
+│  + High memory usage                                                         │
+│  + Many child processes with memory                                          │
+│  + High oom_score_adj (positive)                                            │
+│                                                                              │
+│  Factors that decrease score (less likely to kill):                         │
+│  - Running as root (slight bonus)                                           │
+│  - Low oom_score_adj (negative)                                             │
+│  - oom_score_adj = -1000 (immune)                                           │
+│                                                                              │
+│  Examples:                                                                   │
+│  ┌────────────────────┬────────────────┬───────────────┬─────────┐         │
+│  │ Process            │ Memory Usage   │ oom_score_adj │ Score   │         │
+│  ├────────────────────┼────────────────┼───────────────┼─────────┤         │
+│  │ memory-hog         │ 50%            │ 0             │ 500     │         │
+│  │ important-service  │ 20%            │ -500          │ -300    │         │
+│  │ database           │ 30%            │ -1000         │ (immune)│         │
+│  └────────────────────┴────────────────┴───────────────┴─────────┘         │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Configuring OOM Behavior
+
+```bash
+# View OOM scores
+cat /proc/<pid>/oom_score
+cat /proc/<pid>/oom_score_adj
+
+# Make process immune to OOM
+echo -1000 > /proc/<pid>/oom_score_adj
+
+# Make process OOM target
+echo 1000 > /proc/<pid>/oom_score_adj
+
+# Disable OOM killer (dangerous!)
+echo 2 > /proc/sys/vm/overcommit_memory
+
+# Panic on OOM instead of killing
+echo 1 > /proc/sys/vm/panic_on_oom
+```
+
+---
+
+## Memory Cgroups
+
+Critical for container resource management.
+
+### Cgroup v2 Memory Controller
+
+```bash
+# Create cgroup
+mkdir /sys/fs/cgroup/mygroup
+
+# Set memory limit (100MB)
+echo 104857600 > /sys/fs/cgroup/mygroup/memory.max
+
+# Set soft limit (target when under pressure)
+echo 52428800 > /sys/fs/cgroup/mygroup/memory.high
+
+# Add process to cgroup
+echo $$ > /sys/fs/cgroup/mygroup/cgroup.procs
+
+# View current usage
+cat /sys/fs/cgroup/mygroup/memory.current
+
+# View statistics
+cat /sys/fs/cgroup/mygroup/memory.stat
+```
+
+### Memory Cgroup OOM
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                       CGROUP OOM BEHAVIOR                                    │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  memory.max hit:                                                             │
+│  1. Direct reclaim within cgroup                                            │
+│  2. If reclaim fails → cgroup OOM killer                                    │
+│  3. Kill process within cgroup (not system-wide!)                           │
+│                                                                              │
+│  Options:                                                                    │
+│  - memory.oom.group = 0: Kill one process in cgroup                         │
+│  - memory.oom.group = 1: Kill entire cgroup (container behavior)            │
+│                                                                              │
+│  Docker/Kubernetes:                                                          │
+│  - resources.limits.memory → memory.max                                     │
+│  - resources.requests.memory → scheduling decision                          │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## NUMA (Non-Uniform Memory Access)
+
+### NUMA Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                          NUMA TOPOLOGY                                       │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  ┌─────────────────────────────┐   ┌─────────────────────────────┐          │
+│  │         NUMA Node 0         │   │         NUMA Node 1         │          │
+│  │                             │   │                             │          │
+│  │  ┌─────┐ ┌─────┐ ┌─────┐   │   │  ┌─────┐ ┌─────┐ ┌─────┐   │          │
+│  │  │CPU 0│ │CPU 1│ │CPU 2│   │   │  │CPU 4│ │CPU 5│ │CPU 6│   │          │
+│  │  └──┬──┘ └──┬──┘ └──┬──┘   │   │  └──┬──┘ └──┬──┘ └──┬──┘   │          │
+│  │     │       │       │       │   │     │       │       │       │          │
+│  │  ┌──┴───────┴───────┴──┐   │   │  ┌──┴───────┴───────┴──┐   │          │
+│  │  │   Memory Controller │   │   │  │   Memory Controller │   │          │
+│  │  └──────────┬──────────┘   │   │  └──────────┬──────────┘   │          │
+│  │             │              │   │             │              │          │
+│  │  ┌──────────┴──────────┐   │   │  ┌──────────┴──────────┐   │          │
+│  │  │    Local Memory     │   │   │  │    Local Memory     │   │          │
+│  │  │    (32 GB)          │   │   │  │    (32 GB)          │   │          │
+│  │  └─────────────────────┘   │   │  └─────────────────────┘   │          │
+│  │                             │   │                             │          │
+│  └─────────────┬───────────────┘   └─────────────┬───────────────┘          │
+│                │                                  │                          │
+│                └──────────────────────────────────┘                          │
+│                        Interconnect (QPI/UPI)                                │
+│                                                                              │
+│  Local access: ~100ns     Remote access: ~300ns (3x slower!)                │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### NUMA Policies
+
+```bash
+# View NUMA topology
+numactl --hardware
+
+# Run with specific NUMA policy
+numactl --cpunodebind=0 --membind=0 ./myprogram  # Local only
+numactl --interleave=all ./myprogram  # Spread across nodes
+
+# View NUMA stats
+numastat
+numastat -p <pid>
+
+# View per-process NUMA memory
+cat /proc/<pid>/numa_maps
+```
+
+---
+
+## Huge Pages
+
+### Why Huge Pages Matter
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                        HUGE PAGES BENEFITS                                   │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  Regular pages (4 KB):                                                       │
+│  - 1 GB memory = 262,144 pages = 262,144 TLB entries needed                │
+│  - Typical TLB: 1024-4096 entries → Many TLB misses!                        │
+│                                                                              │
+│  Huge pages (2 MB):                                                          │
+│  - 1 GB memory = 512 huge pages = 512 TLB entries                          │
+│  - Much better TLB hit rate                                                  │
+│                                                                              │
+│  Giant pages (1 GB):                                                         │
+│  - 1 GB memory = 1 page = 1 TLB entry                                       │
+│  - Perfect for large memory workloads                                        │
+│                                                                              │
+│  Use cases:                                                                  │
+│  - Databases (PostgreSQL, MySQL)                                            │
+│  - Virtual machines (QEMU/KVM)                                              │
+│  - Large in-memory caches                                                    │
+│  - HPC applications                                                          │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Configuring Huge Pages
+
+```bash
+# View huge page info
+cat /proc/meminfo | grep Huge
+# HugePages_Total:     128
+# HugePages_Free:      100
+# HugePages_Rsvd:        0
+# Hugepagesize:       2048 kB
+
+# Reserve huge pages
+echo 128 > /proc/sys/vm/nr_hugepages
+
+# Use in application (mmap)
+void *ptr = mmap(NULL, size, PROT_READ|PROT_WRITE,
+                 MAP_PRIVATE|MAP_ANONYMOUS|MAP_HUGETLB, -1, 0);
+
+# Transparent Huge Pages (automatic)
+cat /sys/kernel/mm/transparent_hugepage/enabled
+# [always] madvise never
+```
+
+---
+
+## Lab Exercises
+
+<AccordionGroup>
+  <Accordion title="Lab 1: Memory Allocation Analysis" icon="magnifying-glass">
+    **Objective**: Understand memory allocation patterns
+    
+    ```bash
+    # Watch memory allocation in real-time
+    watch -n 1 'cat /proc/meminfo | head -20'
+    
+    # Trace page allocations
+    sudo perf record -e kmem:mm_page_alloc -a sleep 5
+    sudo perf script | head -50
+    
+    # View buddy allocator fragmentation
+    cat /proc/buddyinfo
+    
+    # Trigger memory pressure
+    stress --vm 2 --vm-bytes 1G --timeout 10s
+    
+    # Watch reclaim
+    watch -n 1 'cat /proc/vmstat | grep -E "pgfault|pgmaj|pswp"'
+    ```
+  </Accordion>
+  
+  <Accordion title="Lab 2: OOM Killer Experimentation" icon="bomb">
+    **Objective**: Understand OOM killer behavior
+    
+    ```bash
+    # Create a cgroup with 100MB limit
+    sudo mkdir /sys/fs/cgroup/test_oom
+    echo 104857600 | sudo tee /sys/fs/cgroup/test_oom/memory.max
+    
+    # Run memory-hungry process in cgroup
+    sudo bash -c 'echo $$ > /sys/fs/cgroup/test_oom/cgroup.procs && \
+                  python3 -c "x = [0] * (200 * 1024 * 1024 // 8)"'
+    
+    # Watch OOM events
+    sudo dmesg | tail -20
+    
+    # View OOM scores for all processes
+    for pid in $(ls /proc | grep -E '^[0-9]+$'); do
+        if [ -f /proc/$pid/oom_score ]; then
+            echo "$pid $(cat /proc/$pid/oom_score 2>/dev/null) $(cat /proc/$pid/comm 2>/dev/null)"
+        fi
+    done | sort -nk2 | tail -20
+    
+    # Cleanup
+    sudo rmdir /sys/fs/cgroup/test_oom
+    ```
+  </Accordion>
+  
+  <Accordion title="Lab 3: Page Fault Analysis" icon="chart-line">
+    **Objective**: Profile page faults
+    
+    ```c
+    // fault_test.c
+    #include <stdio.h>
+    #include <stdlib.h>
+    #include <sys/mman.h>
+    #include <sys/resource.h>
+    
+    void print_faults(const char *label) {
+        struct rusage usage;
+        getrusage(RUSAGE_SELF, &usage);
+        printf("%s - Minor: %ld, Major: %ld\n", 
+               label, usage.ru_minflt, usage.ru_majflt);
+    }
+    
+    int main() {
+        size_t size = 100 * 1024 * 1024;  // 100 MB
+        
+        print_faults("Before allocation");
+        
+        // Allocate (no faults yet - lazy allocation)
+        char *mem = malloc(size);
+        print_faults("After malloc");
+        
+        // Touch every page (causes faults)
+        for (size_t i = 0; i < size; i += 4096) {
+            mem[i] = 'x';
+        }
+        print_faults("After touching pages");
+        
+        free(mem);
+        return 0;
+    }
+    ```
+    
+    ```bash
+    gcc fault_test.c -o fault_test
+    ./fault_test
+    ```
+  </Accordion>
+</AccordionGroup>
+
+---
+
+## Interview Questions
+
+<AccordionGroup>
+  <Accordion title="Q1: Explain the difference between minor and major page faults" icon="question">
+    **Answer**:
+    
+    **Minor fault**:
+    - Page is in memory but not mapped in page table
+    - No disk I/O required
+    - Examples: First touch of allocated memory, COW after fork
+    - Cost: ~1-10 microseconds
+    
+    **Major fault**:
+    - Page not in memory, must read from disk
+    - Examples: Swap-in, reading memory-mapped file
+    - Cost: ~1-10 milliseconds (1000x slower!)
+    
+    **Production impact**:
+    - Minor faults: Normal, usually not a concern
+    - Major faults: Serious performance problem, indicates memory pressure or working set too large
+    
+    **Monitoring**:
+    ```bash
+    perf stat -e page-faults,minor-faults,major-faults ./program
+    ```
+  </Accordion>
+  
+  <Accordion title="Q2: How does the kernel decide which process to kill during OOM?" icon="question">
+    **Answer**:
+    
+    **OOM score calculation**:
+    ```
+    score = (process_memory / total_memory) × 1000 + oom_score_adj
+    ```
+    
+    **Factors**:
+    1. Memory usage (primary factor)
+    2. `oom_score_adj` (-1000 to +1000)
+    3. Root processes get slight preference
+    
+    **Selection process**:
+    1. Calculate score for all processes
+    2. Select process with highest score
+    3. Send SIGKILL to that process
+    4. Wait for memory to free
+    
+    **Protection strategies**:
+    - Set `oom_score_adj = -1000` for critical services
+    - Use memory cgroups to limit container memory
+    - Enable `vm.panic_on_oom` for critical systems
+  </Accordion>
+  
+  <Accordion title="Q3: What are the trade-offs between kmalloc and vmalloc?" icon="question">
+    **Answer**:
+    
+    | Aspect | kmalloc | vmalloc |
+    |--------|---------|---------|
+    | Physical memory | Contiguous | Non-contiguous |
+    | Max size | ~4 MB | Virtual space limit |
+    | Performance | Faster | Slower (TLB overhead) |
+    | Use in DMA | Yes | No (not physically contiguous) |
+    | Interrupt context | Yes (GFP_ATOMIC) | No (may sleep) |
+    
+    **When to use kmalloc**:
+    - Small allocations (<4 MB)
+    - DMA buffers
+    - Performance-critical paths
+    - Interrupt context
+    
+    **When to use vmalloc**:
+    - Large allocations
+    - Module loading
+    - Memory that doesn't need DMA
+    - Non-critical paths
+  </Accordion>
+  
+  <Accordion title="Q4: Explain how cgroups memory limits work with containers" icon="question">
+    **Answer**:
+    
+    **Memory cgroup controls**:
+    - `memory.max`: Hard limit (OOM if exceeded)
+    - `memory.high`: Soft limit (throttling)
+    - `memory.low`: Best-effort protection
+    - `memory.min`: Hard protection
+    
+    **Container behavior**:
+    1. Container requests resources (Kubernetes requests)
+    2. Scheduler places based on available memory
+    3. Cgroup limits enforced at runtime
+    4. Exceeding `memory.max` → container OOM (not host)
+    
+    **OOM handling**:
+    - Default: Kill one process in cgroup
+    - `memory.oom.group = 1`: Kill entire cgroup
+    - Docker default: Restart policy determines behavior
+    
+    **Best practices**:
+    - Set `memory.max` to prevent runaway containers
+    - Set `memory.high` slightly below max for graceful throttling
+    - Monitor container memory usage with cAdvisor/Prometheus
+  </Accordion>
+</AccordionGroup>
+
+---
+
+## Key Takeaways
+
+<CardGroup cols={2}>
+  <Card title="Buddy Allocator" icon="layer-group">
+    Manages physical pages efficiently with power-of-2 coalescing
+  </Card>
+  <Card title="Slab Allocator" icon="boxes-stacked">
+    Optimizes small object allocation with caching and per-CPU pools
+  </Card>
+  <Card title="OOM Killer" icon="skull">
+    Protects system by killing processes based on memory score
+  </Card>
+  <Card title="Memory Cgroups" icon="box">
+    Enable container memory limits with per-cgroup OOM handling
+  </Card>
+</CardGroup>
+
+---
+
+Next: [Virtual Memory & Address Translation →](/courses/linux-internals/virtual-memory)
