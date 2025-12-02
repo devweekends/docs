@@ -1,0 +1,1127 @@
+---
+title: "Memory Management Deep Dive"
+sidebarTitle: "Memory Management"
+description: "PostgreSQL memory subsystem internals — contexts, allocators, and shared memory"
+icon: "microchip"
+---
+
+<Frame>
+  <img src="/images/courses/database-engineering/memory-management-concept.svg" alt="Memory Management Deep Dive - Contexts, palloc, and shared memory" />
+</Frame>
+
+# Memory Management Deep Dive
+
+This module provides comprehensive coverage of PostgreSQL's memory management system. Understanding memory management is essential for writing efficient extensions, debugging memory issues, and optimizing database performance.
+
+<Info>
+**Target Audience**: Extension developers, core contributors, performance engineers  
+**Prerequisites**: C programming, basic OS memory concepts  
+**Source Directories**: `src/backend/utils/mmgr/`, `src/include/utils/`  
+**Interview Relevance**: Staff+ systems programming roles
+</Info>
+
+---
+
+## Part 1: Memory Context System
+
+### 1.1 Why Memory Contexts?
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    THE MEMORY MANAGEMENT PROBLEM                             │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│   Traditional malloc/free:                                                   │
+│   ─────────────────────────────────────────────────────────────────────────  │
+│   • Every allocation needs matching free                                    │
+│   • Memory leaks if free is forgotten                                       │
+│   • Difficult to track ownership                                            │
+│   • Error handling complicates cleanup                                      │
+│   • Fragmentation over time                                                 │
+│                                                                              │
+│   PostgreSQL's solution: Memory Contexts                                    │
+│   ─────────────────────────────────────────────────────────────────────────  │
+│   • Allocations belong to a context                                         │
+│   • Context deletion frees ALL allocations at once                          │
+│   • Hierarchical - child contexts deleted with parent                       │
+│   • Automatic cleanup on error (transaction abort)                          │
+│   • No need to track individual allocations                                 │
+│                                                                              │
+│   Example:                                                                   │
+│                                                                              │
+│   ┌─────────────── TopMemoryContext ───────────────┐                        │
+│   │                                                 │                        │
+│   │  ┌─── MessageContext ───┐  ┌─── CacheContext ─┐│                        │
+│   │  │ Query strings        │  │ Catalog cache    ││                        │
+│   │  │ Error messages       │  │ Relation cache   ││                        │
+│   │  └──────────────────────┘  └──────────────────┘│                        │
+│   │                                                 │                        │
+│   │  ┌─── PortalContext (per query) ───────────┐   │                        │
+│   │  │                                         │   │                        │
+│   │  │  ┌─── ExecutorState ───┐                │   │                        │
+│   │  │  │ Plan tree           │                │   │                        │
+│   │  │  │ Intermediate results│                │   │                        │
+│   │  │  └─────────────────────┘                │   │                        │
+│   │  │                                         │   │                        │
+│   │  │  ┌─── ExprContext ─────┐                │   │                        │
+│   │  │  │ Per-tuple memory    │ ← Reset often! │   │                        │
+│   │  │  └─────────────────────┘                │   │                        │
+│   │  └─────────────────────────────────────────┘   │                        │
+│   │                                                 │                        │
+│   └─────────────────────────────────────────────────┘                        │
+│                                                                              │
+│   When query completes: Delete PortalContext → All query memory freed!     │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### 1.2 Memory Context Structure
+
+```c
+/* src/include/utils/memutils.h */
+
+typedef struct MemoryContextData
+{
+    NodeTag     type;           /* T_AllocSetContext, etc. */
+    
+    /* Hierarchy linkage */
+    MemoryContext parent;       /* Parent context (NULL for TopMemoryContext) */
+    MemoryContext firstchild;   /* First child context */
+    MemoryContext prevchild;    /* Sibling linkage */
+    MemoryContext nextchild;
+    
+    char       *name;           /* Context name (for debugging) */
+    const char *ident;          /* Optional identifier */
+    
+    /* Memory accounting */
+    Size        mem_allocated;  /* Total bytes allocated */
+    
+    /* Context type determines allocation strategy */
+    const MemoryContextMethods *methods;
+    
+    /* Flags */
+    bool        isReset;        /* Context has been reset */
+    bool        allowInCritSection;  /* Allow alloc in critical section */
+} MemoryContextData;
+
+/* Methods for different context types */
+typedef struct MemoryContextMethods
+{
+    void   *(*alloc)(MemoryContext context, Size size);
+    void    (*free_p)(MemoryContext context, void *pointer);
+    void   *(*realloc)(MemoryContext context, void *pointer, Size size);
+    void    (*reset)(MemoryContext context);
+    void    (*delete_context)(MemoryContext context);
+    Size    (*get_chunk_space)(MemoryContext context, void *pointer);
+    bool    (*is_empty)(MemoryContext context);
+    void    (*stats)(MemoryContext context, ...);
+} MemoryContextMethods;
+```
+
+### 1.3 Context Lifecycle
+
+```c
+/* Creating a context */
+MemoryContext
+AllocSetContextCreate(MemoryContext parent,
+                      const char *name,
+                      Size minContextSize,
+                      Size initBlockSize,
+                      Size maxBlockSize)
+{
+    AllocSet    context;
+    
+    /* Allocate the context header from parent */
+    context = MemoryContextAlloc(parent, sizeof(AllocSetContext));
+    
+    /* Initialize the context */
+    MemoryContextCreate((MemoryContext) context,
+                       T_AllocSetContext,
+                       &AllocSetMethods,
+                       parent,
+                       name);
+    
+    /* Set allocation parameters */
+    context->initBlockSize = initBlockSize;
+    context->maxBlockSize = maxBlockSize;
+    context->nextBlockSize = initBlockSize;
+    
+    return (MemoryContext) context;
+}
+
+/* Using a context */
+void
+ProcessQuery(const char *query)
+{
+    MemoryContext queryContext;
+    MemoryContext oldContext;
+    
+    /* Create context for this query */
+    queryContext = AllocSetContextCreate(
+        CurrentMemoryContext,
+        "QueryContext",
+        ALLOCSET_DEFAULT_SIZES);
+    
+    /* Switch to new context */
+    oldContext = MemoryContextSwitchTo(queryContext);
+    
+    /* All allocations now go to queryContext */
+    result = palloc(sizeof(Result));
+    data = palloc(dataSize);
+    /* ... do query processing ... */
+    
+    /* Switch back */
+    MemoryContextSwitchTo(oldContext);
+    
+    /* When done, delete entire context - all memory freed! */
+    MemoryContextDelete(queryContext);
+}
+
+/* Reset (keep context, free contents) */
+MemoryContextReset(context);  /* Frees all allocations, keeps context */
+
+/* Delete (free context and all contents) */
+MemoryContextDelete(context);  /* Frees everything including context itself */
+```
+
+---
+
+## Part 2: AllocSet Implementation
+
+### 2.1 Block-Based Allocation
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    ALLOCSET BLOCK STRUCTURE                                  │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│   AllocSet Context                                                          │
+│   ┌────────────────────────────────────────────────────────────────────┐    │
+│   │  blocks ──────────────────────────────────────────────────────┐    │    │
+│   │  freelist[0] ── (for 8-byte chunks)                           │    │    │
+│   │  freelist[1] ── (for 16-byte chunks)                          │    │    │
+│   │  freelist[2] ── (for 32-byte chunks)                          │    │    │
+│   │  ...                                                          │    │    │
+│   │  freelist[10] ─ (for 8KB chunks)                              │    │    │
+│   │  initBlockSize = 8KB                                          │    │    │
+│   │  maxBlockSize = 8MB                                           │    │    │
+│   └───────────────────────────────────────────────────────────────────┘    │
+│                                │                                            │
+│                                ▼                                            │
+│   Block Chain                                                               │
+│   ┌──────────────────┐    ┌──────────────────┐    ┌──────────────────┐     │
+│   │ Block (8KB)      │───►│ Block (16KB)     │───►│ Block (32KB)     │     │
+│   │                  │    │                  │    │                  │     │
+│   │ ┌─────────────┐  │    │ ┌─────────────┐  │    │ ┌─────────────┐  │     │
+│   │ │ BlockHeader │  │    │ │ BlockHeader │  │    │ │ BlockHeader │  │     │
+│   │ │ aset ptr    │  │    │ │ aset ptr    │  │    │ │ aset ptr    │  │     │
+│   │ │ freeptr     │  │    │ │ freeptr     │  │    │ │ freeptr     │  │     │
+│   │ │ endptr      │  │    │ │ endptr      │  │    │ │ endptr      │  │     │
+│   │ └─────────────┘  │    │ └─────────────┘  │    │ └─────────────┘  │     │
+│   │ ┌─────────────┐  │    │ ┌─────────────┐  │    │ ┌─────────────┐  │     │
+│   │ │ Chunk 1     │  │    │ │ Chunk       │  │    │ │ Chunk       │  │     │
+│   │ │ (allocated) │  │    │ │ (allocated) │  │    │ │ (allocated) │  │     │
+│   │ ├─────────────┤  │    │ ├─────────────┤  │    │ ├─────────────┤  │     │
+│   │ │ Chunk 2     │  │    │ │             │  │    │ │             │  │     │
+│   │ │ (allocated) │  │    │ │ FREE SPACE  │  │    │ │ FREE SPACE  │  │     │
+│   │ ├─────────────┤  │    │ │   ↑         │  │    │ │   ↑         │  │     │
+│   │ │ FREE SPACE  │  │    │ │ freeptr     │  │    │ │ freeptr     │  │     │
+│   │ │   ↑         │  │    │ │             │  │    │ │             │  │     │
+│   │ │ freeptr     │  │    │ │   endptr ↓  │  │    │ │   endptr ↓  │  │     │
+│   │ │   endptr ↓  │  │    │ └─────────────┘  │    │ └─────────────┘  │     │
+│   │ └─────────────┘  │    │                  │    │                  │     │
+│   └──────────────────┘    └──────────────────┘    └──────────────────┘     │
+│                                                                              │
+│   Block sizes double until maxBlockSize (to reduce malloc overhead)         │
+│   8KB → 16KB → 32KB → 64KB → ... → 8MB                                      │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### 2.2 Chunk Structure
+
+```c
+/* Every allocation has a chunk header */
+typedef struct AllocChunkData
+{
+    /* Size of the chunk (requested + alignment padding) */
+    Size        size;
+    
+    /* Number of bytes requested (for debugging) */
+    Size        requested_size;
+    
+    /* Back pointer to containing context */
+    void       *aset;
+    
+    /* Padding to maintain alignment */
+} AllocChunkData;
+
+/* Chunk sizes are powers of 2 for freelist indexing */
+/*
+ * Freelist index:  0    1    2    3    4     5     6     7     8     9     10
+ * Chunk size:      8   16   32   64  128   256   512  1024  2048  4096   8192
+ */
+
+#define ALLOC_MINBITS   3   /* Minimum chunk = 8 bytes */
+#define ALLOCSET_NUM_FREELISTS  11
+
+/* Mapping size to freelist index */
+static inline int
+AllocSetFreeIndex(Size size)
+{
+    int         idx;
+    
+    if (size <= (1 << ALLOC_MINBITS))
+        return 0;
+    
+    /* Find highest set bit */
+    idx = pg_leftmost_one_pos32((uint32) size - 1) - ALLOC_MINBITS + 1;
+    
+    if (idx >= ALLOCSET_NUM_FREELISTS)
+        idx = ALLOCSET_NUM_FREELISTS - 1;
+    
+    return idx;
+}
+```
+
+### 2.3 palloc Implementation
+
+```c
+/* src/backend/utils/mmgr/aset.c */
+
+void *
+AllocSetAlloc(MemoryContext context, Size size)
+{
+    AllocSet    set = (AllocSet) context;
+    AllocBlock  block;
+    AllocChunk  chunk;
+    int         fidx;
+    Size        chunk_size;
+    Size        blksize;
+    
+    /* Compute chunk size (power of 2 >= requested + header) */
+    chunk_size = 1 << (pg_leftmost_one_pos32(size + ALLOC_CHUNKHDRSZ - 1) + 1);
+    
+    /* For large allocations, get dedicated block */
+    if (chunk_size > set->maxBlockSize)
+    {
+        /* Allocate a dedicated block from OS */
+        blksize = chunk_size + ALLOC_BLOCKHDRSZ + ALLOC_CHUNKHDRSZ;
+        block = malloc(blksize);
+        /* ... initialize and return ... */
+    }
+    
+    /* Check freelist for this size */
+    fidx = AllocSetFreeIndex(chunk_size);
+    chunk = set->freelist[fidx];
+    
+    if (chunk != NULL)
+    {
+        /* Reuse chunk from freelist */
+        set->freelist[fidx] = chunk->next;
+        chunk->aset = set;
+        return AllocChunkGetPointer(chunk);
+    }
+    
+    /* No free chunk - allocate from current block */
+    block = set->blocks;
+    
+    if (block == NULL || 
+        block->endptr - block->freeptr < chunk_size + ALLOC_CHUNKHDRSZ)
+    {
+        /* Need new block */
+        blksize = set->nextBlockSize;
+        set->nextBlockSize = Min(set->nextBlockSize * 2, set->maxBlockSize);
+        
+        block = malloc(blksize);
+        block->aset = set;
+        block->freeptr = ((char *) block) + ALLOC_BLOCKHDRSZ;
+        block->endptr = ((char *) block) + blksize;
+        block->next = set->blocks;
+        set->blocks = block;
+    }
+    
+    /* Carve chunk from block */
+    chunk = (AllocChunk) block->freeptr;
+    chunk->aset = set;
+    chunk->size = chunk_size;
+    block->freeptr += chunk_size + ALLOC_CHUNKHDRSZ;
+    
+    return AllocChunkGetPointer(chunk);
+}
+```
+
+### 2.4 pfree Implementation
+
+```c
+void
+AllocSetFree(MemoryContext context, void *pointer)
+{
+    AllocSet    set = (AllocSet) context;
+    AllocChunk  chunk = AllocPointerGetChunk(pointer);
+    
+    /* For external (large) chunks, free directly */
+    if (chunk->size > set->maxBlockSize)
+    {
+        AllocBlock  block = (AllocBlock) (((char *) chunk) - ALLOC_BLOCKHDRSZ);
+        
+        /* Remove from block list */
+        if (block == set->blocks)
+            set->blocks = block->next;
+        else
+        {
+            AllocBlock  prev = set->blocks;
+            while (prev->next != block)
+                prev = prev->next;
+            prev->next = block->next;
+        }
+        
+        free(block);
+        return;
+    }
+    
+    /* Add to appropriate freelist */
+    int fidx = AllocSetFreeIndex(chunk->size);
+    chunk->next = set->freelist[fidx];
+    set->freelist[fidx] = chunk;
+    
+    /* Note: Memory is NOT returned to OS! */
+    /* It stays in the context for reuse */
+}
+```
+
+---
+
+## Part 3: Generation Context
+
+### 3.1 When to Use Generation Context
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    GENERATION CONTEXT USE CASE                               │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│   Problem with AllocSet for certain workloads:                              │
+│   ─────────────────────────────────────────────────────────────────────────  │
+│                                                                              │
+│   Tuple processing allocates many same-size chunks:                         │
+│   1. Read tuple → palloc(tuple_size)                                        │
+│   2. Process tuple                                                          │
+│   3. Free tuple → pfree()                                                   │
+│   4. Repeat millions of times                                               │
+│                                                                              │
+│   AllocSet behavior:                                                        │
+│   • Chunks go to freelist                                                   │
+│   • Next alloc checks freelist (overhead)                                   │
+│   • Good for long-lived data, wasteful for FIFO                             │
+│                                                                              │
+│   Generation Context solution:                                              │
+│   ─────────────────────────────────────────────────────────────────────────  │
+│                                                                              │
+│   Optimized for "allocate many, then free all" patterns:                    │
+│   • No freelists - just bump-allocate                                       │
+│   • Track free count per block                                              │
+│   • Free entire block when all chunks freed                                 │
+│   • ~30% faster for tuple-by-tuple processing                               │
+│                                                                              │
+│   Usage:                                                                     │
+│   GenerationContext = AllocSetContextCreate(...,                            │
+│                           ALLOCSET_SMALL_SIZES);  /* or use generation */   │
+│                                                                              │
+│   Or explicitly:                                                             │
+│   GenerationContextCreate(parent, "TupleContext", blockSize);               │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### 3.2 Generation Context Structure
+
+```c
+/* src/include/utils/memutils.h */
+
+typedef struct GenerationContext
+{
+    MemoryContextData header;   /* Standard context header */
+    
+    /* Block management */
+    dlist_head  blocks;         /* List of blocks */
+    GenerationBlock *keeper;    /* Keep one block around after reset */
+    
+    Size        blockSize;      /* Standard block size */
+    Size        allocChunkLimit;/* Max chunk to put in block */
+} GenerationContext;
+
+typedef struct GenerationBlock
+{
+    dlist_node  node;           /* List linkage */
+    GenerationContext *context; /* Owning context */
+    Size        blksize;        /* Allocated size of block */
+    int         nchunks;        /* Number of chunks in block */
+    int         nfree;          /* Number of freed chunks */
+    char       *freeptr;        /* Start of free space */
+    char       *endptr;         /* End of block */
+} GenerationBlock;
+
+/*
+ * When nfree == nchunks, entire block can be freed.
+ * This is the key optimization for FIFO patterns.
+ */
+```
+
+---
+
+## Part 4: Slab Allocator
+
+### 4.1 Slab Context for Fixed-Size Objects
+
+```c
+/*
+ * Slab allocator is optimal when:
+ * 1. All allocations are same size
+ * 2. High allocation/deallocation rate
+ * 3. Want to minimize fragmentation
+ *
+ * Examples: executor tuple slots, lock structures
+ */
+
+typedef struct SlabContext
+{
+    MemoryContextData header;
+    
+    Size        chunkSize;      /* Size of each chunk */
+    Size        fullChunkSize;  /* Including header and alignment */
+    Size        blockSize;      /* Size of each block */
+    int         chunksPerBlock; /* Chunks that fit in a block */
+    
+    dlist_head  freelist;       /* Blocks with free chunks */
+    dlist_head  fullBlocks;     /* Completely full blocks */
+    dlist_head  emptyBlocks;    /* Completely empty blocks */
+} SlabContext;
+
+/* Usage example */
+MemoryContext
+CreateTupleSlotContext(void)
+{
+    return SlabContextCreate(
+        CurrentMemoryContext,
+        "TupleSlots",
+        SLAB_DEFAULT_BLOCK_SIZE,
+        sizeof(TupleTableSlot));  /* Fixed chunk size */
+}
+
+/* All allocations from this context are sizeof(TupleTableSlot) */
+slot = MemoryContextAlloc(slabContext, sizeof(TupleTableSlot));
+```
+
+---
+
+## Part 5: Shared Memory
+
+### 5.1 Shared Memory Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    POSTGRESQL SHARED MEMORY LAYOUT                           │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│   ┌─────────────────────────────────────────────────────────────────────┐   │
+│   │                     SHARED MEMORY SEGMENT                            │   │
+│   │                     (shmget/shmat on Unix)                          │   │
+│   ├─────────────────────────────────────────────────────────────────────┤   │
+│   │                                                                     │   │
+│   │   Fixed Structures (allocated at startup)                          │   │
+│   │   ┌───────────────────────────────────────────────────────────────┐ │   │
+│   │   │ ShmemIndex         │ Hash table for named allocations        │ │   │
+│   │   ├────────────────────┼─────────────────────────────────────────┤ │   │
+│   │   │ BufferDescriptors  │ Array of NBuffers descriptors           │ │   │
+│   │   ├────────────────────┼─────────────────────────────────────────┤ │   │
+│   │   │ BufferBlocks       │ Actual buffer pool (8KB * NBuffers)     │ │   │
+│   │   ├────────────────────┼─────────────────────────────────────────┤ │   │
+│   │   │ LWLockArray        │ All lightweight locks                   │ │   │
+│   │   ├────────────────────┼─────────────────────────────────────────┤ │   │
+│   │   │ LockMethodTable    │ Lock manager hash tables                │ │   │
+│   │   ├────────────────────┼─────────────────────────────────────────┤ │   │
+│   │   │ ProcArray          │ PGPROC structures for all backends      │ │   │
+│   │   ├────────────────────┼─────────────────────────────────────────┤ │   │
+│   │   │ WALBuffer          │ WAL insertion buffers                   │ │   │
+│   │   ├────────────────────┼─────────────────────────────────────────┤ │   │
+│   │   │ XactSLRU           │ Commit log (CLOG) buffers               │ │   │
+│   │   ├────────────────────┼─────────────────────────────────────────┤ │   │
+│   │   │ SubtransSLRU       │ Subtransaction tracking                 │ │   │
+│   │   ├────────────────────┼─────────────────────────────────────────┤ │   │
+│   │   │ MultiXactSLRU      │ MultiXact buffers                       │ │   │
+│   │   └────────────────────┴─────────────────────────────────────────┘ │   │
+│   │                                                                     │   │
+│   │   Dynamic Shared Memory (DSM)                                      │   │
+│   │   ┌───────────────────────────────────────────────────────────────┐ │   │
+│   │   │ Parallel query worker communication                          │ │   │
+│   │   │ Background worker shared state                               │ │   │
+│   │   │ Extension-allocated shared memory                            │ │   │
+│   │   └───────────────────────────────────────────────────────────────┘ │   │
+│   │                                                                     │   │
+│   └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                              │
+│   Size calculation (simplified):                                            │
+│   shared_memory ≈ shared_buffers +                                          │
+│                   max_connections * sizeof(PGPROC) +                        │
+│                   wal_buffers +                                             │
+│                   lock_table_size +                                         │
+│                   misc_overhead                                             │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### 5.2 Shared Memory Allocation
+
+```c
+/* src/backend/storage/ipc/shmem.c */
+
+/*
+ * Shared memory allocation is different from regular palloc:
+ * 1. Must request during startup (size is fixed)
+ * 2. Must use ShmemInitStruct for named allocations
+ * 3. Cannot free (shared memory lifetime = server lifetime)
+ */
+
+/* Request shared memory during startup */
+void
+RequestAddinShmemSpace(Size size)
+{
+    /* Called from _PG_init() in extension */
+    /* Adds to total shared memory request */
+    addinShmemSize = add_size(addinShmemSize, size);
+}
+
+/* Allocate named structure at startup */
+void *
+ShmemInitStruct(const char *name, Size size, bool *foundPtr)
+{
+    ShmemIndexEnt *result;
+    void         *structPtr;
+    
+    /* Look up in shared memory index */
+    result = ShmemInitHash(name, ...);
+    
+    if (result->location != NULL)
+    {
+        /* Already allocated (by another backend or previous startup) */
+        *foundPtr = true;
+        return result->location;
+    }
+    
+    /* First allocation - carve out space */
+    *foundPtr = false;
+    structPtr = ShmemAlloc(size);
+    result->location = structPtr;
+    
+    return structPtr;
+}
+
+/* Example: Extension allocating shared state */
+void
+_PG_init(void)
+{
+    /* Request space during postmaster startup */
+    if (!process_shared_preload_libraries_in_progress)
+        return;
+    
+    RequestAddinShmemSpace(sizeof(MySharedState));
+    
+    /* Hook to initialize during shared memory setup */
+    prev_shmem_startup_hook = shmem_startup_hook;
+    shmem_startup_hook = my_shmem_startup;
+}
+
+void
+my_shmem_startup(void)
+{
+    bool found;
+    
+    if (prev_shmem_startup_hook)
+        prev_shmem_startup_hook();
+    
+    MySharedState = ShmemInitStruct("MyExtension",
+                                    sizeof(MySharedState),
+                                    &found);
+    if (!found)
+    {
+        /* First time - initialize */
+        memset(MySharedState, 0, sizeof(MySharedState));
+        SpinLockInit(&MySharedState->mutex);
+    }
+}
+```
+
+### 5.3 Dynamic Shared Memory (DSM)
+
+```c
+/*
+ * DSM allows creating shared memory segments at runtime.
+ * Used for parallel query, background workers.
+ */
+
+/* Create a new DSM segment */
+dsm_segment *
+dsm_create(Size size, int flags)
+{
+    /* Creates OS shared memory segment */
+    /* Mappable by other backends via dsm_handle */
+}
+
+/* Attach to existing segment */
+dsm_segment *
+dsm_attach(dsm_handle handle)
+{
+    /* Maps segment created by another backend */
+}
+
+/* Example: Parallel query setup */
+void
+ParallelQuerySetup(int nworkers)
+{
+    dsm_segment *seg;
+    Size         segsize;
+    
+    /* Calculate needed size */
+    segsize = sizeof(SharedExecutorState) +
+              nworkers * sizeof(WorkerState);
+    
+    /* Create segment */
+    seg = dsm_create(segsize, 0);
+    
+    /* Pin segment so it survives until explicitly unpinned */
+    dsm_pin_segment(seg);
+    
+    /* Initialize shared state */
+    SharedExecutorState *shstate = dsm_segment_address(seg);
+    shstate->nworkers = nworkers;
+    
+    /* Pass handle to workers (via BGWORKER_SHMEM_ACCESS) */
+    /* Workers call dsm_attach(handle) to map same segment */
+}
+```
+
+---
+
+## Part 6: Memory Accounting and Limits
+
+### 6.1 work_mem Enforcement
+
+```c
+/*
+ * work_mem limits memory for sorts, hash tables, etc.
+ * But it's per-operation, not per-query!
+ */
+
+/* Check before allocating large chunk */
+bool
+MemoryContextCheck(MemoryContext context, Size size)
+{
+    /* 
+     * work_mem is in KB, we're tracking bytes
+     * But enforcement is complex:
+     * - Applied per sort/hash operation
+     * - Multiple operations can each use work_mem
+     * - Query with 10 hash joins could use 10 * work_mem
+     */
+}
+
+/* Tracking memory usage in hash table */
+static inline bool
+ExecHashIncreaseNumBatches(HashJoinTable hashtable)
+{
+    /* Check if we've exceeded work_mem */
+    Size space_used = hashtable->spaceUsed;
+    Size space_limit = work_mem * 1024L;
+    
+    if (space_used > space_limit)
+    {
+        /* Spill to disk (increase batches) */
+        return true;
+    }
+    return false;
+}
+
+/* Sort memory tracking */
+void
+tuplesort_performsort(Tuplesortstate *state)
+{
+    if (state->memtupcount > 0)
+    {
+        Size mem_used = GetMemoryChunkSpace(state->memtuples);
+        
+        if (mem_used >= state->allowedMem)
+        {
+            /* Switch to external sort (use temp files) */
+            tuplesort_begin_external_sort(state);
+        }
+    }
+}
+```
+
+### 6.2 Memory Context Statistics
+
+```sql
+-- View memory context tree (PostgreSQL 14+)
+SELECT 
+    name,
+    ident,
+    parent,
+    level,
+    total_bytes,
+    total_nblocks,
+    free_bytes,
+    free_chunks,
+    used_bytes
+FROM pg_backend_memory_contexts
+ORDER BY total_bytes DESC
+LIMIT 20;
+
+-- Example output:
+--           name           | total_bytes | used_bytes
+-- -------------------------+-------------+------------
+-- TopMemoryContext         |    2457600  |   2100800
+-- CacheMemoryContext       |    1048576  |    950272
+-- PortalContext            |     524288  |    480256
+-- ExecutorState            |     262144  |    240128
+-- ExprContext              |       8192  |      4096
+```
+
+### 6.3 Memory Monitoring Functions
+
+```c
+/* Get memory usage of a context and children */
+void
+MemoryContextStats(MemoryContext context)
+{
+    MemoryContextStatsDetail(context, 100);  /* Dump to log */
+}
+
+/* Programmatic stats */
+void
+MemoryContextMemAllocated(MemoryContext context, Size *allocated)
+{
+    *allocated = context->mem_allocated;
+    
+    /* Include children */
+    for (MemoryContext child = context->firstchild;
+         child != NULL;
+         child = child->nextchild)
+    {
+        Size child_allocated;
+        MemoryContextMemAllocated(child, &child_allocated);
+        *allocated += child_allocated;
+    }
+}
+
+/* In-process checking */
+#ifdef USE_ASSERT_CHECKING
+#define MemoryContextCheck(context) \
+    MemoryContextCheckInternal(context, true)
+#else
+#define MemoryContextCheck(context) ((void)0)
+#endif
+```
+
+---
+
+## Part 7: NUMA Considerations
+
+### 7.1 NUMA and PostgreSQL
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    NUMA ARCHITECTURE IMPACT                                  │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│   NUMA (Non-Uniform Memory Access):                                         │
+│   ─────────────────────────────────────────────────────────────────────────  │
+│                                                                              │
+│   ┌─────────────────────────┐    ┌─────────────────────────┐                │
+│   │       NUMA Node 0       │    │       NUMA Node 1       │                │
+│   │  ┌─────┐ ┌─────┐       │    │  ┌─────┐ ┌─────┐       │                │
+│   │  │ CPU │ │ CPU │       │    │  │ CPU │ │ CPU │       │                │
+│   │  │ 0-7 │ │ 8-15│       │    │  │16-23│ │24-31│       │                │
+│   │  └──┬──┘ └──┬──┘       │    │  └──┬──┘ └──┬──┘       │                │
+│   │     │       │           │    │     │       │           │                │
+│   │     └───┬───┘           │    │     └───┬───┘           │                │
+│   │         │               │    │         │               │                │
+│   │    ┌────┴────┐         │    │    ┌────┴────┐         │                │
+│   │    │ Memory  │         │    │    │ Memory  │         │                │
+│   │    │ 64 GB   │         │    │    │ 64 GB   │         │                │
+│   │    └─────────┘         │    │    └─────────┘         │                │
+│   └───────────┬─────────────┘    └───────────┬─────────────┘                │
+│               │                              │                               │
+│               └──────────────┬───────────────┘                               │
+│                              │                                               │
+│                    QPI/UPI Interconnect                                     │
+│                                                                              │
+│   Problem:                                                                   │
+│   • Shared memory allocated on first-touch (where first accessed)           │
+│   • If postmaster on Node 0 touches all shared_buffers...                   │
+│   • All 8GB allocated on Node 0                                             │
+│   • Backends on Node 1 have 2x memory latency!                              │
+│                                                                              │
+│   Solutions:                                                                │
+│   ─────────────────────────────────────────────────────────────────────────  │
+│   1. numactl --interleave=all postgres                                      │
+│      - Spreads allocations across nodes                                     │
+│      - Consistent latency for all backends                                  │
+│                                                                              │
+│   2. numactl --membind=0 --cpunodebind=0 postgres                           │
+│      - Bind to single node (for smaller instances)                          │
+│      - Consistent latency, but limited to one node's memory                 │
+│                                                                              │
+│   3. Linux kernel settings:                                                 │
+│      vm.zone_reclaim_mode = 0  (don't reclaim from local zone first)       │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### 7.2 Huge Pages
+
+```bash
+# Huge pages reduce TLB misses for large shared_buffers
+
+# Calculate huge pages needed
+# shared_buffers = 8GB, huge page size = 2MB
+# 8GB / 2MB = 4096 huge pages
+
+# Set in /etc/sysctl.conf
+vm.nr_hugepages = 4200  # Add some headroom
+
+# PostgreSQL configuration
+# postgresql.conf
+huge_pages = on  # or 'try' for fallback
+
+# Verify usage
+grep Huge /proc/meminfo
+# HugePages_Total:    4200
+# HugePages_Free:      200  (most in use!)
+# HugePages_Rsvd:      100
+```
+
+---
+
+## Part 8: Common Memory Issues
+
+### 8.1 Memory Leaks
+
+```c
+/*
+ * Memory leak patterns and fixes
+ */
+
+/* LEAK: Allocating in wrong context */
+void
+ProcessRows(void)
+{
+    /* Each iteration allocates in CurrentMemoryContext */
+    /* If that's a long-lived context, memory grows! */
+    for (;;)
+    {
+        row = palloc(sizeof(Row));  /* LEAK if not in per-row context! */
+        ProcessRow(row);
+        /* pfree(row) helps but fragmented memory remains */
+    }
+}
+
+/* FIX: Use per-iteration context */
+void
+ProcessRows(void)
+{
+    MemoryContext perRowContext = AllocSetContextCreate(
+        CurrentMemoryContext,
+        "PerRowContext",
+        ALLOCSET_SMALL_SIZES);
+    MemoryContext oldContext;
+    
+    for (;;)
+    {
+        oldContext = MemoryContextSwitchTo(perRowContext);
+        row = palloc(sizeof(Row));
+        ProcessRow(row);
+        MemoryContextSwitchTo(oldContext);
+        
+        /* Reset frees ALL memory in context */
+        MemoryContextReset(perRowContext);
+    }
+    
+    MemoryContextDelete(perRowContext);
+}
+
+/* LEAK: Forgetting to switch back context */
+void
+BadFunction(void)
+{
+    MemoryContext old = MemoryContextSwitchTo(someContext);
+    
+    if (error_condition)
+        return;  /* LEAK: Didn't switch back! */
+    
+    MemoryContextSwitchTo(old);  /* Never reached */
+}
+
+/* FIX: Use PG_TRY/PG_CATCH or ensure switch-back */
+void
+SafeFunction(void)
+{
+    MemoryContext old = MemoryContextSwitchTo(someContext);
+    
+    PG_TRY();
+    {
+        /* ... work ... */
+    }
+    PG_FINALLY();
+    {
+        MemoryContextSwitchTo(old);
+    }
+    PG_END_TRY();
+}
+```
+
+### 8.2 Memory Corruption Detection
+
+```c
+/* Enable in development builds */
+/* configure --enable-cassert */
+
+/*
+ * Memory debugging features:
+ * 
+ * 1. Wipe freed memory (detect use-after-free)
+ *    - pfree fills memory with 0x7F
+ *    - Use of freed memory more likely to crash/fail
+ *
+ * 2. Chunk header validation
+ *    - Each chunk has magic number
+ *    - Detected on free if corrupted
+ *
+ * 3. Context checks
+ *    - MemoryContextCheck() validates tree
+ *    - Run periodically in debug builds
+ */
+
+#ifdef CLOBBER_FREED_MEMORY
+void
+AllocSetFree(MemoryContext context, void *pointer)
+{
+    /* Wipe freed memory */
+    memset(pointer, 0x7F, chunk->size);
+    /* ... rest of free ... */
+}
+#endif
+
+/* Runtime memory checking */
+#ifdef USE_VALGRIND
+#include <valgrind/memcheck.h>
+
+void
+AllocSetAlloc(...)
+{
+    /* Tell Valgrind about the allocation */
+    VALGRIND_MEMPOOL_ALLOC(set, ret, size);
+    return ret;
+}
+#endif
+```
+
+---
+
+## Part 9: Interview Questions
+
+<AccordionGroup>
+  <Accordion title="Q: Why does PostgreSQL use memory contexts instead of malloc/free?">
+    **Answer**:
+    
+    1. **Automatic cleanup**: When a context is deleted, all allocations are freed at once. No need to track individual frees.
+    
+    2. **Hierarchy**: Child contexts are automatically cleaned up with parents. Query context deletion cleans up all query-related memory.
+    
+    3. **Error handling**: On transaction abort, transaction context is deleted - all transaction memory freed without individual tracking.
+    
+    4. **Reduced fragmentation**: Block-based allocation reduces external fragmentation.
+    
+    5. **Performance**: 
+       - Freelist caching avoids malloc overhead
+       - Bump allocation in blocks is O(1)
+       - Context reset is O(n blocks), not O(n allocations)
+    
+    **Trade-off**: Individual pfree() doesn't return memory to OS; memory stays in context for reuse. This is usually good (faster reuse) but can cause apparent memory bloat.
+  </Accordion>
+  
+  <Accordion title="Q: How would you debug a PostgreSQL memory leak?">
+    **Answer**:
+    
+    **Step 1: Identify the problem**
+    ```sql
+    -- Check backend memory usage
+    SELECT pid, backend_type, 
+           pg_size_pretty(total_bytes) 
+    FROM pg_backend_memory_contexts;
+    ```
+    
+    **Step 2: Get detailed context info**
+    ```sql
+    -- Find which context is growing
+    SELECT name, total_bytes, free_bytes, used_bytes
+    FROM pg_backend_memory_contexts
+    WHERE total_bytes > 10000000  -- >10MB
+    ORDER BY total_bytes DESC;
+    ```
+    
+    **Step 3: Enable detailed logging**
+    ```c
+    // In source code, add memory context stats:
+    MemoryContextStats(TopMemoryContext);
+    // Logs tree of contexts with sizes
+    ```
+    
+    **Step 4: Common causes**
+    - Per-row allocation in transaction context
+    - Cache not being invalidated
+    - Prepared statements accumulating
+    - Extension not cleaning up
+    
+    **Step 5: Fix pattern**
+    - Add appropriate per-iteration context
+    - Ensure context reset in loops
+    - Use PG_TRY/PG_FINALLY for cleanup
+  </Accordion>
+  
+  <Accordion title="Q: Explain how shared_buffers memory differs from work_mem">
+    **Answer**:
+    
+    | Aspect | shared_buffers | work_mem |
+    |--------|----------------|----------|
+    | **Type** | Shared memory | Per-backend private |
+    | **When allocated** | Startup, fixed | On demand |
+    | **Purpose** | Buffer cache (pages) | Sorts, hash tables |
+    | **Sizing** | 25% of RAM | 4MB-256MB typical |
+    | **Scope** | All backends share | Per-operation |
+    | **Limit** | Hard limit | Soft guideline |
+    | **Overflow** | Read from disk | Spill to temp files |
+    
+    **Key insight**: A query with 5 hash joins can use 5 × work_mem. Multiply by max_connections for worst case:
+    
+    ```
+    Potential memory = max_connections × operations_per_query × work_mem
+    Example: 100 connections × 5 operations × 256MB = 128GB (!!)
+    ```
+    
+    This is why work_mem must be set conservatively.
+  </Accordion>
+</AccordionGroup>
+
+---
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Catalog System" icon="folder-tree" href="/courses/database-engineering/catalog-system">
+    System catalogs and metadata management
+  </Card>
+  <Card title="Extension Development" icon="puzzle-piece" href="/courses/database-engineering/extension-development">
+    Building PostgreSQL extensions
+  </Card>
+</CardGroup>

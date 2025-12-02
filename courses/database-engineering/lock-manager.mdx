@@ -1,0 +1,1203 @@
+---
+title: "Lock Manager Deep Dive"
+sidebarTitle: "Lock Manager Internals"
+description: "PostgreSQL locking subsystem internals — from spinlocks to deadlock detection"
+icon: "lock"
+---
+
+<Frame>
+  <img src="/images/courses/database-engineering/lock-manager-concept.svg" alt="Lock Manager Deep Dive - Spinlocks, LWLocks, and heavyweight locks" />
+</Frame>
+
+# Lock Manager Deep Dive
+
+This module provides production-grade understanding of PostgreSQL's locking subsystem. Essential knowledge for debugging contention issues, understanding deadlocks, and contributing to concurrency-related code.
+
+<Info>
+**Target Audience**: Database infrastructure engineers, performance specialists  
+**Prerequisites**: Transactions module, basic OS concurrency concepts  
+**Source Directories**: `src/backend/storage/lmgr/`, `src/include/storage/`  
+**Interview Relevance**: Staff+ distributed systems roles
+</Info>
+
+---
+
+## Part 1: Lock Hierarchy Overview
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    POSTGRESQL LOCK HIERARCHY                                 │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│   Level 1: SPINLOCKS (Lowest level)                                         │
+│   ────────────────────────────────────────────────────────────────────────   │
+│   • CPU-level atomic operations                                             │
+│   • Busy-wait (no context switch)                                           │
+│   • Hold for nanoseconds                                                    │
+│   • Used to protect LWLock internals                                        │
+│                                                                              │
+│                              ▼                                               │
+│                                                                              │
+│   Level 2: LIGHTWEIGHT LOCKS (LWLocks)                                      │
+│   ────────────────────────────────────────────────────────────────────────   │
+│   • Shared/Exclusive modes                                                  │
+│   • Can sleep (no busy-wait)                                                │
+│   • Hold for microseconds to milliseconds                                   │
+│   • Protect shared memory structures                                        │
+│   • Examples: BufferContent, WALInsert, ProcArray                           │
+│                                                                              │
+│                              ▼                                               │
+│                                                                              │
+│   Level 3: HEAVYWEIGHT LOCKS (Regular Locks)                                │
+│   ────────────────────────────────────────────────────────────────────────   │
+│   • Eight lock modes (Access Share → Access Exclusive)                      │
+│   • Deadlock detection                                                      │
+│   • Hold for transaction duration                                           │
+│   • Protect database objects (tables, rows, pages)                          │
+│                                                                              │
+│                              ▼                                               │
+│                                                                              │
+│   Level 4: PREDICATE LOCKS (Serializable Isolation)                         │
+│   ────────────────────────────────────────────────────────────────────────   │
+│   • Track read dependencies for SSI                                         │
+│   • Don't block; detect conflicts                                           │
+│   • Used only at SERIALIZABLE isolation level                               │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Part 2: Spinlocks
+
+### 2.1 Spinlock Implementation
+
+```c
+/* src/include/storage/s_lock.h */
+
+/*
+ * Spinlocks are the most primitive synchronization mechanism.
+ * They use CPU atomic instructions and busy-wait.
+ */
+
+/* x86-64 implementation using XCHG */
+static __inline__ int
+tas(volatile slock_t *lock)
+{
+    register slock_t _res = 1;
+    
+    __asm__ __volatile__(
+        "lock\n"
+        "xchgb %0,%1\n"
+        : "+q"(_res), "+m"(*lock)
+        :
+        : "memory", "cc");
+    
+    return (int) _res;
+}
+
+/* ARM implementation using LDREX/STREX */
+static __inline__ int
+tas(volatile slock_t *lock)
+{
+    int ret;
+    int val = 1;
+    
+    __asm__ __volatile__(
+        "1: ldrex %0, [%2]\n"
+        "   strex %1, %3, [%2]\n"
+        "   cmp %1, #0\n"
+        "   bne 1b"
+        : "=&r"(ret), "=&r"(tmp)
+        : "r"(lock), "r"(val)
+        : "cc", "memory");
+    
+    return ret;
+}
+
+/* Spinlock acquire with backoff */
+void
+SpinLockAcquire(volatile slock_t *lock)
+{
+    int spins = 0;
+    
+    while (tas(lock))
+    {
+        /* Spin with exponential backoff */
+        if (++spins > NUM_SPINLOCK_DELAYS)
+        {
+            /*
+             * Exceeded spin limit - yield CPU.
+             * This is a safety valve; spinlocks should 
+             * never be held this long.
+             */
+            pg_usleep(1);
+            spins = 0;
+        }
+        else
+        {
+            /* CPU pause instruction - reduces power, helps hyperthreading */
+            SPIN_DELAY();
+        }
+    }
+}
+```
+
+### 2.2 Spinlock Usage Rules
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    SPINLOCK RULES (CRITICAL!)                                │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│   ✓ DO:                                                                     │
+│   • Hold for absolute minimum time (nanoseconds)                            │
+│   • Use only to protect LWLock wait-queue manipulation                      │
+│   • Release in same function that acquired                                  │
+│                                                                              │
+│   ✗ DON'T:                                                                  │
+│   • Call any function that might block                                      │
+│   • Access disk or network                                                  │
+│   • Allocate memory                                                         │
+│   • Acquire another spinlock (no nesting!)                                  │
+│   • Call elog/ereport (might allocate)                                      │
+│                                                                              │
+│   Why so strict?                                                             │
+│   • Spinlocks busy-wait - wastes CPU while waiting                          │
+│   • No deadlock detection - must guarantee no deadlocks                     │
+│   • Priority inversion possible - low-priority holder blocks everyone       │
+│                                                                              │
+│   Example of safe spinlock usage:                                           │
+│   ┌────────────────────────────────────────────────────────────────────┐    │
+│   │  SpinLockAcquire(&lock);                                           │    │
+│   │  /* Only simple memory operations here */                          │    │
+│   │  value = shared_data->counter;                                     │    │
+│   │  shared_data->counter = value + 1;                                 │    │
+│   │  SpinLockRelease(&lock);                                           │    │
+│   └────────────────────────────────────────────────────────────────────┘    │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Part 3: Lightweight Locks (LWLocks)
+
+### 3.1 LWLock Architecture
+
+```c
+/* src/include/storage/lwlock.h */
+
+typedef struct LWLock
+{
+    uint16      tranche;        /* Tranche ID (identifies lock type) */
+    pg_atomic_uint32 state;     /* Lock state - packed bits */
+    proclist_head waiters;      /* List of waiting PGPROCs */
+#ifdef LOCK_DEBUG
+    pg_atomic_uint32 nwaiters;  /* Number of waiters */
+    struct PGPROC *owner;       /* Current exclusive owner */
+#endif
+} LWLock;
+
+/*
+ * Lock state bits (packed into 32-bit atomic):
+ *
+ * Bits 0-23:  Number of shared lockers (up to 16M concurrent readers)
+ * Bit 24:     Exclusive lock held
+ * Bit 25:     Lock has waiters
+ * Bits 26-31: Reserved
+ */
+#define LW_FLAG_HAS_WAITERS     ((uint32) 1 << 25)
+#define LW_FLAG_RELEASE_OK      ((uint32) 1 << 26)
+#define LW_VAL_EXCLUSIVE        ((uint32) 1 << 24)
+#define LW_VAL_SHARED           1
+
+/* LWLock modes */
+typedef enum LWLockMode
+{
+    LW_EXCLUSIVE,   /* Write lock - blocks all others */
+    LW_SHARED,      /* Read lock - allows other readers */
+    LW_WAIT_UNTIL_FREE  /* Special: wait then don't acquire */
+} LWLockMode;
+```
+
+### 3.2 LWLock Acquisition
+
+```c
+/* Simplified acquisition flow from lwlock.c */
+
+bool
+LWLockAcquire(LWLock *lock, LWLockMode mode)
+{
+    PGPROC *proc = MyProc;
+    uint32 old_state;
+    
+    /* Fast path: try atomic acquire */
+    if (mode == LW_EXCLUSIVE)
+    {
+        /* Try to set exclusive bit if currently unlocked */
+        old_state = pg_atomic_fetch_or_u32(&lock->state, LW_VAL_EXCLUSIVE);
+        if ((old_state & LW_VAL_EXCLUSIVE) == 0 &&
+            (old_state & LW_SHARED_MASK) == 0)
+        {
+            /* Success! We got the exclusive lock */
+            return true;
+        }
+    }
+    else /* LW_SHARED */
+    {
+        /* Increment shared count if no exclusive holder/waiter */
+        old_state = pg_atomic_fetch_add_u32(&lock->state, LW_VAL_SHARED);
+        if ((old_state & LW_VAL_EXCLUSIVE) == 0)
+        {
+            /* Success! We got a shared lock */
+            return true;
+        }
+        /* Failed - undo the increment */
+        pg_atomic_fetch_sub_u32(&lock->state, LW_VAL_SHARED);
+    }
+    
+    /* Slow path: must queue and wait */
+    return LWLockAcquireCommon(lock, mode);
+}
+
+static bool
+LWLockAcquireCommon(LWLock *lock, LWLockMode mode)
+{
+    PGPROC *proc = MyProc;
+    
+    for (;;)
+    {
+        /* Add ourselves to wait queue */
+        SpinLockAcquire(&lock->mutex);
+        
+        /* Try to acquire again while holding spinlock */
+        if (LWLockAttemptLock(lock, mode))
+        {
+            SpinLockRelease(&lock->mutex);
+            return true;
+        }
+        
+        /* Queue ourselves */
+        proc->lwWaiting = true;
+        proc->lwWaitMode = mode;
+        proclist_push_tail(&lock->waiters, proc->pgprocno, lwWaitLink);
+        
+        /* Set has-waiters flag */
+        pg_atomic_fetch_or_u32(&lock->state, LW_FLAG_HAS_WAITERS);
+        
+        SpinLockRelease(&lock->mutex);
+        
+        /* Sleep until woken */
+        for (;;)
+        {
+            PGSemaphoreLock(proc->sem);
+            
+            if (!proc->lwWaiting)
+                break;  /* We were granted the lock */
+                
+            /* Check for interrupts (cancel, die) */
+            CHECK_FOR_INTERRUPTS();
+        }
+        
+        /* Lock was granted */
+        return true;
+    }
+}
+```
+
+### 3.3 Common LWLock Tranches
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    IMPORTANT LWLOCK TRANCHES                                 │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│   Tranche               Purpose                          Contention Risk    │
+│   ──────────────────────────────────────────────────────────────────────    │
+│   BufferContent         Protect buffer page contents     High (hot pages)   │
+│   BufferMapping         Buffer hash table                Medium             │
+│   WALInsert             WAL insertion                    Very High          │
+│   WALWrite              WAL file writes                  High               │
+│   ProcArray             Active transaction list          Medium             │
+│   XidGen                Transaction ID generation        Low                │
+│   CLogControl           Commit log buffers               Medium             │
+│   SubtransControl       Subtransaction tracking          Low                │
+│   SInvalRead            Shared invalidation queue        Medium             │
+│   AutovacuumSchedule    Autovacuum coordination          Low                │
+│   RelCacheInit          Relation cache init              Low (startup)      │
+│   CheckpointStart       Checkpoint coordination          Low                │
+│                                                                              │
+│   Monitoring LWLock waits:                                                  │
+│   ─────────────────────────────────────────────────────────────────────────  │
+│                                                                              │
+│   SELECT wait_event_type, wait_event, count(*)                              │
+│   FROM pg_stat_activity                                                     │
+│   WHERE wait_event_type = 'LWLock'                                          │
+│   GROUP BY 1, 2                                                             │
+│   ORDER BY 3 DESC;                                                          │
+│                                                                              │
+│   -- See all current LWLock waits                                           │
+│   SELECT pid, wait_event, state, query                                      │
+│   FROM pg_stat_activity                                                     │
+│   WHERE wait_event_type = 'LWLock';                                         │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### 3.4 WALInsertLock Contention (Hot Topic)
+
+```c
+/*
+ * WALInsertLock is often the hottest lock in write-heavy workloads.
+ * PostgreSQL uses multiple WAL insert locks to reduce contention.
+ */
+
+/* Number of WAL insertion locks (compile-time constant) */
+#define NUM_XLOGINSERT_LOCKS  8
+
+/*
+ * WAL insertion flow:
+ *
+ * 1. Reserve space in WAL (need exclusive insert lock)
+ *    - Acquire one of NUM_XLOGINSERT_LOCKS locks
+ *    - Advance reserved position
+ *    - Hold lock while copying data
+ *
+ * 2. Copy data to WAL buffer
+ *    - Still holding insert lock
+ *    - May need to wait for buffer space
+ *
+ * 3. Release insert lock
+ *    - Others can now insert
+ *    - Our data not yet durable!
+ *
+ * 4. Wait for flush (if synchronous_commit)
+ *    - WALWriteLock for actual writes
+ *    - fsync for durability
+ */
+
+/* Reducing WAL insert contention: */
+/*
+ * 1. Batch inserts into larger transactions
+ * 2. Use synchronous_commit = off (if acceptable)
+ * 3. Use unlogged tables for temporary data
+ * 4. Increase wal_buffers
+ * 5. Use faster storage (NVMe)
+ * 6. Consider commit_delay for group commit
+ */
+```
+
+---
+
+## Part 4: Heavyweight Locks
+
+### 4.1 Lock Modes Matrix
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    HEAVYWEIGHT LOCK MODES                                    │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│   Mode                    Conflicts With              Acquired By            │
+│   ─────────────────────────────────────────────────────────────────────────  │
+│   AccessShare (1)         AccessExclusive             SELECT                 │
+│   RowShare (2)            Exclusive, AccessExclusive  SELECT FOR UPDATE/SHARE│
+│   RowExclusive (3)        Share, ShareRowExcl,        INSERT, UPDATE, DELETE │
+│                           Exclusive, AccessExclusive                         │
+│   ShareUpdateExclusive(4) ShareUpdateExcl, Share,     VACUUM, ANALYZE,       │
+│                           ShareRowExcl, Excl, AccExcl CREATE INDEX CONCUR    │
+│   Share (5)               RowExcl, ShareUpdateExcl,   CREATE INDEX           │
+│                           ShareRowExcl, Excl, AccExcl                        │
+│   ShareRowExclusive (6)   RowExcl, ShareUpdateExcl,   CREATE TRIGGER, some   │
+│                           Share, ShareRowExcl,         ALTER TABLE            │
+│                           Excl, AccessExcl                                    │
+│   Exclusive (7)           All except AccessShare      REFRESH MATVIEW CONCUR │
+│   AccessExclusive (8)     ALL modes                   DROP, TRUNCATE,        │
+│                                                        ALTER TABLE, VACUUM FULL│
+│                                                                              │
+│   Conflict Matrix (X = conflicts):                                          │
+│   ─────────────────────────────────────────────────────────────────────────  │
+│                                                                              │
+│          │ AS  RS  RE  SUE  S  SRE  E  AE                                   │
+│   ───────┼─────────────────────────────────                                 │
+│   AS     │                              X                                    │
+│   RS     │                         X    X                                    │
+│   RE     │              X    X     X    X                                    │
+│   SUE    │         X    X    X     X    X                                    │
+│   S      │         X    X    X     X    X                                    │
+│   SRE    │         X    X    X     X    X                                    │
+│   E      │    X    X    X    X     X    X                                    │
+│   AE     │ X  X    X    X    X     X    X                                    │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### 4.2 Lock Manager Data Structures
+
+```c
+/* src/backend/storage/lmgr/lock.c */
+
+/*
+ * Lock hash table structure
+ */
+
+/* Lock tag identifies what is being locked */
+typedef struct LOCKTAG
+{
+    uint32      locktag_field1; /* OID of database */
+    uint32      locktag_field2; /* OID of relation */
+    uint32      locktag_field3; /* Block number or other */
+    uint32      locktag_field4; /* Offset or other */
+    uint8       locktag_type;   /* Lock type */
+    uint8       locktag_lockmethodid;  /* Lock method */
+} LOCKTAG;
+
+/* Lock types */
+typedef enum LockTagType
+{
+    LOCKTAG_RELATION,           /* Whole relation */
+    LOCKTAG_RELATION_EXTEND,    /* Extending a relation */
+    LOCKTAG_DATABASE_FROZEN_IDS, /* Database frozen XID */
+    LOCKTAG_PAGE,               /* Single page */
+    LOCKTAG_TUPLE,              /* Single tuple */
+    LOCKTAG_TRANSACTION,        /* Transaction ID (for waiting) */
+    LOCKTAG_VIRTUALTRANSACTION, /* Virtual transaction ID */
+    LOCKTAG_SPECULATIVE_TOKEN,  /* Speculative insertion token */
+    LOCKTAG_OBJECT,             /* Non-relation database object */
+    LOCKTAG_USERLOCK,           /* Advisory lock */
+    LOCKTAG_ADVISORY            /* New advisory lock */
+} LockTagType;
+
+/* The main lock structure in shared memory */
+typedef struct LOCK
+{
+    LOCKTAG     tag;            /* What is locked */
+    LOCKMASK    grantMask;      /* Bitmask of granted lock modes */
+    LOCKMASK    waitMask;       /* Bitmask of awaited lock modes */
+    SHM_QUEUE   procLocks;      /* List of PROCLOCK objects */
+    PROC_QUEUE  waitProcs;      /* Queue of waiting PGPROCs */
+    int         requested[MAX_LOCKMODES];  /* Count per mode */
+    int         nRequested;     /* Total requested */
+    int         granted[MAX_LOCKMODES];    /* Count per mode */
+    int         nGranted;       /* Total granted */
+} LOCK;
+
+/* Per-backend lock holding info */
+typedef struct PROCLOCK
+{
+    PROCLOCKTAG tag;            /* (LOCK*, PGPROC*) identifier */
+    PGPROC     *groupLeader;    /* Proc's lock group leader */
+    LOCKMASK    holdMask;       /* Locks this proc holds */
+    LOCKMASK    releaseMask;    /* Locks to release on commit */
+    SHM_QUEUE   lockLink;       /* Links in LOCK's procLocks list */
+    SHM_QUEUE   procLink;       /* Links in PGPROC's procLocks list */
+} PROCLOCK;
+```
+
+### 4.3 Lock Acquisition Flow
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    LOCK ACQUISITION FLOW                                     │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│   LockAcquire(LOCKTAG, lockmode)                                            │
+│   │                                                                          │
+│   ├─► 1. Check local lock table (fast path for same-backend)               │
+│   │      └─► If already hold compatible lock: just increment count          │
+│   │                                                                          │
+│   ├─► 2. Hash LOCKTAG to find partition                                     │
+│   │      └─► Lock table is partitioned for concurrency                      │
+│   │                                                                          │
+│   ├─► 3. Acquire partition LWLock (LWLockAcquire)                           │
+│   │                                                                          │
+│   ├─► 4. Look up or create LOCK entry                                       │
+│   │      └─► HashTableLookup/Insert in shared memory                        │
+│   │                                                                          │
+│   ├─► 5. Look up or create PROCLOCK entry                                   │
+│   │      └─► Links PGPROC to LOCK                                           │
+│   │                                                                          │
+│   ├─► 6. Try to grant lock                                                  │
+│   │      │                                                                   │
+│   │      ├─► Check conflict matrix against grantMask + waitMask             │
+│   │      │                                                                   │
+│   │      ├─► If no conflict:                                                │
+│   │      │   └─► Grant lock, update masks, return SUCCESS                   │
+│   │      │                                                                   │
+│   │      └─► If conflict:                                                   │
+│   │          └─► Continue to step 7                                         │
+│   │                                                                          │
+│   ├─► 7. Check for deadlock (if waiting would be needed)                    │
+│   │      └─► Run deadlock detection before sleeping                         │
+│   │                                                                          │
+│   ├─► 8. Add to wait queue                                                  │
+│   │      └─► Queue ordered by mode + FIFO                                   │
+│   │                                                                          │
+│   ├─► 9. Release partition LWLock                                           │
+│   │                                                                          │
+│   └─► 10. Sleep on semaphore until granted or timeout                       │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### 4.4 Viewing Locks
+
+```sql
+-- All current locks
+SELECT 
+    locktype,
+    relation::regclass,
+    mode,
+    granted,
+    pid,
+    pg_blocking_pids(pid) as blocked_by
+FROM pg_locks
+WHERE NOT granted
+ORDER BY pid;
+
+-- Detailed lock view with queries
+SELECT 
+    blocked.pid AS blocked_pid,
+    blocked.usename AS blocked_user,
+    blocking.pid AS blocking_pid,
+    blocking.usename AS blocking_user,
+    blocked.query AS blocked_query,
+    blocking.query AS blocking_query,
+    blocked.wait_event_type,
+    blocked.wait_event
+FROM pg_stat_activity AS blocked
+JOIN pg_locks AS blocked_locks ON blocked.pid = blocked_locks.pid
+JOIN pg_locks AS blocking_locks ON 
+    blocked_locks.locktype = blocking_locks.locktype AND
+    blocked_locks.relation = blocking_locks.relation AND
+    blocked_locks.pid != blocking_locks.pid
+JOIN pg_stat_activity AS blocking ON blocking_locks.pid = blocking.pid
+WHERE NOT blocked_locks.granted;
+
+-- Lock tree visualization
+WITH RECURSIVE lock_tree AS (
+    SELECT pid, pg_blocking_pids(pid) as blockers, 0 as depth
+    FROM pg_stat_activity 
+    WHERE cardinality(pg_blocking_pids(pid)) = 0 
+      AND pid != pg_backend_pid()
+    
+    UNION ALL
+    
+    SELECT s.pid, pg_blocking_pids(s.pid), lt.depth + 1
+    FROM pg_stat_activity s
+    JOIN lock_tree lt ON s.pid = ANY(lt.blockers)
+)
+SELECT repeat('  ', depth) || pid::text as tree, 
+       (SELECT query FROM pg_stat_activity WHERE pid = lock_tree.pid)
+FROM lock_tree
+ORDER BY depth, pid;
+```
+
+---
+
+## Part 5: Deadlock Detection
+
+### 5.1 Deadlock Detection Algorithm
+
+```c
+/*
+ * PostgreSQL uses a wait-for graph to detect deadlocks.
+ * Detection runs when a process has waited deadlock_timeout
+ * (default 1 second) without getting the lock.
+ */
+
+/*
+ * Wait-For Graph:
+ * 
+ * Nodes: Transactions (PGPROCs)
+ * Edges: A → B means A is waiting for B
+ * 
+ * Deadlock = cycle in the graph
+ * 
+ *     T1 ──waits for──► T2
+ *      ▲                 │
+ *      │                 │
+ *      └──waits for──────┘
+ *           DEADLOCK!
+ */
+
+/* From deadlock.c - cycle detection */
+static bool
+FindLockCycle(PGPROC *checkProc, EDGE *softEdges, int *nSoftEdges)
+{
+    int         nVisitedProcs = 0;
+    int         i;
+    
+    /* Start DFS from checkProc */
+    visitedProcs[nVisitedProcs++] = checkProc;
+    
+    /* Explore all outgoing edges */
+    for (i = 0; i < nVisitedProcs; i++)
+    {
+        PGPROC     *proc = visitedProcs[i];
+        LOCK       *lock = proc->waitLock;
+        PROCLOCK   *proclock;
+        
+        if (lock == NULL)
+            continue;
+        
+        /* Check each holder of the lock we're waiting for */
+        proclock = (PROCLOCK *) SHMQueueNext(&lock->procLocks,
+                                             &lock->procLocks,
+                                             offsetof(PROCLOCK, lockLink));
+        
+        while (proclock)
+        {
+            PGPROC *holder = proclock->tag.myProc;
+            
+            /* Skip if this holder wouldn't block us */
+            if (!DoLockModesConflict(proc->waitLockMode, 
+                                     proclock->holdMask))
+            {
+                proclock = NextProcLock(proclock);
+                continue;
+            }
+            
+            /* Check if this completes a cycle */
+            if (holder == checkProc)
+            {
+                /* DEADLOCK DETECTED! */
+                return true;
+            }
+            
+            /* Add to exploration list if not visited */
+            if (!IsVisited(holder))
+            {
+                visitedProcs[nVisitedProcs++] = holder;
+            }
+            
+            proclock = NextProcLock(proclock);
+        }
+    }
+    
+    return false;  /* No cycle found */
+}
+```
+
+### 5.2 Deadlock Resolution
+
+```c
+/*
+ * When deadlock detected, PostgreSQL chooses a victim to abort.
+ * 
+ * Victim selection heuristic:
+ * 1. Prefer to abort the process that just started waiting
+ *    (the one that triggered detection)
+ * 2. Abort the transaction that has done the least work
+ * 
+ * The victim's transaction is rolled back with:
+ * ERROR: deadlock detected
+ * DETAIL: Process X waits for ShareLock on relation Y; 
+ *         blocked by process Z.
+ *         Process Z waits for ExclusiveLock on relation W; 
+ *         blocked by process X.
+ * HINT: See server log for query details.
+ */
+
+/* Client sees: */
+/*
+ * ERROR:  deadlock detected
+ * DETAIL:  Process 12345 waits for ShareLock on tuple (0,5) of 
+ *          relation 16384 of database 12345; blocked by process 12346.
+ *          Process 12346 waits for ShareLock on tuple (0,3) of 
+ *          relation 16384 of database 12345; blocked by process 12345.
+ * HINT:  See server log for query details.
+ * CONTEXT:  while locking tuple (0,5) in relation "accounts"
+ */
+```
+
+### 5.3 Deadlock Prevention Strategies
+
+```sql
+-- Strategy 1: Consistent lock ordering
+-- Always access tables/rows in the same order
+
+-- BAD: Transaction 1        Transaction 2
+--      UPDATE accounts      UPDATE orders
+--      WHERE id = 1         WHERE id = 1
+--      UPDATE orders        UPDATE accounts
+--      WHERE id = 1         WHERE id = 1
+--      ↑ DEADLOCK RISK!
+
+-- GOOD: Both in same order
+--      UPDATE accounts      UPDATE accounts
+--      UPDATE orders        UPDATE orders
+
+-- Strategy 2: Lock all resources upfront
+BEGIN;
+SELECT * FROM accounts WHERE id IN (1, 2, 3) FOR UPDATE;
+-- Now do work...
+COMMIT;
+
+-- Strategy 3: Use NOWAIT or SKIP LOCKED
+BEGIN;
+SELECT * FROM accounts WHERE id = 1 FOR UPDATE NOWAIT;
+-- ERROR immediately if locked, no waiting = no deadlock
+COMMIT;
+
+-- Strategy 4: Reduce lock scope
+-- Use row-level locks instead of table-level
+-- Keep transactions short
+
+-- Strategy 5: Use advisory locks for application-level ordering
+SELECT pg_advisory_lock(hashtext('resource_' || resource_id::text));
+-- Do work
+SELECT pg_advisory_unlock(hashtext('resource_' || resource_id::text));
+```
+
+---
+
+## Part 6: Row-Level Locking Details
+
+### 6.1 Tuple Lock Implementation
+
+```c
+/*
+ * Row-level locks are NOT stored in the lock manager!
+ * They're encoded in the tuple header (xmax field).
+ * 
+ * This is critical for scalability - millions of row locks
+ * don't consume lock manager memory.
+ */
+
+/* Lock strength (from lockdefs.h) */
+typedef enum LockTupleMode
+{
+    LockTupleKeyShare,      /* SELECT FOR KEY SHARE */
+    LockTupleShare,         /* SELECT FOR SHARE */
+    LockTupleNoKeyUpdate,   /* SELECT FOR NO KEY UPDATE */
+    LockTupleExclusive      /* SELECT FOR UPDATE */
+} LockTupleMode;
+
+/*
+ * Tuple header bits used for row locking:
+ *
+ * HEAP_XMAX_LOCK_ONLY   - xmax is a locker, not deleter
+ * HEAP_XMAX_KEYSHR_LOCK - Key share lock held
+ * HEAP_XMAX_SHR_LOCK    - Share lock held  
+ * HEAP_XMAX_EXCL_LOCK   - Exclusive lock held
+ *
+ * When multiple transactions lock same row:
+ * - xmax points to a MultiXact ID
+ * - MultiXact contains list of (xid, lock mode) pairs
+ * - Stored in pg_multixact/members and pg_multixact/offsets
+ */
+
+/* Lock a tuple for update */
+TM_Result
+heap_lock_tuple(Relation relation, HeapTuple tuple,
+                CommandId cid, LockTupleMode mode,
+                LockWaitPolicy wait_policy,
+                bool follow_updates,
+                Buffer *buffer, TM_FailureData *tmfd)
+{
+    HTSU_Result result;
+    TransactionId xmax;
+    uint16      infomask;
+    
+    /* Read current tuple state */
+    *buffer = ReadBuffer(relation, ItemPointerGetBlockNumber(&tuple->t_self));
+    LockBuffer(*buffer, BUFFER_LOCK_EXCLUSIVE);
+    
+    /* Check visibility and current locks */
+    xmax = HeapTupleHeaderGetRawXmax(tuple->t_data);
+    infomask = tuple->t_data->t_infomask;
+    
+    if (TransactionIdIsValid(xmax))
+    {
+        /* Someone has xmax set - check if conflict */
+        if (DoesMultiXactConflict(xmax, mode))
+        {
+            /* Must wait for the conflicting locker */
+            if (wait_policy == LockWaitBlock)
+            {
+                /* Release buffer lock, wait for xmax transaction */
+                LockBuffer(*buffer, BUFFER_LOCK_UNLOCK);
+                XactLockTableWait(xmax, relation, &tuple->t_self,
+                                  XLTW_Lock);
+                /* Re-acquire and retry */
+                goto recheck;
+            }
+            else if (wait_policy == LockWaitSkip)
+                return TM_WouldBlock;
+            else /* LockWaitError */
+                return TM_WouldBlock;  /* Caller raises error */
+        }
+    }
+    
+    /* Can acquire the lock - update tuple header */
+    if (NeedMultiXact(xmax, mode))
+    {
+        /* Create/extend MultiXact */
+        newxmax = MultiXactIdCreate(xmax, mode);
+    }
+    else
+    {
+        newxmax = GetCurrentTransactionId();
+    }
+    
+    HeapTupleHeaderSetXmax(tuple->t_data, newxmax);
+    /* Set appropriate lock bits */
+    SetTupleLockBits(tuple->t_data, mode);
+    
+    return TM_Ok;
+}
+```
+
+### 6.2 MultiXact System
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    MULTIXACT FOR CONCURRENT ROW LOCKS                        │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│   Scenario: Multiple transactions lock same row for share                   │
+│                                                                              │
+│   T1: SELECT * FROM accounts WHERE id = 1 FOR SHARE;                        │
+│   T2: SELECT * FROM accounts WHERE id = 1 FOR SHARE;                        │
+│   T3: SELECT * FROM accounts WHERE id = 1 FOR SHARE;                        │
+│                                                                              │
+│   Tuple Header State:                                                        │
+│   ┌───────────────────────────────────────────────────────────────────┐     │
+│   │ xmax = MultiXactId 12345                                          │     │
+│   │ t_infomask = HEAP_XMAX_IS_MULTI | HEAP_XMAX_LOCK_ONLY | SHARED   │     │
+│   └───────────────────────────────────────────────────────────────────┘     │
+│                                                                              │
+│   pg_multixact/offsets:                                                     │
+│   ┌───────────────────────────────────────────────────────────────────┐     │
+│   │ MultiXactId 12345 → offset 1000, nmembers 3                       │     │
+│   └───────────────────────────────────────────────────────────────────┘     │
+│                                                                              │
+│   pg_multixact/members (at offset 1000):                                    │
+│   ┌───────────────────────────────────────────────────────────────────┐     │
+│   │ [0]: xid=T1, status=ForShare                                      │     │
+│   │ [1]: xid=T2, status=ForShare                                      │     │
+│   │ [2]: xid=T3, status=ForShare                                      │     │
+│   └───────────────────────────────────────────────────────────────────┘     │
+│                                                                              │
+│   When T4 tries FOR UPDATE:                                                 │
+│   1. Check MultiXact members                                                │
+│   2. FOR UPDATE conflicts with FOR SHARE                                    │
+│   3. T4 must wait for all of T1, T2, T3 to finish                          │
+│                                                                              │
+│   Cleanup:                                                                   │
+│   • VACUUM removes old MultiXact entries                                    │
+│   • Must track oldest active MultiXact                                      │
+│   • Can cause bloat if long transactions hold row locks                     │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Part 7: Advisory Locks
+
+### 7.1 Advisory Lock Types
+
+```sql
+-- Session-level locks (held until explicit unlock or session end)
+SELECT pg_advisory_lock(key);           -- Exclusive
+SELECT pg_advisory_lock_shared(key);    -- Shared
+SELECT pg_advisory_unlock(key);         -- Release
+SELECT pg_advisory_unlock_all();        -- Release all
+
+-- Transaction-level locks (released at transaction end)
+SELECT pg_advisory_xact_lock(key);          -- Exclusive
+SELECT pg_advisory_xact_lock_shared(key);   -- Shared
+-- No explicit unlock - released at COMMIT/ROLLBACK
+
+-- Non-blocking versions (return true/false)
+SELECT pg_try_advisory_lock(key);           -- Try exclusive
+SELECT pg_try_advisory_lock_shared(key);    -- Try shared
+
+-- Two-key versions (for finer granularity)
+SELECT pg_advisory_lock(classid, objid);    -- Two int4 keys
+```
+
+### 7.2 Advisory Lock Use Cases
+
+```sql
+-- Use Case 1: Singleton job processing
+CREATE OR REPLACE FUNCTION process_daily_report()
+RETURNS void AS $$
+BEGIN
+    -- Only one instance should run
+    IF NOT pg_try_advisory_lock(hashtext('daily_report')) THEN
+        RAISE NOTICE 'Another instance is running';
+        RETURN;
+    END IF;
+    
+    -- Do the actual work
+    PERFORM generate_report();
+    
+    PERFORM pg_advisory_unlock(hashtext('daily_report'));
+END;
+$$ LANGUAGE plpgsql;
+
+-- Use Case 2: Prevent duplicate order processing
+CREATE OR REPLACE FUNCTION process_order(order_id integer)
+RETURNS boolean AS $$
+BEGIN
+    -- Lock this specific order
+    IF NOT pg_try_advisory_xact_lock('orders'::regclass::int, order_id) THEN
+        RETURN false;  -- Another process handling this order
+    END IF;
+    
+    -- Process order (lock held for transaction)
+    UPDATE orders SET status = 'processing' WHERE id = order_id;
+    -- ... more processing ...
+    UPDATE orders SET status = 'completed' WHERE id = order_id;
+    
+    RETURN true;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Use Case 3: Rate limiting
+CREATE OR REPLACE FUNCTION check_rate_limit(user_id integer)
+RETURNS boolean AS $$
+DECLARE
+    lock_acquired boolean;
+BEGIN
+    -- Try to acquire lock for this user
+    -- Each user can have only one concurrent request
+    SELECT pg_try_advisory_lock(hashtext('rate:' || user_id::text))
+    INTO lock_acquired;
+    
+    RETURN lock_acquired;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Viewing advisory locks
+SELECT 
+    classid,
+    objid,
+    mode,
+    pid,
+    granted
+FROM pg_locks 
+WHERE locktype = 'advisory';
+```
+
+---
+
+## Part 8: Lock-Related Performance Issues
+
+### 8.1 Common Lock Contention Patterns
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    LOCK CONTENTION PATTERNS                                  │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│   Pattern 1: Hot Row                                                         │
+│   ─────────────────────────────────────────────────────────────────────────  │
+│   Problem: Many transactions update same row                                │
+│   Example: Counter table, sequence simulation                               │
+│   Symptoms: High tuple lock waits, serialization errors                     │
+│   Solutions:                                                                │
+│   • Use sequences instead of counter tables                                 │
+│   • Partition hot data                                                      │
+│   • Use SKIP LOCKED for queue patterns                                      │
+│   • Consider optimistic locking with retry                                  │
+│                                                                              │
+│   Pattern 2: Lock Escalation                                                │
+│   ─────────────────────────────────────────────────────────────────────────  │
+│   Problem: Operations acquiring table-level locks                           │
+│   Example: VACUUM FULL, ALTER TABLE, REFRESH MATERIALIZED VIEW             │
+│   Symptoms: Queries blocked, connection pile-up                             │
+│   Solutions:                                                                │
+│   • Use CONCURRENTLY variants                                               │
+│   • Schedule during low-traffic windows                                     │
+│   • Use statement_timeout to prevent indefinite waits                       │
+│                                                                              │
+│   Pattern 3: Foreign Key Contention                                         │
+│   ─────────────────────────────────────────────────────────────────────────  │
+│   Problem: FK checks acquire locks on parent table                          │
+│   Example: High INSERT rate to child table                                  │
+│   Symptoms: Parent table locked frequently                                  │
+│   Solutions:                                                                │
+│   • Index foreign key columns (crucial!)                                    │
+│   • Batch child inserts                                                     │
+│   • Consider deferrable constraints                                         │
+│                                                                              │
+│   Pattern 4: Long Transactions                                              │
+│   ─────────────────────────────────────────────────────────────────────────  │
+│   Problem: Transaction holds locks while doing slow operations              │
+│   Example: Reporting query with FOR UPDATE                                  │
+│   Symptoms: Growing lock waits, deadlocks                                   │
+│   Solutions:                                                                │
+│   • Keep transactions short                                                 │
+│   • Don't hold locks during external calls                                  │
+│   • Use READ COMMITTED if possible                                          │
+│   • Implement idle_in_transaction_session_timeout                          │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### 8.2 Lock Monitoring Queries
+
+```sql
+-- Real-time lock contention
+SELECT 
+    now() - query_start as duration,
+    pid,
+    usename,
+    wait_event_type,
+    wait_event,
+    state,
+    left(query, 60) as query
+FROM pg_stat_activity
+WHERE wait_event_type IN ('Lock', 'LWLock')
+ORDER BY duration DESC;
+
+-- Lock statistics over time (requires pg_stat_statements)
+SELECT 
+    queryid,
+    calls,
+    mean_time,
+    blk_read_time + blk_write_time as io_time,
+    left(query, 80) as query
+FROM pg_stat_statements
+ORDER BY mean_time DESC
+LIMIT 20;
+
+-- Lock wait events histogram
+SELECT 
+    wait_event,
+    count(*) as occurrences
+FROM pg_stat_activity
+WHERE wait_event_type = 'Lock'
+  AND state = 'active'
+GROUP BY wait_event
+ORDER BY occurrences DESC;
+
+-- Find lock-holding sessions
+WITH lock_holders AS (
+    SELECT 
+        pid,
+        granted,
+        mode,
+        locktype,
+        relation::regclass
+    FROM pg_locks
+    WHERE relation IS NOT NULL
+)
+SELECT 
+    h.pid as holder_pid,
+    h.mode as holder_mode,
+    h.relation,
+    w.pid as waiter_pid,
+    w.mode as waiter_mode,
+    a.query as holder_query
+FROM lock_holders h
+JOIN lock_holders w ON h.relation = w.relation 
+                   AND h.pid != w.pid 
+                   AND h.granted 
+                   AND NOT w.granted
+JOIN pg_stat_activity a ON h.pid = a.pid;
+```
+
+---
+
+## Part 9: Interview Deep Dives
+
+<AccordionGroup>
+  <Accordion title="Q: Explain the difference between LWLocks and heavyweight locks">
+    **Answer**:
+    
+    | Aspect | LWLock | Heavyweight Lock |
+    |--------|--------|------------------|
+    | **Purpose** | Protect shared memory structures | Protect database objects |
+    | **Modes** | Shared/Exclusive only | 8 modes (AccessShare to AccessExclusive) |
+    | **Deadlock Detection** | None (must avoid by design) | Yes, runs after deadlock_timeout |
+    | **Duration** | Microseconds to milliseconds | Can span entire transaction |
+    | **Visibility** | Not in pg_locks | Visible in pg_locks |
+    | **Wait Tracking** | wait_event_type = 'LWLock' | wait_event_type = 'Lock' |
+    | **Memory** | Fixed in shared memory | Can grow (lock table) |
+    
+    **Key insight**: LWLocks are for internal synchronization; heavyweight locks are for user-visible database object protection.
+  </Accordion>
+  
+  <Accordion title="Q: How does PostgreSQL detect and resolve deadlocks?">
+    **Answer**:
+    
+    1. **Detection Trigger**:
+       - Process waits longer than `deadlock_timeout` (default 1s)
+       - Detection is expensive, so we delay it
+    
+    2. **Algorithm**:
+       - Build wait-for graph from lock manager data
+       - Run DFS to find cycles
+       - Cycle = deadlock
+    
+    3. **Resolution**:
+       - Choose victim (usually the detecting process)
+       - Abort victim's transaction
+       - Error raised to client
+       - Other transactions proceed
+    
+    4. **Why not prevent deadlocks?**
+       - Prevention requires knowing all locks upfront
+       - Would require either:
+         - Lock ordering (not practical for SQL)
+         - Wait-die/wound-wait (complex, reduces concurrency)
+       - Detection is simpler and deadlocks are rare
+  </Accordion>
+  
+  <Accordion title="Q: How would you debug a production lock contention issue?">
+    **Answer**:
+    
+    ```sql
+    -- Step 1: Identify waiting sessions
+    SELECT pid, wait_event, query, now() - query_start as duration
+    FROM pg_stat_activity 
+    WHERE wait_event_type = 'Lock';
+    
+    -- Step 2: Find what's blocking them
+    SELECT 
+        blocked.pid AS victim,
+        blocking.pid AS blocker,
+        blocked.query AS waiting_query,
+        blocking.query AS blocking_query
+    FROM pg_stat_activity blocked
+    JOIN pg_stat_activity blocking 
+      ON blocking.pid = ANY(pg_blocking_pids(blocked.pid));
+    
+    -- Step 3: Analyze lock details
+    SELECT * FROM pg_locks WHERE pid IN (blocker_pid, victim_pid);
+    
+    -- Step 4: Check transaction age
+    SELECT pid, xact_start, now() - xact_start as xact_duration
+    FROM pg_stat_activity WHERE pid = blocker_pid;
+    ```
+    
+    **Resolution options**:
+    - Terminate blocker: `SELECT pg_terminate_backend(blocker_pid);`
+    - Cancel query: `SELECT pg_cancel_backend(blocker_pid);`
+    - Wait for natural completion
+    
+    **Prevention**:
+    - Set `lock_timeout` and `statement_timeout`
+    - Use `idle_in_transaction_session_timeout`
+    - Review application lock ordering
+  </Accordion>
+</AccordionGroup>
+
+---
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Buffer Manager Internals" icon="memory" href="/courses/database-engineering/buffer-manager">
+    Deep dive into PostgreSQL's buffer pool
+  </Card>
+  <Card title="Memory Management" icon="microchip" href="/courses/database-engineering/memory-management">
+    Memory contexts and allocation patterns
+  </Card>
+</CardGroup>
