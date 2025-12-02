@@ -446,6 +446,671 @@ class IdempotentConsumer:
         )
 ```
 
+## Stream Processing Implementation
+
+![Stream Processing Pipeline](/images/system-design/stream-processing.svg)
+
+Real-world stream processing with Kafka and async processing:
+
+<Tabs>
+  <Tab title="Python">
+```python
+import asyncio
+from dataclasses import dataclass, field
+from typing import Dict, Any, List, Callable, Optional
+from datetime import datetime, timedelta
+from collections import defaultdict
+import json
+from abc import ABC, abstractmethod
+
+# ============== Kafka Consumer with Backpressure ==============
+class StreamProcessor:
+    """Production-ready stream processor with backpressure handling"""
+    
+    def __init__(
+        self,
+        kafka_config: Dict[str, Any],
+        topic: str,
+        group_id: str,
+        max_concurrent: int = 100,
+        batch_size: int = 100,
+        batch_timeout_ms: int = 1000
+    ):
+        self.kafka_config = kafka_config
+        self.topic = topic
+        self.group_id = group_id
+        self.max_concurrent = max_concurrent
+        self.batch_size = batch_size
+        self.batch_timeout_ms = batch_timeout_ms
+        self.semaphore = asyncio.Semaphore(max_concurrent)
+        self.handlers: List[Callable] = []
+        self.running = False
+    
+    def add_handler(self, handler: Callable) -> None:
+        """Add processing handler"""
+        self.handlers.append(handler)
+    
+    async def start(self) -> None:
+        """Start consuming and processing messages"""
+        from aiokafka import AIOKafkaConsumer
+        
+        self.consumer = AIOKafkaConsumer(
+            self.topic,
+            bootstrap_servers=self.kafka_config['bootstrap_servers'],
+            group_id=self.group_id,
+            auto_offset_reset='earliest',
+            enable_auto_commit=False,
+            max_poll_records=self.batch_size
+        )
+        
+        await self.consumer.start()
+        self.running = True
+        
+        try:
+            async for message in self.consumer:
+                await self._process_with_backpressure(message)
+        finally:
+            await self.consumer.stop()
+    
+    async def _process_with_backpressure(self, message) -> None:
+        """Process with concurrency limit"""
+        async with self.semaphore:
+            try:
+                event = json.loads(message.value.decode())
+                
+                # Run all handlers
+                for handler in self.handlers:
+                    await handler(event)
+                
+                # Commit offset after successful processing
+                await self.consumer.commit()
+                
+            except Exception as e:
+                await self._handle_error(message, e)
+    
+    async def _handle_error(self, message, error: Exception) -> None:
+        """Send to dead letter queue on failure"""
+        from aiokafka import AIOKafkaProducer
+        
+        dlq_message = {
+            "original_topic": self.topic,
+            "original_message": message.value.decode(),
+            "error": str(error),
+            "timestamp": datetime.utcnow().isoformat(),
+            "partition": message.partition,
+            "offset": message.offset
+        }
+        
+        producer = AIOKafkaProducer(
+            bootstrap_servers=self.kafka_config['bootstrap_servers']
+        )
+        await producer.start()
+        try:
+            await producer.send_and_wait(
+                f"{self.topic}.dlq",
+                json.dumps(dlq_message).encode()
+            )
+        finally:
+            await producer.stop()
+
+# ============== Windowed Aggregations ==============
+@dataclass
+class WindowedAggregator:
+    """Tumbling window aggregation"""
+    
+    window_size: timedelta
+    aggregations: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    watermark_delay: timedelta = field(default_factory=lambda: timedelta(seconds=30))
+    
+    def add_event(self, event: Dict[str, Any], timestamp: datetime) -> None:
+        """Add event to appropriate window"""
+        window_key = self._get_window_key(timestamp)
+        
+        if window_key not in self.aggregations:
+            self.aggregations[window_key] = {
+                "count": 0,
+                "sum": 0.0,
+                "min": float('inf'),
+                "max": float('-inf'),
+                "window_start": window_key,
+                "window_end": window_key + self.window_size
+            }
+        
+        agg = self.aggregations[window_key]
+        value = event.get("value", 0)
+        
+        agg["count"] += 1
+        agg["sum"] += value
+        agg["min"] = min(agg["min"], value)
+        agg["max"] = max(agg["max"], value)
+    
+    def _get_window_key(self, timestamp: datetime) -> datetime:
+        """Get window start time for timestamp"""
+        window_seconds = self.window_size.total_seconds()
+        ts_seconds = timestamp.timestamp()
+        window_start = (ts_seconds // window_seconds) * window_seconds
+        return datetime.fromtimestamp(window_start)
+    
+    def get_closed_windows(self, watermark: datetime) -> List[Dict[str, Any]]:
+        """Get windows that are past the watermark"""
+        closed = []
+        cutoff = watermark - self.watermark_delay
+        
+        for window_key, agg in list(self.aggregations.items()):
+            if agg["window_end"] < cutoff:
+                agg["avg"] = agg["sum"] / agg["count"] if agg["count"] > 0 else 0
+                closed.append(agg)
+                del self.aggregations[window_key]
+        
+        return closed
+
+# ============== Exactly-Once Processing ==============
+class ExactlyOnceProcessor:
+    """
+    Exactly-once semantics with transactional processing
+    """
+    
+    def __init__(self, db_pool, redis_client):
+        self.db_pool = db_pool
+        self.redis = redis_client
+        self.dedup_ttl = 86400 * 7  # 7 days
+    
+    async def process(
+        self, 
+        event: Dict[str, Any], 
+        processor: Callable
+    ) -> Optional[Any]:
+        """Process event with exactly-once guarantee"""
+        event_id = event.get("event_id")
+        
+        if not event_id:
+            raise ValueError("Event must have event_id for exactly-once")
+        
+        # Check if already processed
+        if await self._is_duplicate(event_id):
+            return None
+        
+        # Acquire lock for this event
+        lock_key = f"lock:event:{event_id}"
+        lock_acquired = await self.redis.set(
+            lock_key, "1", 
+            ex=60,  # Lock timeout
+            nx=True
+        )
+        
+        if not lock_acquired:
+            return None  # Another instance is processing
+        
+        try:
+            async with self.db_pool.acquire() as conn:
+                async with conn.transaction():
+                    # Process the event
+                    result = await processor(event, conn)
+                    
+                    # Mark as processed in same transaction
+                    await conn.execute("""
+                        INSERT INTO processed_events (event_id, processed_at)
+                        VALUES ($1, $2)
+                        ON CONFLICT (event_id) DO NOTHING
+                    """, event_id, datetime.utcnow())
+            
+            # Also cache in Redis for fast lookups
+            await self.redis.setex(
+                f"processed:{event_id}", 
+                self.dedup_ttl, 
+                "1"
+            )
+            
+            return result
+            
+        finally:
+            await self.redis.delete(lock_key)
+    
+    async def _is_duplicate(self, event_id: str) -> bool:
+        """Check Redis first, then DB"""
+        # Fast path: check Redis
+        if await self.redis.exists(f"processed:{event_id}"):
+            return True
+        
+        # Slow path: check database
+        async with self.db_pool.acquire() as conn:
+            result = await conn.fetchval("""
+                SELECT 1 FROM processed_events 
+                WHERE event_id = $1
+            """, event_id)
+            
+            if result:
+                # Backfill Redis cache
+                await self.redis.setex(
+                    f"processed:{event_id}", 
+                    self.dedup_ttl, 
+                    "1"
+                )
+                return True
+        
+        return False
+
+# ============== Stream Join Implementation ==============
+class StreamJoiner:
+    """Join two streams within a time window"""
+    
+    def __init__(
+        self, 
+        window_size: timedelta,
+        left_key: str,
+        right_key: str
+    ):
+        self.window_size = window_size
+        self.left_key = left_key
+        self.right_key = right_key
+        self.left_buffer: Dict[str, List[Dict]] = defaultdict(list)
+        self.right_buffer: Dict[str, List[Dict]] = defaultdict(list)
+    
+    def add_left(self, event: Dict[str, Any]) -> List[Dict]:
+        """Add event from left stream, return any matches"""
+        key = event.get(self.left_key)
+        timestamp = datetime.fromisoformat(event["timestamp"])
+        
+        # Clean old events
+        self._cleanup_buffer(self.left_buffer, timestamp)
+        self._cleanup_buffer(self.right_buffer, timestamp)
+        
+        # Store in buffer
+        self.left_buffer[key].append({
+            "event": event,
+            "timestamp": timestamp
+        })
+        
+        # Find matches in right buffer
+        matches = []
+        for right_event in self.right_buffer.get(key, []):
+            if abs((right_event["timestamp"] - timestamp).total_seconds()) < \
+               self.window_size.total_seconds():
+                matches.append({
+                    "left": event,
+                    "right": right_event["event"],
+                    "join_timestamp": timestamp.isoformat()
+                })
+        
+        return matches
+    
+    def add_right(self, event: Dict[str, Any]) -> List[Dict]:
+        """Add event from right stream, return any matches"""
+        key = event.get(self.right_key)
+        timestamp = datetime.fromisoformat(event["timestamp"])
+        
+        # Clean old events
+        self._cleanup_buffer(self.left_buffer, timestamp)
+        self._cleanup_buffer(self.right_buffer, timestamp)
+        
+        # Store in buffer
+        self.right_buffer[key].append({
+            "event": event,
+            "timestamp": timestamp
+        })
+        
+        # Find matches in left buffer
+        matches = []
+        for left_event in self.left_buffer.get(key, []):
+            if abs((left_event["timestamp"] - timestamp).total_seconds()) < \
+               self.window_size.total_seconds():
+                matches.append({
+                    "left": left_event["event"],
+                    "right": event,
+                    "join_timestamp": timestamp.isoformat()
+                })
+        
+        return matches
+    
+    def _cleanup_buffer(
+        self, 
+        buffer: Dict[str, List[Dict]], 
+        current_time: datetime
+    ) -> None:
+        """Remove events outside the window"""
+        cutoff = current_time - self.window_size
+        
+        for key in list(buffer.keys()):
+            buffer[key] = [
+                e for e in buffer[key] 
+                if e["timestamp"] > cutoff
+            ]
+            if not buffer[key]:
+                del buffer[key]
+```
+  </Tab>
+  <Tab title="JavaScript">
+```javascript
+const { Kafka } = require('kafkajs');
+const Redis = require('ioredis');
+
+// ============== Stream Processor with Backpressure ==============
+class StreamProcessor {
+  constructor(config) {
+    this.kafka = new Kafka(config.kafka);
+    this.topic = config.topic;
+    this.groupId = config.groupId;
+    this.maxConcurrent = config.maxConcurrent || 100;
+    this.handlers = [];
+    this.activeProcessing = 0;
+    this.running = false;
+  }
+
+  addHandler(handler) {
+    this.handlers.push(handler);
+  }
+
+  async start() {
+    this.consumer = this.kafka.consumer({ groupId: this.groupId });
+    
+    await this.consumer.connect();
+    await this.consumer.subscribe({ topic: this.topic, fromBeginning: true });
+
+    this.running = true;
+
+    await this.consumer.run({
+      eachMessage: async ({ topic, partition, message }) => {
+        // Backpressure: wait if too many concurrent
+        while (this.activeProcessing >= this.maxConcurrent) {
+          await this.sleep(10);
+        }
+
+        this.activeProcessing++;
+        
+        try {
+          const event = JSON.parse(message.value.toString());
+          
+          for (const handler of this.handlers) {
+            await handler(event);
+          }
+        } catch (error) {
+          await this.handleError(message, error);
+        } finally {
+          this.activeProcessing--;
+        }
+      }
+    });
+  }
+
+  async handleError(message, error) {
+    const producer = this.kafka.producer();
+    await producer.connect();
+
+    const dlqMessage = {
+      originalTopic: this.topic,
+      originalMessage: message.value.toString(),
+      error: error.message,
+      timestamp: new Date().toISOString(),
+      partition: message.partition,
+      offset: message.offset
+    };
+
+    await producer.send({
+      topic: `${this.topic}.dlq`,
+      messages: [{ value: JSON.stringify(dlqMessage) }]
+    });
+
+    await producer.disconnect();
+  }
+
+  sleep(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
+  }
+
+  async stop() {
+    this.running = false;
+    await this.consumer.disconnect();
+  }
+}
+
+// ============== Windowed Aggregator ==============
+class WindowedAggregator {
+  constructor(windowSizeMs, watermarkDelayMs = 30000) {
+    this.windowSizeMs = windowSizeMs;
+    this.watermarkDelayMs = watermarkDelayMs;
+    this.windows = new Map();
+  }
+
+  addEvent(event, timestamp = new Date()) {
+    const windowKey = this.getWindowKey(timestamp);
+    
+    if (!this.windows.has(windowKey)) {
+      this.windows.set(windowKey, {
+        count: 0,
+        sum: 0,
+        min: Infinity,
+        max: -Infinity,
+        windowStart: new Date(windowKey),
+        windowEnd: new Date(windowKey + this.windowSizeMs)
+      });
+    }
+
+    const agg = this.windows.get(windowKey);
+    const value = event.value || 0;
+
+    agg.count++;
+    agg.sum += value;
+    agg.min = Math.min(agg.min, value);
+    agg.max = Math.max(agg.max, value);
+  }
+
+  getWindowKey(timestamp) {
+    const ts = timestamp.getTime();
+    return Math.floor(ts / this.windowSizeMs) * this.windowSizeMs;
+  }
+
+  getClosedWindows(watermark = new Date()) {
+    const closed = [];
+    const cutoff = watermark.getTime() - this.watermarkDelayMs;
+
+    for (const [windowKey, agg] of this.windows) {
+      if (agg.windowEnd.getTime() < cutoff) {
+        agg.avg = agg.count > 0 ? agg.sum / agg.count : 0;
+        closed.push(agg);
+        this.windows.delete(windowKey);
+      }
+    }
+
+    return closed;
+  }
+}
+
+// ============== Exactly-Once Processor ==============
+class ExactlyOnceProcessor {
+  constructor(pool, redis) {
+    this.pool = pool;
+    this.redis = redis;
+    this.dedupTtl = 86400 * 7; // 7 days
+  }
+
+  async process(event, processor) {
+    const eventId = event.eventId;
+    
+    if (!eventId) {
+      throw new Error('Event must have eventId for exactly-once');
+    }
+
+    // Check if already processed
+    if (await this.isDuplicate(eventId)) {
+      return null;
+    }
+
+    // Acquire distributed lock
+    const lockKey = `lock:event:${eventId}`;
+    const lockAcquired = await this.redis.set(
+      lockKey, '1', 
+      'EX', 60, 
+      'NX'
+    );
+
+    if (!lockAcquired) {
+      return null; // Another instance is processing
+    }
+
+    const client = await this.pool.connect();
+    
+    try {
+      await client.query('BEGIN');
+
+      // Process the event
+      const result = await processor(event, client);
+
+      // Mark as processed in same transaction
+      await client.query(`
+        INSERT INTO processed_events (event_id, processed_at)
+        VALUES ($1, $2)
+        ON CONFLICT (event_id) DO NOTHING
+      `, [eventId, new Date()]);
+
+      await client.query('COMMIT');
+
+      // Cache in Redis for fast lookups
+      await this.redis.setex(
+        `processed:${eventId}`,
+        this.dedupTtl,
+        '1'
+      );
+
+      return result;
+
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally {
+      client.release();
+      await this.redis.del(lockKey);
+    }
+  }
+
+  async isDuplicate(eventId) {
+    // Fast path: check Redis
+    if (await this.redis.exists(`processed:${eventId}`)) {
+      return true;
+    }
+
+    // Slow path: check database
+    const client = await this.pool.connect();
+    try {
+      const result = await client.query(`
+        SELECT 1 FROM processed_events WHERE event_id = $1
+      `, [eventId]);
+
+      if (result.rows.length > 0) {
+        // Backfill Redis cache
+        await this.redis.setex(
+          `processed:${eventId}`,
+          this.dedupTtl,
+          '1'
+        );
+        return true;
+      }
+    } finally {
+      client.release();
+    }
+
+    return false;
+  }
+}
+
+// ============== Stream Join ==============
+class StreamJoiner {
+  constructor(windowSizeMs, leftKey, rightKey) {
+    this.windowSizeMs = windowSizeMs;
+    this.leftKey = leftKey;
+    this.rightKey = rightKey;
+    this.leftBuffer = new Map();
+    this.rightBuffer = new Map();
+  }
+
+  addLeft(event) {
+    const key = event[this.leftKey];
+    const timestamp = new Date(event.timestamp);
+
+    this.cleanup(timestamp);
+
+    if (!this.leftBuffer.has(key)) {
+      this.leftBuffer.set(key, []);
+    }
+    this.leftBuffer.get(key).push({ event, timestamp });
+
+    // Find matches in right buffer
+    const matches = [];
+    const rightEvents = this.rightBuffer.get(key) || [];
+    
+    for (const rightEntry of rightEvents) {
+      if (Math.abs(rightEntry.timestamp - timestamp) < this.windowSizeMs) {
+        matches.push({
+          left: event,
+          right: rightEntry.event,
+          joinTimestamp: timestamp.toISOString()
+        });
+      }
+    }
+
+    return matches;
+  }
+
+  addRight(event) {
+    const key = event[this.rightKey];
+    const timestamp = new Date(event.timestamp);
+
+    this.cleanup(timestamp);
+
+    if (!this.rightBuffer.has(key)) {
+      this.rightBuffer.set(key, []);
+    }
+    this.rightBuffer.get(key).push({ event, timestamp });
+
+    // Find matches in left buffer
+    const matches = [];
+    const leftEvents = this.leftBuffer.get(key) || [];
+    
+    for (const leftEntry of leftEvents) {
+      if (Math.abs(leftEntry.timestamp - timestamp) < this.windowSizeMs) {
+        matches.push({
+          left: leftEntry.event,
+          right: event,
+          joinTimestamp: timestamp.toISOString()
+        });
+      }
+    }
+
+    return matches;
+  }
+
+  cleanup(currentTime) {
+    const cutoff = currentTime.getTime() - this.windowSizeMs;
+
+    for (const [key, events] of this.leftBuffer) {
+      const filtered = events.filter(e => e.timestamp.getTime() > cutoff);
+      if (filtered.length === 0) {
+        this.leftBuffer.delete(key);
+      } else {
+        this.leftBuffer.set(key, filtered);
+      }
+    }
+
+    for (const [key, events] of this.rightBuffer) {
+      const filtered = events.filter(e => e.timestamp.getTime() > cutoff);
+      if (filtered.length === 0) {
+        this.rightBuffer.delete(key);
+      } else {
+        this.rightBuffer.set(key, filtered);
+      }
+    }
+  }
+}
+
+module.exports = {
+  StreamProcessor,
+  WindowedAggregator,
+  ExactlyOnceProcessor,
+  StreamJoiner
+};
+```
+  </Tab>
+</Tabs>
+
 ## ETL vs ELT
 
 ```

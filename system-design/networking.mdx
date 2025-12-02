@@ -333,6 +333,8 @@ connection overhead        Low latency, real-time
 
 ### WebSocket Scaling Challenge
 
+![WebSocket Scaling with Pub/Sub](/images/system-design/websocket-scaling.svg)
+
 ```
 ┌─────────────────────────────────────────────────────────────────┐
 │                WebSocket Scaling with Pub/Sub                   │
@@ -358,6 +360,546 @@ connection overhead        Low latency, real-time
 │                                                                 │
 └─────────────────────────────────────────────────────────────────┘
 ```
+
+## WebSocket Implementation
+
+Production-ready WebSocket server with connection management:
+
+<Tabs>
+  <Tab title="Python">
+```python
+import asyncio
+import json
+from typing import Dict, Set, Optional, Any
+from dataclasses import dataclass, field
+from datetime import datetime
+import uuid
+import aioredis
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from contextlib import asynccontextmanager
+
+@dataclass
+class Connection:
+    """Represents a WebSocket connection"""
+    websocket: WebSocket
+    user_id: str
+    connection_id: str = field(default_factory=lambda: str(uuid.uuid4()))
+    connected_at: datetime = field(default_factory=datetime.utcnow)
+    subscriptions: Set[str] = field(default_factory=set)
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+class ConnectionManager:
+    """
+    Production WebSocket connection manager with Redis pub/sub
+    for multi-server deployments
+    """
+    
+    def __init__(self, redis_url: str = "redis://localhost"):
+        self.redis_url = redis_url
+        self.connections: Dict[str, Connection] = {}
+        self.user_connections: Dict[str, Set[str]] = {}
+        self.room_connections: Dict[str, Set[str]] = {}
+        self.redis: Optional[aioredis.Redis] = None
+        self.pubsub: Optional[aioredis.client.PubSub] = None
+    
+    async def initialize(self) -> None:
+        """Initialize Redis connection for pub/sub"""
+        self.redis = await aioredis.from_url(self.redis_url)
+        self.pubsub = self.redis.pubsub()
+        
+        # Start listening for broadcast messages
+        asyncio.create_task(self._redis_listener())
+    
+    async def connect(
+        self, 
+        websocket: WebSocket, 
+        user_id: str,
+        metadata: Optional[Dict] = None
+    ) -> Connection:
+        """Accept and register a new WebSocket connection"""
+        await websocket.accept()
+        
+        connection = Connection(
+            websocket=websocket,
+            user_id=user_id,
+            metadata=metadata or {}
+        )
+        
+        # Register connection
+        self.connections[connection.connection_id] = connection
+        
+        if user_id not in self.user_connections:
+            self.user_connections[user_id] = set()
+        self.user_connections[user_id].add(connection.connection_id)
+        
+        # Notify user came online
+        await self._publish_presence(user_id, "online")
+        
+        return connection
+    
+    async def disconnect(self, connection: Connection) -> None:
+        """Clean up a disconnected WebSocket"""
+        conn_id = connection.connection_id
+        user_id = connection.user_id
+        
+        # Remove from rooms
+        for room in connection.subscriptions:
+            if room in self.room_connections:
+                self.room_connections[room].discard(conn_id)
+        
+        # Remove from user connections
+        if user_id in self.user_connections:
+            self.user_connections[user_id].discard(conn_id)
+            
+            # If no more connections, user is offline
+            if not self.user_connections[user_id]:
+                del self.user_connections[user_id]
+                await self._publish_presence(user_id, "offline")
+        
+        # Remove connection
+        del self.connections[conn_id]
+    
+    async def join_room(self, connection: Connection, room: str) -> None:
+        """Subscribe connection to a room"""
+        connection.subscriptions.add(room)
+        
+        if room not in self.room_connections:
+            self.room_connections[room] = set()
+            # Subscribe to Redis channel for this room
+            await self.pubsub.subscribe(f"room:{room}")
+        
+        self.room_connections[room].add(connection.connection_id)
+    
+    async def leave_room(self, connection: Connection, room: str) -> None:
+        """Unsubscribe connection from a room"""
+        connection.subscriptions.discard(room)
+        
+        if room in self.room_connections:
+            self.room_connections[room].discard(connection.connection_id)
+    
+    async def send_to_user(self, user_id: str, message: Dict) -> int:
+        """Send message to all connections of a user"""
+        sent = 0
+        
+        # Local connections
+        if user_id in self.user_connections:
+            for conn_id in self.user_connections[user_id]:
+                if conn_id in self.connections:
+                    try:
+                        await self.connections[conn_id].websocket.send_json(message)
+                        sent += 1
+                    except Exception:
+                        pass
+        
+        # Broadcast to other servers via Redis
+        await self.redis.publish(
+            f"user:{user_id}",
+            json.dumps(message)
+        )
+        
+        return sent
+    
+    async def broadcast_to_room(self, room: str, message: Dict) -> int:
+        """Broadcast message to all connections in a room"""
+        sent = 0
+        
+        # Local connections
+        if room in self.room_connections:
+            for conn_id in self.room_connections[room]:
+                if conn_id in self.connections:
+                    try:
+                        await self.connections[conn_id].websocket.send_json(message)
+                        sent += 1
+                    except Exception:
+                        pass
+        
+        # Broadcast to other servers via Redis
+        await self.redis.publish(
+            f"room:{room}",
+            json.dumps(message)
+        )
+        
+        return sent
+    
+    async def _redis_listener(self) -> None:
+        """Listen for messages from other servers"""
+        async for message in self.pubsub.listen():
+            if message['type'] != 'message':
+                continue
+            
+            channel = message['channel'].decode()
+            data = json.loads(message['data'])
+            
+            if channel.startswith('room:'):
+                room = channel.split(':', 1)[1]
+                await self._local_broadcast_room(room, data)
+            elif channel.startswith('user:'):
+                user_id = channel.split(':', 1)[1]
+                await self._local_send_user(user_id, data)
+    
+    async def _local_broadcast_room(self, room: str, message: Dict) -> None:
+        """Broadcast to local room connections only"""
+        if room in self.room_connections:
+            for conn_id in self.room_connections[room]:
+                if conn_id in self.connections:
+                    try:
+                        await self.connections[conn_id].websocket.send_json(message)
+                    except Exception:
+                        pass
+    
+    async def _local_send_user(self, user_id: str, message: Dict) -> None:
+        """Send to local user connections only"""
+        if user_id in self.user_connections:
+            for conn_id in self.user_connections[user_id]:
+                if conn_id in self.connections:
+                    try:
+                        await self.connections[conn_id].websocket.send_json(message)
+                    except Exception:
+                        pass
+    
+    async def _publish_presence(self, user_id: str, status: str) -> None:
+        """Publish user presence change"""
+        await self.redis.publish(
+            "presence",
+            json.dumps({"user_id": user_id, "status": status})
+        )
+
+# FastAPI WebSocket endpoint
+app = FastAPI()
+manager = ConnectionManager()
+
+@app.on_event("startup")
+async def startup():
+    await manager.initialize()
+
+@app.websocket("/ws/{user_id}")
+async def websocket_endpoint(websocket: WebSocket, user_id: str):
+    connection = await manager.connect(websocket, user_id)
+    
+    try:
+        while True:
+            data = await websocket.receive_json()
+            
+            # Handle different message types
+            msg_type = data.get("type")
+            
+            if msg_type == "join_room":
+                await manager.join_room(connection, data["room"])
+                
+            elif msg_type == "leave_room":
+                await manager.leave_room(connection, data["room"])
+                
+            elif msg_type == "room_message":
+                await manager.broadcast_to_room(
+                    data["room"],
+                    {
+                        "type": "message",
+                        "room": data["room"],
+                        "from": user_id,
+                        "content": data["content"],
+                        "timestamp": datetime.utcnow().isoformat()
+                    }
+                )
+                
+            elif msg_type == "direct_message":
+                await manager.send_to_user(
+                    data["to"],
+                    {
+                        "type": "direct_message",
+                        "from": user_id,
+                        "content": data["content"],
+                        "timestamp": datetime.utcnow().isoformat()
+                    }
+                )
+                
+    except WebSocketDisconnect:
+        await manager.disconnect(connection)
+```
+  </Tab>
+  <Tab title="JavaScript">
+```javascript
+const WebSocket = require('ws');
+const Redis = require('ioredis');
+const { v4: uuidv4 } = require('uuid');
+
+class Connection {
+  constructor(ws, userId, metadata = {}) {
+    this.ws = ws;
+    this.userId = userId;
+    this.connectionId = uuidv4();
+    this.connectedAt = new Date();
+    this.subscriptions = new Set();
+    this.metadata = metadata;
+    this.isAlive = true;
+  }
+
+  send(message) {
+    if (this.ws.readyState === WebSocket.OPEN) {
+      this.ws.send(JSON.stringify(message));
+      return true;
+    }
+    return false;
+  }
+}
+
+class ConnectionManager {
+  constructor(redisUrl = 'redis://localhost') {
+    this.redis = new Redis(redisUrl);
+    this.subscriber = new Redis(redisUrl);
+    this.connections = new Map();
+    this.userConnections = new Map();
+    this.roomConnections = new Map();
+    
+    this.setupRedisSubscriber();
+    this.startHeartbeat();
+  }
+
+  setupRedisSubscriber() {
+    this.subscriber.on('message', (channel, message) => {
+      const data = JSON.parse(message);
+      
+      if (channel.startsWith('room:')) {
+        const room = channel.split(':')[1];
+        this.localBroadcastRoom(room, data);
+      } else if (channel.startsWith('user:')) {
+        const userId = channel.split(':')[1];
+        this.localSendUser(userId, data);
+      }
+    });
+  }
+
+  startHeartbeat() {
+    setInterval(() => {
+      for (const [connId, conn] of this.connections) {
+        if (!conn.isAlive) {
+          this.disconnect(conn);
+          continue;
+        }
+        conn.isAlive = false;
+        conn.ws.ping();
+      }
+    }, 30000);
+  }
+
+  async connect(ws, userId, metadata = {}) {
+    const connection = new Connection(ws, userId, metadata);
+
+    // Setup event handlers
+    ws.on('pong', () => {
+      connection.isAlive = true;
+    });
+
+    // Register connection
+    this.connections.set(connection.connectionId, connection);
+
+    if (!this.userConnections.has(userId)) {
+      this.userConnections.set(userId, new Set());
+    }
+    this.userConnections.get(userId).add(connection.connectionId);
+
+    // Publish presence
+    await this.publishPresence(userId, 'online');
+
+    return connection;
+  }
+
+  async disconnect(connection) {
+    const { connectionId, userId, subscriptions } = connection;
+
+    // Remove from rooms
+    for (const room of subscriptions) {
+      if (this.roomConnections.has(room)) {
+        this.roomConnections.get(room).delete(connectionId);
+      }
+    }
+
+    // Remove from user connections
+    if (this.userConnections.has(userId)) {
+      const userConns = this.userConnections.get(userId);
+      userConns.delete(connectionId);
+
+      if (userConns.size === 0) {
+        this.userConnections.delete(userId);
+        await this.publishPresence(userId, 'offline');
+      }
+    }
+
+    // Close WebSocket
+    try {
+      connection.ws.terminate();
+    } catch (e) {}
+
+    this.connections.delete(connectionId);
+  }
+
+  async joinRoom(connection, room) {
+    connection.subscriptions.add(room);
+
+    if (!this.roomConnections.has(room)) {
+      this.roomConnections.set(room, new Set());
+      await this.subscriber.subscribe(`room:${room}`);
+    }
+
+    this.roomConnections.get(room).add(connection.connectionId);
+  }
+
+  async leaveRoom(connection, room) {
+    connection.subscriptions.delete(room);
+
+    if (this.roomConnections.has(room)) {
+      this.roomConnections.get(room).delete(connection.connectionId);
+    }
+  }
+
+  async sendToUser(userId, message) {
+    let sent = 0;
+
+    // Local connections
+    if (this.userConnections.has(userId)) {
+      for (const connId of this.userConnections.get(userId)) {
+        const conn = this.connections.get(connId);
+        if (conn && conn.send(message)) {
+          sent++;
+        }
+      }
+    }
+
+    // Broadcast to other servers
+    await this.redis.publish(`user:${userId}`, JSON.stringify(message));
+
+    return sent;
+  }
+
+  async broadcastToRoom(room, message) {
+    let sent = 0;
+
+    // Local connections
+    if (this.roomConnections.has(room)) {
+      for (const connId of this.roomConnections.get(room)) {
+        const conn = this.connections.get(connId);
+        if (conn && conn.send(message)) {
+          sent++;
+        }
+      }
+    }
+
+    // Broadcast to other servers
+    await this.redis.publish(`room:${room}`, JSON.stringify(message));
+
+    return sent;
+  }
+
+  localBroadcastRoom(room, message) {
+    if (this.roomConnections.has(room)) {
+      for (const connId of this.roomConnections.get(room)) {
+        const conn = this.connections.get(connId);
+        if (conn) conn.send(message);
+      }
+    }
+  }
+
+  localSendUser(userId, message) {
+    if (this.userConnections.has(userId)) {
+      for (const connId of this.userConnections.get(userId)) {
+        const conn = this.connections.get(connId);
+        if (conn) conn.send(message);
+      }
+    }
+  }
+
+  async publishPresence(userId, status) {
+    await this.redis.publish('presence', JSON.stringify({
+      userId,
+      status,
+      timestamp: new Date().toISOString()
+    }));
+  }
+}
+
+// Express + WS Server
+const express = require('express');
+const http = require('http');
+const url = require('url');
+
+const app = express();
+const server = http.createServer(app);
+const wss = new WebSocket.Server({ noServer: true });
+const manager = new ConnectionManager();
+
+server.on('upgrade', (request, socket, head) => {
+  const pathname = url.parse(request.url).pathname;
+  const match = pathname.match(/^\/ws\/(.+)$/);
+
+  if (match) {
+    const userId = match[1];
+    
+    wss.handleUpgrade(request, socket, head, async (ws) => {
+      const connection = await manager.connect(ws, userId);
+
+      ws.on('message', async (data) => {
+        try {
+          const message = JSON.parse(data);
+          await handleMessage(connection, message);
+        } catch (e) {
+          console.error('Message error:', e);
+        }
+      });
+
+      ws.on('close', () => {
+        manager.disconnect(connection);
+      });
+
+      ws.on('error', (error) => {
+        console.error('WebSocket error:', error);
+        manager.disconnect(connection);
+      });
+    });
+  } else {
+    socket.destroy();
+  }
+});
+
+async function handleMessage(connection, message) {
+  const { type, room, to, content } = message;
+
+  switch (type) {
+    case 'join_room':
+      await manager.joinRoom(connection, room);
+      break;
+
+    case 'leave_room':
+      await manager.leaveRoom(connection, room);
+      break;
+
+    case 'room_message':
+      await manager.broadcastToRoom(room, {
+        type: 'message',
+        room,
+        from: connection.userId,
+        content,
+        timestamp: new Date().toISOString()
+      });
+      break;
+
+    case 'direct_message':
+      await manager.sendToUser(to, {
+        type: 'direct_message',
+        from: connection.userId,
+        content,
+        timestamp: new Date().toISOString()
+      });
+      break;
+  }
+}
+
+server.listen(3000, () => {
+  console.log('WebSocket server running on port 3000');
+});
+
+module.exports = { ConnectionManager, Connection };
+```
+  </Tab>
+</Tabs>
 
 ## gRPC
 

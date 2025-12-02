@@ -251,6 +251,632 @@ CREATE INDEX idx_content ON articles USING GIN(to_tsvector('english', content));
 | Faster joins | Memory usage |
 | — | Index maintenance |
 
+## Practical Database Patterns
+
+### Connection Pooling
+
+Managing database connections efficiently is critical for performance.
+
+<Tabs>
+  <Tab title="Python (SQLAlchemy)">
+```python
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker, scoped_session
+from contextlib import contextmanager
+
+class DatabasePool:
+    """Production-ready database connection pool"""
+    
+    def __init__(self, database_url: str):
+        self.engine = create_engine(
+            database_url,
+            pool_size=20,           # Persistent connections
+            max_overflow=30,        # Extra connections under load
+            pool_timeout=30,        # Wait time for connection
+            pool_recycle=3600,      # Recycle connections hourly
+            pool_pre_ping=True,     # Verify connection before use
+            echo=False              # Set True for SQL logging
+        )
+        
+        self._session_factory = sessionmaker(bind=self.engine)
+        self.Session = scoped_session(self._session_factory)
+    
+    @contextmanager
+    def get_session(self):
+        """Context manager for database sessions"""
+        session = self.Session()
+        try:
+            yield session
+            session.commit()
+        except Exception as e:
+            session.rollback()
+            raise e
+        finally:
+            session.close()
+    
+    def execute_with_retry(self, query, params=None, max_retries=3):
+        """Execute query with automatic retry on transient failures"""
+        import time
+        
+        for attempt in range(max_retries):
+            try:
+                with self.get_session() as session:
+                    result = session.execute(query, params or {})
+                    return result.fetchall()
+            except Exception as e:
+                if "connection" in str(e).lower() and attempt < max_retries - 1:
+                    time.sleep(2 ** attempt)  # Exponential backoff
+                    continue
+                raise
+
+
+# Usage
+db = DatabasePool("postgresql://user:pass@localhost/mydb")
+
+with db.get_session() as session:
+    users = session.query(User).filter(User.active == True).all()
+```
+  </Tab>
+  <Tab title="JavaScript (Node.js + pg)">
+```javascript
+const { Pool } = require('pg');
+
+class DatabasePool {
+  constructor(config) {
+    this.pool = new Pool({
+      host: config.host,
+      port: config.port,
+      database: config.database,
+      user: config.user,
+      password: config.password,
+      
+      // Connection pool settings
+      max: 20,                    // Max connections
+      min: 5,                     // Min connections
+      idleTimeoutMillis: 30000,   // Close idle after 30s
+      connectionTimeoutMillis: 5000,  // Timeout on connect
+      
+      // Health checks
+      allowExitOnIdle: false
+    });
+
+    // Log pool events for monitoring
+    this.pool.on('error', (err) => {
+      console.error('Unexpected pool error:', err);
+    });
+    
+    this.pool.on('connect', (client) => {
+      console.log('New client connected');
+    });
+  }
+
+  async query(text, params) {
+    const start = Date.now();
+    const result = await this.pool.query(text, params);
+    const duration = Date.now() - start;
+    
+    console.log('Query executed', {
+      text: text.substring(0, 100),
+      duration,
+      rows: result.rowCount
+    });
+    
+    return result;
+  }
+
+  async withTransaction(callback) {
+    const client = await this.pool.connect();
+    
+    try {
+      await client.query('BEGIN');
+      const result = await callback(client);
+      await client.query('COMMIT');
+      return result;
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
+  async executeWithRetry(text, params, maxRetries = 3) {
+    for (let attempt = 0; attempt < maxRetries; attempt++) {
+      try {
+        return await this.query(text, params);
+      } catch (error) {
+        if (this.isTransientError(error) && attempt < maxRetries - 1) {
+          await this.sleep(Math.pow(2, attempt) * 1000);
+          continue;
+        }
+        throw error;
+      }
+    }
+  }
+
+  isTransientError(error) {
+    const transientCodes = ['ECONNRESET', 'ETIMEDOUT', '57P01'];
+    return transientCodes.some(code => 
+      error.code === code || error.message.includes(code)
+    );
+  }
+
+  sleep(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
+  }
+}
+
+// Usage
+const db = new DatabasePool({
+  host: 'localhost',
+  database: 'mydb',
+  user: 'postgres',
+  password: 'secret'
+});
+
+// Simple query
+const users = await db.query(
+  'SELECT * FROM users WHERE active = $1',
+  [true]
+);
+
+// With transaction
+const result = await db.withTransaction(async (client) => {
+  await client.query('UPDATE accounts SET balance = balance - $1 WHERE id = $2', [100, 'acc1']);
+  await client.query('UPDATE accounts SET balance = balance + $1 WHERE id = $2', [100, 'acc2']);
+  return { success: true };
+});
+```
+  </Tab>
+</Tabs>
+
+### Read/Write Splitting
+
+Route reads to replicas and writes to primary for better scalability.
+
+<Tabs>
+  <Tab title="Python">
+```python
+import random
+from datetime import datetime, timedelta
+from typing import Optional, List, Any
+from enum import Enum
+
+class QueryType(Enum):
+    READ = "read"
+    WRITE = "write"
+
+class ReadWriteRouter:
+    """
+    Routes queries to primary or replicas based on query type
+    and session consistency requirements.
+    """
+    
+    def __init__(self, primary_pool, replica_pools: list):
+        self.primary = primary_pool
+        self.replicas = replica_pools
+        self.user_writes = {}  # Track recent writes per user
+        self.replication_lag_threshold = 5  # seconds
+    
+    def get_connection(self, query_type: QueryType, 
+                       user_id: Optional[str] = None):
+        """
+        Get appropriate connection based on query type and user session.
+        Ensures read-your-writes consistency.
+        """
+        if query_type == QueryType.WRITE:
+            # All writes go to primary
+            self._record_write(user_id)
+            return self.primary
+        
+        # For reads, check if user recently wrote
+        if user_id and self._should_read_from_primary(user_id):
+            return self.primary
+        
+        # Otherwise, load balance across replicas
+        return self._get_healthy_replica()
+    
+    def _record_write(self, user_id: Optional[str]):
+        if user_id:
+            self.user_writes[user_id] = datetime.utcnow()
+    
+    def _should_read_from_primary(self, user_id: str) -> bool:
+        """Read from primary if user wrote recently"""
+        last_write = self.user_writes.get(user_id)
+        if not last_write:
+            return False
+        
+        time_since_write = (datetime.utcnow() - last_write).total_seconds()
+        return time_since_write < self.replication_lag_threshold
+    
+    def _get_healthy_replica(self):
+        """Get a healthy replica with lowest lag"""
+        healthy = [r for r in self.replicas if self._is_healthy(r)]
+        
+        if not healthy:
+            # Fallback to primary if no healthy replicas
+            return self.primary
+        
+        # Random selection (could be weighted by lag)
+        return random.choice(healthy)
+    
+    def _is_healthy(self, replica) -> bool:
+        try:
+            # Check replication lag
+            result = replica.execute("SELECT pg_last_xact_replay_timestamp()")
+            lag = (datetime.utcnow() - result).total_seconds()
+            return lag < 30  # Healthy if lag < 30 seconds
+        except:
+            return False
+
+
+# ORM Integration Example
+class UserRepository:
+    def __init__(self, router: ReadWriteRouter):
+        self.router = router
+    
+    def find_by_id(self, user_id: str, session_user: str = None) -> dict:
+        """Read operation - goes to replica"""
+        conn = self.router.get_connection(QueryType.READ, session_user)
+        return conn.execute(
+            "SELECT * FROM users WHERE id = %s", 
+            (user_id,)
+        ).fetchone()
+    
+    def update(self, user_id: str, data: dict, session_user: str) -> bool:
+        """Write operation - goes to primary"""
+        conn = self.router.get_connection(QueryType.WRITE, session_user)
+        conn.execute(
+            "UPDATE users SET name = %s WHERE id = %s",
+            (data['name'], user_id)
+        )
+        return True
+
+
+# Usage
+router = ReadWriteRouter(primary_pool, [replica1, replica2])
+repo = UserRepository(router)
+
+# This write goes to primary
+repo.update("user_123", {"name": "Alice"}, session_user="user_123")
+
+# This read goes to primary (recent write by same user)
+user = repo.find_by_id("user_123", session_user="user_123")
+
+# This read goes to replica (different user)
+user = repo.find_by_id("user_123", session_user="user_456")
+```
+  </Tab>
+  <Tab title="JavaScript">
+```javascript
+class ReadWriteRouter {
+  constructor(primaryPool, replicaPools) {
+    this.primary = primaryPool;
+    this.replicas = replicaPools;
+    this.userWrites = new Map();  // userId -> timestamp
+    this.replicationLagThreshold = 5000;  // 5 seconds
+    this.currentReplicaIndex = 0;
+  }
+
+  getConnection(queryType, userId = null) {
+    if (queryType === 'write') {
+      this.recordWrite(userId);
+      return this.primary;
+    }
+
+    // Read-your-writes consistency
+    if (userId && this.shouldReadFromPrimary(userId)) {
+      return this.primary;
+    }
+
+    return this.getHealthyReplica();
+  }
+
+  recordWrite(userId) {
+    if (userId) {
+      this.userWrites.set(userId, Date.now());
+    }
+  }
+
+  shouldReadFromPrimary(userId) {
+    const lastWrite = this.userWrites.get(userId);
+    if (!lastWrite) return false;
+    
+    return (Date.now() - lastWrite) < this.replicationLagThreshold;
+  }
+
+  getHealthyReplica() {
+    // Round-robin with health check
+    const startIndex = this.currentReplicaIndex;
+    
+    do {
+      const replica = this.replicas[this.currentReplicaIndex];
+      this.currentReplicaIndex = 
+        (this.currentReplicaIndex + 1) % this.replicas.length;
+      
+      if (this.isHealthy(replica)) {
+        return replica;
+      }
+    } while (this.currentReplicaIndex !== startIndex);
+    
+    // Fallback to primary
+    console.warn('No healthy replicas, falling back to primary');
+    return this.primary;
+  }
+
+  async isHealthy(replica) {
+    try {
+      const result = await replica.query(
+        "SELECT pg_last_xact_replay_timestamp() as lag_time"
+      );
+      const lagTime = new Date(result.rows[0].lag_time);
+      const lagSeconds = (Date.now() - lagTime) / 1000;
+      return lagSeconds < 30;
+    } catch {
+      return false;
+    }
+  }
+}
+
+// Express.js middleware for automatic routing
+function dbMiddleware(router) {
+  return (req, res, next) => {
+    const userId = req.user?.id;
+    
+    // Determine query type from HTTP method
+    const queryType = ['GET', 'HEAD', 'OPTIONS'].includes(req.method)
+      ? 'read' 
+      : 'write';
+    
+    req.db = router.getConnection(queryType, userId);
+    next();
+  };
+}
+
+// Usage with Express
+const router = new ReadWriteRouter(primaryPool, [replica1, replica2]);
+
+app.use(dbMiddleware(router));
+
+app.get('/api/users/:id', async (req, res) => {
+  // Automatically routes to replica
+  const result = await req.db.query(
+    'SELECT * FROM users WHERE id = $1',
+    [req.params.id]
+  );
+  res.json(result.rows[0]);
+});
+
+app.put('/api/users/:id', async (req, res) => {
+  // Automatically routes to primary
+  await req.db.query(
+    'UPDATE users SET name = $1 WHERE id = $2',
+    [req.body.name, req.params.id]
+  );
+  res.json({ success: true });
+});
+```
+  </Tab>
+</Tabs>
+
+### Sharding Implementation
+
+![Sharding Strategies](/images/system-design/sharding-implementation.svg)
+
+<Tabs>
+  <Tab title="Python">
+```python
+import hashlib
+from typing import Dict, Any, List
+
+class ShardRouter:
+    """
+    Routes queries to appropriate shard based on shard key.
+    Uses consistent hashing for even distribution.
+    """
+    
+    def __init__(self, shards: Dict[int, Any]):
+        self.shards = shards  # shard_id -> connection pool
+        self.num_shards = len(shards)
+    
+    def get_shard(self, shard_key: str) -> Any:
+        """Get shard connection for a given key"""
+        shard_id = self._compute_shard_id(shard_key)
+        return self.shards[shard_id]
+    
+    def _compute_shard_id(self, key: str) -> int:
+        """Consistent hash to determine shard"""
+        hash_value = int(hashlib.md5(key.encode()).hexdigest(), 16)
+        return hash_value % self.num_shards
+    
+    def execute_on_shard(self, shard_key: str, query: str, params: tuple):
+        """Execute query on appropriate shard"""
+        shard = self.get_shard(shard_key)
+        return shard.execute(query, params)
+    
+    def scatter_gather(self, query: str, params: tuple = None) -> List[Any]:
+        """Execute query on ALL shards and combine results"""
+        results = []
+        for shard_id, shard in self.shards.items():
+            try:
+                result = shard.execute(query, params or ())
+                results.extend(result.fetchall())
+            except Exception as e:
+                print(f"Shard {shard_id} failed: {e}")
+        return results
+
+
+class ShardedUserRepository:
+    """User repository with sharding by user_id"""
+    
+    def __init__(self, shard_router: ShardRouter):
+        self.router = shard_router
+    
+    def create_user(self, user_id: str, data: dict) -> bool:
+        """Create user on appropriate shard"""
+        query = """
+            INSERT INTO users (id, name, email, created_at)
+            VALUES (%s, %s, %s, NOW())
+        """
+        self.router.execute_on_shard(
+            shard_key=user_id,
+            query=query,
+            params=(user_id, data['name'], data['email'])
+        )
+        return True
+    
+    def find_by_id(self, user_id: str) -> dict:
+        """Find user - knows exactly which shard"""
+        query = "SELECT * FROM users WHERE id = %s"
+        result = self.router.execute_on_shard(user_id, query, (user_id,))
+        return result.fetchone()
+    
+    def find_by_email(self, email: str) -> dict:
+        """Find by email - must scatter-gather all shards"""
+        query = "SELECT * FROM users WHERE email = %s"
+        results = self.router.scatter_gather(query, (email,))
+        return results[0] if results else None
+    
+    def get_total_count(self) -> int:
+        """Count across all shards"""
+        query = "SELECT COUNT(*) as count FROM users"
+        results = self.router.scatter_gather(query)
+        return sum(r['count'] for r in results)
+
+
+# Setup
+shards = {
+    0: create_pool("postgresql://localhost:5432/users_shard_0"),
+    1: create_pool("postgresql://localhost:5433/users_shard_1"),
+    2: create_pool("postgresql://localhost:5434/users_shard_2"),
+    3: create_pool("postgresql://localhost:5435/users_shard_3"),
+}
+
+router = ShardRouter(shards)
+repo = ShardedUserRepository(router)
+
+# Usage
+repo.create_user("user_123", {"name": "Alice", "email": "alice@example.com"})
+user = repo.find_by_id("user_123")  # Goes to one shard
+user = repo.find_by_email("alice@example.com")  # Queries ALL shards
+```
+  </Tab>
+  <Tab title="JavaScript">
+```javascript
+const crypto = require('crypto');
+
+class ShardRouter {
+  constructor(shards) {
+    this.shards = shards;  // Map: shardId -> pool
+    this.numShards = Object.keys(shards).length;
+  }
+
+  getShard(shardKey) {
+    const shardId = this.computeShardId(shardKey);
+    return this.shards[shardId];
+  }
+
+  computeShardId(key) {
+    const hash = crypto.createHash('md5').update(key).digest('hex');
+    const hashValue = parseInt(hash.substring(0, 8), 16);
+    return hashValue % this.numShards;
+  }
+
+  async executeOnShard(shardKey, query, params = []) {
+    const shard = this.getShard(shardKey);
+    return await shard.query(query, params);
+  }
+
+  async scatterGather(query, params = []) {
+    const promises = Object.entries(this.shards).map(
+      async ([shardId, shard]) => {
+        try {
+          const result = await shard.query(query, params);
+          return result.rows;
+        } catch (error) {
+          console.error(`Shard ${shardId} failed:`, error);
+          return [];
+        }
+      }
+    );
+
+    const results = await Promise.all(promises);
+    return results.flat();
+  }
+}
+
+class ShardedUserRepository {
+  constructor(shardRouter) {
+    this.router = shardRouter;
+  }
+
+  async createUser(userId, data) {
+    const query = `
+      INSERT INTO users (id, name, email, created_at)
+      VALUES ($1, $2, $3, NOW())
+      RETURNING *
+    `;
+    const result = await this.router.executeOnShard(
+      userId,
+      query,
+      [userId, data.name, data.email]
+    );
+    return result.rows[0];
+  }
+
+  async findById(userId) {
+    const query = 'SELECT * FROM users WHERE id = $1';
+    const result = await this.router.executeOnShard(userId, query, [userId]);
+    return result.rows[0];
+  }
+
+  async findByEmail(email) {
+    // Must query all shards (email is not shard key)
+    const query = 'SELECT * FROM users WHERE email = $1';
+    const results = await this.router.scatterGather(query, [email]);
+    return results[0];
+  }
+
+  async searchByName(namePattern) {
+    // Full scatter-gather search
+    const query = `SELECT * FROM users WHERE name ILIKE $1 LIMIT 100`;
+    return await this.router.scatterGather(query, [`%${namePattern}%`]);
+  }
+
+  async getTotalCount() {
+    const query = 'SELECT COUNT(*) as count FROM users';
+    const results = await this.router.scatterGather(query);
+    return results.reduce((sum, r) => sum + parseInt(r.count), 0);
+  }
+}
+
+// Setup with 4 shards
+const shards = {
+  0: new Pool({ connectionString: 'postgres://localhost:5432/users_0' }),
+  1: new Pool({ connectionString: 'postgres://localhost:5433/users_1' }),
+  2: new Pool({ connectionString: 'postgres://localhost:5434/users_2' }),
+  3: new Pool({ connectionString: 'postgres://localhost:5435/users_3' }),
+};
+
+const router = new ShardRouter(shards);
+const repo = new ShardedUserRepository(router);
+
+// Express routes
+app.post('/api/users', async (req, res) => {
+  const userId = generateId();
+  const user = await repo.createUser(userId, req.body);
+  res.status(201).json(user);
+});
+
+app.get('/api/users/:id', async (req, res) => {
+  const user = await repo.findById(req.params.id);
+  if (!user) return res.status(404).json({ error: 'Not found' });
+  res.json(user);
+});
+```
+  </Tab>
+</Tabs>
+
 ## Query Optimization
 
 ### EXPLAIN ANALYZE
