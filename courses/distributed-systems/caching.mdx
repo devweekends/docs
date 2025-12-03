@@ -1,0 +1,1061 @@
+---
+title: "Distributed Caching"
+sidebarTitle: "Caching"
+description: "Cache architectures, consistency strategies, and patterns for high-performance distributed systems"
+icon: "bolt"
+---
+
+# Distributed Caching
+
+Caching is often the difference between a system that handles 100 QPS and one that handles 1 million QPS. This module covers everything from cache fundamentals to advanced distributed caching patterns.
+
+<Info>
+**Track Duration**: 10-14 hours  
+**Key Topics**: Cache Strategies, Consistency, Invalidation, Redis, Memcached, Cache Stampede  
+**Interview Focus**: Cache consistency, invalidation strategies, hot key handling
+</Info>
+
+---
+
+## Why Caching Matters
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    LATENCY COMPARISON                                        │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  Operation                              Time                                │
+│  ─────────────────────────────────────  ─────────────                       │
+│  L1 cache reference                     0.5 ns                              │
+│  L2 cache reference                     7 ns                                │
+│  Main memory reference                  100 ns                              │
+│  ──────────────────────────────────────────────────                         │
+│  In-memory cache (Redis on localhost)  100-500 μs                           │
+│  In-memory cache (Redis same DC)       1-5 ms                               │
+│  SSD random read                        150 μs                              │
+│  ──────────────────────────────────────────────────                         │
+│  Database query (simple)               1-10 ms                              │
+│  Database query (complex)              10-100 ms                            │
+│  Network round trip (same DC)          0.5-1 ms                             │
+│  Network round trip (cross-region)     50-150 ms                            │
+│                                                                              │
+│  IMPACT OF CACHING:                                                         │
+│  ──────────────────                                                         │
+│  Without cache: 100ms DB query × 1000 QPS = 100 DB connections busy        │
+│  With 99% cache hit: 1ms cache × 990 + 100ms DB × 10 = 2 DB connections    │
+│                                                                              │
+│  CACHING IS A FORCE MULTIPLIER                                              │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Cache Strategies
+
+### Read Strategies
+
+<Tabs>
+  <Tab title="Cache-Aside (Lazy Loading)">
+    Application manages cache explicitly. Most common pattern.
+    
+    ```
+    ┌──────────┐     1. Read      ┌───────────┐
+    │  Client  │ ───────────────► │   Cache   │
+    │          │ ◄─────────────── │  (Redis)  │
+    └────┬─────┘   2. Miss/Hit    └───────────┘
+         │                              │
+         │ 3. On miss,                  │
+         │    read from DB              │
+         ▼                              │
+    ┌──────────┐                        │
+    │ Database │                        │
+    └────┬─────┘                        │
+         │                              │
+         └───── 4. Store in cache ──────┘
+    ```
+    
+    ```python
+    async def get_user(user_id: str) -> User:
+        # 1. Try cache first
+        cached = await cache.get(f"user:{user_id}")
+        if cached:
+            return User.from_json(cached)
+        
+        # 2. Cache miss - read from database
+        user = await db.query("SELECT * FROM users WHERE id = ?", user_id)
+        
+        # 3. Populate cache for next time
+        await cache.set(f"user:{user_id}", user.to_json(), ttl=3600)
+        
+        return user
+    ```
+    
+    **Pros**: Simple, only caches what's needed, cache failures don't break reads
+    **Cons**: Cache miss = slow first read, potential for stale data
+  </Tab>
+  
+  <Tab title="Read-Through">
+    Cache itself fetches from database on miss.
+    
+    ```
+    ┌──────────┐     Read       ┌───────────┐
+    │  Client  │ ─────────────► │   Cache   │
+    │          │ ◄───────────── │  (Layer)  │
+    └──────────┘                └─────┬─────┘
+                                      │
+                                      │ On miss,
+                                      │ cache fetches
+                                      ▼
+                                ┌──────────┐
+                                │ Database │
+                                └──────────┘
+    ```
+    
+    ```python
+    class ReadThroughCache:
+        def __init__(self, cache, loader):
+            self.cache = cache
+            self.loader = loader
+        
+        async def get(self, key: str):
+            cached = await self.cache.get(key)
+            if cached is not None:
+                return cached
+            
+            # Cache handles loading
+            value = await self.loader(key)
+            await self.cache.set(key, value)
+            return value
+    
+    # Usage
+    cache = ReadThroughCache(
+        redis_client,
+        loader=lambda key: db.get_user(key.split(":")[1])
+    )
+    user = await cache.get("user:123")
+    ```
+    
+    **Pros**: Simpler application code, centralized caching logic
+    **Cons**: Cache must understand data model, less flexible
+  </Tab>
+  
+  <Tab title="Refresh-Ahead">
+    Proactively refresh cache before expiration.
+    
+    ```
+    ┌──────────────────────────────────────────────┐
+    │  Timeline for cached item (TTL = 60s)        │
+    │                                              │
+    │  0s        45s            60s                │
+    │  ├──────────┼──────────────┼                 │
+    │  │ CACHED   │ REFRESH ZONE │ EXPIRED         │
+    │  │          │              │                 │
+    │  └──────────┴──────────────┴                 │
+    │                                              │
+    │  When accessed in refresh zone:              │
+    │  1. Return current cached value immediately  │
+    │  2. Async: Fetch fresh value, update cache   │
+    │                                              │
+    └──────────────────────────────────────────────┘
+    ```
+    
+    ```python
+    async def get_with_refresh_ahead(key: str, ttl: int = 60, refresh_at: int = 45):
+        cached, remaining_ttl = await cache.get_with_ttl(key)
+        
+        if cached is None:
+            # Cache miss - fetch and cache
+            value = await fetch_from_db(key)
+            await cache.set(key, value, ttl=ttl)
+            return value
+        
+        # Check if we're in the refresh zone
+        if remaining_ttl < (ttl - refresh_at):
+            # Trigger async refresh
+            asyncio.create_task(refresh_cache(key, ttl))
+        
+        # Return cached value immediately
+        return cached
+    
+    async def refresh_cache(key: str, ttl: int):
+        value = await fetch_from_db(key)
+        await cache.set(key, value, ttl=ttl)
+    ```
+    
+    **Pros**: Always fast reads, data stays fresh
+    **Cons**: Complex, may refresh data that's never read again
+  </Tab>
+</Tabs>
+
+### Write Strategies
+
+<Tabs>
+  <Tab title="Write-Through">
+    Write to cache AND database synchronously.
+    
+    ```
+    ┌──────────┐     Write      ┌───────────┐     Write     ┌──────────┐
+    │  Client  │ ─────────────► │   Cache   │ ─────────────►│ Database │
+    │          │ ◄───────────── │  (Sync)   │ ◄─────────────│          │
+    └──────────┘      ACK       └───────────┘      ACK      └──────────┘
+    ```
+    
+    ```python
+    async def update_user(user_id: str, data: dict):
+        # Write to database first (source of truth)
+        await db.update("UPDATE users SET ... WHERE id = ?", user_id, data)
+        
+        # Then update cache
+        user = await db.get_user(user_id)
+        await cache.set(f"user:{user_id}", user.to_json(), ttl=3600)
+        
+        return user
+    ```
+    
+    **Pros**: Cache always consistent, no stale data
+    **Cons**: Higher write latency, both must succeed
+  </Tab>
+  
+  <Tab title="Write-Behind (Write-Back)">
+    Write to cache immediately, persist to DB asynchronously.
+    
+    ```
+    ┌──────────┐     Write      ┌───────────┐
+    │  Client  │ ─────────────► │   Cache   │
+    │          │ ◄───────────── │           │
+    └──────────┘      ACK       └─────┬─────┘
+                                      │
+                                      │ Async (batched)
+                                      ▼
+                                ┌──────────┐
+                                │ Database │
+                                └──────────┘
+    ```
+    
+    ```python
+    class WriteBehindCache:
+        def __init__(self, cache, db, batch_size=100, flush_interval=1.0):
+            self.cache = cache
+            self.db = db
+            self.pending_writes = []
+            self.batch_size = batch_size
+            self.flush_interval = flush_interval
+            asyncio.create_task(self._flush_loop())
+        
+        async def write(self, key: str, value: any):
+            # Write to cache immediately
+            await self.cache.set(key, value)
+            
+            # Queue for database write
+            self.pending_writes.append((key, value))
+            
+            if len(self.pending_writes) >= self.batch_size:
+                await self._flush()
+        
+        async def _flush(self):
+            if not self.pending_writes:
+                return
+            
+            batch = self.pending_writes
+            self.pending_writes = []
+            
+            # Batch write to database
+            await self.db.batch_upsert(batch)
+        
+        async def _flush_loop(self):
+            while True:
+                await asyncio.sleep(self.flush_interval)
+                await self._flush()
+    ```
+    
+    **Pros**: Very fast writes, reduced DB load (batching)
+    **Cons**: Data loss risk if cache fails before persist, complex
+  </Tab>
+  
+  <Tab title="Write-Around">
+    Write directly to database, don't update cache.
+    
+    ```
+    ┌──────────┐                 ┌───────────┐
+    │  Client  │                 │   Cache   │
+    └────┬─────┘                 └───────────┘
+         │
+         │ Write directly
+         ▼
+    ┌──────────┐
+    │ Database │
+    └──────────┘
+    ```
+    
+    ```python
+    async def update_user(user_id: str, data: dict):
+        # Write to database only
+        await db.update("UPDATE users SET ... WHERE id = ?", user_id, data)
+        
+        # Either invalidate cache (let it refetch)
+        await cache.delete(f"user:{user_id}")
+        
+        # Or let TTL expire naturally
+        # (depends on staleness tolerance)
+    ```
+    
+    **Pros**: Simple, good for write-heavy infrequently-read data
+    **Cons**: First read after write is slow
+  </Tab>
+</Tabs>
+
+---
+
+## Cache Invalidation
+
+<Warning>
+**"There are only two hard things in Computer Science: cache invalidation and naming things."** — Phil Karlton
+</Warning>
+
+### Invalidation Strategies
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    CACHE INVALIDATION APPROACHES                             │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  1. TTL (Time To Live)                                                      │
+│  ─────────────────────                                                      │
+│  Set expiration time on each entry                                          │
+│  Simple but may serve stale data until expiry                               │
+│                                                                              │
+│  cache.set("user:123", data, ttl=3600)  # Expires in 1 hour                │
+│                                                                              │
+│  2. EXPLICIT INVALIDATION                                                   │
+│  ────────────────────────                                                   │
+│  Delete from cache when data changes                                        │
+│  Must track all places that cache data                                      │
+│                                                                              │
+│  await db.update_user(user_id, data)                                       │
+│  await cache.delete(f"user:{user_id}")                                     │
+│                                                                              │
+│  3. EVENT-DRIVEN INVALIDATION                                               │
+│  ────────────────────────────                                               │
+│  Publish events when data changes                                           │
+│  Cache subscribers invalidate on events                                     │
+│                                                                              │
+│  Database → Event Bus → Cache Invalidator                                   │
+│     (CDC)     (Kafka)     (Consumer)                                        │
+│                                                                              │
+│  4. VERSION-BASED INVALIDATION                                              │
+│  ─────────────────────────────                                              │
+│  Include version in cache key                                               │
+│  Bump version to invalidate all entries                                     │
+│                                                                              │
+│  cache.get(f"user:{user_id}:v{version}")                                   │
+│  # Change version to invalidate all user caches                             │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### The Delete vs Update Debate
+
+```python
+# APPROACH 1: Delete on write (RECOMMENDED)
+async def update_user(user_id: str, data: dict):
+    await db.update_user(user_id, data)
+    await cache.delete(f"user:{user_id}")  # Let next read populate
+    
+# APPROACH 2: Update on write
+async def update_user(user_id: str, data: dict):
+    updated_user = await db.update_user(user_id, data)
+    await cache.set(f"user:{user_id}", updated_user, ttl=3600)
+```
+
+**Why Delete is Usually Better**:
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    DELETE vs UPDATE                                          │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  RACE CONDITION with UPDATE:                                                │
+│  ────────────────────────────                                               │
+│                                                                              │
+│  Thread 1                              Thread 2                             │
+│  ────────                              ────────                             │
+│  1. Read user (version 1)                                                   │
+│                                        2. Read user (version 1)             │
+│  3. Write user (version 2)                                                  │
+│                                        4. Write user (version 3)            │
+│  5. Update cache (version 2)                                                │
+│                                        6. Update cache (version 3)          │
+│                                                                              │
+│  If steps complete in order: 1,2,3,5,4,6 → Cache has version 3 (correct)   │
+│  If steps complete as: 1,2,3,4,5,6 → Cache has version 2 (WRONG!)          │
+│                                                                              │
+│  ═══════════════════════════════════════════════════════════════════════    │
+│                                                                              │
+│  DELETE is SAFER:                                                           │
+│  ────────────────                                                           │
+│                                                                              │
+│  Thread 1: Write version 2, DELETE cache                                   │
+│  Thread 2: Write version 3, DELETE cache                                   │
+│                                                                              │
+│  Cache is empty, next read gets version 3 (correct!)                       │
+│                                                                              │
+│  EXCEPTION: Update is OK if you use compare-and-swap                       │
+│  (check version before updating cache)                                      │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Cache Stampede (Thundering Herd)
+
+When a popular cache key expires, many requests simultaneously hit the database.
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    CACHE STAMPEDE                                            │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  Timeline:                                                                  │
+│                                                                              │
+│  t=0     Key "popular" cached (TTL 60s)                                    │
+│  t=59    1000 requests/second hitting cache ✓                              │
+│  t=60    Cache expires! All 1000 requests now hit DB simultaneously!       │
+│          DB overwhelmed → slow response → more requests pile up            │
+│                                                                              │
+│  Requests:  ──────────────────────────█████████████████████████            │
+│  Cache:     ████████████████████████──────────────────────────             │
+│  Database:  ───────────────────────███████████████████████████             │
+│                                     ↑                                       │
+│                                     Stampede!                               │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Stampede Prevention Strategies
+
+<Tabs>
+  <Tab title="Locking (Single Flight)">
+    Only one request fetches, others wait.
+    
+    ```python
+    import asyncio
+    from typing import Dict
+    
+    class SingleFlight:
+        """
+        Deduplicates concurrent requests for the same key.
+        Only one fetch happens, all waiters get the result.
+        """
+        
+        def __init__(self):
+            self._in_flight: Dict[str, asyncio.Future] = {}
+        
+        async def do(self, key: str, fetch_func) -> any:
+            if key in self._in_flight:
+                # Wait for in-flight request
+                return await self._in_flight[key]
+            
+            # We're the first, create a future
+            future = asyncio.Future()
+            self._in_flight[key] = future
+            
+            try:
+                result = await fetch_func()
+                future.set_result(result)
+                return result
+            except Exception as e:
+                future.set_exception(e)
+                raise
+            finally:
+                del self._in_flight[key]
+    
+    # Usage
+    single_flight = SingleFlight()
+    
+    async def get_user(user_id: str):
+        cached = await cache.get(f"user:{user_id}")
+        if cached:
+            return cached
+        
+        # All concurrent requests for same user will share one DB query
+        user = await single_flight.do(
+            f"user:{user_id}",
+            lambda: db.get_user(user_id)
+        )
+        
+        await cache.set(f"user:{user_id}", user, ttl=3600)
+        return user
+    ```
+    
+    **Pros**: Prevents duplicate DB queries
+    **Cons**: All waiters blocked on one request
+  </Tab>
+  
+  <Tab title="Probabilistic Early Expiry">
+    Refresh before expiry with some probability.
+    
+    ```python
+    import random
+    import math
+    
+    async def get_with_probabilistic_refresh(
+        key: str,
+        fetch_func,
+        ttl: int = 3600,
+        beta: float = 1.0  # Controls refresh aggressiveness
+    ):
+        cached, remaining_ttl = await cache.get_with_ttl(key)
+        
+        if cached is None:
+            # Cache miss
+            value = await fetch_func()
+            await cache.set(key, value, ttl=ttl)
+            return value
+        
+        # Calculate probability of refresh
+        # Higher probability as TTL approaches 0
+        expiry_gap = remaining_ttl / ttl
+        random_factor = random.random()
+        should_refresh = random_factor > math.exp(-beta * math.log(1 / expiry_gap))
+        
+        if should_refresh:
+            # Refresh in background
+            asyncio.create_task(_refresh(key, fetch_func, ttl))
+        
+        return cached
+    
+    async def _refresh(key: str, fetch_func, ttl: int):
+        value = await fetch_func()
+        await cache.set(key, value, ttl=ttl)
+    ```
+    
+    **Pros**: Spreads refreshes over time, no locks
+    **Cons**: May still have some concurrent refreshes
+  </Tab>
+  
+  <Tab title="External Lock (Redis Lock)">
+    Use distributed lock for refresh.
+    
+    ```python
+    async def get_with_lock(key: str, fetch_func, ttl: int = 3600):
+        cached = await cache.get(key)
+        if cached:
+            return cached
+        
+        lock_key = f"lock:{key}"
+        
+        # Try to acquire lock
+        acquired = await cache.set_nx(lock_key, "1", ttl=10)  # 10s lock timeout
+        
+        if acquired:
+            try:
+                # We have the lock, fetch and cache
+                value = await fetch_func()
+                await cache.set(key, value, ttl=ttl)
+                return value
+            finally:
+                await cache.delete(lock_key)
+        else:
+            # Another process is fetching, wait and retry
+            for _ in range(10):  # Max 10 retries
+                await asyncio.sleep(0.1)  # 100ms
+                cached = await cache.get(key)
+                if cached:
+                    return cached
+            
+            # Give up waiting, fetch ourselves
+            return await fetch_func()
+    ```
+    
+    **Pros**: Only one fetch, works across processes
+    **Cons**: Lock overhead, potential deadlocks if not careful
+  </Tab>
+  
+  <Tab title="Stale-While-Revalidate">
+    Serve stale data while refreshing in background.
+    
+    ```python
+    async def get_stale_while_revalidate(
+        key: str,
+        fetch_func,
+        ttl: int = 3600,
+        stale_ttl: int = 7200  # Serve stale for 2 hours
+    ):
+        cached, remaining_ttl = await cache.get_with_ttl(key)
+        
+        if cached is None:
+            # Complete miss
+            value = await fetch_func()
+            await cache.set(key, value, ttl=stale_ttl)
+            await cache.set(f"{key}:fresh_until", time.time() + ttl, ttl=stale_ttl)
+            return value
+        
+        fresh_until = await cache.get(f"{key}:fresh_until") or 0
+        
+        if time.time() > fresh_until:
+            # Data is stale, refresh in background
+            asyncio.create_task(_refresh(key, fetch_func, ttl, stale_ttl))
+        
+        # Return cached data (possibly stale)
+        return cached
+    
+    async def _refresh(key: str, fetch_func, ttl: int, stale_ttl: int):
+        value = await fetch_func()
+        await cache.set(key, value, ttl=stale_ttl)
+        await cache.set(f"{key}:fresh_until", time.time() + ttl, ttl=stale_ttl)
+    ```
+    
+    **Pros**: Always fast, never blocks on refresh
+    **Cons**: May serve stale data, more complex
+  </Tab>
+</Tabs>
+
+---
+
+## Hot Key Problem
+
+When one key gets disproportionate traffic.
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    HOT KEY PROBLEM                                           │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  SCENARIO:                                                                  │
+│  Celebrity tweet goes viral, "tweet:12345" gets 100K QPS                   │
+│  All requests go to ONE Redis node (key-based sharding)                    │
+│  That node becomes bottleneck, even if others are idle                     │
+│                                                                              │
+│  ┌─────────────┐                                                            │
+│  │ Redis Node 1│ ← 100K QPS (overwhelmed!)                                 │
+│  │ tweet:12345 │                                                            │
+│  └─────────────┘                                                            │
+│  ┌─────────────┐                                                            │
+│  │ Redis Node 2│ ← 1K QPS (idle)                                           │
+│  │ other keys  │                                                            │
+│  └─────────────┘                                                            │
+│  ┌─────────────┐                                                            │
+│  │ Redis Node 3│ ← 1K QPS (idle)                                           │
+│  │ other keys  │                                                            │
+│  └─────────────┘                                                            │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Hot Key Solutions
+
+<Tabs>
+  <Tab title="Local Cache (L1)">
+    Add in-process cache before Redis.
+    
+    ```python
+    from functools import lru_cache
+    import time
+    
+    class TwoLevelCache:
+        """
+        L1: In-process (fast, small, per-instance)
+        L2: Distributed (slower, large, shared)
+        """
+        
+        def __init__(self, l2_client, l1_max_size=1000, l1_ttl=10):
+            self.l2 = l2_client
+            self.l1_ttl = l1_ttl
+            self.l1 = {}  # {key: (value, expire_at)}
+        
+        async def get(self, key: str):
+            # Check L1 first
+            if key in self.l1:
+                value, expire_at = self.l1[key]
+                if time.time() < expire_at:
+                    return value
+                del self.l1[key]
+            
+            # L1 miss, check L2
+            value = await self.l2.get(key)
+            
+            if value is not None:
+                # Store in L1 for next time
+                self.l1[key] = (value, time.time() + self.l1_ttl)
+            
+            return value
+    
+    # Hot keys served from memory, never hit Redis!
+    ```
+    
+    **Pros**: Extremely fast, reduces L2 load
+    **Cons**: Inconsistency between instances, memory usage
+  </Tab>
+  
+  <Tab title="Key Replication">
+    Spread hot key across multiple shards.
+    
+    ```python
+    import random
+    
+    class ReplicatedKeyCache:
+        """
+        Replicate hot keys across multiple logical slots.
+        Reads pick a random replica, writes update all.
+        """
+        
+        def __init__(self, cache, replicas=10):
+            self.cache = cache
+            self.replicas = replicas
+            self.hot_keys = set()  # Track known hot keys
+        
+        def _get_replica_key(self, key: str, replica: int = None) -> str:
+            if replica is None:
+                replica = random.randint(0, self.replicas - 1)
+            return f"{key}:replica:{replica}"
+        
+        async def get(self, key: str):
+            if key in self.hot_keys:
+                # Pick random replica
+                replica_key = self._get_replica_key(key)
+                return await self.cache.get(replica_key)
+            return await self.cache.get(key)
+        
+        async def set_hot(self, key: str, value: any, ttl: int = 3600):
+            """Set a known hot key across all replicas"""
+            self.hot_keys.add(key)
+            
+            # Write to all replicas
+            tasks = [
+                self.cache.set(self._get_replica_key(key, i), value, ttl=ttl)
+                for i in range(self.replicas)
+            ]
+            await asyncio.gather(*tasks)
+        
+        async def delete_hot(self, key: str):
+            """Delete hot key from all replicas"""
+            self.hot_keys.discard(key)
+            
+            tasks = [
+                self.cache.delete(self._get_replica_key(key, i))
+                for i in range(self.replicas)
+            ]
+            await asyncio.gather(*tasks)
+    ```
+    
+    **Pros**: Spreads load across cluster
+    **Cons**: More storage, complex invalidation
+  </Tab>
+  
+  <Tab title="Request Coalescing">
+    Batch concurrent requests for same key.
+    
+    ```python
+    from collections import defaultdict
+    import asyncio
+    
+    class RequestCoalescer:
+        """
+        Coalesce concurrent requests for the same key.
+        Instead of N cache hits, do 1 cache hit and broadcast result.
+        """
+        
+        def __init__(self, cache, batch_window_ms=5):
+            self.cache = cache
+            self.batch_window = batch_window_ms / 1000
+            self.pending = defaultdict(list)  # key -> [(event, result_holder)]
+            self._lock = asyncio.Lock()
+        
+        async def get(self, key: str):
+            async with self._lock:
+                if key in self.pending:
+                    # Join existing batch
+                    event = asyncio.Event()
+                    result_holder = {'value': None, 'error': None}
+                    self.pending[key].append((event, result_holder))
+                    
+                    # Wait outside lock
+                    async with self._lock:
+                        pass
+                    await event.wait()
+                    
+                    if result_holder['error']:
+                        raise result_holder['error']
+                    return result_holder['value']
+                
+                # Start a new batch
+                self.pending[key] = []
+            
+            # Wait for more requests to join
+            await asyncio.sleep(self.batch_window)
+            
+            # Get waiters and clear
+            async with self._lock:
+                waiters = self.pending.pop(key, [])
+            
+            # Fetch once
+            try:
+                value = await self.cache.get(key)
+                
+                # Notify all waiters
+                for event, result_holder in waiters:
+                    result_holder['value'] = value
+                    event.set()
+                
+                return value
+            
+            except Exception as e:
+                for event, result_holder in waiters:
+                    result_holder['error'] = e
+                    event.set()
+                raise
+    ```
+    
+    **Pros**: Reduces cache hits by order of magnitude
+    **Cons**: Adds small latency (batch window), complex
+  </Tab>
+</Tabs>
+
+---
+
+## Distributed Cache Architectures
+
+### Redis Cluster
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    REDIS CLUSTER ARCHITECTURE                                │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  16,384 HASH SLOTS distributed across nodes:                                │
+│                                                                              │
+│  ┌─────────────────────────────────────────────────────────────────────┐    │
+│  │                        Hash Slots                                   │    │
+│  │  0      5460    5461    10922   10923    16383                     │    │
+│  │  ├───────┼───────┼────────┼───────┼────────┤                       │    │
+│  │  │ Node A│       │ Node B │       │ Node C │                       │    │
+│  │  └───────┴───────┴────────┴───────┴────────┘                       │    │
+│  └─────────────────────────────────────────────────────────────────────┘    │
+│                                                                              │
+│  REPLICATION FOR HIGH AVAILABILITY:                                         │
+│                                                                              │
+│  ┌─────────────┐   ┌─────────────┐   ┌─────────────┐                       │
+│  │   Node A    │   │   Node B    │   │   Node C    │                       │
+│  │   (Master)  │   │   (Master)  │   │   (Master)  │                       │
+│  └──────┬──────┘   └──────┬──────┘   └──────┬──────┘                       │
+│         │                 │                 │                               │
+│         ▼                 ▼                 ▼                               │
+│  ┌─────────────┐   ┌─────────────┐   ┌─────────────┐                       │
+│  │   Node A'   │   │   Node B'   │   │   Node C'   │                       │
+│  │   (Replica) │   │   (Replica) │   │   (Replica) │                       │
+│  └─────────────┘   └─────────────┘   └─────────────┘                       │
+│                                                                              │
+│  KEY ROUTING:                                                               │
+│  ────────────                                                               │
+│  slot = CRC16(key) % 16384                                                  │
+│  Route to node owning that slot                                             │
+│                                                                              │
+│  HASH TAGS (force keys to same slot):                                       │
+│  {user:123}:profile  ─┐                                                     │
+│  {user:123}:settings ─┼─ Same slot (hash computed on "user:123")           │
+│  {user:123}:orders   ─┘                                                     │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Memcached vs Redis
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    MEMCACHED vs REDIS COMPARISON                             │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  FEATURE              MEMCACHED           REDIS                             │
+│  ───────              ─────────           ─────                             │
+│  Data structures      Strings only        Strings, Lists, Sets,            │
+│                                           Hashes, Sorted Sets,              │
+│                                           Streams, HyperLogLog              │
+│                                                                              │
+│  Persistence          None                RDB snapshots, AOF                │
+│                       (pure cache)        (can be persistent)               │
+│                                                                              │
+│  Replication          None built-in       Master-replica                    │
+│                                           (async by default)                │
+│                                                                              │
+│  Clustering           Client-side         Redis Cluster                     │
+│                       sharding            (automatic sharding)              │
+│                                                                              │
+│  Memory efficiency    Better for          More overhead per key            │
+│                       small values                                          │
+│                                                                              │
+│  Threading            Multi-threaded      Single-threaded (mostly)          │
+│                       (better multi-core) (simpler, no locks)               │
+│                                                                              │
+│  Eviction             LRU, random         LRU, LFU, volatile-lru,          │
+│                                           volatile-ttl, etc.                │
+│                                                                              │
+│  ═══════════════════════════════════════════════════════════════════════    │
+│                                                                              │
+│  USE MEMCACHED WHEN:                                                        │
+│  • Pure caching (ephemeral data)                                            │
+│  • Simple key-value with large fan-out                                      │
+│  • Need multi-threaded performance                                          │
+│                                                                              │
+│  USE REDIS WHEN:                                                            │
+│  • Need complex data structures                                             │
+│  • Pub/sub, streams, or queues                                              │
+│  • Need persistence or replication                                          │
+│  • Lua scripting for atomic operations                                      │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Cache Consistency Patterns
+
+### Eventual Consistency
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    CACHE CONSISTENCY APPROACHES                              │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  1. CACHE-ASIDE (Common, Eventually Consistent)                             │
+│     ───────────────────────────────────────────                             │
+│     Write: Update DB, delete cache                                          │
+│     Read:  Check cache, miss → read DB → populate cache                     │
+│                                                                              │
+│     Consistency gap: Between DB write and cache delete                      │
+│     Another request might read stale data                                   │
+│                                                                              │
+│  2. READ-YOUR-WRITES CONSISTENCY                                            │
+│     ────────────────────────────────                                        │
+│     After writing, user always sees their own write                         │
+│                                                                              │
+│     Implementation: Session-local cache or sticky sessions                  │
+│                                                                              │
+│  3. DOUBLE-DELETE PATTERN                                                   │
+│     ──────────────────────                                                  │
+│     1. Delete cache                                                         │
+│     2. Update database                                                      │
+│     3. Wait (e.g., 500ms)                                                   │
+│     4. Delete cache again                                                   │
+│                                                                              │
+│     Why? Prevents race condition where stale read re-populates cache       │
+│                                                                              │
+│  4. CDC (Change Data Capture)                                               │
+│     ──────────────────────────                                              │
+│     Database → Debezium → Kafka → Cache Invalidator                        │
+│                                                                              │
+│     Reliable, ordered, but adds latency                                     │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Double-Delete Implementation
+
+```python
+async def update_user_with_double_delete(user_id: str, data: dict):
+    """
+    Double-delete pattern for better cache consistency.
+    
+    Timeline:
+    1. Delete cache (invalidate current stale entry)
+    2. Update database
+    3. Wait for replication lag + processing time
+    4. Delete cache again (catch any reads that slipped through)
+    """
+    cache_key = f"user:{user_id}"
+    
+    # First delete
+    await cache.delete(cache_key)
+    
+    # Update database
+    await db.update_user(user_id, data)
+    
+    # Schedule second delete
+    asyncio.create_task(_delayed_delete(cache_key, delay=0.5))
+
+async def _delayed_delete(key: str, delay: float):
+    await asyncio.sleep(delay)
+    await cache.delete(key)
+```
+
+---
+
+## Interview Questions
+
+<AccordionGroup>
+  <Accordion title="Q: How would you design a caching layer for a social media feed?" icon="rss">
+    **Key considerations**:
+    
+    1. **Cache structure**:
+       - User's feed: `feed:{user_id}` → List of post IDs
+       - Individual posts: `post:{post_id}` → Post data
+       - Two-level: Feed IDs (small) + Post content (larger, reusable)
+    
+    2. **Invalidation strategy**:
+       - New post: Fan-out to update all follower feeds
+       - For large fan-out (celebrities): Don't fan-out, pull on read
+       - Post edit/delete: Delete post cache, let feed IDs remain
+    
+    3. **Hot keys (celebrity posts)**:
+       - Local L1 cache + remote L2
+       - Replicate across shards
+       - Consider CDN for very popular content
+    
+    4. **Consistency**:
+       - Eventual is usually acceptable for feeds
+       - Author should see own posts immediately (read-your-writes)
+  </Accordion>
+  
+  <Accordion title="Q: How do you handle cache stampede for a popular product page?" icon="cart-shopping">
+    **Solutions in order of sophistication**:
+    
+    1. **Single-flight**: Only one DB query, others wait
+    2. **Lock with fallback**: If can't get lock, serve stale
+    3. **Probabilistic refresh**: Spread expiry over time
+    4. **Stale-while-revalidate**: Always serve stale, refresh async
+    
+    **Best approach**: Combine single-flight + stale-while-revalidate
+    - Always fast response (stale is OK for products)
+    - Background refresh prevents stampede
+    - Single-flight prevents duplicate refreshes
+  </Accordion>
+  
+  <Accordion title="Q: When would you use cache-aside vs write-through?" icon="pen">
+    **Cache-Aside (lazy loading)**:
+    - Read-heavy workloads
+    - When not all data needs to be cached
+    - When cache failure shouldn't break writes
+    - Most common for web applications
+    
+    **Write-Through**:
+    - When cache consistency is critical
+    - Write-heavy workloads where you need fast subsequent reads
+    - When you can tolerate higher write latency
+    
+    **Write-Behind**:
+    - Write-heavy, read-light workloads
+    - When you can batch database writes
+    - When you can tolerate potential data loss
+    - Gaming leaderboards, view counts, etc.
+  </Accordion>
+</AccordionGroup>
+
+---
+
+## Key Takeaways
+
+<CardGroup cols={2}>
+  <Card title="Cache Strategically" icon="bullseye">
+    Not everything needs caching. Cache hot paths where latency matters most.
+  </Card>
+  <Card title="Plan for Invalidation" icon="trash">
+    Design invalidation strategy upfront. Delete is usually safer than update.
+  </Card>
+  <Card title="Handle the Stampede" icon="users">
+    Popular keys + expiration = danger. Use locking, probabilities, or stale serving.
+  </Card>
+  <Card title="Accept Eventual Consistency" icon="clock-rotate-left">
+    For most use cases, eventual is fine. Build UX around it.
+  </Card>
+</CardGroup>
