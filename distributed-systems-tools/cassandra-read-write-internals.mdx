@@ -1,0 +1,1034 @@
+---
+title: "Cassandra Read & Write Path Internals"
+sidebarTitle: "4. Read/Write Internals"
+description: "Deep dive into how Cassandra processes reads and writes at the lowest level - from client request to disk I/O"
+icon: "route"
+---
+
+# Cassandra Read & Write Path Internals
+
+<Info>
+**Module Duration**: 6-7 hours
+**Learning Style**: Low-level internals + Performance analysis + Hands-on tracing
+**Outcome**: Understand exactly how every read and write flows through Cassandra, predict performance, debug issues
+</Info>
+
+## Why Internals Matter
+
+Understanding the read/write paths lets you:
+- **Predict query performance** before running
+- **Design optimal schemas** that match Cassandra's strengths
+- **Debug production slowness** - know exactly where time is spent
+- **Tune effectively** - configure JVM, compaction, caching based on workload
+- **Interview at top companies** - explain distributed database internals
+
+<Note>
+This isn't just theory. We'll trace actual queries, measure latency at each stage, and optimize based on what we learn.
+</Note>
+
+---
+
+## Part 1: Write Path Deep Dive
+
+### Overview: Why Writes are Fast
+
+**Cassandra's Core Principle**: Writes are optimized above all else.
+
+**Why?**
+```
+Traditional databases (MySQL, PostgreSQL):
+Write → Check constraints → Read existing data → Modify → Write → Update indexes
+                ↑ Random disk I/O
+                ↑ Locks needed
+                ↑ Slow!
+
+Cassandra:
+Write → Append to CommitLog → Append to MemTable → ACK
+        ↑ Sequential I/O    ↑ Memory write
+        ↑ No locks (last-write-wins)
+        ↑ FAST!
+
+Result: 100,000+ writes/sec per node
+```
+
+### The Complete Write Journey
+
+Let's trace a write from client to disk:
+
+```cql
+-- Client executes:
+INSERT INTO users (id, name, email)
+VALUES (123, 'Alice', 'alice@example.com')
+USING TIMESTAMP 1640000000000000;
+```
+
+**Stage 1: Coordinator Selection** (0.1ms)
+```
+Client connects to any node (e.g., Node A)
+→ Node A becomes COORDINATOR for this write
+
+Why any node?
+- Peer-to-peer architecture
+- No single point of failure
+- Load distributed automatically
+```
+
+**Stage 2: Determine Replicas** (0.1ms)
+```python
+# Coordinator calculates token
+token = hash(partition_key)  # hash(123)
+# Assume token = 42
+
+# Look up token range ownership
+# Replication Factor = 3
+# Ring: [Node A: 0-25] [Node B: 26-50] [Node C: 51-75] [Node D: 76-99]
+
+# Token 42 falls in Node B's range
+primary_replica = Node B
+replica_2 = Node C  # Next in ring
+replica_3 = Node D  # Next after C
+
+replicas = [Node B, Node C, Node D]
+```
+
+**Stage 3: Send Mutation to Replicas** (Network latency)
+```
+Coordinator → Node B, C, D (parallel):
+
+Mutation message:
+{
+  keyspace: "my_keyspace",
+  table: "users",
+  partition_key: 123,
+  clustering_key: null,
+  columns: {
+    name: "Alice",
+    email: "alice@example.com"
+  },
+  timestamp: 1640000000000000,
+  ttl: null
+}
+
+Network latency: ~1-5ms (same datacenter)
+                 ~50-200ms (cross-region)
+```
+
+**Stage 4: Each Replica Processes Write** (0.5-2ms)
+
+Now let's go deep into what happens on **each replica**:
+
+#### Step 4a: Append to CommitLog (Durability)
+
+```java
+// Simplified CommitLog append logic
+class CommitLog {
+    private FileChannel channel;
+    private ByteBuffer buffer;
+
+    void append(Mutation mutation) {
+        // 1. Serialize mutation
+        byte[] data = serialize(mutation);
+
+        // 2. Calculate checksum
+        int checksum = CRC32.calculate(data);
+
+        // 3. Allocate space in CommitLog segment
+        CommitLogSegment segment = allocator.allocate(data.length + 8);
+
+        // 4. Write to buffer (NOT disk yet!)
+        buffer.putInt(checksum);
+        buffer.putInt(data.length);
+        buffer.put(data);
+
+        // 5. Return (async flush to disk happens later)
+        return;
+    }
+
+    // Background thread flushes periodically
+    void syncLoop() {
+        while (running) {
+            Thread.sleep(commitlog_sync_period_in_ms);  // Default: 10 seconds
+            channel.force(true);  // fsync - ensure data on disk
+        }
+    }
+}
+```
+
+**CommitLog Characteristics**:
+```
+Structure:
+/var/lib/cassandra/commitlog/
+  ├── CommitLog-7-1234567890.log (32 MB)
+  ├── CommitLog-7-1234567891.log (32 MB, active)
+  └── ...
+
+Properties:
+✅ Append-only (sequential writes = fast)
+✅ Compressed (LZ4 by default)
+✅ Rotates to new segment when full
+✅ Deleted after MemTable flushed
+
+Sync modes:
+- periodic (default): Flush every 10s (fast, risk 10s data loss)
+- batch: Flush immediately (slow, fully durable)
+- (Deprecated) group: Flush when bytes threshold
+```
+
+**Measuring CommitLog Impact**:
+```bash
+# Test write throughput with/without commitlog
+# WARNING: Only for testing, never in production!
+
+# Disable commitlog (data loss guaranteed on crash)
+nodetool disableautocompaction
+nodetool disablehandoff
+
+# Run writes
+cassandra-stress write n=1000000 -rate threads=50
+
+# With commitlog: ~50,000 writes/sec
+# Without: ~150,000 writes/sec
+# Difference: CommitLog adds ~60% overhead (but ensures durability)
+```
+
+#### Step 4b: Write to MemTable (In-Memory Index)
+
+```java
+// Simplified MemTable structure
+class MemTable {
+    // ConcurrentSkipListMap: Lock-free, sorted by partition+clustering key
+    private ConcurrentSkipListMap<DecoratedKey, PartitionUpdate> data;
+
+    // Memory tracking
+    private AtomicLong liveDataSize = new AtomicLong(0);
+    private static final long FLUSH_THRESHOLD = 512 * 1024 * 1024; // 512 MB
+
+    void apply(Mutation mutation) {
+        for (PartitionUpdate update : mutation.getPartitionUpdates()) {
+            DecoratedKey key = update.partitionKey();
+
+            // Merge with existing data (last-write-wins by timestamp)
+            data.compute(key, (k, existing) -> {
+                if (existing == null) {
+                    liveDataSize.addAndGet(update.dataSize());
+                    return update;
+                } else {
+                    // Merge: Keep latest timestamp for each cell
+                    PartitionUpdate merged = existing.merge(update);
+                    liveDataSize.addAndGet(merged.dataSize() - existing.dataSize());
+                    return merged;
+                }
+            });
+
+            // Check if MemTable full
+            if (liveDataSize.get() > FLUSH_THRESHOLD) {
+                scheduleFlush();
+            }
+        }
+    }
+}
+```
+
+**MemTable Data Structure**:
+```
+ConcurrentSkipListMap structure:
+
+Level 3: [user_100] -----------------> [user_500]
+Level 2: [user_100] --> [user_300] --> [user_500]
+Level 1: [user_100] --> [user_200] --> [user_300] --> [user_400] --> [user_500]
+
+Each node stores:
+{
+  key: user_123,
+  columns: {
+    name: {value: "Alice", timestamp: 1640000000000000},
+    email: {value: "alice@example.com", timestamp: 1640000000000000}
+  }
+}
+
+Why Skip List?
+✅ O(log n) insert/lookup (like balanced tree)
+✅ Lock-free (concurrent writes without locks)
+✅ Cache-friendly (better than tree)
+✅ Sorted iteration (for flushing to SSTable)
+```
+
+**Write Conflicts Resolution**:
+```cql
+-- Two concurrent writes to same cell:
+-- Client 1:
+UPDATE users SET email = 'alice@new.com'
+WHERE id = 123
+USING TIMESTAMP 1640000000000000;
+
+-- Client 2 (slightly later):
+UPDATE users SET email = 'alice@newer.com'
+WHERE id = 123
+USING TIMESTAMP 1640000000000001;
+                              ^^^^ Higher timestamp
+
+-- MemTable state after both:
+user_123:
+  email: {value: 'alice@newer.com', timestamp: 1640000000000001}
+         ↑ Last-write-wins (by timestamp)
+
+-- Client 1's write silently overwritten
+-- No locks, no errors, no conflicts
+```
+
+**Stage 5: Acknowledgment & Consistency Level** (0.1ms)
+
+```java
+// Coordinator waits for ACKs based on consistency level
+class WriteHandler {
+    void handleWrite(Mutation mutation, ConsistencyLevel cl) {
+        List<Node> replicas = getReplicas(mutation);
+        int requiredAcks = calculateRequired(cl, replicas);
+
+        // Send to all replicas (parallel)
+        CountDownLatch acks = new CountDownLatch(requiredAcks);
+        for (Node replica : replicas) {
+            sendAsync(replica, mutation, () -> {
+                acks.countDown();
+            });
+        }
+
+        // Wait for required ACKs
+        boolean success = acks.await(write_request_timeout_in_ms, MILLISECONDS);
+
+        if (success) {
+            return SUCCESS;
+        } else {
+            throw new WriteTimeoutException();
+        }
+    }
+
+    int calculateRequired(ConsistencyLevel cl, List<Node> replicas) {
+        switch (cl) {
+            case ONE:    return 1;
+            case TWO:    return 2;
+            case THREE:  return 3;
+            case QUORUM: return (replicas.size() / 2) + 1;  // e.g., 2 out of 3
+            case ALL:    return replicas.size();
+            default:     throw new IllegalArgumentException();
+        }
+    }
+}
+```
+
+**Consistency Level Impact on Latency**:
+```
+Setup: RF=3, replicas in same DC, each write ~2ms
+
+CL=ONE:
+  - Wait for 1 ACK
+  - Latency: ~2ms (min)
+
+CL=QUORUM:
+  - Wait for 2 ACKs
+  - Latency: ~2ms (still, parallel)
+  - BUT: If 1 node slow → Wait for slowest of 2
+  - p99 latency: ~5ms
+
+CL=ALL:
+  - Wait for 3 ACKs
+  - Latency: Max of all 3
+  - p99 latency: ~10ms (one slow node = slow write)
+
+Recommendation: QUORUM for most workloads (balance)
+```
+
+**Stage 6: Hinted Handoff (Failure Handling)**
+
+```
+What if Node C is down?
+
+RF=3, CL=QUORUM, Node C unreachable:
+
+Coordinator:
+  - Sends write to B, C (timeout), D
+  - Receives ACKs from B, D (2 ACKs)
+  - QUORUM satisfied (2/3) → Return SUCCESS
+  - Stores "hint" for C:
+    "When C comes back, replay this write"
+
+Hint storage:
+/var/lib/cassandra/hints/
+  node_c_uuid/
+    hint-1640000000-1.bin
+    hint-1640000000-2.bin
+    ...
+
+When Node C returns online:
+  - Coordinator sends hints to C
+  - C applies writes (catches up)
+  - Deletes hint files
+
+Maximum hint window:
+  max_hint_window_in_ms: 10800000  # 3 hours default
+
+  If C down > 3 hours:
+    - Hints discarded
+    - Manual repair needed
+```
+
+### Write Path Timeline (Typical)
+
+```
+Total write latency breakdown (CL=QUORUM, local DC):
+
+┌──────────────────────────────────────────────────────────────┐
+│ Stage                          Time (ms)    Cumulative       │
+├──────────────────────────────────────────────────────────────┤
+│ Client → Coordinator           0.1          0.1              │
+│ Calculate replicas             0.1          0.2              │
+│ Coordinator → Replicas         1.0          1.2              │
+│   (network latency)                                          │
+│                                                              │
+│ On each replica (parallel):                                 │
+│   Serialize mutation           0.1                           │
+│   Append to CommitLog          0.3                           │
+│   Write to MemTable            0.2                           │
+│   Total per replica:           0.6          1.8              │
+│                                                              │
+│ Replica → Coordinator          1.0          2.8              │
+│   (ACK network latency)                                      │
+│                                                              │
+│ Coordinator → Client           0.1          2.9              │
+├──────────────────────────────────────────────────────────────┤
+│ TOTAL (p50):                                ~3ms             │
+│ TOTAL (p99):                                ~10ms            │
+│   (accounting for GC pauses, network jitter)                │
+└──────────────────────────────────────────────────────────────┘
+
+Later (asynchronous):
+│ MemTable flush to SSTable      5000ms (when MemTable full)  │
+│ Compaction                      varies (background)          │
+```
+
+### Measuring Write Path Performance
+
+**Using Tracing**:
+```cql
+-- Enable tracing for next query
+TRACING ON;
+
+INSERT INTO users (id, name, email)
+VALUES (123, 'Alice', 'alice@example.com');
+
+-- Output shows each step:
+Tracing session: 8e1d3c40-6a32-11ec-9b4d-0242ac110002
+
+ activity                                                  | timestamp                  | source    | elapsed
+----------------------------------------------------------+----------------------------+-----------+---------
+                                          Execute CQL3 query | 2024-01-15 10:30:00.000000 | 10.0.0.1  |       0
+ Parsing INSERT INTO users ...                            | 2024-01-15 10:30:00.000100 | 10.0.0.1  |     100
+                  Preparing statement                      | 2024-01-15 10:30:00.000200 | 10.0.0.1  |     200
+Determining replicas for mutation                         | 2024-01-15 10:30:00.000300 | 10.0.0.1  |     300
+    Sending MUTATION to /10.0.0.2                         | 2024-01-15 10:30:00.000400 | 10.0.0.1  |     400
+    Sending MUTATION to /10.0.0.3                         | 2024-01-15 10:30:00.000400 | 10.0.0.1  |     400
+                Appending to commitlog                     | 2024-01-15 10:30:00.001000 | 10.0.0.2  |    1000
+            Adding to users memtable                       | 2024-01-15 10:30:00.001100 | 10.0.0.2  |    1100
+                Appending to commitlog                     | 2024-01-15 10:30:00.001200 | 10.0.0.3  |    1200
+            Adding to users memtable                       | 2024-01-15 10:30:00.001300 | 10.0.0.3  |    1300
+   REQUEST_RESPONSE from /10.0.0.2                        | 2024-01-15 10:30:00.002000 | 10.0.0.1  |    2000
+   REQUEST_RESPONSE from /10.0.0.3                        | 2024-01-15 10:30:00.002100 | 10.0.0.1  |    2100
+                                    Request complete       | 2024-01-15 10:30:00.002200 | 10.0.0.1  |    2200
+
+-- Total: 2.2ms
+```
+
+**Using nodetool proxyhistograms**:
+```bash
+nodetool proxyhistograms
+
+Proxy Histograms:
+Percentile      Write Latency
+50%             2.34 ms
+75%             3.12 ms
+95%             5.67 ms
+98%             8.45 ms
+99%             11.23 ms
+Min             1.02 ms
+Max             145.67 ms
+
+# What this shows:
+# - p50: Typical write (2.34ms)
+# - p99: Slow writes (11.23ms) - GC or slow node
+# - Max: Outlier (145ms) - GC pause or network issue
+```
+
+---
+
+## Part 2: Read Path Deep Dive
+
+### Overview: Why Reads are Complex
+
+**The Challenge**:
+```
+Writes are simple:
+  - Data → MemTable (done)
+  - MemTable → SSTable (later)
+
+Reads are complex:
+  - Data might be in MemTable
+  - OR in SSTable 1
+  - OR in SSTable 2
+  - OR in SSTable 3...
+  - Must merge all sources
+  - Apply deletions (tombstones)
+  - Pick latest timestamp
+
+Result: Reads are 10-50x slower than writes
+```
+
+### The Complete Read Journey
+
+```cql
+-- Client executes:
+SELECT name, email FROM users WHERE id = 123;
+```
+
+**Stage 1: Coordinator & Consistency Level** (0.1ms)
+
+```java
+class ReadHandler {
+    void handleRead(Query query, ConsistencyLevel cl) {
+        List<Node> replicas = getReplicas(query.partitionKey);
+
+        if (cl == ConsistencyLevel.ONE) {
+            // Read from fastest replica
+            Node fastest = selectFastest(replicas);
+            return readFrom(fastest);
+        } else if (cl == ConsistencyLevel.QUORUM) {
+            // Read from majority
+            int required = (replicas.size() / 2) + 1;
+            List<Node> selected = selectFastest(replicas, required);
+
+            // Full data from one, digests from others
+            Response fullData = readFrom(selected.get(0));
+            List<Response> digests = readDigests(selected.subList(1, required));
+
+            // Compare digests
+            if (digestsMatch(fullData, digests)) {
+                return fullData;  // Consistent
+            } else {
+                // Mismatch → Read repair
+                return readRepair(selected, fullData);
+            }
+        }
+    }
+}
+```
+
+**Stage 2: Replica Read Path**
+
+Now the deep dive into how a single replica reads data:
+
+#### Step 2a: Check Row Cache (Optional)
+
+```java
+class RowCache {
+    private LoadingCache<RowKey, CachedRow> cache;
+
+    CachedRow get(RowKey key) {
+        // Check if row is cached
+        CachedRow cached = cache.getIfPresent(key);
+        if (cached != null) {
+            metrics.rowCacheHit.inc();
+            return cached;  // Fast path!
+        }
+
+        metrics.rowCacheMiss.inc();
+        return null;  // Must read from disk
+    }
+}
+
+// Enable row cache per table:
+ALTER TABLE users WITH caching = {
+    'keys': 'ALL',
+    'rows_per_partition': '100'
+};
+
+// Typical hit rate: 70-90% for hot data
+// Cache size: Limited by heap (careful!)
+```
+
+**Row Cache Trade-offs**:
+```
+✅ Pros:
+  - Sub-millisecond reads (0.1ms)
+  - Bypasses all disk I/O
+  - Perfect for hot rows
+
+❌ Cons:
+  - Uses heap memory (GC pressure)
+  - Invalidated on writes (cache churning)
+  - Only caches full partitions
+  - Not suitable for write-heavy tables
+
+When to use:
+  ✅ Read-heavy (90%+ reads)
+  ✅ Small hot dataset (top 10% of rows)
+  ❌ Write-heavy
+  ❌ Large partitions
+```
+
+#### Step 2b: Check Key Cache
+
+```java
+class KeyCache {
+    // Maps partition key → SSTable file offset
+    private LoadingCache<KeyCacheKey, RowIndexEntry> cache;
+
+    RowIndexEntry get(DecoratedKey key, SSTableReader sstable) {
+        KeyCacheKey cacheKey = new KeyCacheKey(sstable.descriptor, key);
+        RowIndexEntry entry = cache.getIfPresent(cacheKey);
+
+        if (entry != null) {
+            metrics.keyCacheHit.inc();
+            return entry;  // Jump directly to SSTable offset
+        }
+
+        metrics.keyCacheMiss.inc();
+        // Must read index from disk
+        return sstable.getPosition(key);
+    }
+}
+
+// Always enabled by default
+// Stores: partition key → (SSTable file, byte offset)
+// Size: ~200 bytes per entry
+// Hit rate: 80-95% typical
+```
+
+#### Step 2c: Query MemTable
+
+```java
+class MemTable {
+    UnfilteredPartitionIterator getPartition(DecoratedKey key) {
+        // O(log n) lookup in skip list
+        PartitionUpdate partition = data.get(key);
+
+        if (partition == null) {
+            return EmptyIterator.instance;
+        }
+
+        return partition.unfilteredIterator();
+    }
+}
+
+// Always checked first (most recent data)
+// Latency: 0.01ms (in-memory)
+```
+
+#### Step 2d: Query Each SSTable
+
+This is where reads get expensive:
+
+```java
+class SSTableReader {
+    UnfilteredPartitionIterator getPartition(DecoratedKey key) {
+        // 1. Check Bloom filter (avoid disk read if definitely not present)
+        if (!bloomFilter.mightContain(key)) {
+            metrics.bloomFilterTrueNegative.inc();
+            return EmptyIterator.instance;  // Definitely not in this SSTable
+        }
+
+        metrics.bloomFilterPositive.inc();  // Maybe in SSTable
+
+        // 2. Check key cache for index position
+        RowIndexEntry indexEntry = keyCache.get(key, this);
+
+        if (indexEntry == null) {
+            // 3. Key cache miss: Read partition index from disk
+            indexEntry = readIndexFromDisk(key);  // 1 disk read
+        }
+
+        if (indexEntry == null) {
+            metrics.bloomFilterFalsePositive.inc();
+            return EmptyIterator.instance;  // Bloom filter lied
+        }
+
+        // 4. Read data from disk at offset
+        return readDataAtOffset(indexEntry.position);  // 1 disk read
+    }
+}
+```
+
+**Bloom Filter Explained**:
+```
+Bloom Filter: Probabilistic data structure
+
+Can answer: "Is partition key X in this SSTable?"
+  - NO (100% accurate) → Skip SSTable
+  - MAYBE (false positive possible) → Check SSTable
+
+Example:
+  SSTable contains: [user_100, user_200, user_300]
+
+  Query: user_200
+  Bloom filter: MAYBE → Check SSTable → Found!
+
+  Query: user_999
+  Bloom filter: NO → Skip SSTable (no disk I/O!)
+
+  Query: user_500
+  Bloom filter: MAYBE → Check SSTable → Not found (false positive)
+
+False positive rate: ~1% (configurable)
+  bloom_filter_fp_chance: 0.01 (default)
+
+  Lower = fewer false positives but larger filter
+  Higher = more false positives but smaller filter
+```
+
+**SSTable Read Cost**:
+```
+For each SSTable:
+  Bloom filter check:  0.001ms (in-memory)
+  Key cache hit:       0ms (offset cached)
+  Key cache miss:      1-5ms (read index from disk)
+  Data read:           1-10ms (read data pages from disk)
+
+With 10 SSTables:
+  Best case:  9 bloom misses + 1 hit = ~2ms
+  Worst case: 10 index reads + 10 data reads = ~100ms
+
+Why compaction matters:
+  Fewer SSTables = Fewer disk reads = Faster
+```
+
+#### Step 2e: Merge Results
+
+```java
+class ReadExecutor {
+    UnfilteredPartitionIterator mergeResults(
+        UnfilteredPartitionIterator memtableIter,
+        List<UnfilteredPartitionIterator> sstableIters
+    ) {
+        // Merge all iterators, keeping latest timestamp for each cell
+        List<UnfilteredPartitionIterator> all = new ArrayList<>();
+        all.add(memtableIter);
+        all.addAll(sstableIters);
+
+        return UnfilteredPartitionIterators.merge(
+            all,
+            UnfilteredPartitionIterators.MergeListener.NOOP
+        );
+    }
+}
+
+// Merge algorithm (simplified):
+for each cell in partition:
+    memtable_value = memtable.get(cell)
+    sstable1_value = sstable1.get(cell)
+    sstable2_value = sstable2.get(cell)
+
+    // Pick highest timestamp
+    result = max_by_timestamp(memtable_value, sstable1_value, sstable2_value)
+
+    // Apply tombstones (deletions)
+    if result.isTombstone() and not_expired(result):
+        skip_cell()  // Deleted
+    else:
+        return result.value
+```
+
+**Tombstone Handling**:
+```cql
+-- Delete creates tombstone
+DELETE FROM users WHERE id = 123;
+
+-- Tombstone stored with timestamp and TTL (gc_grace_seconds)
+Tombstone {
+    partition_key: 123,
+    timestamp: 1640000000000000,
+    local_delete_time: 1640086400,  # Now + gc_grace_seconds (10 days default)
+}
+
+-- During read merge:
+if (tombstone.timestamp > cell.timestamp):
+    # Deletion happened after write
+    if (now < tombstone.local_delete_time):
+        # Still within grace period
+        skip_cell()
+    else:
+        # Grace period expired, tombstone should be compacted away
+        # But still present → Tombstone accumulation problem!
+```
+
+**Stage 3: Read Repair (CL >= QUORUM)**
+
+```java
+class ReadRepair {
+    void repair(List<Node> replicas, Response fullData, List<Response> digests) {
+        // Detected mismatch
+        Set<Node> inconsistent = new HashSet<>();
+
+        for (int i = 0; i < digests.size(); i++) {
+            if (!fullData.digest.equals(digests.get(i).digest)) {
+                inconsistent.add(replicas.get(i + 1));
+            }
+        }
+
+        // Resolve: Read full data from all inconsistent nodes
+        List<Response> inconsistentData = readAll(inconsistent);
+
+        // Merge all versions (timestamp-based)
+        Response merged = mergeByTimestamp(fullData, inconsistentData);
+
+        // Write merged data back to inconsistent nodes
+        for (Node node : inconsistent) {
+            sendMutation(node, merged);
+        }
+
+        // Return merged result to client
+        return merged;
+    }
+}
+```
+
+### Read Path Timeline
+
+```
+Total read latency breakdown (CL=ONE, single partition):
+
+┌────────────────────────────────────────────────────────────────┐
+│ Stage                          Time (ms)    Cumulative         │
+├────────────────────────────────────────────────────────────────┤
+│ Client → Coordinator           0.1          0.1                │
+│ Determine replica              0.1          0.2                │
+│ Coordinator → Replica          1.0          1.2                │
+│                                                                │
+│ On replica:                                                    │
+│   Row cache check              0.01         1.21               │
+│   Row cache MISS                                               │
+│                                                                │
+│   MemTable lookup              0.01         1.22               │
+│                                                                │
+│   For each SSTable (assume 5):                                │
+│     Bloom filter check         0.001 × 5    1.225              │
+│     Bloom miss (3 SSTables)    skip                            │
+│     Bloom hit (2 SSTables):                                    │
+│       Key cache check          0.001 × 2    1.227              │
+│       Key cache HIT (1)        0                               │
+│       Key cache MISS (1)       5.0          6.227              │
+│       Data read (2 SSTables)   3.0 × 2      12.227             │
+│                                                                │
+│   Merge results                0.1          12.327             │
+│                                                                │
+│ Replica → Coordinator          1.0          13.327             │
+│ Coordinator → Client           0.1          13.427             │
+├────────────────────────────────────────────────────────────────┤
+│ TOTAL (p50):                                ~13ms              │
+│ TOTAL (p99):                                ~50ms              │
+│   (with cache misses, slow disk, GC)                          │
+└────────────────────────────────────────────────────────────────┘
+
+Compare to write (p50: 3ms):
+Read is 4-5x slower due to disk I/O
+```
+
+---
+
+## Part 3: Practical Optimization
+
+### Exercise 1: Measuring Read Performance
+
+**Setup**:
+```bash
+# Create test table
+cqlsh -e "
+CREATE KEYSPACE test WITH REPLICATION = {
+    'class': 'SimpleStrategy',
+    'replication_factor': 3
+};
+
+CREATE TABLE test.users (
+    id UUID PRIMARY KEY,
+    name TEXT,
+    email TEXT,
+    created_at TIMESTAMP
+);
+"
+
+# Insert 1M rows
+cassandra-stress write n=1000000 -schema 'replication(factor=3)' -rate threads=50
+
+# Flush to SSTables
+nodetool flush test users
+```
+
+**Measure baseline**:
+```cql
+TRACING ON;
+SELECT * FROM test.users WHERE id = <some_uuid>;
+
+-- Check metrics:
+nodetool tablestats test.users
+
+SSTable count: 15  ← Too many!
+Bloom filter false positives: 150000
+Bloom filter true negatives: 850000
+Key cache hit rate: 0.75
+
+-- Read latency:
+nodetool tablehistograms test.users
+
+Read Latency (microseconds):
+50%: 15000 (15ms)
+95%: 45000 (45ms)
+99%: 95000 (95ms)  ← Slow!
+```
+
+**Optimization 1: Compact SSTables**:
+```bash
+# Force compaction
+nodetool compact test users
+
+# After:
+nodetool tablestats test.users
+
+SSTable count: 1  ← Much better!
+Bloom filter false positives: 0
+Key cache hit rate: 0.95  ← Improved
+
+# New latency:
+Read Latency:
+50%: 3000 (3ms)   ← 5x faster!
+95%: 8000 (8ms)
+99%: 15000 (15ms)
+```
+
+**Optimization 2: Enable Row Cache**:
+```cql
+ALTER TABLE test.users WITH caching = {
+    'keys': 'ALL',
+    'rows_per_partition': '100'
+};
+
+-- Warm up cache
+SELECT * FROM test.users WHERE id = <uuid_1>;
+SELECT * FROM test.users WHERE id = <uuid_2>;
+-- ... repeat for hot keys
+
+-- Check cache stats:
+nodetool info | grep "Row Cache"
+
+Row Cache: entries 50000, size 256 MB, hit rate 0.89
+
+-- New latency for cached rows:
+Read Latency:
+50%: 300 (0.3ms)  ← 10x faster!
+95%: 500 (0.5ms)
+99%: 1000 (1ms)
+```
+
+### Exercise 2: Tombstone Debugging
+
+**Symptom**: Read query slow despite small result set
+
+```cql
+-- Query returns 10 rows but takes 5 seconds
+SELECT * FROM events WHERE user_id = <uuid> AND date = '2024-01-15';
+```
+
+**Diagnosis**:
+```bash
+# Enable tombstone warnings
+nodetool settraceprobability 1.0
+
+# Run query
+cqlsh -e "SELECT * FROM events WHERE user_id = <uuid> AND date = '2024-01-15';"
+
+# Check logs
+grep "Scanned over" /var/log/cassandra/system.log
+
+WARN  [SharedPool-Worker-1] 2024-01-15 10:30:00,000 SliceQueryFilter.java:275 -
+Read 10 live rows and 50000 tombstone cells for query
+SELECT * FROM events WHERE user_id = ... (see tombstone_warn_threshold)
+
+-- Problem: 50,000 tombstones scanned!
+```
+
+**Root Cause**:
+```cql
+-- Application deletes old events daily
+DELETE FROM events WHERE user_id = <uuid> AND date < '2024-01-01';
+
+-- Creates thousands of tombstones
+-- These must be scanned during reads
+-- Result: Slow queries
+```
+
+**Solutions**:
+```cql
+-- Solution 1: Use TTL instead of DELETE
+CREATE TABLE events (
+    user_id UUID,
+    date DATE,
+    event_time TIMESTAMP,
+    data TEXT,
+    PRIMARY KEY (user_id, date, event_time)
+) WITH default_time_to_live = 2592000;  -- 30 days
+
+INSERT INTO events (user_id, date, event_time, data)
+VALUES (?, ?, ?, ?);
+-- Automatically expires after 30 days, no tombstones!
+
+-- Solution 2: Time-window compaction
+ALTER TABLE events WITH compaction = {
+    'class': 'TimeWindowCompactionStrategy',
+    'compaction_window_unit': 'DAYS',
+    'compaction_window_size': 1
+};
+-- Drops entire SSTables when expired
+
+-- Solution 3: Partition by time bucket
+CREATE TABLE events_v2 (
+    user_id UUID,
+    bucket TEXT,  -- '2024-01'
+    event_time TIMESTAMP,
+    data TEXT,
+    PRIMARY KEY ((user_id, bucket), event_time)
+);
+-- Drop old partitions entirely
+-- No tombstones, no scan overhead
+```
+
+---
+
+## Summary
+
+✅ **Write Path Mastered**:
+- Sequential CommitLog append (fast)
+- In-memory MemTable write (fast)
+- Last-write-wins conflict resolution
+- Hinted handoff for availability
+- Typical latency: 2-5ms
+
+✅ **Read Path Mastered**:
+- Multi-level caching (row, key, OS page)
+- Bloom filters avoid disk I/O
+- SSTable merge complexity
+- Tombstone impact
+- Typical latency: 5-50ms
+
+✅ **Optimization Techniques**:
+- Compaction reduces SSTables → Faster reads
+- Caching for hot data → Sub-millisecond reads
+- TTL avoids tombstones → Predictable performance
+- Proper data modeling → Single-partition reads
+
+---
+
+## What's Next?
+
+<Card
+  title="Module 5: Cluster Operations"
+  icon="server"
+  href="/distributed-systems-tools/cassandra-cluster-operations"
+>
+  Master gossip protocol, repair, multi-DC replication, and cluster management
+</Card>
