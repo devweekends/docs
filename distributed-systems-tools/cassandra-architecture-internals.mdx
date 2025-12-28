@@ -1,0 +1,1119 @@
+---
+title: "Cassandra Architecture & Storage Internals"
+sidebarTitle: "2. Architecture & Internals"
+description: "Deep dive into Cassandra's ring topology, consistent hashing, vnodes, and native storage engine"
+icon: "diagram-project"
+---
+
+# Cassandra Architecture & Storage Internals
+
+<Info>
+**Module Duration**: 5-6 hours
+**Learning Style**: Architecture + Storage Engine + Hands-on Analysis
+**Outcome**: Understand exactly how Cassandra stores and retrieves data at the lowest level
+</Info>
+
+## Why Architecture Matters
+
+Most Cassandra tutorials show you CQL queries. This module goes deeper - understanding the architecture lets you:
+- **Predict performance** - Know why certain queries are fast/slow
+- **Design better schemas** - Model data to match Cassandra's strengths
+- **Debug production issues** - Understand what's happening under the hood
+- **Optimize clusters** - Make informed tuning decisions
+- **Interview confidently** - Explain trade-offs, not just features
+
+<Note>
+We'll explore the actual on-disk storage format, memory structures, and how data flows through the system. Bring your curiosity!
+</Note>
+
+---
+
+## The Ring Topology Deep Dive
+
+### Why a Ring? (Historical Context)
+
+**The Problem with Master-Slave**:
+```
+Traditional Master-Slave (MySQL, HDFS):
+┌─────────────┐
+│   Master    │ ← Single point of failure
+│  (Metadata) │ ← Bottleneck for writes
+└──────┬──────┘ ← Complex failover
+       │
+  ┌────┴────┬────────┐
+  ▼         ▼        ▼
+┌────┐   ┌────┐   ┌────┐
+│ S1 │   │ S2 │   │ S3 │ Slaves
+└────┘   └────┘   └────┘
+
+If master fails:
+1. Detect failure (30-60s)
+2. Elect new master (Paxos/Raft)
+3. Promote slave
+4. Update clients
+5. Total downtime: 1-2 minutes
+```
+
+**Cassandra's Peer-to-Peer Solution**:
+```
+All nodes equal:
+      ┌───┐
+   ┌─▶│ A │◀─┐
+   │  └───┘  │
+   │         │
+┌──┴──┐   ┌──┴──┐
+│  D  │   │  B  │ ← Every node can:
+└──┬──┘   └──┬──┘    - Accept writes
+   │         │       - Serve reads
+   │  ┌───┐  │       - Coordinate requests
+   └─▶│ C │◀─┘       - Replicate data
+      └───┘
+
+If A fails:
+1. Gossip detects (3-5s)
+2. Clients route to B/C/D
+3. No promotion needed
+4. Total downtime: ~0s (hinted handoff)
+```
+
+### Consistent Hashing Explained
+
+**The Core Problem**: How do you distribute data evenly across N nodes, and minimize data movement when nodes are added/removed?
+
+**Naive Approach (Hash Modulo)**:
+```python
+# Bad: Rehashes most data on cluster changes
+node = hash(key) % num_nodes
+
+# Example with 4 nodes:
+hash("user123") = 42
+42 % 4 = 2 → Node 2
+
+# Add 5th node:
+42 % 5 = 2 → Still Node 2 (lucky!)
+
+# But:
+hash("user456") = 88
+88 % 4 = 0 → Node 0
+88 % 5 = 3 → Node 3 (MOVED!)
+
+# On average: Adding 1 node rehashes N/(N+1) of data
+# 4→5 nodes: 80% of data moves! Unacceptable!
+```
+
+**Consistent Hashing Solution**:
+```
+1. Create a "hash space" (ring): 0 to 2^64-1
+
+2. Each node gets a position on ring:
+   Node A: hash("A") = 0
+   Node B: hash("B") = 4611686018427387904  (2^62)
+   Node C: hash("C") = 9223372036854775808  (2^63)
+   Node D: hash("D") = 13835058055282163712 (3*2^62)
+
+3. Visualize as ring:
+         0 (Node A)
+           ↓
+    ┌──────────────┐
+    │              │
+D ←─┤              ├─→ B
+    │              │
+    └──────────────┘
+           ↑
+         C (2^63)
+
+4. Data placement:
+   hash("user123") = 42 → Falls between A and B → Goes to B
+   hash("user456") = 2^63 + 100 → Falls between C and D → Goes to D
+
+5. Adding Node E at position 2^62 + 1000:
+   - Only keys between B and E move
+   - Rest of data unchanged!
+   - On average: Only 1/(N+1) of data moves
+```
+
+**Real Numbers**:
+```
+4 nodes → 5 nodes:
+- Hash modulo: 80% data movement
+- Consistent hashing: 20% data movement
+- 4x better!
+
+100 nodes → 101 nodes:
+- Hash modulo: 99% data movement
+- Consistent hashing: ~1% data movement
+- 99x better!
+```
+
+### Virtual Nodes (Vnodes) - The Modern Approach
+
+**Problem with Single Token Per Node**:
+```
+Classic Cassandra (pre-1.2):
+Each node gets 1 position on ring
+
+Node A: token = 0
+Node B: token = 2^62
+Node C: token = 2^63
+Node D: token = 3*2^62
+
+Issues:
+1. Uneven data distribution if nodes aren't perfectly spaced
+2. Adding node requires manual token assignment (error-prone)
+3. Replacing failed node: Must use exact same token
+4. Hot spots if data access uneven
+```
+
+**Vnodes Solution (Default Since Cassandra 1.2)**:
+```
+Each physical node owns MULTIPLE positions on ring
+
+Default: 256 vnodes per node (num_tokens = 256)
+
+Node A gets 256 random tokens:
+  vnode_1: hash("A_1") = 123456
+  vnode_2: hash("A_2") = 9876543
+  ...
+  vnode_256: hash("A_256") = 5555555
+
+Node B gets 256 random tokens:
+  vnode_1: hash("B_1") = 234567
+  ...
+
+Ring looks like:
+[A_1][B_5][C_2][D_1][A_2][B_6][C_3][D_2][A_3]...
+
+Benefits:
+1. Automatic even distribution
+2. Adding node: Shares load with ALL existing nodes
+3. Removing node: Load redistributed to ALL nodes
+4. No manual token assignment
+```
+
+**Vnode Distribution Example**:
+```python
+# 4 nodes, 256 vnodes each = 1024 vnodes total
+# Each node should own ~25% of ring
+
+Without vnodes (manual tokens):
+Node A: 0 to 2^62 (25%... if perfectly calculated)
+
+With vnodes (automatic):
+Node A: vnode_1 (0.1%) + vnode_2 (0.1%) + ... + vnode_256 (0.1%)
+      = 25.3% (statistically approaches 25%)
+
+Variance:
+- Manual: High (depends on human token choice)
+- Vnodes: Low (law of large numbers)
+```
+
+**Streaming on Node Addition**:
+```
+Adding Node E with 256 vnodes:
+
+Before:
+Ring has 1024 vnodes (256 × 4 nodes)
+
+After:
+Ring has 1280 vnodes (256 × 5 nodes)
+Each node should own 1280/5 = 256 vnodes
+
+Node E receives ~64 vnodes from each existing node:
+- From A: vnodes that now belong to E's token ranges
+- From B: vnodes that now belong to E's token ranges
+- From C: vnodes that now belong to E's token ranges
+- From D: vnodes that now belong to E's token ranges
+
+Total data streamed: ~20% of cluster (evenly from all nodes)
+
+Time: Depends on data size
+- 100 GB cluster: ~10 minutes (with 10 Gbps network)
+- 10 TB cluster: ~3 hours
+```
+
+**Configuring Vnodes**:
+```yaml
+# cassandra.yaml
+
+# Default (recommended for most clusters)
+num_tokens: 256
+
+# Fewer vnodes (better for very large clusters, 100+ nodes)
+num_tokens: 128
+
+# Single token (legacy, not recommended)
+num_tokens: 1
+
+# Auto-calculate based on cluster size (Cassandra 4.0+)
+allocate_tokens_for_local_replication_factor: 3
+```
+
+---
+
+## Data Distribution & Replication
+
+### Replication Factor Deep Dive
+
+**Replication Factor (RF)**: Number of copies of each data partition.
+
+**Common Configurations**:
+```
+RF = 1 (Development only, never production)
+- Single copy
+- No fault tolerance
+- Fast writes
+- Use case: Throwaway dev environment
+
+RF = 2 (Rare, not recommended)
+- Two copies
+- Can survive 1 node failure
+- But: Can't achieve quorum with 1 node down
+- Use case: Non-critical data, tight budget
+
+RF = 3 (Production standard)
+- Three copies
+- Can survive 2 node failures
+- QUORUM = 2 nodes (majority)
+- Use case: Most production deployments
+
+RF = 5+ (Critical data)
+- Five+ copies
+- Can survive 4+ node failures
+- Higher storage cost
+- Use case: Financial systems, regulatory requirements
+```
+
+**How Replication Works**:
+```
+Example: RF = 3, 6-node cluster
+
+Write to key "user123":
+hash("user123") = 42
+
+Step 1: Find primary node
+Ring position 42 falls on Node B
+→ Node B is PRIMARY replica
+
+Step 2: Find replica nodes (walk clockwise on ring)
+Next vnode after 42: Node D
+Next vnode after D: Node F
+→ Replicas: B (primary), D, F
+
+Step 3: Coordinator sends write to B, D, F
+All three nodes write to:
+1. CommitLog (disk, sequential)
+2. MemTable (memory)
+
+Step 4: Wait for consistency level ACKs
+- CL=ONE: Wait for 1 ACK (B or D or F)
+- CL=QUORUM: Wait for 2 ACKs (any 2 of B, D, F)
+- CL=ALL: Wait for all 3 ACKs
+```
+
+### Replication Strategies
+
+**1. SimpleStrategy (Single Datacenter)**:
+```cql
+CREATE KEYSPACE my_keyspace WITH REPLICATION = {
+    'class': 'SimpleStrategy',
+    'replication_factor': 3
+};
+
+How it works:
+- Places replicas on consecutive nodes in ring
+- No datacenter awareness
+- Simple, but not rack-aware
+
+Ring with RF=3:
+[A][B][C][D][E][F]
+ ↑  ↑  ↑
+ Primary, Replica1, Replica2 for partition P1
+
+Good for: Development, single-DC deployments
+Bad for: Production (no rack awareness)
+```
+
+**2. NetworkTopologyStrategy (Production)**:
+```cql
+CREATE KEYSPACE my_keyspace WITH REPLICATION = {
+    'class': 'NetworkTopologyStrategy',
+    'dc1': 3,  -- 3 replicas in datacenter 1
+    'dc2': 2   -- 2 replicas in datacenter 2
+};
+
+How it works:
+- Datacenter-aware
+- Rack-aware within each DC
+- Places replicas in different racks for fault tolerance
+
+Example topology:
+DC1:
+  Rack A: [Node1, Node2]
+  Rack B: [Node3, Node4]
+  Rack C: [Node5, Node6]
+
+DC2:
+  Rack A: [Node7, Node8]
+  Rack B: [Node9, Node10]
+
+Partition P1 with RF=3 in DC1:
+- Primary: Node1 (Rack A)
+- Replica1: Node3 (Rack B) ← Different rack!
+- Replica2: Node5 (Rack C) ← Different rack!
+
+Benefits:
+- Survives entire rack failure
+- Survives entire datacenter failure (with multi-DC RF)
+- Localized reads per DC
+```
+
+**Defining Datacenter & Rack**:
+```properties
+# cassandra-rackdc.properties
+
+# AWS deployment
+dc=us-east-1
+rack=us-east-1a
+
+# Another node in same DC, different AZ
+dc=us-east-1
+rack=us-east-1b
+
+# Node in different region
+dc=eu-west-1
+rack=eu-west-1a
+```
+
+### Snitch - Topology Awareness
+
+**What is a Snitch?**
+Cassandra component that determines network topology (DC and rack of each node).
+
+**Common Snitches**:
+
+1. **SimpleSnitch** (Default, single DC):
+```yaml
+endpoint_snitch: SimpleSnitch
+
+# All nodes in same DC and rack
+# No network topology awareness
+# Use only for development
+```
+
+2. **GossipingPropertyFileSnitch** (Most common):
+```yaml
+endpoint_snitch: GossipingPropertyFileSnitch
+
+# Reads cassandra-rackdc.properties
+# Nodes gossip their DC/rack info
+# Best for most deployments
+```
+
+3. **Ec2Snitch** (AWS):
+```yaml
+endpoint_snitch: Ec2Snitch
+
+# Auto-detects AWS region as DC
+# Auto-detects availability zone as rack
+# No configuration needed
+# Use for AWS deployments
+```
+
+4. **GoogleCloudSnitch** (GCP):
+```yaml
+endpoint_snitch: GoogleCloudSnitch
+
+# Auto-detects GCP region as DC
+# Auto-detects GCP zone as rack
+```
+
+**Why Snitches Matter**:
+```
+Without proper snitch:
+- All nodes treated as same rack
+- Replicas might land on same rack
+- Rack failure = data loss
+
+With proper snitch:
+- Replicas spread across racks
+- Fault-tolerant to rack failures
+- Optimized network traffic (local reads)
+```
+
+---
+
+## Storage Engine Internals
+
+### On-Disk Storage Structure
+
+**Cassandra Storage Hierarchy**:
+```
+/var/lib/cassandra/
+├── commitlog/              ← Write-ahead log
+│   ├── CommitLog-7-1234.log
+│   └── CommitLog-7-1235.log
+│
+├── data/                   ← Actual data files
+│   └── my_keyspace/
+│       └── users-abc123/   ← Table directory
+│           ├── mc-1-big-Data.db         ← Data file
+│           ├── mc-1-big-Index.db        ← Partition index
+│           ├── mc-1-big-Summary.db      ← Partition summary
+│           ├── mc-1-big-Filter.db       ← Bloom filter
+│           ├── mc-1-big-Statistics.db   ← Statistics
+│           ├── mc-1-big-TOC.txt         ← Table of contents
+│           └── mc-1-big-Digest.crc32    ← Checksum
+│
+├── saved_caches/           ← Row/key caches
+└── hints/                  ← Hinted handoff data
+```
+
+### CommitLog - Durability Guarantee
+
+**Purpose**: Ensure no write is lost, even on node crash.
+
+**How It Works**:
+```
+Write flow:
+1. Client sends write
+2. Coordinator receives
+3. BEFORE acknowledging:
+   a) Append to CommitLog (sequential disk write)
+   b) Write to MemTable (memory)
+4. Acknowledge to client
+5. Later: MemTable flushed to SSTable (async)
+
+Crash scenario:
+Node crashes after step 4, before MemTable flush
+→ On restart: Replay CommitLog
+→ Reconstruct MemTable
+→ No data loss!
+```
+
+**CommitLog Structure**:
+```
+CommitLog file format (simplified):
+
+[Header: Version, Compression, Checksum]
+[Segment 1]
+  ├─ [Mutation 1: keyspace, table, key, columns, timestamp]
+  ├─ [Mutation 2: ...]
+  └─ [Mutation N: ...]
+[Segment 2]
+  └─ ...
+
+Properties:
+- Append-only (sequential writes = fast)
+- Fixed-size segments (default 32 MB)
+- Rotates to new segment when full
+- Deleted after MemTable flushed
+```
+
+**CommitLog Configuration**:
+```yaml
+# cassandra.yaml
+
+# Sync mode (durability vs performance trade-off)
+commitlog_sync: periodic  # Default: flush every N ms
+commitlog_sync_period_in_ms: 10000  # 10 seconds
+
+# OR
+commitlog_sync: batch  # Flush every N bytes
+commitlog_sync_batch_window_in_ms: 2
+
+# Segment size
+commitlog_segment_size_in_mb: 32
+
+# Compression (save disk, cost CPU)
+commitlog_compression:
+  - class_name: LZ4Compressor
+```
+
+**Sync Modes Comparison**:
+```
+periodic (default):
+- Batches writes for 10 seconds
+- Flushes to disk together
+- Pros: Better throughput (batch I/O)
+- Cons: Up to 10s data loss on crash
+- Use: Most applications (acceptable loss)
+
+batch:
+- Flushes immediately
+- Pros: No data loss (durable)
+- Cons: Slower (more disk I/O)
+- Use: Financial systems, critical data
+
+Benchmarks:
+- periodic: 50,000 writes/sec
+- batch: 10,000 writes/sec
+- 5x throughput difference
+```
+
+### MemTable - In-Memory Write Buffer
+
+**Purpose**: Fast writes + batching for efficient disk I/O.
+
+**Structure**:
+```java
+// Simplified MemTable internals
+class MemTable {
+    // ConcurrentSkipListMap for fast, lock-free writes
+    ConcurrentSkipListMap<DecoratedKey, ColumnFamily> data;
+
+    // Memory tracker
+    long currentSize;
+    long maxSize = 512MB; // Configurable
+
+    // When full
+    void flush() {
+        // 1. Switch to new MemTable (writes continue)
+        // 2. Sort data by partition key
+        // 3. Write to SSTable on disk
+        // 4. Update indexes
+        // 5. Delete corresponding CommitLog segments
+    }
+}
+```
+
+**Write to MemTable**:
+```
+mutation = {
+    key: "user123",
+    column: "email",
+    value: "alice@example.com",
+    timestamp: 1640000000000000
+}
+
+MemTable stores:
+user123 → {
+    email: ("alice@example.com", timestamp: 1640000000000000)
+}
+
+Concurrent writes to same key:
+Thread 1: email = "alice@example.com" (timestamp: T1)
+Thread 2: name = "Alice" (timestamp: T2)
+
+Both stored:
+user123 → {
+    email: ("alice@example.com", T1),
+    name: ("Alice", T2)
+}
+
+Later write to same column:
+Thread 3: email = "alice@new.com" (timestamp: T3)
+
+MemTable keeps LATEST:
+user123 → {
+    email: ("alice@new.com", T3),  ← Overwrites T1
+    name: ("Alice", T2)
+}
+```
+
+**MemTable Configuration**:
+```yaml
+# Per-table configuration
+CREATE TABLE users (
+    id UUID PRIMARY KEY,
+    name TEXT,
+    email TEXT
+) WITH memtable_flush_period_in_ms = 3600000;  -- Flush hourly
+
+# Global configuration (cassandra.yaml)
+memtable_allocation_type: heap_buffers  # or offheap_buffers
+memtable_heap_space_in_mb: 2048  # Max heap for MemTables
+memtable_offheap_space_in_mb: 2048  # Max off-heap
+```
+
+**Flush Triggers**:
+```
+MemTable flushes when ANY condition met:
+
+1. Size threshold:
+   MemTable size > memtable_heap_space / num_tables
+
+2. Time threshold:
+   Time since last flush > memtable_flush_period_in_ms
+
+3. CommitLog pressure:
+   CommitLog size > threshold → Flush oldest MemTable
+
+4. Manual trigger:
+   nodetool flush keyspace table
+```
+
+### SSTable - Immutable On-Disk Storage
+
+**Key Property**: **Immutable** - Never modified after written.
+
+**Why Immutable?**
+```
+Mutable approach (traditional databases):
+- Read-modify-write cycle
+- Locks needed (concurrency)
+- Random disk I/O (slow)
+- Fragmentation over time
+
+Immutable approach (Cassandra):
+- Append-only writes
+- No locks (just append new version)
+- Sequential disk I/O (fast)
+- Compaction handles cleanup
+```
+
+**SSTable File Components**:
+
+1. **Data.db** - Actual data:
+```
+Partition 1:
+  [Partition Key: user123]
+  [Clustering Column 1: timestamp=T1]
+    [Column: email, value: "alice@example.com"]
+    [Column: name, value: "Alice"]
+  [Clustering Column 2: timestamp=T2]
+    [Column: status, value: "active"]
+
+Partition 2:
+  [Partition Key: user456]
+  ...
+
+Format: Sorted by partition key, then clustering columns
+```
+
+2. **Index.db** - Partition Index:
+```
+Maps partition keys → byte offset in Data.db
+
+user123 → offset: 0
+user456 → offset: 1024
+user789 → offset: 2048
+
+Allows O(1) jump to partition in Data.db
+```
+
+3. **Summary.db** - Partition Summary (in-memory):
+```
+Sparse index of Index.db
+
+Every 128th partition key:
+user000 → Index.db offset: 0
+user128 → Index.db offset: 16384
+user256 → Index.db offset: 32768
+
+Reduces Index.db lookups (saves disk I/O)
+```
+
+4. **Filter.db** - Bloom Filter:
+```
+Probabilistic data structure
+
+Can answer: "Is user999 in this SSTable?"
+- Definitely NOT (100% accurate) → Skip SSTable
+- Probably YES (false positive possible) → Check SSTable
+
+Benefits:
+- In-memory (few KB per SSTable)
+- Saves disk reads for missing data
+- 90%+ of SSTables skipped on average
+```
+
+5. **Statistics.db** - Metadata:
+```
+{
+    "minTimestamp": 1640000000,
+    "maxTimestamp": 1640100000,
+    "minPartitionKey": "user000",
+    "maxPartitionKey": "user999",
+    "numPartitions": 1000,
+    "totalSize": 1048576,
+    "compressionRatio": 0.7,
+    "estimatedRowSize": {
+        "min": 100,
+        "max": 5000,
+        "mean": 1024
+    }
+}
+
+Used for:
+- Query optimization
+- Compaction decisions
+- Disk space estimation
+```
+
+**Read from SSTable**:
+```
+Query: SELECT * FROM users WHERE id = 'user456'
+
+Step 1: Check Bloom filter
+if (!bloomFilter.mightContain("user456")) {
+    return;  // Skip this SSTable
+}
+
+Step 2: Check Summary (in-memory)
+user456 falls between user384 and user512
+→ Index.db offset range: [24576, 32768]
+
+Step 3: Binary search Index.db (disk read)
+Found: user456 → Data.db offset: 1024
+
+Step 4: Read Data.db at offset 1024 (disk read)
+Return partition data
+
+Total disk reads: 2 (Index + Data)
+With cache: Often 0-1 (Index cached)
+```
+
+---
+
+## Compaction Strategies
+
+### Why Compaction is Needed
+
+**The Problem**:
+```
+Over time:
+MemTable flush → SSTable1
+MemTable flush → SSTable2
+MemTable flush → SSTable3
+...
+MemTable flush → SSTable100
+
+Same key updated multiple times:
+SSTable1: user123 → {email: "v1", timestamp: T1}
+SSTable5: user123 → {email: "v2", timestamp: T5}
+SSTable10: user123 → {email: "v3", timestamp: T10}
+
+Read query for user123:
+- Must check SSTables 1, 5, 10, ..., 100
+- Merge results (take latest timestamp)
+- 100 disk reads! (SLOW)
+
+Deleted data:
+SSTable20: DELETE user999 (tombstone, T20)
+→ Tombstone stays forever unless compacted
+→ Wastes disk space
+```
+
+**The Solution: Compaction**
+```
+Merge SSTables:
+SSTable1 + SSTable5 + SSTable10 + ... + SSTable100
+  ↓
+SSTable_merged
+
+Benefits:
+- Fewer SSTables to read (faster reads)
+- Latest versions kept (old versions discarded)
+- Tombstones removed (after gc_grace_seconds)
+- Disk space reclaimed
+```
+
+### Size-Tiered Compaction Strategy (STCS)
+
+**Default strategy, optimized for writes.**
+
+**How It Works**:
+```
+1. Group SSTables by similar size
+2. When 4 SSTables of similar size exist → Merge
+3. Result: 1 larger SSTable
+
+Example:
+Time 0: [10MB] [10MB] [10MB] [10MB] ← 4 similar-sized
+Time 1: → Compact → [40MB]
+
+Time 2: [40MB] [10MB] [10MB] [10MB] [10MB]
+Time 3: [40MB] → Compact → [40MB]
+
+Time 4: [40MB] [40MB] ← 2 similar-sized
+Wait for 2 more 40MB SSTables...
+
+Time 10: [40MB] [40MB] [40MB] [40MB]
+Time 11: → Compact → [160MB]
+
+Eventually: [640MB] (from many 10MB SSTables)
+```
+
+**Configuration**:
+```cql
+CREATE TABLE users (
+    id UUID PRIMARY KEY,
+    name TEXT
+) WITH compaction = {
+    'class': 'SizeTieredCompactionStrategy',
+    'min_threshold': 4,  -- Min SSTables to compact
+    'max_threshold': 32  -- Max SSTables in one compaction
+};
+```
+
+**Pros**:
+- Fast writes (no immediate compaction)
+- Simple algorithm
+- Good for write-heavy workloads
+
+**Cons**:
+- Reads can be slow (many SSTables)
+- Space amplification (need 2x space during compaction)
+- Compaction storms (sudden burst of I/O)
+
+**Best For**:
+- Write-heavy workloads
+- Time-series data (recent data read more)
+- Immutable data
+
+### Leveled Compaction Strategy (LCS)
+
+**Optimized for reads.**
+
+**How It Works**:
+```
+Organize SSTables into levels:
+
+Level 0: [10MB] [10MB] [10MB] [10MB] (new SSTables)
+Level 1: [10MB] [10MB] [10MB] ... [10MB] (max 100MB total)
+Level 2: [100MB] [100MB] ... [100MB] (max 1GB total)
+Level 3: [1GB] [1GB] ... (max 10GB total)
+
+Rules:
+1. Each level is 10x larger than previous
+2. Within a level, SSTables don't overlap
+3. When level full → compact to next level
+
+Example:
+Level 0 fills with 4× 10MB SSTables
+→ Compact to Level 1 (merge with overlapping SSTables)
+→ Result: 10MB SSTable in Level 1 (no overlap with others)
+
+Key insight: Non-overlapping SSTables
+→ Query only reads 1 SSTable per level (max N levels)
+→ Predictable read performance
+```
+
+**Configuration**:
+```cql
+CREATE TABLE users (
+    id UUID PRIMARY KEY,
+    name TEXT
+) WITH compaction = {
+    'class': 'LeveledCompactionStrategy',
+    'sstable_size_in_mb': 160  -- Target SSTable size
+};
+```
+
+**Pros**:
+- Fast, predictable reads (90% reads touch ≤ 1 SSTable)
+- Less space amplification (10% extra vs 50% for STCS)
+- No compaction storms
+
+**Cons**:
+- More compaction I/O (compacts more frequently)
+- Slower writes (more background compaction)
+
+**Best For**:
+- Read-heavy workloads
+- Mixed read/write (balanced)
+- Limited disk space
+
+### Time Window Compaction Strategy (TWCS)
+
+**Optimized for time-series data.**
+
+**How It Works**:
+```
+1. Group SSTables by time window (e.g., 1 day)
+2. Compact SSTables within same time window
+3. NEVER compact across time windows
+4. Expired windows deleted entirely (TTL)
+
+Example with 1-day windows:
+Day 1: [SSTable_2024-01-01_1] [SSTable_2024-01-01_2]
+       → Compact → [SSTable_2024-01-01_merged]
+
+Day 2: [SSTable_2024-01-02_1] [SSTable_2024-01-02_2]
+       → Compact → [SSTable_2024-01-02_merged]
+
+Day 30 (with TTL=30 days):
+Delete [SSTable_2024-01-01_merged] entirely
+→ Efficient expiration (delete file, no tombstones!)
+```
+
+**Configuration**:
+```cql
+CREATE TABLE sensor_data (
+    sensor_id UUID,
+    timestamp TIMESTAMP,
+    temperature DECIMAL,
+    PRIMARY KEY (sensor_id, timestamp)
+) WITH compaction = {
+    'class': 'TimeWindowCompactionStrategy',
+    'compaction_window_unit': 'DAYS',
+    'compaction_window_size': 1
+}
+AND default_time_to_live = 2592000;  -- 30 days TTL
+```
+
+**Pros**:
+- Perfect for time-series + TTL
+- Efficient expiration (delete entire SSTables)
+- Predictable disk usage
+- No tombstone accumulation
+
+**Cons**:
+- Only works for time-series patterns
+- Requires careful time window sizing
+
+**Best For**:
+- Time-series data (IoT, logs, metrics)
+- Data with TTL
+- Append-only workloads
+
+### Choosing a Compaction Strategy
+
+**Decision Tree**:
+```
+What's your workload?
+├─ Time-series with TTL?
+│  └─ YES → TWCS
+│
+├─ Write-heavy, reads rare?
+│  └─ YES → STCS
+│
+├─ Read-heavy or balanced?
+│  └─ YES → LCS
+│
+└─ Append-only immutable data?
+   └─ YES → STCS or TWCS
+```
+
+**Performance Comparison** (Typical benchmarks):
+
+| Strategy | Read Latency | Write Throughput | Space | Compaction I/O |
+|----------|--------------|------------------|-------|----------------|
+| STCS     | Variable     | Highest          | 2x    | Lowest         |
+| LCS      | Consistent   | Medium           | 1.1x  | Highest        |
+| TWCS     | Good         | High             | 1.2x  | Low            |
+
+---
+
+## Practical Exercises
+
+### Exercise 1: Analyze Ring Topology
+
+**Setup a 3-node cluster and explore**:
+
+```bash
+# On each node, check ring status
+nodetool ring
+
+# Output (simplified):
+Address         Rack  Status  Token                    Owns
+192.168.1.1     rack1 Up      -9223372036854775808     33.3%
+192.168.1.2     rack1 Up      -3074457345618258603     33.3%
+192.168.1.3     rack1 Up      3074457345618258602      33.4%
+
+# Explanation:
+# - Token range: -2^63 to 2^63-1
+# - Each node owns ~33% of ring
+# - Vnodes distribute evenly
+```
+
+**Task**: Insert data and verify distribution:
+```cql
+CREATE KEYSPACE test WITH REPLICATION = {
+    'class': 'SimpleStrategy',
+    'replication_factor': 2
+};
+
+CREATE TABLE test.users (
+    id UUID PRIMARY KEY,
+    name TEXT
+);
+
+-- Insert 1000 users
+-- Then check distribution:
+```
+
+```bash
+# On each node
+nodetool tablestats test.users
+
+# Check "Number of partitions" per node
+# Should be roughly equal
+```
+
+### Exercise 2: Observe Compaction
+
+**Monitor compaction in action**:
+
+```bash
+# Enable compaction logging
+nodetool setlogginglevel org.apache.cassandra.db.compaction DEBUG
+
+# Trigger manual compaction
+nodetool compact my_keyspace my_table
+
+# Watch logs
+tail -f /var/log/cassandra/system.log | grep compaction
+
+# Output shows:
+# - Which SSTables being merged
+# - Progress percentage
+# - Final result SSTable
+```
+
+**Task**: Compare strategies:
+```cql
+-- Table 1: STCS
+CREATE TABLE stcs_test (...) WITH compaction = {
+    'class': 'SizeTieredCompactionStrategy'
+};
+
+-- Table 2: LCS
+CREATE TABLE lcs_test (...) WITH compaction = {
+    'class': 'LeveledCompactionStrategy'
+};
+
+-- Insert same data to both
+-- Run: nodetool tablestats
+-- Compare: "SSTable count", "Space used"
+```
+
+---
+
+## Key Takeaways
+
+<CardGroup cols={2}>
+  <Card title="Ring Topology = Peer-to-Peer" icon="circle-nodes">
+    No master node. Every node is equal. Consistent hashing distributes data evenly. Vnodes automate token management.
+  </Card>
+
+  <Card title="Immutable SSTables" icon="lock">
+    Append-only writes (fast). Never modified after creation. Compaction merges and cleans up periodically.
+  </Card>
+
+  <Card title="LSM Tree Trade-offs" icon="scale-balanced">
+    Fast writes (MemTable + CommitLog). Slower reads (multiple SSTables). Compaction bridges the gap.
+  </Card>
+
+  <Card title="Compaction Strategy Matters" icon="gears">
+    STCS for writes, LCS for reads, TWCS for time-series. Choose based on workload, not defaults.
+  </Card>
+</CardGroup>
+
+---
+
+## What's Next?
+
+Now that you understand the architecture, let's learn how to model data to match Cassandra's strengths.
+
+<Card
+  title="Module 3: Data Modeling for Cassandra"
+  icon="table"
+  href="/distributed-systems-tools/cassandra-data-modeling"
+>
+  Master query-driven data modeling, partition keys, clustering columns, and denormalization patterns
+</Card>
+
+<Note>
+**Pro Tip**: Revisit this module when troubleshooting production issues. Understanding the internals helps diagnose: "Why is this query slow?" → Check: Bloom filters, compaction strategy, SSTables per read.
+</Note>
