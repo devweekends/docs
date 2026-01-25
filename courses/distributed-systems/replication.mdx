@@ -187,6 +187,122 @@ FROM pg_stat_replication;
 - **Read from leader**: For critical reads after writes
 - **Version vectors**: Track causality explicitly
 
+### Implementing Read-Your-Writes Guarantees
+
+One of the most common consistency issues users experience. Here's how to implement it:
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    READ-YOUR-WRITES IMPLEMENTATION                           │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  PROBLEM:                                                                   │
+│  User writes to leader, immediately reads from follower → stale data!       │
+│                                                                              │
+│  Client ──Write──► Leader (v5)                                              │
+│  Client ──Read───► Follower (still at v3) → "Where's my data?!"            │
+│                                                                              │
+│  ═══════════════════════════════════════════════════════════════════════    │
+│                                                                              │
+│  SOLUTION 1: STICKY SESSIONS (Simple)                                       │
+│  ─────────────────────────────────────                                      │
+│  Route all requests from same user to same replica                          │
+│  • Use user_id hash for routing                                             │
+│  • Works if replica is leader or caught-up follower                        │
+│  • Breaks on failover                                                       │
+│                                                                              │
+│  SOLUTION 2: READ-FROM-LEADER (Strong but bottleneck)                       │
+│  ────────────────────────────────────────────────────                       │
+│  After write, read from leader for X seconds                                │
+│  • Simple to implement                                                      │
+│  • Increases leader load                                                    │
+│  • Time-based heuristic (may still serve stale)                            │
+│                                                                              │
+│  SOLUTION 3: VERSION TRACKING (Robust)                                      │
+│  ─────────────────────────────────────                                      │
+│  Track write version, ensure read version ≥ write version                  │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+**Production Implementation (Version Tracking)**:
+
+```python
+class ReadYourWritesClient:
+    """
+    Client-side implementation of Read-Your-Writes guarantee.
+    Used by: MongoDB, CockroachDB, Spanner
+    """
+    def __init__(self):
+        # Track the latest write version per key (or global)
+        self.write_version = {}  # key -> version
+    
+    def write(self, key, value):
+        """Write to leader, record version"""
+        response = self.leader.write(key, value)
+        # Store the version returned by leader
+        self.write_version[key] = response.version
+        return response
+    
+    def read(self, key):
+        """Read ensuring we see our writes"""
+        min_version = self.write_version.get(key, 0)
+        
+        # Option A: Send min_version to replica, it waits until caught up
+        response = self.replica.read(
+            key, 
+            min_version=min_version  # "Don't respond until you have this version"
+        )
+        
+        # Option B: Read from any replica, retry if stale
+        for replica in self.replicas:
+            response = replica.read(key)
+            if response.version >= min_version:
+                return response
+        
+        # Fallback to leader if no replica is fresh enough
+        return self.leader.read(key)
+
+class ReplicaServer:
+    """Server-side: Wait for replication before responding"""
+    
+    def read(self, key, min_version=None):
+        if min_version is not None:
+            # Wait until we've replicated up to min_version
+            self.wait_for_version(min_version, timeout=5.0)
+        
+        return self.storage.get(key)
+    
+    def wait_for_version(self, target_version, timeout):
+        """Block until replication catches up"""
+        start = time.time()
+        while self.current_version < target_version:
+            if time.time() - start > timeout:
+                raise StaleReadError("Replica too far behind")
+            time.sleep(0.01)  # Busy wait (use condition variable in prod)
+```
+
+**Comparison of Approaches**:
+
+| Approach | Consistency | Availability | Complexity |
+|----------|-------------|--------------|------------|
+| Sticky Sessions | Weak | High | Low |
+| Read-from-Leader | Strong | Lower | Low |
+| Version Tracking | Strong | High | Medium |
+| Causal Tokens | Strong | High | High |
+
+**Causal Consistency Tokens** (Advanced):
+Systems like MongoDB use "causal consistency tokens" that encode the entire causal history, not just a single version. This ensures you see all causally-related writes, not just your own.
+
+```python
+# MongoDB-style causal token
+{
+    "clusterTime": {"$timestamp": {"t": 1624000000, "i": 1}},
+    "operationTime": {"$timestamp": {"t": 1624000000, "i": 1}},
+    "afterClusterTime": {"$timestamp": {"t": 1623999999, "i": 5}}
+}
+```
+
 ---
 
 ### Handling Failover
@@ -574,6 +690,20 @@ When conflicts happen, how do you resolve them?
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
 
+### Dotted Version Vectors (DVV)
+
+Traditional Version Vectors can grow linearly with the number of nodes ($O(N)$ overhead) and can be imprecise for concurrent updates to the same node. **Dotted Version Vectors** (DVV), used in Riak, solve this by separating the "dot" (a specific update) from the "causal context."
+
+**Key Benefit**: DVVs accurately distinguish between "I have seen this update" and "This update is a sibling of that one," leading to significantly fewer false conflicts during churn.
+
+```text
+Format: [ (NodeID, Counter), VersionVector ]
+- (NodeID, Counter) is the "Dot" representing the specific event.
+- VersionVector is the "Context" representing what this node had seen.
+```
+
+---
+
 ### Last-Write-Wins (LWW) Deep Dive
 
 ```
@@ -940,6 +1070,42 @@ Merge: {A: 5, B: 3, C: 0} → value = 8 (no conflict!)
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
 
+### JSON CRDTs & Rich Text (Automerge/Yjs)
+
+Modeling a simple counter or set is one thing, but how do you model a **JSON Document** or a **Rich Text Document** (like this one)?
+
+#### 1. JSON CRDT Architecture
+A JSON CRDT models the document as a **Tree of CRDTs**.
+- **Objects**: Maps where keys map to other CRDTs.
+- **Arrays**: Sequences where each element has a unique ID and a pointer to the previous element (**RGA - Replicated Growable Array**).
+- **Registers**: For leaf values (strings, numbers).
+
+#### 2. The Interleaving Problem
+In collaborative text editing, if Alice inserts "A" and Bob inserts "B" at the same position, a naive CRDT might result in "BA" for Alice and "AB" for Bob. Modern CRDTs like **Yjs** and **Automerge** use **Causal Ordering** and **Unique IDs** to ensure that all replicas agree on the order (e.g., "AB" for everyone).
+
+---
+
+### Delta-CRDTs: Optimizing Bandwidth
+
+The biggest drawback of **State-based CRDTs (CvRDTs)** is that the state grows over time. If you have a counter with 1,000 nodes, you must send all 1,000 counts every time you sync.
+
+**Delta-CRDTs** solve this by only sending the **Delta** (the changes) since the last successful synchronization.
+- **Dot Store**: A way to track which specific updates (dots) a neighbor has already seen.
+- **Delta-Group**: A collection of updates that are merged together before being sent.
+- **Efficiency**: Reduces bandwidth from $O(N)$ to $O(\Delta)$, making CRDTs viable for mobile devices on slow networks.
+
+---
+
+### Garbage Collection & Tombstones
+
+When you remove an element from a CRDT (like a `2P-Set` or `OR-Set`), you must keep a **Tombstone** to prove to other nodes that the item was deleted. If you delete the tombstone too early, a node that hasn't seen the deletion might "re-infect" the cluster with the old data.
+
+#### Strategies for Cleaning Tombstones:
+1.  **Stable State GC**: Only delete a tombstone once you have proof (via gossip) that **every node in the cluster** has seen the deletion.
+2.  **Time-based GC**: Delete tombstones after a very long period (e.g., 30 days). If a node stays offline longer than that, it must be completely wiped and re-synced from scratch.
+
+---
+
 ### CRDT Usage in Practice
 
 ```
@@ -965,6 +1131,200 @@ LIMITATIONS:
 • Complex to implement correctly
 • May need garbage collection for tombstones
 ```
+
+### Multi-Paxos / Raft Groups (Sharded Consensus)
+
+A single consensus group (e.g., one Raft cluster) is bottlenecked by the CPU and I/O of a single leader. To scale to millions of requests, you must use **Sharded Consensus**.
+
+#### Architecture: Multi-Group
+Instead of one large group, we partition the data into many small shards, each managed by its own independent consensus group.
+
+```text
+┌───────────────────────────────────────────────────────────────┐
+│                    SHARDED CONSENSUS GROUPS                   │
+├───────────────────────────────────────────────────────────────┤
+│                                                               │
+│  SHARD A (Keys 0-99)     SHARD B (Keys 100-199)               │
+│  ┌─────────────────┐     ┌─────────────────┐                  │
+│  │ Raft Group 1    │     │ Raft Group 2    │                  │
+│  │ (Nodes 1, 2, 3) │     │ (Nodes 4, 5, 6) │                  │
+│  └─────────────────┘     └─────────────────┘                  │
+│                                                               │
+│  COORDINATOR: A "Placement Driver" or "Master" tracks which   │
+│  nodes belong to which Raft groups.                           │
+│                                                               │
+└───────────────────────────────────────────────────────────────┘
+```
+
+#### The Challenge: Cross-Shard Transactions
+When an operation affects multiple shards (e.g., `Transfer($5) from Shard A to Shard B`), you need a higher-level protocol like **Two-Phase Commit (2PC)** or **Percolator** to coordinate across the individual consensus groups.
+
+**Used By**: CockroachDB (Ranges), TiDB (Regions), and Google Spanner (Paxos Groups).
+
+---
+
+### Chain Replication
+Chain replication is a widely used technique for high-throughput, linearizable replication. It is used in systems like FAWN and CORFU.
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                        CHAIN REPLICATION                                     │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  STRUCTURE: Nodes are arranged in a chain: Head → ... → Tail                │
+│                                                                              │
+│  WRITE PATH:                                                                │
+│  1. Client sends write to the HEAD.                                         │
+│  2. Head applies write and forwards to next node.                           │
+│  3. Propagation continues until it reaches the TAIL.                        │
+│  4. Tail sends ACK back up the chain or directly to client.                 │
+│                                                                              │
+│  READ PATH:                                                                 │
+│  1. Clients read ONLY from the TAIL.                                        │
+│                                                                              │
+│  WHY IT WORKS:                                                              │
+│  - Linearizability: A write is only visible (at the Tail) once it has been  │
+│    persisted by ALL nodes in the chain.                                     │
+│  - Higher Throughput: The load is distributed across the chain.             │
+│                                                                              │
+│  FAILURE HANDLING:                                                          │
+│  - Head fails: Next node becomes the new Head.                              │
+│  - Tail fails: Predecessor becomes the new Tail.                            │
+│  - Internal node fails: Predecessor and successor link up.                  │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Advanced Design Scenarios
+
+### Scenario 1: Global E‑Commerce Database Replication
+
+You run a global e‑commerce platform with users in US, EU, and APAC. You want **strong guarantees for orders and payments**, but can tolerate slightly stale reads for product browsing.
+
+**Design**:
+
+- **Topology**:
+  - Single **write leader region** (e.g., `us-east-1`) with synchronous followers in the same region.
+  - **Read replicas per region** (EU, APAC) receiving asynchronous replication from the leader.
+- **Write path**:
+  - All order and payment writes go to the **regional leader** in `us-east-1`.
+  - Use **semi-synchronous replication** inside the leader region: commit after 1 follower ACK to avoid single-copy-of-truth.
+- **Read path**:
+  - **Critical reads** (order status, payment status): hit the leader region or only replicas with **replication lag < T ms**.
+  - **Non-critical reads** (product catalog, reviews): go to nearest regional replica even if seconds behind.
+
+```text
+US-East (Primary Region)
+  - primary-db (leader, sync to 1 follower)
+  - follower-db-1 (sync)
+  - follower-db-2 (async)
+
+EU-West (Read Region)
+  - repl-db-eu (async follower)
+
+AP-South (Read Region)
+  - repl-db-ap (async follower)
+```
+
+**Consistency & failure behavior**:
+
+- **RPO/RTO**:
+  - With semi-sync in primary region, losing the leader does **not** lose committed transactions; failover to the in-region sync follower.
+  - Cross-region replication remains **async** → if the entire region fails, you may lose up to \(Δ\) seconds of writes that haven’t replicated.
+- **Patterns used**:
+  - From this module: **single-leader replication**, **sync vs async**, **replication lag awareness**, and **failover**.
+  - Combined with consistency models: guarantee **read-your-writes** by routing post-write reads to the leader or using a `min_lsn`/`min_commit_time` threshold on replicas.
+
+---
+
+### Scenario 2: Active‑Active User Profile Store
+
+You want low-latency profile updates and reads from any region, and you’re willing to accept **eventual consistency** for some fields but not for others.
+
+**Requirements**:
+
+- Profile updates can happen in **any region** (multi-leader / active‑active).
+- Some fields (e.g., `email`, `phone`) must avoid conflicting values.
+- Other fields (e.g., `last_seen_at`, `recently_viewed`) can be merged.
+
+**Design**:
+
+- **Multi-leader replication** between regions with a log for each leader.
+- **Per-field conflict resolution strategy**:
+  - Identity fields (`email`, `phone`, `name`): **Last-Write-Wins per field** with server-side timestamps (avoid whole-record LWW).
+  - Activity fields (`recently_viewed`, `devices`, `tags`): treat as **CRDT sets or counters** and **merge**.
+
+```text
+Profile document:
+{
+  id: "user-123",
+  email: { value: "a@x.com", ts: 1700000000 },
+  phone: { value: "+1-555-...", ts: 1700000100 },
+  devices: G-Set of device IDs,
+  tags:   OR-Set of tags
+}
+
+On update:
+- For scalar fields: compare timestamps.
+- For sets: CRDT merge (union / OR‑Set semantics).
+```
+
+**Failure / partition behavior**:
+
+- During a partition, each region continues accepting writes.
+- On healing:
+  - For scalars, keep value with **newer timestamp** (assuming bounded skew, or use hybrid logical clocks).
+  - For sets/counters, apply CRDT **merge** (no conflicts).
+
+This scenario composes:
+
+- **Multi-leader replication** + **conflict detection** (version vectors or timestamps).
+- **Conflict resolution** strategies and **CRDTs** for different fields in the same entity.
+
+---
+
+### Scenario 3: Leaderless Metrics Store with Tunable Consistency
+
+You’re designing a high-throughput **metrics and logs** store similar to Dynamo/Cassandra. Availability and write throughput matter more than strict consistency.
+
+**Design**:
+
+- **Leaderless replication** with parameters \(N, W, R\):
+  - \(N = 3\) replicas per key.
+  - For **writes**: \(W = 2\) for production metrics, \(W = 1\) for debug logs.
+  - For **reads**: \(R = 1\) for dashboards where staleness is acceptable, \(R = 2\) for alerting queries.
+- **Anti-entropy**:
+  - Enable **read repair** on reads (update stale replicas in background).
+  - Periodically run **Merkle tree** comparisons between nodes to reconcile drift.
+
+```text
+Write metrics(point):
+  - Hash(key) → choose N replicas.
+  - Try to write to all N.
+  - If at least W ACKs within timeout → success.
+  - If fewer than W → client sees write failure (but some replicas may still store point).
+
+Read metrics(query):
+  - Contact R replicas.
+  - Return value with latest timestamp.
+  - Schedule background repairs for stale replicas.
+```
+
+**Partition & failure behavior**:
+
+- **Partial node failures**: As long as at least \(W\) nodes are reachable for writes and \(R\) for reads, the system remains available with overlapping quorums.
+- **Sloppy quorums + hinted handoff**:
+  - When a home replica is down, temporarily write to a substitute node (hinted handoff) to keep \(W\) high.
+  - On recovery, hints are replayed to repair the downed node.
+- **Trade-offs**:
+  - For **alerting**: configure \(W + R > N\) and avoid sloppy quorums to favor correctness.
+  - For **debug logs**: allow \(W = 1, R = 1\) and sloppy quorums to maximize write availability.
+
+This scenario applies:
+
+- **Quorum mathematics** (\(W + R > N\)), **sloppy quorums**, **hinted handoff**, and **anti-entropy** techniques from this module in a concrete operational design.
 
 ---
 

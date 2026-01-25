@@ -1,0 +1,2390 @@
+---
+title: "Kernel Memory Internals: Buddy, SLUB & Page Cache"
+sidebarTitle: "Kernel Memory"
+description: "A deep dive into the Buddy Allocator, SLUB object caching, NUMA architecture, and Page Cache writeback"
+icon: "microchip"
+---
+
+# Kernel Memory Management
+
+While user-space processes use `malloc()` and rely on lazy paging, the kernel must manage physical memory with absolute precision. Kernel memory must often be contiguous, always pinned (not swapped), and extremely fast to allocate. This chapter explores the multi-level hierarchy that allows the Linux kernel to manage gigabytes of RAM with microsecond overhead.
+
+<Info>
+**Mastery Level**: Senior Kernel Engineer
+**Key Internals**: Buddy System Orders, SLUB partial lists, NUMA Zones, Dirty Page Ratios
+**Prerequisites**: [Memory Management & Paging](/operating-systems/memory-management), [Virtual Memory](/operating-systems/virtual-memory)
+**Duration**: 8-12 hours for complete mastery
+</Info>
+
+---
+
+## Course Overview
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                  KERNEL MEMORY MANAGEMENT                        │
+│                  ════════════════════════                        │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  LAYER 1: Physical Memory                                       │
+│  ────────────────────────                                       │
+│  ■ Buddy Allocator (Page Frame Management)                     │
+│  ■ Memory Zones (DMA, NORMAL, HIGHMEM)                         │
+│  ■ NUMA Nodes and Memory Affinity                              │
+│                                                                  │
+│  LAYER 2: Object Caching                                        │
+│  ─────────────────────                                          │
+│  ■ SLAB/SLUB/SLOB Allocators                                   │
+│  ■ Per-CPU Caches and Partial Lists                            │
+│  ■ kmalloc vs vmalloc                                           │
+│                                                                  │
+│  LAYER 3: Specialized Allocators                                │
+│  ──────────────────────────────                                 │
+│  ■ Memory Pools (mempool)                                       │
+│  ■ DMA Buffers and Coherent Memory                             │
+│  ■ Per-CPU Variables                                            │
+│  ■ High Memory Mapping                                          │
+│                                                                  │
+│  LAYER 4: Page Cache                                            │
+│  ────────────────────                                           │
+│  ■ Page Cache Architecture                                      │
+│  ■ Dirty Page Management                                        │
+│  ■ Writeback Mechanisms                                         │
+│  ■ Memory Reclaim                                               │
+│                                                                  │
+│  LAYER 5: Advanced Topics                                       │
+│  ──────────────────────                                         │
+│  ■ Kernel Address Space Layout                                  │
+│  ■ OOM Killer                                                   │
+│  ■ Memory Compaction                                            │
+│  ■ Transparent Huge Pages in Kernel                            │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 1. The Buddy Allocator: Physical Page Management
+
+The Buddy System is the foundational allocator for the kernel. It manages physical RAM in units of **Page Frames** (usually 4KB on x86-64).
+
+### 1.1 The Math of Orders
+
+The allocator maintains free lists for different "Orders." An order $k$ represents a block of $2^k$ contiguous pages.
+
+```
+Order-based Memory Organization:
+═════════════════════════════════
+
+Order 0:  1 page  = 4 KB     [████]
+Order 1:  2 pages = 8 KB     [████████]
+Order 2:  4 pages = 16 KB    [████████████████]
+Order 3:  8 pages = 32 KB    [████████████████████████████████]
+...
+Order 10: 1024 pages = 4 MB  [huge contiguous block]
+Order 11: 2048 pages = 8 MB  (MAX_ORDER - 1 on most systems)
+
+Why Powers of Two?
+──────────────────
+• Fast splitting and merging (bit operations)
+• Efficient buddy address calculation
+• Minimal fragmentation with proper coalescing
+```
+
+**Key Limits**:
+- **MAX_ORDER**: Usually 11 (configurable at compile time)
+- **Maximum allocation**: 4MB (Order 10) on default x86-64 systems
+- **Minimum allocation**: 4KB (Order 0)
+
+### 1.2 Buddy Address Mathematics
+
+The "buddy" of a block is the other half of the next-larger block. The buddy address can be calculated using XOR:
+
+```c
+// Buddy address calculation
+unsigned long buddy_pfn = pfn ^ (1UL << order);
+
+Example with Order 2 (4 pages):
+─────────────────────────────────
+pfn = 0x1000 (binary: ...0001 0000 0000 0000)
+order = 2
+buddy_pfn = 0x1000 ^ (1 << 2)
+         = 0x1000 ^ 0x4
+         = 0x1004 (binary: ...0001 0000 0000 0100)
+
+The buddy is exactly 2^order pages away!
+```
+
+### 1.3 Splitting Algorithm
+
+When a larger block must be divided to satisfy a smaller allocation:
+
+```
+Splitting Example (Request Order 0, only Order 2 available):
+═══════════════════════════════════════════════════════════
+
+Initial State:
+Order 2: [AAAA] (free)
+Order 1: (empty)
+Order 0: (empty)
+
+Step 1: Split Order 2 → Two Order 1 blocks
+Order 2: (empty)
+Order 1: [AA] [BB] (BB goes to free list)
+Order 0: (empty)
+
+Step 2: Split first Order 1 → Two Order 0 blocks
+Order 2: (empty)
+Order 1: [BB] (free)
+Order 0: [A] [a] (allocate A, a goes to free list)
+
+Final Result:
+─────────────
+Allocated: [A] (Order 0)
+Free:      [a] (Order 0), [BB] (Order 1)
+```
+
+**Pseudocode**:
+```c
+struct page *alloc_pages(gfp_t flags, unsigned int order) {
+    unsigned int current_order = order;
+
+    // Try to find a free block at requested order
+    while (current_order < MAX_ORDER) {
+        if (free_list[current_order] is not empty) {
+            struct page *page = remove_from_free_list(current_order);
+
+            // Split down to requested size
+            while (current_order > order) {
+                current_order--;
+                struct page *buddy = page + (1 << current_order);
+                add_to_free_list(buddy, current_order);
+            }
+
+            return page;
+        }
+        current_order++;
+    }
+
+    return NULL; // Out of memory!
+}
+```
+
+### 1.4 Coalescing (Merging) Algorithm
+
+When a block is freed, the kernel checks if its buddy is also free. If so, they merge into a larger block:
+
+```
+Coalescing Example:
+═══════════════════
+
+Initial State:
+Order 2: (empty)
+Order 1: [BB] (free)
+Order 0: [A] [a] (a is being freed)
+
+Step 1: Check if buddy of [a] is free
+Buddy of a is A (at offset +1)
+A is NOT free (still allocated) → Cannot coalesce
+Add [a] to Order 0 free list
+
+Later: [A] is freed
+Step 2: Check if buddy of [A] is free
+Buddy of A is [a] (at offset +1)
+[a] IS free → Coalesce!
+
+Step 3: Remove [a] from Order 0, merge A+a → [AA]
+Add [AA] to Order 1
+
+Step 4: Check if buddy of [AA] is free
+Buddy of [AA] is [BB]
+[BB] IS free → Coalesce!
+
+Step 5: Remove [BB] from Order 1, merge AA+BB → [AAAA]
+Add [AAAA] to Order 2
+
+Final State:
+Order 2: [AAAA] (fully coalesced!)
+Order 1: (empty)
+Order 0: (empty)
+```
+
+**Key Insight**: Coalescing combats external fragmentation by creating larger contiguous blocks.
+
+### 1.5 Anti-Fragmentation and Migration Types
+
+Linux classifies pages by "mobility" to reduce fragmentation:
+
+```
+Page Migration Types:
+═════════════════════
+
+UNMOVABLE:
+│ • Kernel core data structures
+│ • Cannot be moved once allocated
+│ • Causes fragmentation if scattered
+│
+MOVABLE:
+│ • User-space pages
+│ • Page cache
+│ • Can be migrated to compact memory
+│
+RECLAIMABLE:
+│ • Kernel caches (dentry, inode)
+│ • Can be freed under pressure
+│
+CMA (Contiguous Memory Allocator):
+│ • Reserved for devices requiring large contiguous buffers
+│ • Movable pages can use it when devices don't need it
+```
+
+**Fragmentation Mitigation Strategy**:
+```
+Memory Layout by Type:
+┌────────────────────────────────────────────────────────────┐
+│ [UNMOVABLE zone] [MOVABLE zone] [RECLAIMABLE zone] [CMA]  │
+│  └─ Kernel data   └─ User pages  └─ Caches         └─ DMA │
+└────────────────────────────────────────────────────────────┘
+
+If you mix unmovable pages with movable pages:
+[M][U][M][M][U][M] → Can't create Order 3+ blocks!
+
+By segregating:
+[U][U][U][U] [M][M][M][M] → Can compact movable pages
+```
+
+### 1.6 Viewing Buddy Info
+
+```bash
+# View free blocks per zone and order
+$ cat /proc/buddyinfo
+
+Node 0, zone   DMA    0    1    1    1    1    0    1    1    1    1    3
+Node 0, zone DMA32  128  256  512  384  256  128   64   32   16    8    4
+Node 0, zone Normal 1024 2048 4096 2048 1024 512  256  128   64   32   16
+
+Columns represent Order 0 through Order 10
+Numbers are free blocks at that order
+
+Example interpretation for "Normal" zone:
+─────────────────────────────────────────
+Order 0:  1024 free blocks (1024 * 4KB = 4 MB)
+Order 1:  2048 free blocks (2048 * 8KB = 16 MB)
+Order 2:  4096 free blocks (4096 * 16KB = 64 MB)
+...
+Order 10:   16 free blocks (16 * 4MB = 64 MB)
+```
+
+---
+
+## 2. Memory Zones: Hardware Constraints
+
+Modern x86-64 systems divide physical RAM into zones based on hardware addressing limitations.
+
+### 2.1 Zone Types
+
+```
+Memory Zone Architecture (Example 16GB System):
+═══════════════════════════════════════════════
+
+Physical Address Space:
+┌─────────────────────────────────────────────────────────┐
+│                                                         │
+│  0-16MB:     ZONE_DMA                                  │
+│  │           (ISA devices, 24-bit addressing)         │
+│  │           [legacy, rarely used today]              │
+│  │                                                      │
+│  16MB-4GB:   ZONE_DMA32                                │
+│  │           (32-bit devices, PCI devices)            │
+│  │           [most DMA happens here]                  │
+│  │                                                      │
+│  4GB-16GB:   ZONE_NORMAL                               │
+│  │           (Directly mapped in kernel space)        │
+│  │           [most kernel allocations]                │
+│  │                                                      │
+│  >16GB:      ZONE_HIGHMEM (32-bit only!)              │
+│              (Not directly mapped)                      │
+│              [Not present on 64-bit systems]           │
+│                                                         │
+└─────────────────────────────────────────────────────────┘
+
+x86-64 Kernel Virtual Address Space:
+┌─────────────────────────────────────────────────────────┐
+│                                                         │
+│  0xffff888000000000: Direct mapping (ZONE_NORMAL)     │
+│  │                    All physical RAM accessible      │
+│  │                    with simple offset translation   │
+│  │                                                      │
+│  0xffffc90000000000: vmalloc/ioremap area             │
+│  │                    Non-contiguous physical pages    │
+│  │                                                      │
+│  0xffffffffa0000000: Kernel modules                    │
+│  │                                                      │
+│  0xffffffffff600000: vsyscall page                     │
+│                                                         │
+└─────────────────────────────────────────────────────────┘
+```
+
+### 2.2 Zone Fallback Order
+
+When allocation from a zone fails, the kernel tries fallback zones:
+
+```c
+// Allocation preference order
+ZONE_NORMAL request:
+  1. Try ZONE_NORMAL
+  2. Fallback to ZONE_DMA32 (if available)
+  3. Fallback to ZONE_DMA (last resort)
+
+ZONE_DMA32 request:
+  1. Try ZONE_DMA32
+  2. Fallback to ZONE_DMA
+
+ZONE_DMA request:
+  1. Try ZONE_DMA ONLY (no fallback!)
+
+Why? DMA zones are precious; don't waste them on non-DMA allocations.
+```
+
+### 2.3 Zone Watermarks
+
+Each zone maintains three watermarks for memory pressure handling:
+
+```
+Zone Watermarks:
+════════════════
+
+High: ───────────────────────────────
+      │ Normal operation
+      │ Direct reclaim stops
+      │
+Min:  ───────┬───────────────────────
+      │      │ Start background reclaim (kswapd)
+      │      │
+Low:  ─────  │  ───────────────────
+             │  Direct reclaim required
+             │  Throttle allocations
+             │
+             ▼
+     [Out of Memory!]
+
+Typical values (for 16GB system):
+──────────────────────────────────
+min:  128 MB
+low:  160 MB
+high: 192 MB
+
+Configuration:
+$ cat /proc/sys/vm/min_free_kbytes
+131072  # 128 MB minimum free memory
+
+$ sysctl vm.min_free_kbytes=262144  # Increase to 256MB
+```
+
+**Memory Pressure States**:
+
+```c
+// Kernel reclaim states
+if (free_pages > high_watermark) {
+    // Happy state: no reclaim needed
+    return ALLOC_SUCCESS;
+
+} else if (free_pages > low_watermark) {
+    // Warn kswapd to start background reclaim
+    wakeup_kswapd();
+    return ALLOC_SUCCESS;
+
+} else if (free_pages > min_watermark) {
+    // Direct reclaim: caller must free pages
+    if (try_to_free_pages() == SUCCESS) {
+        return ALLOC_SUCCESS;
+    }
+
+} else {
+    // Emergency: OOM killer territory
+    invoke_oom_killer();
+}
+```
+
+---
+
+## 3. SLAB, SLUB, and SLOB: Object Caching
+
+The Buddy Allocator is too coarse for small objects (like a 128-byte `struct task_struct`). For this, the kernel uses object allocators.
+
+### 3.1 The Philosophy of Caching
+
+```
+Problem Without Object Caching:
+═══════════════════════════════
+
+Need: 128-byte task_struct
+Buddy Allocator: Minimum 4KB page
+Waste: 4096 - 128 = 3968 bytes (97% waste!)
+
+With multiple small allocations:
+[task][task][task]...[wasted 3KB]
+
+When freed:
+[free][task][free][task] → External fragmentation!
+```
+
+**SLUB Solution** (Linux's modern allocator):
+
+```
+SLUB Architecture:
+══════════════════
+
+Per-CPU Caches (Fast Path - No Locks):
+┌─────────────────────────────────────────────────────┐
+│ CPU 0: [obj][obj][obj][freelist]                   │
+│ CPU 1: [obj][obj][obj][freelist]                   │
+│ CPU 2: [obj][obj][obj][freelist]                   │
+│ CPU 3: [obj][obj][obj][freelist]                   │
+└─────────────────────────────────────────────────────┘
+               │ (per-cpu cache empty)
+               ▼
+Per-Node Partial Lists (Slow Path - With Lock):
+┌─────────────────────────────────────────────────────┐
+│ Node 0: [slab][slab][slab]... (partially used)    │
+│ Node 1: [slab][slab][slab]...                      │
+└─────────────────────────────────────────────────────┘
+               │ (no partial slabs)
+               ▼
+Buddy Allocator (Slowest Path):
+┌─────────────────────────────────────────────────────┐
+│ Allocate new slab from buddy system                │
+│ Carve into objects, add to per-cpu cache           │
+└─────────────────────────────────────────────────────┘
+```
+
+### 3.2 SLUB Internals: The Lockless Path
+
+**Fast Path** (common case, 99% of allocations):
+
+```c
+// Simplified SLUB fast path
+void *kmem_cache_alloc(struct kmem_cache *s, gfp_t flags) {
+    // 1. Get per-CPU freelist pointer (no lock!)
+    void **freelist = this_cpu_ptr(s->cpu_slab->freelist);
+    void *object = *freelist;
+
+    if (unlikely(object == NULL)) {
+        goto slow_path; // No objects in per-CPU cache
+    }
+
+    // 2. Update freelist to next object
+    void *next_free = get_freepointer(s, object);
+    *freelist = next_free;
+
+    // 3. Return object (entire operation lockless!)
+    return object;
+
+slow_path:
+    return __slab_alloc(s, flags, node); // Requires lock
+}
+```
+
+**Slow Path** (per-CPU cache refill):
+
+```c
+// Slow path: refill from partial list
+void *__slab_alloc(struct kmem_cache *s, gfp_t flags, int node) {
+    struct kmem_cache_cpu *c = get_cpu_slab(s);
+    struct page *page;
+
+    // Try to get a slab from the node's partial list
+    spin_lock(&s->node[node]->list_lock); // Now we need a lock
+
+    page = get_partial(s, flags, node);
+    if (page) {
+        c->page = page;
+        c->freelist = page->freelist;
+        spin_unlock(&s->node[node]->list_lock);
+        goto retry; // Go back to fast path
+    }
+
+    spin_unlock(&s->node[node]->list_lock);
+
+    // No partial slabs: allocate new from buddy
+    page = new_slab(s, flags, node);
+    if (page) {
+        c->page = page;
+        c->freelist = page->freelist;
+        goto retry;
+    }
+
+    return NULL; // Out of memory
+}
+```
+
+### 3.3 SLUB vs SLAB vs SLOB
+
+```
+Allocator Comparison:
+═════════════════════
+
+SLAB (Original, deprecated):
+├── Complex per-CPU queues
+├── Object coloring for cache alignment
+├── Per-node shared array caches
+├── High memory overhead (metadata)
+└── Good for small # of CPUs (<8)
+
+SLUB (Modern default):
+├── Simple per-CPU freelist
+├── Minimal metadata overhead
+├── Lockless fast path
+├── Better NUMA support
+├── Scales to 100+ CPUs
+└── Default since Linux 2.6.23
+
+SLOB (Simple List of Blocks):
+├── Minimal code (~600 lines)
+├── No per-CPU or per-node caching
+├── Best-fit allocation
+├── Lowest memory overhead
+└── Only for tiny embedded systems (<32MB RAM)
+
+Feature Matrix:
+────────────────────────────────────────────────
+              │ SLAB  │ SLUB  │ SLOB  │
+──────────────┼───────┼───────┼───────┤
+Complexity    │ High  │ Med   │ Low   │
+CPU Overhead  │ Med   │ Low   │ High  │
+Mem Overhead  │ High  │ Low   │ Lower │
+Scalability   │ Poor  │ Excellent │ N/A│
+Lock Contention│ High │ Low   │ High  │
+Cache Coloring│ Yes   │ No    │ No    │
+NUMA Support  │ Med   │ Good  │ None  │
+────────────────────────────────────────────────
+```
+
+### 3.4 Kmem Caches
+
+The kernel maintains hundreds of specialized caches:
+
+```bash
+# View all kmem caches
+$ cat /proc/slabinfo
+
+# Example output (simplified):
+# name            <active_objs> <num_objs> <objsize> <objperslab> <pagesperslab>
+task_struct         512       512       4544        7              8
+mm_struct           256       256       1024        4              1
+inode_cache        8192      8192        624        13             2
+dentry             16384     16384        192        21             1
+buffer_head        4096      4096        104        39             1
+kmalloc-128        2048      2048        128        32             1
+kmalloc-256        1024      1024        256        16             1
+kmalloc-512         512       512        512         8             1
+kmalloc-1k          256       256       1024         4             1
+kmalloc-2k          128       128       2048         2             1
+
+# Monitor cache efficiency
+$ slabtop
+
+Active / Total Objects: 2,435,617 / 2,618,424
+Active / Total Slabs: 124,563 / 124,563
+Active / Total Caches: 112 / 168
+Active / Total Size: 1,245,234K / 1,346,889K
+Minimum / Average / Maximum Object: 0.01K / 0.51K / 8.00K
+
+OBJS ACTIVE  USE OBJ SIZE  SLABS OBJ/SLAB CACHE SIZE NAME
+────────────────────────────────────────────────────────────
+524288 524288 100%  0.19K  24966       21  99864K dentry
+262144 262144 100%  0.62K  20165       13 161320K inode_cache
+131072 131072 100%  0.12K   4096       32  16384K kmalloc-128
+```
+
+### 3.5 Creating Custom Caches
+
+Kernel modules can create their own caches for frequently allocated structures:
+
+```c
+// Create cache for custom structure
+struct my_data {
+    int id;
+    char name[64];
+    struct list_head list;
+    // ... more fields
+};
+
+static struct kmem_cache *my_data_cache;
+
+// Module init
+static int __init my_module_init(void) {
+    my_data_cache = kmem_cache_create(
+        "my_data_cache",           // Name
+        sizeof(struct my_data),    // Object size
+        0,                         // Alignment (0 = default)
+        SLAB_HWCACHE_ALIGN |       // Align to cache line
+        SLAB_PANIC,                // Panic if creation fails
+        NULL                       // Constructor (optional)
+    );
+
+    return 0;
+}
+
+// Allocation
+static struct my_data *alloc_my_data(void) {
+    struct my_data *data;
+
+    // Allocate from cache (lockless fast path!)
+    data = kmem_cache_alloc(my_data_cache, GFP_KERNEL);
+    if (!data)
+        return NULL;
+
+    // Initialize fields
+    data->id = next_id++;
+    INIT_LIST_HEAD(&data->list);
+
+    return data;
+}
+
+// Deallocation
+static void free_my_data(struct my_data *data) {
+    kmem_cache_free(my_data_cache, data);
+}
+
+// Module exit
+static void __exit my_module_exit(void) {
+    kmem_cache_destroy(my_data_cache);
+}
+```
+
+**Benefits of Custom Caches**:
+- Pre-initialized objects (constructor functions)
+- Cache-line alignment for performance
+- Reduced allocation overhead
+- Better memory locality (similar objects grouped together)
+- Easier debugging (dedicated cache for tracking)
+
+---
+
+## 4. `kmalloc` vs. `vmalloc`
+
+Two fundamental kernel allocation functions with different trade-offs:
+
+### 4.1 kmalloc: Physically Contiguous
+
+```c
+// Allocate physically contiguous memory
+void *buffer = kmalloc(size, GFP_KERNEL);
+
+Physical Memory:
+┌──────────────────────────────────────────┐
+│ [    buffer (contiguous)               ] │
+└──────────────────────────────────────────┘
+   ^                                      ^
+   phys_addr                    phys_addr + size
+
+Kernel Virtual Address:
+┌──────────────────────────────────────────┐
+│ [    buffer (contiguous, direct map)   ] │
+└──────────────────────────────────────────┘
+   ^
+   virt_addr = __va(phys_addr)
+
+Translation: virt_addr = phys_addr + PAGE_OFFSET
+(Simple offset, no page table walk!)
+```
+
+**kmalloc Characteristics**:
+- Physically contiguous
+- Virtually contiguous
+- Fast allocation (from SLUB cache)
+- Fast access (single TLB entry covers entire allocation)
+- Size limited by largest buddy order (~4MB typically)
+- **Use for**: DMA buffers, hardware registers, critical paths
+
+**kmalloc Size Classes**:
+```
+kmalloc-8      → Objects up to 8 bytes
+kmalloc-16     → Objects 9-16 bytes
+kmalloc-32     → Objects 17-32 bytes
+kmalloc-64     → Objects 33-64 bytes
+kmalloc-128    → Objects 65-128 bytes
+kmalloc-256    → Objects 129-256 bytes
+kmalloc-512    → Objects 257-512 bytes
+kmalloc-1k     → Objects 513-1024 bytes
+kmalloc-2k     → Objects 1025-2048 bytes
+kmalloc-4k     → Objects 2049-4096 bytes
+kmalloc-8k     → Objects 4097-8192 bytes
+...
+kmalloc-4M     → Objects up to 4MB (MAX_ORDER)
+```
+
+### 4.2 vmalloc: Virtually Contiguous
+
+```c
+// Allocate virtually contiguous (but physically scattered)
+void *buffer = vmalloc(size);
+
+Physical Memory (scattered):
+┌────┐      ┌────┐      ┌────┐      ┌────┐
+│ p1 │      │ p2 │      │ p3 │      │ p4 │
+└────┘      └────┘      └────┘      └────┘
+  ^           ^           ^           ^
+phys1       phys2       phys3       phys4
+
+Page Tables:
+┌──────────────────────────────────────────┐
+│ virt     -> phys1                        │
+│ virt+4K  -> phys2                        │
+│ virt+8K  -> phys3                        │
+│ virt+12K -> phys4                        │
+└──────────────────────────────────────────┘
+
+Kernel Virtual Address (vmalloc area):
+┌──────────────────────────────────────────┐
+│ [    buffer (contiguous in virtual)    ] │
+└──────────────────────────────────────────┘
+   ^
+   virt_addr (in 0xffffc90000000000 range)
+```
+
+**vmalloc Characteristics**:
+- Physically scattered (individual pages)
+- Virtually contiguous
+- Slower allocation (must update page tables)
+- Slower access (TLB miss per 4KB page)
+- Can allocate very large buffers (limited by virtual address space)
+- **Use for**: Large buffers (>4MB), non-DMA, less critical paths
+
+### 4.3 Comparison Table
+
+```
+Feature Comparison:
+═══════════════════════════════════════════════════════════
+
+┌────────────────────┬────────────────────┬───────────────────┐
+│ Feature            │ kmalloc            │ vmalloc           │
+├────────────────────┼────────────────────┼───────────────────┤
+│ Physical           │ ✓ Contiguous       │ ✗ Scattered       │
+│ Virtual            │ ✓ Contiguous       │ ✓ Contiguous      │
+│ Size Limit         │ ~4MB (MAX_ORDER)   │ GBs (virt space)  │
+│ Performance        │ ⚡ Very Fast       │ 🐌 Slower         │
+│ TLB Efficiency     │ ✓ Excellent        │ ✗ Poor            │
+│ DMA Safe           │ ✓ Yes              │ ✗ No              │
+│ Page Fault         │ ✗ No               │ ✓ Yes (on alloc)  │
+│ Allocation Speed   │ ⚡ Fast (SLUB)     │ 🐌 Slow (PT walk) │
+│ Fragmentation      │ ⚠ Can fail         │ ✓ Unlikely        │
+│ Use Case           │ DMA, small, hot    │ Large, non-DMA    │
+└────────────────────┴────────────────────┴───────────────────┘
+
+Performance Numbers (typical x86-64):
+────────────────────────────────────────────
+Operation               kmalloc     vmalloc
+────────────────────────────────────────────
+Allocation time (1MB)   ~10 μs      ~200 μs
+Sequential access       100% speed  ~70% speed
+Random access           100% speed  ~50% speed
+TLB misses              ~1          ~256 (per MB)
+────────────────────────────────────────────
+```
+
+### 4.4 When to Use Each
+
+```c
+// Use kmalloc for:
+
+// 1. DMA buffers (MUST be physically contiguous)
+void *dma_buffer = kmalloc(4096, GFP_KERNEL | GFP_DMA);
+
+// 2. Small allocations (<4KB)
+struct my_struct *s = kmalloc(sizeof(*s), GFP_KERNEL);
+
+// 3. Hot paths (performance critical)
+void *buffer = kmalloc(1024, GFP_ATOMIC); // In interrupt context
+
+// 4. Hardware-mapped memory
+void *hw_buffer = kmalloc(size, GFP_KERNEL);
+dma_addr_t dma_addr = virt_to_phys(hw_buffer); // Works!
+
+
+// Use vmalloc for:
+
+// 1. Large allocations (>4MB)
+void *huge_buffer = vmalloc(128 * 1024 * 1024); // 128MB
+
+// 2. When physical contiguity not required
+void *log_buffer = vmalloc(16 * 1024 * 1024); // 16MB log
+
+// 3. Module loading (kernel modules use vmalloc space)
+// (automatically handled by kernel)
+
+// 4. When kmalloc fails due to fragmentation
+void *buffer = kmalloc(large_size, GFP_KERNEL);
+if (!buffer) {
+    // Fallback to vmalloc
+    buffer = vmalloc(large_size);
+}
+
+
+// DON'T use vmalloc for:
+
+// ✗ DMA buffers (not physically contiguous!)
+void *dma_buf = vmalloc(size); // WRONG!
+dma_addr_t addr = virt_to_phys(dma_buf); // BROKEN!
+
+// ✗ Interrupt context (vmalloc can sleep)
+void interrupt_handler(void) {
+    void *buf = vmalloc(size); // BUG! Cannot sleep in interrupt!
+}
+
+// ✗ Small allocations (overhead not worth it)
+void *tiny = vmalloc(64); // Wasteful!
+```
+
+---
+
+## 5. Memory Pools (mempool)
+
+Memory pools guarantee allocation success by reserving a pool of pre-allocated objects.
+
+### 5.1 The Problem
+
+```
+Normal Allocation Under Memory Pressure:
+════════════════════════════════════════
+
+System running low on memory...
+
+Critical I/O operation needs buffer:
+    buffer = kmalloc(4096, GFP_KERNEL);
+
+If kmalloc returns NULL:
+    ↓
+I/O fails
+    ↓
+File system stalls
+    ↓
+System deadlocks (cannot free memory because I/O can't complete!)
+
+This is the classic "low memory deadlock"
+```
+
+### 5.2 mempool Solution
+
+```c
+// mempool architecture
+struct mempool {
+    spinlock_t lock;
+    int min_nr;           // Minimum reserved elements
+    int curr_nr;          // Current available elements
+    void **elements;      // Pre-allocated element array
+
+    void *(*alloc)(gfp_t gfp_mask, void *pool_data);
+    void (*free)(void *element, void *pool_data);
+    void *pool_data;
+
+    wait_queue_head_t wait; // Waiters when pool exhausted
+};
+
+Operation:
+══════════
+
+Normal case (pool not empty):
+    1. Try regular kmalloc
+    2. If succeeds: return
+    3. If fails: fall back to pool reserve
+
+Memory pressure (pool empty):
+    1. Try regular kmalloc
+    2. If fails: sleep until element returned to pool
+    3. Guaranteed to eventually succeed!
+```
+
+**Creating and Using a mempool**:
+
+```c
+// Create mempool for 32 emergency buffers
+static mempool_t *io_pool;
+
+static int __init init_io_pool(void) {
+    io_pool = mempool_create_kmalloc_pool(
+        32,              // Minimum reserved elements
+        4096             // Size of each element
+    );
+
+    if (!io_pool)
+        return -ENOMEM;
+
+    return 0;
+}
+
+// Allocate from pool
+static void *alloc_io_buffer(void) {
+    void *buffer;
+
+    // Try normal allocation first
+    buffer = mempool_alloc(io_pool, GFP_NOIO);
+
+    // If system is out of memory, this will wait
+    // until a buffer is freed back to the pool,
+    // guaranteeing eventual success!
+
+    return buffer;
+}
+
+// Return to pool
+static void free_io_buffer(void *buffer) {
+    mempool_free(buffer, io_pool);
+}
+
+// Destroy pool
+static void __exit exit_io_pool(void) {
+    mempool_destroy(io_pool);
+}
+```
+
+**mempool Use Cases**:
+- I/O subsystem emergency buffers
+- Critical kernel threads that must not fail
+- Deadlock prevention in memory management paths
+- Device drivers requiring guaranteed allocation
+
+---
+
+## 6. DMA and Coherent Memory
+
+Direct Memory Access (DMA) requires special memory handling.
+
+### 6.1 DMA Requirements
+
+```
+DMA Constraints:
+════════════════
+
+1. Physically Contiguous:
+   Device DMA engines use physical addresses
+   Cannot use vmalloc (scattered pages)
+
+2. Address Limits:
+   32-bit devices: Can only DMA to first 4GB (ZONE_DMA32)
+   ISA devices: Can only DMA to first 16MB (ZONE_DMA)
+
+3. Cache Coherency:
+   CPU cache and device view of memory must be consistent
+
+4. Alignment:
+   Many devices require specific alignment (cache line, page, etc.)
+```
+
+### 6.2 DMA Allocation Methods
+
+```c
+// Method 1: kmalloc with DMA flags
+void *buffer = kmalloc(size, GFP_KERNEL | GFP_DMA);
+dma_addr_t dma_handle = virt_to_phys(buffer);
+
+// Method 2: dma_alloc_coherent (recommended)
+void *cpu_addr = dma_alloc_coherent(
+    dev,          // Device
+    size,         // Size
+    &dma_handle,  // OUT: DMA address for device
+    GFP_KERNEL    // Flags
+);
+
+// cpu_addr:    Use this in kernel code
+// dma_handle:  Give this to device
+
+// Device configuration:
+writel(dma_handle, dev->base + DMA_ADDR_REG);
+writel(size, dev->base + DMA_SIZE_REG);
+writel(DMA_START, dev->base + DMA_CONTROL_REG);
+
+// When done:
+dma_free_coherent(dev, size, cpu_addr, dma_handle);
+```
+
+### 6.3 Streaming DMA vs Coherent DMA
+
+```
+Coherent DMA (dma_alloc_coherent):
+══════════════════════════════════
+┌────────────────────────────────────────────┐
+│ CPU writes -> Memory <- Device reads       │
+│ NO CACHE FLUSHES NEEDED                    │
+│ Slower (uncached or write-combining)       │
+│ Used for: DMA ring buffers, descriptors   │
+└────────────────────────────────────────────┘
+
+Streaming DMA (dma_map_single):
+═══════════════════════════════
+┌────────────────────────────────────────────┐
+│ CPU prepares -> [sync] -> Device DMA       │
+│ Device writes -> [sync] -> CPU reads       │
+│ REQUIRES EXPLICIT CACHE MANAGEMENT         │
+│ Faster (uses cached memory)                │
+│ Used for: Network packets, disk I/O       │
+└────────────────────────────────────────────┘
+
+Example streaming DMA:
+
+// Prepare buffer for device READ
+struct sk_buff *skb = alloc_skb(size, GFP_KERNEL);
+dma_addr_t dma_addr = dma_map_single(
+    dev,
+    skb->data,
+    size,
+    DMA_FROM_DEVICE  // Device will write
+);
+
+// Give to device
+program_device_rx(dma_addr, size);
+
+// Wait for completion...
+
+// Sync before CPU access
+dma_unmap_single(dev, dma_addr, size, DMA_FROM_DEVICE);
+
+// Now CPU can safely read skb->data
+process_packet(skb);
+```
+
+---
+
+## 7. High Memory and kmap
+
+On 32-bit systems, high memory (>896MB) is not directly mapped.
+
+### 7.1 The 32-bit Problem
+
+```
+32-bit Kernel Virtual Address Space (4GB total):
+═════════════════════════════════════════════════
+
+0x00000000 - 0xBFFFFFFF (3GB):  User space
+0xC0000000 - 0xFFFFFFFF (1GB):  Kernel space
+    │
+    ├─ 0xC0000000 - 0xF7FFFFFF: Direct map (896MB)
+    │  └─> Maps physical 0-896MB linearly
+    │
+    ├─ 0xF8000000 - 0xFFBFFFFF: vmalloc/ioremap
+    │
+    └─ 0xFFC00000 - 0xFFFFFFFF: kmap (HIGH_MEM)
+       └─> Temporary mappings for >896MB physical
+
+Physical Memory:
+┌───────────────────────────────────────────────┐
+│ 0-896MB:   ZONE_NORMAL (directly mapped)     │
+│ >896MB:    ZONE_HIGHMEM (requires kmap)      │
+└───────────────────────────────────────────────┘
+
+If system has 4GB RAM:
+- First 896MB: Always accessible via direct map
+- Remaining 3.1GB: Must use kmap to access
+```
+
+### 7.2 kmap Functions
+
+```c
+// Permanent mapping (limited slots, can sleep)
+void *kmap(struct page *page) {
+    if (!PageHighMem(page))
+        return page_address(page); // Direct map
+
+    return kmap_high(page); // Create temporary mapping
+}
+
+void kunmap(struct page *page) {
+    if (PageHighMem(page))
+        kunmap_high(page);
+}
+
+// Atomic mapping (cannot sleep, interrupt-safe)
+void *kmap_atomic(struct page *page) {
+    if (!PageHighMem(page))
+        return page_address(page);
+
+    return kmap_atomic_high(page); // Per-CPU temporary mapping
+}
+
+void kunmap_atomic(void *addr) {
+    // Must be called from same CPU!
+    kunmap_atomic_high(addr);
+}
+
+// Usage example:
+void process_highmem_page(struct page *page) {
+    char *data;
+
+    // Map page into kernel address space
+    data = kmap_atomic(page);
+
+    // Access page data
+    memset(data, 0, PAGE_SIZE);
+
+    // MUST unmap before returning or sleeping!
+    kunmap_atomic(data);
+}
+```
+
+**x86-64 Note**: On 64-bit systems, ZONE_HIGHMEM doesn't exist because the kernel can directly map all physical memory (huge 64-bit virtual address space).
+
+---
+
+## 8. Per-CPU Variables
+
+Per-CPU variables eliminate lock contention by giving each CPU its own copy.
+
+### 8.1 Per-CPU Architecture
+
+```
+Traditional Global Variable (requires locking):
+═══════════════════════════════════════════════
+
+Global counter:
+┌─────────────┐
+│  counter    │ ← CPU0 (lock, increment, unlock)
+└─────────────┘ ← CPU1 (lock, increment, unlock)
+                ← CPU2 (lock, increment, unlock)
+                ← CPU3 (lock, increment, unlock)
+
+Lock contention on every access!
+
+Per-CPU Variable (lockless):
+════════════════════════════
+
+┌─────────────┐  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐
+│ CPU0:       │  │ CPU1:       │  │ CPU2:       │  │ CPU3:       │
+│  counter=10 │  │  counter=15 │  │  counter=8  │  │  counter=12 │
+└─────────────┘  └─────────────┘  └─────────────┘  └─────────────┘
+
+Each CPU accesses its own copy (no locks needed!)
+To get total: sum all per-CPU values
+```
+
+### 8.2 Defining and Using Per-CPU Variables
+
+```c
+// Define per-CPU variable
+DEFINE_PER_CPU(int, my_counter);
+
+// Accessing (preemption-safe version):
+void increment_counter(void) {
+    int cpu = get_cpu(); // Disable preemption
+    per_cpu(my_counter, cpu)++;
+    put_cpu(); // Re-enable preemption
+}
+
+// Accessing (simpler, still safe):
+void increment_counter_v2(void) {
+    // Automatically handles preemption
+    this_cpu_inc(my_counter);
+}
+
+// Reading all CPUs:
+int get_total_counter(void) {
+    int sum = 0;
+    int cpu;
+
+    for_each_possible_cpu(cpu) {
+        sum += per_cpu(my_counter, cpu);
+    }
+
+    return sum;
+}
+
+// Complex per-CPU structures:
+struct percpu_data {
+    unsigned long counter;
+    struct list_head list;
+    spinlock_t lock; // Still might need locks within per-CPU context
+};
+
+DEFINE_PER_CPU(struct percpu_data, my_data);
+
+// Initialization:
+static int __init init_percpu_data(void) {
+    int cpu;
+
+    for_each_possible_cpu(cpu) {
+        struct percpu_data *data = &per_cpu(my_data, cpu);
+        data->counter = 0;
+        INIT_LIST_HEAD(&data->list);
+        spin_lock_init(&data->lock);
+    }
+
+    return 0;
+}
+```
+
+### 8.3 Per-CPU Allocation
+
+```c
+// Dynamic per-CPU allocation
+int __percpu *counters;
+
+// Allocate per-CPU integers
+counters = alloc_percpu(int);
+if (!counters)
+    return -ENOMEM;
+
+// Use
+this_cpu_inc(*counters);
+
+// Read specific CPU
+int cpu0_count = *per_cpu_ptr(counters, 0);
+
+// Free
+free_percpu(counters);
+
+// Per-CPU with alignment:
+struct cache_aligned_data {
+    unsigned long counter;
+} ____cacheline_aligned;
+
+struct cache_aligned_data __percpu *data;
+data = alloc_percpu(struct cache_aligned_data);
+```
+
+**Benefits**:
+- Zero contention (no locks needed)
+- Better cache locality (data stays in L1/L2)
+- Scales linearly with CPU count
+- Interrupt-safe (as long as preemption is disabled)
+
+**Use Cases**:
+- Statistics counters
+- Per-CPU caches (SLUB)
+- Network packet queues
+- Scheduler runqueues
+
+---
+
+## 9. The Page Cache and Writeback
+
+The Page Cache is Linux's most important performance optimization.
+
+### 9.1 Page Cache Architecture
+
+```
+File I/O Through Page Cache:
+════════════════════════════
+
+User Space:
+┌─────────────────────────────────────────────┐
+│ read(fd, buffer, size)                      │
+└─────────────────┬───────────────────────────┘
+                  │ System call
+                  ▼
+Kernel VFS:
+┌─────────────────────────────────────────────┐
+│ Check Page Cache:                           │
+│   key = (inode, offset)                     │
+│                                             │
+│   ┌─────────────┐                          │
+│   │ Page Cache  │                          │
+│   │  (radix tree)│                          │
+│   │ ┌─────────┐│                          │
+│   │ │ page    ││ ← CACHE HIT!             │
+│   │ └─────────┘│    └─> Copy to user      │
+│   │ ┌─────────┐│                          │
+│   │ │ page    ││                          │
+│   │ └─────────┘│                          │
+│   └─────────────┘                          │
+│                                             │
+│   CACHE MISS:                               │
+│   ↓                                         │
+└───┼─────────────────────────────────────────┘
+    │
+    ▼ Submit I/O
+┌─────────────────────────────────────────────┐
+│ Block Layer:                                │
+│   - I/O scheduler                           │
+│   - Merge adjacent requests                 │
+│   - Submit to driver                        │
+└───┬─────────────────────────────────────────┘
+    │
+    ▼
+┌─────────────────────────────────────────────┐
+│ Device Driver:                              │
+│   - DMA transfer                            │
+│   - Completion interrupt                    │
+└───┬─────────────────────────────────────────┘
+    │
+    ▼ On completion
+┌─────────────────────────────────────────────┐
+│ Add page to cache                           │
+│ Wake up waiting process                     │
+│ Return data to user                         │
+└─────────────────────────────────────────────┘
+
+Page Cache Benefits:
+────────────────────
+• Repeated reads: 100x faster (RAM vs disk)
+• Write batching: Combine multiple writes
+• Read-ahead: Predict sequential access
+• Unified cache: All files share pool
+```
+
+### 9.2 Dirty Pages
+
+```c
+// Writing to a file
+ssize_t result = write(fd, buffer, size);
+
+What happens:
+1. Find page in cache (or allocate new page)
+2. Copy data from user buffer to page
+3. Mark page as DIRTY
+4. Return immediately (data NOT on disk yet!)
+
+Page States:
+┌─────────────────────────────────────────────┐
+│                                             │
+│  CLEAN:    Matches disk (safe to discard)  │
+│  DIRTY:    Modified, not written to disk   │
+│  WRITEBACK: Currently being written        │
+│  LOCKED:   I/O in progress                 │
+│                                             │
+└─────────────────────────────────────────────┘
+```
+
+### 9.3 Writeback Mechanism
+
+```
+Flusher Threads (per-device):
+═════════════════════════════
+
+┌─────────────────────────────────────────────┐
+│ Dirty Page Pool:                            │
+│ ┌────┐┌────┐┌────┐┌────┐┌────┐            │
+│ │ D  ││ D  ││ D  ││ D  ││ D  │...         │
+│ └────┘└────┘└────┘└────┘└────┘            │
+│   │                                         │
+│   │ When to flush?                          │
+│   │ ────────────────                        │
+│   │ 1. Periodic timer (every 5s default)    │
+│   │ 2. Dirty ratio exceeded                 │
+│   │ 3. Page aged beyond dirty_expire        │
+│   │ 4. sync() syscall                       │
+│   │ 5. File close (if specified)            │
+│   │                                         │
+│   ▼                                         │
+│ ┌─────────────────────────────────────────┐│
+│ │ Flusher Thread (per device)             ││
+│ │                                         ││
+│ │ 1. Select dirty inodes                  ││
+│ │ 2. For each inode:                      ││
+│ │    - Find dirty pages                   ││
+│ │    - Submit write I/O                   ││
+│ │    - Mark as WRITEBACK                  ││
+│ │ 3. On completion:                       ││
+│ │    - Mark as CLEAN                      ││
+│ │    - Can now be reclaimed               ││
+│ │                                         ││
+│ └─────────────────────────────────────────┘│
+└─────────────────────────────────────────────┘
+```
+
+### 9.4 Dirty Page Ratios
+
+```bash
+# Writeback configuration
+$ sysctl -a | grep dirty
+
+vm.dirty_background_ratio = 10
+  # Start background writeback at 10% of RAM dirty
+
+vm.dirty_ratio = 20
+  # Force synchronous writeback at 20% of RAM dirty
+  # Process blocks until pages are flushed!
+
+vm.dirty_expire_centisecs = 3000
+  # Pages dirty for >30 seconds must be written
+  # (3000 centiseconds = 30 seconds)
+
+vm.dirty_writeback_centisecs = 500
+  # Wake flusher threads every 5 seconds
+  # (500 centiseconds = 5 seconds)
+
+Example (16GB RAM):
+───────────────────────────────────────────────
+dirty_background_ratio = 10% → 1.6 GB
+  └─> Start background writeback at 1.6GB dirty
+
+dirty_ratio = 20% → 3.2 GB
+  └─> Block writers at 3.2GB dirty
+
+Timeline:
+─────────
+0-1.6GB dirty:   Normal operation
+1.6-3.2GB dirty: Background writeback active
+>3.2GB dirty:    All writes block!
+```
+
+### 9.5 Tuning Writeback for Workloads
+
+```bash
+# Database workload (want explicit fsync control):
+sysctl -w vm.dirty_background_ratio=5
+sysctl -w vm.dirty_ratio=10
+sysctl -w vm.dirty_expire_centisecs=500
+# Small buffers, fast writeback, apps control sync
+
+# Bulk data processing (write throughput important):
+sysctl -w vm.dirty_background_ratio=40
+sysctl -w vm.dirty_ratio=80
+sysctl -w vm.dirty_expire_centisecs=9000
+# Large buffers, delayed writeback, maximize throughput
+
+# Low-latency workload:
+sysctl -w vm.dirty_background_ratio=5
+sysctl -w vm.dirty_ratio=10
+sysctl -w vm.dirty_writeback_centisecs=100
+# Small buffers, frequent writeback, minimize latency spikes
+```
+
+---
+
+## 10. Memory Reclaim and OOM Killer
+
+### 10.1 Memory Reclaim
+
+```
+Memory Pressure Handling:
+═════════════════════════
+
+Allocation request arrives:
+    ↓
+┌───────────────────────────┐
+│ Check watermarks          │
+└───────┬───────────────────┘
+        │
+        ├─> High watermark: ✓ Allocate
+        │
+        ├─> Low watermark:
+        │   └─> Wake kswapd (background reclaim)
+        │       Continue with allocation
+        │
+        └─> Min watermark:
+            └─> Direct reclaim (caller must free pages)
+                    ↓
+            ┌─────────────────────────────┐
+            │ Reclaim strategies:         │
+            │                             │
+            │ 1. Shrink page cache        │
+            │    - Drop clean pages       │
+            │    - Write dirty pages      │
+            │                             │
+            │ 2. Shrink slab caches       │
+            │    - Dentries, inodes       │
+            │    - Buffer heads           │
+            │                             │
+            │ 3. Swap out anonymous pages │
+            │    - User process memory    │
+            │    - Requires swap device   │
+            │                             │
+            │ 4. Compact memory           │
+            │    - Move pages together    │
+            │    - Create high-order pages│
+            │                             │
+            └─────────┬───────────────────┘
+                      │
+                      ├─> Reclaim successful: Retry allocation
+                      │
+                      └─> Reclaim failed: OOM Killer
+```
+
+### 10.2 The OOM Killer
+
+```c
+// OOM Killer invocation
+if (out_of_memory_condition()) {
+    // Calculate score for every process
+    for_each_process(p) {
+        oom_score = calculate_oom_score(p);
+    }
+
+    // Select victim (highest score)
+    victim = select_bad_process();
+
+    // Send SIGKILL
+    oom_kill_process(victim);
+}
+
+// OOM Score calculation (simplified)
+unsigned long oom_badness(struct task_struct *p) {
+    long points = 0;
+
+    // 1. Base: memory usage (in pages)
+    points = get_mm_rss(p->mm) + get_mm_counter(p->mm, MM_SWAPENTS);
+
+    // 2. Adjust for user preference
+    points += p->signal->oom_score_adj;
+
+    // 3. Root processes get bonus (less likely to kill)
+    if (has_capability_noaudit(p, CAP_SYS_ADMIN))
+        points -= 30;
+
+    // 4. Long-running processes get small bonus
+    // (don't kill init or long-running daemons)
+    if (p->flags & PF_KTHREAD)
+        return 0; // Never kill kernel threads
+
+    return points;
+}
+```
+
+### 10.3 Protecting Processes from OOM
+
+```bash
+# View OOM scores
+$ cat /proc/*/oom_score | sort -n
+12    # sshd
+45    # systemd
+123   # nginx
+8934  # chrome (high memory usage!)
+4567  # postgres
+
+# View adjustment values
+$ cat /proc/*/oom_score_adj
+
+# Protect critical process (root required)
+$ echo -1000 > /proc/$(pidof postgres)/oom_score_adj
+# Score of -1000 = immune to OOM killer
+
+# Make process more likely to be killed
+$ echo 1000 > /proc/$(pidof chrome)/oom_score_adj
+# Score of +1000 = first victim
+
+# Disable OOM killer entirely (dangerous!)
+$ echo 2 > /proc/sys/vm/overcommit_memory
+$ echo 100 > /proc/sys/vm/overcommit_ratio
+# Only allow 100% of physical RAM to be committed
+```
+
+---
+
+## 11. Kernel Address Space Layout (x86-64)
+
+```
+x86-64 Kernel Virtual Address Space:
+════════════════════════════════════
+
+0x0000000000000000 - 0x00007FFFFFFFFFFF (128 TB)
+┌────────────────────────────────────────────────┐
+│ User space                                     │
+│ (not accessible in kernel mode)                │
+└────────────────────────────────────────────────┘
+
+[Non-canonical addresses (hole)]
+
+0xFFFF800000000000 - 0xFFFF87FFFFFFFFFF (8 TB)
+┌────────────────────────────────────────────────┐
+│ Guard hole (inaccessible)                      │
+└────────────────────────────────────────────────┘
+
+0xFFFF888000000000 - 0xFFFFC87FFFFFFFFF (64 TB)
+┌────────────────────────────────────────────────┐
+│ Direct mapping of all physical memory          │
+│ (phys_addr + PAGE_OFFSET = virt_addr)         │
+│                                                 │
+│ phys 0x00000000 → virt 0xFFFF888000000000     │
+│ phys 0x00001000 → virt 0xFFFF888000001000     │
+│ ...                                             │
+│                                                 │
+│ Used by: kmalloc, kernel data structures       │
+└────────────────────────────────────────────────┘
+
+0xFFFFC90000000000 - 0xFFFFE8FFFFFFFFFF (32 TB)
+┌────────────────────────────────────────────────┐
+│ vmalloc/ioremap area                           │
+│ (virtually contiguous, physically scattered)   │
+│                                                 │
+│ Used by: vmalloc, ioremap, kernel modules      │
+└────────────────────────────────────────────────┘
+
+0xFFFFE90000000000 - 0xFFFFEAFFFFFFFFFF
+┌────────────────────────────────────────────────┐
+│ Virtual memory map (optional)                  │
+│ (sparse mem model)                             │
+└────────────────────────────────────────────────┘
+
+0xFFFFFFFF80000000 - 0xFFFFFFFF9FFFFFFF (512 MB)
+┌────────────────────────────────────────────────┐
+│ Kernel text (.text, .rodata, .data)           │
+│ Direct-mapped kernel image                     │
+└────────────────────────────────────────────────┘
+
+0xFFFFFFFFA0000000 - 0xFFFFFFFFFEFFFFFF
+┌────────────────────────────────────────────────┐
+│ Kernel modules (loaded with insmod)            │
+└────────────────────────────────────────────────┘
+
+0xFFFFFFFFFF600000 - 0xFFFFFFFFFF600FFF (4 KB)
+┌────────────────────────────────────────────────┐
+│ vsyscall page (legacy)                         │
+└────────────────────────────────────────────────┘
+
+Key Points:
+───────────
+• Direct mapping allows fast phys↔virt conversion
+• vmalloc area allows >MAX_ORDER allocations
+• Modules get their own region (for security/KASLR)
+• Total kernel space: ~128 TB (plenty on 64-bit!)
+```
+
+---
+
+## 12. Advanced Topics
+
+### 12.1 Memory Compaction
+
+```
+Before Compaction:
+══════════════════
+[U][F][U][F][U][F][U][F][U][F] (U=used, F=free)
+  └─> Cannot allocate Order 2+ (need 4 contiguous pages)
+
+After Compaction:
+═════════════════
+[U][U][U][U][U][F][F][F][F][F]
+                 └─> Can now allocate Order 3!
+
+Trigger compaction:
+$ echo 1 > /proc/sys/vm/compact_memory
+
+Enable proactive compaction:
+$ sysctl -w vm.compaction_proactiveness=20
+```
+
+### 12.2 Transparent Huge Pages (THP) in Kernel
+
+```bash
+# Check THP status
+$ cat /sys/kernel/mm/transparent_hugepage/enabled
+always [madvise] never
+
+# Enable for kernel (as well as user space)
+$ echo always > /sys/kernel/mm/transparent_hugepage/enabled
+$ echo always > /sys/kernel/mm/transparent_hugepage/defrag
+
+# Benefits:
+# - Fewer TLB entries (512x reduction: 2MB vs 4KB)
+# - Fewer page table levels to walk
+# - Better for large workloads (databases, VMs)
+
+# Costs:
+# - Fragmentation issues
+# - Compaction overhead
+# - May waste memory on sparse allocations
+```
+
+### 12.3 Memory Cgroups
+
+```bash
+# Limit container memory
+$ mkdir /sys/fs/cgroup/memory/container1
+$ echo 1G > /sys/fs/cgroup/memory/container1/memory.max
+$ echo $PID > /sys/fs/cgroup/memory/container1/cgroup.procs
+
+# When limit exceeded:
+# - Trigger memory reclaim within cgroup
+# - If reclaim fails, OOM kill within cgroup only
+# - Host system unaffected
+
+# Monitor usage:
+$ cat /sys/fs/cgroup/memory/container1/memory.current
+536870912  # Current usage in bytes
+
+$ cat /sys/fs/cgroup/memory/container1/memory.events
+low 0
+high 0
+max 5      # Number of times limit hit
+oom 1      # Number of OOM kills
+oom_kill 1
+```
+
+---
+
+## 13. Interview Deep Dive: Senior Level
+
+<AccordionGroup>
+  <Accordion title="Q1: Why does the kernel prefer SLUB over the original SLAB?">
+    **Answer**:
+
+    The original SLAB allocator kept complex metadata (queues and coloring) on every page, which led to:
+
+    **SLAB Problems**:
+    - High memory overhead (per-slab queues, per-CPU queues, shared array caches)
+    - Complex code (~5000 lines)
+    - Poor scalability on NUMA systems (global queues caused contention)
+    - Cache coloring overhead didn't help on modern CPUs
+
+    **SLUB Advantages**:
+    - Simplified per-CPU caching (just a freelist pointer)
+    - Minimal metadata (uses page struct fields cleverly)
+    - Lockless fast path (~10 instructions)
+    - Better NUMA support (per-node partial lists)
+    - Smaller code size (~2000 lines)
+    - Scales to 1000+ CPUs
+
+    **Performance**: SLUB fast path is ~30% faster than SLAB, with 50% less memory overhead.
+
+    **When SLAB was better**: On systems with <8 CPUs and specific cache-sensitive workloads. Modern hardware makes SLUB the clear winner.
+  </Accordion>
+
+  <Accordion title="Q2: Explain 'External' vs. 'Internal' Fragmentation in kernel memory.">
+    **Answer**:
+
+    **External Fragmentation**:
+    - **Definition**: Total free memory is sufficient, but scattered in small chunks
+    - **Example**: Need Order 4 (64KB), but only have Order 0-2 blocks available
+    - **Impact**: Large allocations fail even with plenty of total free memory
+    - **Solution**: Buddy system coalescing, memory compaction, anti-fragmentation page migration
+
+    ```
+    Before: [F][U][F][U][F][U] (F=free, U=used)
+    Problem: Cannot allocate 3 contiguous pages!
+
+    After compaction: [U][U][U][F][F][F]
+    Solution: Can now allocate Order 2+
+    ```
+
+    **Internal Fragmentation**:
+    - **Definition**: Allocated memory that is unused by the requester
+    - **Example**: Allocate 4KB page but only need 100 bytes → 3996 bytes wasted
+    - **Impact**: Memory wasted inside allocations
+    - **Solution**: SLUB allocator with fine-grained size classes
+
+    ```
+    Without SLUB:
+    kmalloc(128) → Wastes 3968 bytes per allocation!
+
+    With SLUB:
+    kmalloc(128) → Allocated from kmalloc-128 cache
+                 → Zero waste, multiple objects per page
+    ```
+
+    **Senior Insight**: Trade-off between the two:
+    - Large pages → More internal fragmentation, less external
+    - Small pages → Less internal fragmentation, more external
+    - SLUB + Buddy system balances both
+  </Accordion>
+
+  <Accordion title="Q3: How can you prevent a database process from being killed by the OOM Killer?">
+    **Answer**:
+
+    **Method 1: OOM Score Adjustment** (recommended)
+    ```bash
+    # Make postgres immune to OOM killer
+    echo -1000 > /proc/$(pidof postgres)/oom_score_adj
+
+    # Or in systemd service file:
+    [Service]
+    OOMScoreAdjust=-1000
+    ```
+
+    **Method 2: Memory Cgroups** (best for containers)
+    ```bash
+    # Limit database to 8GB, but protect from host OOM
+    echo 8G > /sys/fs/cgroup/memory/db/memory.max
+    echo $PID > /sys/fs/cgroup/memory/db/cgroup.procs
+
+    # If DB hits limit, only DB processes are OOM-killed,
+    # not the entire system
+    ```
+
+    **Method 3: Disable Overcommit** (most conservative)
+    ```bash
+    # Strict memory accounting (no overcommit)
+    echo 2 > /proc/sys/vm/overcommit_memory
+    echo 90 > /proc/sys/vm/overcommit_ratio
+
+    # Now allocations fail instead of OOM killing
+    # DB must handle ENOMEM gracefully
+    ```
+
+    **Method 4: Increase System Memory**
+    - Add RAM or swap space
+    - Buys time before OOM condition
+
+    **Production Best Practice**:
+    ```bash
+    # Combine multiple methods:
+    # 1. Protect critical processes
+    echo -1000 > /proc/$(pidof postgres)/oom_score_adj
+    echo -1000 > /proc/$(pidof sshd)/oom_score_adj
+
+    # 2. Make non-critical processes preferred victims
+    echo 500 > /proc/$(pidof chrome)/oom_score_adj
+
+    # 3. Monitor and alert before OOM
+    # Alert at 90% memory usage
+
+    # 4. Proper resource limits (cgroups/systemd)
+    ```
+  </Accordion>
+
+  <Accordion title="Q4: When would you use vmalloc instead of kmalloc? Give specific examples.">
+    **Answer**:
+
+    **Use vmalloc when**:
+
+    1. **Large allocations (>4MB)**:
+    ```c
+    // 64MB log buffer (kmalloc would fail)
+    void *log_buffer = vmalloc(64 * 1024 * 1024);
+    ```
+
+    2. **Physical contiguity not required**:
+    ```c
+    // Module stack traces (don't need DMA)
+    void *stack_trace_buffer = vmalloc(size);
+    ```
+
+    3. **When kmalloc fails due to fragmentation**:
+    ```c
+    void *buf = kmalloc(8 * 1024 * 1024, GFP_KERNEL);
+    if (!buf) {
+        // Fragmentation: no 8MB contiguous block
+        // Fall back to vmalloc
+        buf = vmalloc(8 * 1024 * 1024);
+    }
+    ```
+
+    4. **Kernel module code/data** (automatically uses vmalloc):
+    ```c
+    // Module loading automatically uses vmalloc area
+    // No action needed by developer
+    ```
+
+    **Use kmalloc when**:
+
+    1. **DMA buffers** (must be physically contiguous):
+    ```c
+    // WRONG:
+    void *dma_buf = vmalloc(4096);
+    dma_addr = virt_to_phys(dma_buf); // BROKEN!
+
+    // RIGHT:
+    void *dma_buf = kmalloc(4096, GFP_KERNEL | GFP_DMA);
+    dma_addr = virt_to_phys(dma_buf); // Works!
+    ```
+
+    2. **Hot paths** (performance critical):
+    ```c
+    // Network packet processing (millions per second)
+    struct sk_buff *skb = kmalloc(sizeof(*skb), GFP_ATOMIC);
+    ```
+
+    3. **Small allocations** (<4KB):
+    ```c
+    // Tiny structures (vmalloc overhead not worth it)
+    struct my_struct *s = kmalloc(sizeof(*s), GFP_KERNEL);
+    ```
+
+    4. **Interrupt context** (vmalloc can't sleep):
+    ```c
+    // In interrupt handler
+    void *buf = kmalloc(size, GFP_ATOMIC); // OK
+    void *buf = vmalloc(size); // WRONG! (would sleep)
+    ```
+
+    **Real-World Example**:
+    ```c
+    // Network driver rx ring buffer
+    // Needs to be DMA-accessible
+    rx_ring = kmalloc(ring_size, GFP_KERNEL | GFP_DMA);
+
+    // But large packet buffer pool can use vmalloc
+    packet_pool = vmalloc(pool_size);
+    ```
+  </Accordion>
+
+  <Accordion title="Q5: Explain the difference between GFP_KERNEL, GFP_ATOMIC, and GFP_NOIO.">
+    **Answer**:
+
+    **GFP_KERNEL** (most common):
+    - Can sleep (may trigger direct reclaim)
+    - Can perform I/O to free pages
+    - Can call file system code
+    - **Use when**: Normal process context, can wait
+
+    ```c
+    void *buf = kmalloc(size, GFP_KERNEL);
+    // May sleep if memory pressure requires reclaim
+    ```
+
+    **GFP_ATOMIC** (emergency):
+    - Cannot sleep (will never block)
+    - Cannot perform I/O
+    - Cannot call file system code
+    - Uses emergency reserves
+    - **Use when**: Interrupt handlers, spinlock held, atomic context
+
+    ```c
+    // In interrupt handler
+    irqreturn_t my_irq_handler(int irq, void *dev_id) {
+        void *buf = kmalloc(size, GFP_ATOMIC); // Must not sleep!
+        if (!buf) {
+            // Handle failure gracefully
+        }
+    }
+
+    // With spinlock held
+    spin_lock(&lock);
+    void *buf = kmalloc(size, GFP_ATOMIC); // Can't sleep with lock!
+    spin_unlock(&lock);
+    ```
+
+    **GFP_NOIO** (I/O path):
+    - Can sleep
+    - Cannot perform I/O (but can reclaim clean pages)
+    - **Use when**: Already in I/O path (avoid deadlock)
+
+    ```c
+    // In block device driver
+    static int my_block_write(struct bio *bio) {
+        // Must not trigger more I/O (would deadlock)
+        void *buf = kmalloc(size, GFP_NOIO);
+    }
+    ```
+
+    **GFP_NOFS** (file system path):
+    - Can sleep
+    - Can perform I/O
+    - Cannot call file system code
+    - **Use when**: Already in file system code
+
+    ```c
+    // In file system code
+    static int my_fs_write(struct inode *inode, const void *data) {
+        // Must not recurse into file system
+        void *buf = kmalloc(size, GFP_NOFS);
+    }
+    ```
+
+    **Flag Hierarchy**:
+    ```
+    Most Restrictive:  GFP_ATOMIC    (can do nothing)
+                       GFP_NOIO      (can reclaim, no I/O)
+                       GFP_NOFS      (can I/O, no FS)
+    Least Restrictive: GFP_KERNEL    (can do anything)
+    ```
+
+    **Common Combinations**:
+    ```c
+    // High priority atomic (uses emergency reserves more)
+    GFP_ATOMIC | __GFP_HIGH
+
+    // Kernel allocation with DMA constraint
+    GFP_KERNEL | GFP_DMA
+
+    // Zero-filled memory
+    GFP_KERNEL | __GFP_ZERO
+
+    // Retry harder before failing
+    GFP_KERNEL | __GFP_RETRY_MAYFAIL
+    ```
+  </Accordion>
+
+  <Accordion title="Q6: How does the buddy allocator calculate the address of a buddy block?">
+    **Answer**:
+
+    **Mathematical Property**:
+    The buddy of a block at order $k$ is located exactly $2^k$ pages away, and can be found using XOR.
+
+    **Formula**:
+    ```c
+    buddy_pfn = pfn ^ (1UL << order);
+    ```
+
+    **Why This Works**:
+
+    ```
+    Example: Order 2 (4 pages), starting at pfn 0x1000
+
+    Binary representation:
+    pfn       = 0x1000 = 0001 0000 0000 0000
+    1 << 2    =   0x4  = 0000 0000 0000 0100
+
+    pfn ^ (1<<2) = 0001 0000 0000 0100 = 0x1004
+
+    Verification:
+    Block A: pages 0x1000-0x1003 (4 pages)
+    Block B: pages 0x1004-0x1007 (4 pages)
+    A and B are buddies (came from same Order 3 split)
+    ```
+
+    **Key Insight**: XOR flips the bit at position `order`:
+    ```
+    Order 0: Flip bit 0 → buddy is ±1 pages away
+    Order 1: Flip bit 1 → buddy is ±2 pages away
+    Order 2: Flip bit 2 → buddy is ±4 pages away
+    Order k: Flip bit k → buddy is ±2^k pages away
+    ```
+
+    **Complete Implementation**:
+    ```c
+    static inline bool page_is_buddy(struct page *page,
+                                     struct page *buddy,
+                                     unsigned int order) {
+        unsigned long page_pfn = page_to_pfn(page);
+        unsigned long buddy_pfn = page_to_pfn(buddy);
+
+        // Buddy must be at XOR offset
+        if (buddy_pfn != (page_pfn ^ (1UL << order)))
+            return false;
+
+        // Buddy must be free
+        if (!PageBuddy(buddy))
+            return false;
+
+        // Buddy must be same order
+        if (page_order(buddy) != order)
+            return false;
+
+        return true;
+    }
+    ```
+
+    **Coalescing Example**:
+    ```c
+    void free_pages(struct page *page, unsigned int order) {
+        unsigned long pfn = page_to_pfn(page);
+
+        while (order < MAX_ORDER - 1) {
+            // Calculate buddy
+            unsigned long buddy_pfn = pfn ^ (1UL << order);
+            struct page *buddy = pfn_to_page(buddy_pfn);
+
+            // Check if we can coalesce
+            if (!page_is_buddy(page, buddy, order))
+                break;
+
+            // Remove buddy from free list
+            list_del(&buddy->lru);
+
+            // Merge: keep lower address
+            pfn &= ~(1UL << order);
+            page = pfn_to_page(pfn);
+
+            // Move to next order
+            order++;
+        }
+
+        // Add merged block to free list
+        add_to_free_list(page, order);
+    }
+    ```
+  </Accordion>
+
+  <Accordion title="Q7: Design a kernel memory leak detector. How would you implement it?">
+    **Answer**:
+
+    **Design Requirements**:
+    1. Track all kmalloc/vmalloc allocations
+    2. Record allocation call stack
+    3. Detect memory not freed
+    4. Minimal performance impact
+
+    **Implementation Strategy**:
+
+    ```c
+    // 1. Allocation tracking structure
+    struct mem_track {
+        void *addr;                  // Allocated address
+        size_t size;                 // Size in bytes
+        unsigned long stack[8];      // Call stack (8 frames)
+        unsigned long timestamp;     // jiffies at allocation
+        struct hlist_node hash;      // Hash table linkage
+    };
+
+    // 2. Hash table for fast lookup
+    #define MEM_TRACK_HASH_BITS 16
+    #define MEM_TRACK_HASH_SIZE (1 << MEM_TRACK_HASH_BITS)
+
+    static struct hlist_head mem_track_hash[MEM_TRACK_HASH_SIZE];
+    static spinlock_t mem_track_lock;
+
+    // 3. Hook into kmalloc/kfree
+    void *__kmalloc_tracked(size_t size, gfp_t flags,
+                           const char *func, int line) {
+        void *ptr = __kmalloc(size, flags);
+        if (ptr) {
+            struct mem_track *track;
+
+            track = kmem_cache_alloc(mem_track_cache, GFP_ATOMIC);
+            if (track) {
+                track->addr = ptr;
+                track->size = size;
+                track->timestamp = jiffies;
+
+                // Capture call stack
+                save_stack_trace(&track->stack[0], 8);
+
+                // Add to hash table
+                unsigned long hash = hash_ptr(ptr, MEM_TRACK_HASH_BITS);
+                spin_lock(&mem_track_lock);
+                hlist_add_head(&track->hash, &mem_track_hash[hash]);
+                spin_unlock(&mem_track_lock);
+            }
+        }
+        return ptr;
+    }
+
+    void kfree_tracked(void *ptr) {
+        if (ptr) {
+            // Remove from tracking
+            unsigned long hash = hash_ptr(ptr, MEM_TRACK_HASH_BITS);
+            struct mem_track *track;
+
+            spin_lock(&mem_track_lock);
+            hlist_for_each_entry(track, &mem_track_hash[hash], hash) {
+                if (track->addr == ptr) {
+                    hlist_del(&track->hash);
+                    kmem_cache_free(mem_track_cache, track);
+                    break;
+                }
+            }
+            spin_unlock(&mem_track_lock);
+
+            kfree(ptr);
+        }
+    }
+
+    // 4. Leak detection (report unfreed allocations)
+    void report_memory_leaks(void) {
+        int i;
+        unsigned long now = jiffies;
+
+        printk("Memory Leak Report:\n");
+        printk("===================\n");
+
+        for (i = 0; i < MEM_TRACK_HASH_SIZE; i++) {
+            struct mem_track *track;
+
+            hlist_for_each_entry(track, &mem_track_hash[i], hash) {
+                unsigned long age_sec = (now - track->timestamp) / HZ;
+
+                // Report allocations older than 60 seconds
+                if (age_sec > 60) {
+                    printk("LEAK: %p size=%zu age=%lus\n",
+                           track->addr, track->size, age_sec);
+
+                    // Print call stack
+                    print_stack_trace(&track->stack[0], 8);
+                }
+            }
+        }
+    }
+
+    // 5. /proc interface for reporting
+    static int mem_leak_show(struct seq_file *m, void *v) {
+        int i;
+        unsigned long total_leaked = 0;
+        int leak_count = 0;
+
+        for (i = 0; i < MEM_TRACK_HASH_SIZE; i++) {
+            struct mem_track *track;
+
+            hlist_for_each_entry(track, &mem_track_hash[i], hash) {
+                total_leaked += track->size;
+                leak_count++;
+
+                seq_printf(m, "%p: %zu bytes, age %lu sec\n",
+                          track->addr, track->size,
+                          (jiffies - track->timestamp) / HZ);
+            }
+        }
+
+        seq_printf(m, "\nTotal: %d leaks, %lu bytes\n",
+                  leak_count, total_leaked);
+
+        return 0;
+    }
+    ```
+
+    **Real-World Tools**:
+
+    1. **kmemleak** (built into Linux):
+    ```bash
+    CONFIG_DEBUG_KMEMLEAK=y
+
+    # Enable at boot
+    kmemleak=on
+
+    # Trigger scan
+    echo scan > /sys/kernel/debug/kmemleak
+
+    # View leaks
+    cat /sys/kernel/debug/kmemleak
+    ```
+
+    2. **KASAN** (memory error detector):
+    ```bash
+    CONFIG_KASAN=y
+
+    # Detects:
+    # - Use-after-free
+    # - Out-of-bounds access
+    # - Double-free
+    ```
+
+    3. **slabtop** (monitor slab usage):
+    ```bash
+    slabtop -s c  # Sort by cache size
+    # Watch for growing caches = potential leak
+    ```
+  </Accordion>
+</AccordionGroup>
+
+---
+
+## 14. Advanced Practice
+
+<CardGroup cols={2}>
+  <Card title="Practice 1: Buddy System Analysis" icon="layer-group">
+    Run `cat /proc/buddyinfo` and analyze:
+    - Which orders have most free blocks?
+    - Calculate total free memory per zone
+    - Predict if a 2MB allocation would succeed
+    - Monitor during memory pressure
+  </Card>
+
+  <Card title="Practice 2: SLUB Profiling" icon="chart-line">
+    Use `slabtop` to:
+    - Identify top memory consumers
+    - Calculate waste from partial slabs
+    - Find cache with worst fragmentation
+    - Create custom cache for your module
+  </Card>
+
+  <Card title="Practice 3: Dirty Page Tuning" icon="droplet">
+    Experiment with dirty ratios:
+    - Benchmark file copy with different ratios
+    - Monitor with `vmstat 1`
+    - Observe I/O wait impact
+    - Find optimal settings for workload
+  </Card>
+
+  <Card title="Practice 4: Memory Leak Detection" icon="bug">
+    Write a module that intentionally leaks:
+    - Detect with kmemleak
+    - Use `/proc/slabinfo` to track
+    - Implement custom tracker
+    - Test under load
+  </Card>
+</CardGroup>
+
+```bash
+# Comprehensive memory analysis script
+#!/bin/bash
+
+echo "=== Kernel Memory Report ==="
+echo
+
+echo "1. Buddy Allocator Status:"
+cat /proc/buddyinfo | awk '{
+    print $1, $2, $3
+    total=0
+    for(i=4; i<=NF; i++) {
+        order = i-4
+        blocks = $i
+        size = blocks * (4 * 2^order)
+        total += size
+        printf "  Order %2d: %6d blocks (%8d KB)\n", order, blocks, size
+    }
+    printf "  Total: %d KB\n\n", total
+}'
+
+echo "2. Top SLUB Caches:"
+slabtop -o -s c | head -20
+
+echo "3. Page Cache and Dirty Pages:"
+awk '/^Cached:|^Dirty:|^Writeback:/ {print $1, $2, "KB"}' /proc/meminfo
+
+echo "4. Memory Pressure:"
+cat /proc/vmstat | grep -E 'pgsteal|pgscan|pgfault|compact'
+
+echo "5. OOM Killer Stats:"
+dmesg | grep -i "killed process" | tail -5
+
+echo "6. Slab Info (top consumers):"
+cat /proc/slabinfo | awk 'NR>2 {print $1, $3*$4/1024, "KB"}' | sort -k2 -n -r | head -10
+```
+
+---
+
+## 15. Key Takeaways
+
+<CardGroup cols={2}>
+  <Card title="Multi-Layer Architecture" icon="layer-group">
+    Kernel memory management is hierarchical:
+    - Buddy → Physical pages
+    - SLUB → Object caching
+    - Specialized → DMA, per-CPU, pools
+    - Page Cache → Performance
+  </Card>
+
+  <Card title="Performance is Critical" icon="gauge">
+    Kernel allocation paths are heavily optimized:
+    - Per-CPU caches (lockless fast path)
+    - Direct mapping (no TLB misses)
+    - Aggressive caching (SLUB, page cache)
+    - Zero-copy techniques (DMA)
+  </Card>
+
+  <Card title="Fragmentation Control" icon="puzzle-piece">
+    Multiple mechanisms combat fragmentation:
+    - Buddy coalescing
+    - Page migration types
+    - Memory compaction
+    - Anti-fragmentation strategies
+  </Card>
+
+  <Card title="Understand the Trade-offs" icon="balance-scale">
+    Every allocation method has trade-offs:
+    - kmalloc vs vmalloc
+    - Physical vs virtual contiguity
+    - Performance vs flexibility
+    - Memory waste vs fragmentation
+  </Card>
+</CardGroup>
+
+---
+
+## Resources for Further Study
+
+<AccordionGroup>
+  <Accordion title="Essential Reading" icon="book">
+    - **Linux Kernel Development** by Robert Love (Chapter 12: Memory Management)
+    - **Understanding the Linux Kernel** by Bovet & Cesati (Chapter 8)
+    - **Linux Device Drivers** by Corbet et al. (Chapter 8: Allocating Memory)
+    - **Kernel source**: `mm/` directory, especially `mm/slub.c` and `mm/page_alloc.c`
+  </Accordion>
+
+  <Accordion title="Online Resources" icon="globe">
+    - LWN.net articles on memory management
+    - Kernel documentation: `Documentation/vm/`
+    - Memory Management Glossary: `Documentation/vm/memory-model.rst`
+    - SLUB allocator documentation: `Documentation/vm/slub.rst`
+  </Accordion>
+
+  <Accordion title="Hands-On Labs" icon="flask">
+    - Write a simple buddy allocator
+    - Implement a toy slab allocator
+    - Create a kernel module using custom caches
+    - Benchmark kmalloc vs vmalloc
+    - Experiment with dirty page ratios
+  </Accordion>
+
+  <Accordion title="Advanced Topics" icon="rocket">
+    - Read-Copy-Update (RCU) memory management
+    - Transparent Huge Pages (THP)
+    - Memory hotplug
+    - Memory ballooning in VMs
+    - NUMA memory policies
+    - CMA (Contiguous Memory Allocator)
+  </Accordion>
+</AccordionGroup>
+
+---
+
+Next: [Device Drivers & Hardware I/O](/operating-systems/device-drivers) →

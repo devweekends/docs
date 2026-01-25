@@ -1,809 +1,3141 @@
 ---
-title: "Inter-Process Communication"
+title: "Inter-Process Communication: Kernel Internals & Architecture"
 sidebarTitle: "IPC"
-description: "Pipes, shared memory, message queues, signals, and sockets"
+description: "Pipe ring-buffers, Shared Memory MMU mapping, Signal frames, and Unix Domain Socket kernel paths"
 icon: "message"
 ---
 
 # Inter-Process Communication (IPC)
 
-**IPC** allows processes to exchange data and synchronize actions. Choosing the right IPC mechanism is crucial for performance and is a key topic in systems design interviews.
+In an operating system, processes are isolated by the Virtual Memory Manager to prevent one process from corrupting another. However, complex systems (like Chrome, Nginx, or a Database) require these isolated units to cooperate. **IPC** is the set of mechanisms provided by the kernel to bridge this isolation.
 
 <Info>
-**Interview Frequency**: High  
-**Key Topics**: Pipes, shared memory, message queues, sockets  
-**Time to Master**: 10-12 hours
+**Mastery Level**: Senior Systems Engineer  
+**Key Internals**: Kernel Ring Buffers, Page Table Aliasing, Signal Frames, `rt_sigreturn`  
+**Prerequisites**: [Virtual Memory](/operating-systems/virtual-memory), [Process Internals](/operating-systems/processes)
 </Info>
 
 ---
 
-## IPC Overview
+## 0. The Big Picture: Why So Many IPC Mechanisms?
 
-![IPC Mechanisms Overview](/images/courses/ipc-mechanisms.svg)
+Before diving into each mechanism, understand how they compare:
+
+| Mechanism | Data Model | Copy Overhead | Sync Built-in? | Best For |
+|-----------|------------|---------------|----------------|----------|
+| **Pipe** | Byte stream | 1 kernel copy | Yes (blocking) | Parent–child, simple streaming |
+| **Named Pipe (FIFO)** | Byte stream | 1 kernel copy | Yes | Unrelated processes, simple streaming |
+| **Shared Memory** | Raw bytes | **Zero copy** | No (bring your own) | High-throughput, low-latency bulk data |
+| **Message Queue** | Discrete messages | 1 kernel copy | Yes (blocking, priority) | Structured messages, priority ordering |
+| **Unix Domain Socket** | Stream or datagram | 1 kernel copy | Yes | High-perf local networking, FD passing |
+| **Signal** | Integer only | N/A | N/A | Async events, not data |
+| **TCP/UDP Socket** | Stream/datagram | 1 kernel copy | Yes | Cross-machine, network-transparent |
+
+### Decision Flowchart
+
+1. **Need to pass file descriptors?** → Unix Domain Socket (`SCM_RIGHTS`).
+2. **Need zero-copy bulk transfer?** → Shared Memory + your own synchronization.
+3. **Need structured messages with priority?** → POSIX Message Queue.
+4. **Parent–child streaming?** → Pipe.
+5. **Unrelated processes, streaming?** → Named Pipe or Unix Socket.
+6. **Cross-machine?** → TCP/UDP Socket.
+7. **Async notification only?** → Signal.
 
 ---
 
-## Pipes
+## Understanding Process Isolation
 
-### Anonymous Pipes
+Before diving into IPC mechanisms, let's understand why processes need isolation and how the kernel enforces it.
 
-For parent-child communication:
+### Virtual Memory Isolation
+
+Each process operates in its own virtual address space:
+
+```
+Process A Virtual Memory          Process B Virtual Memory
+┌─────────────────────┐          ┌─────────────────────┐
+│   Stack    0xFFFF   │          │   Stack    0xFFFF   │
+├─────────────────────┤          ├─────────────────────┤
+│                     │          │                     │
+│   Heap              │          │   Heap              │
+│                     │          │                     │
+├─────────────────────┤          ├─────────────────────┤
+│   Data              │          │   Data              │
+├─────────────────────┤          ├─────────────────────┤
+│   Text     0x0000   │          │   Text     0x0000   │
+└─────────────────────┘          └─────────────────────┘
+        ↓                                 ↓
+    Page Table A                     Page Table B
+        ↓                                 ↓
+    ┌───────────────────────────────────────┐
+    │   Physical Memory (RAM)               │
+    │  Different physical frames mapped     │
+    └───────────────────────────────────────┘
+```
+
+**Isolation Benefits**:
+- Memory safety: Process A cannot corrupt Process B
+- Security: Privileged data stays protected
+- Stability: Crash in one process doesn't affect others
+- Predictability: Each process sees a consistent address space
+
+**The Problem**: This isolation prevents direct communication. The kernel must provide controlled mechanisms for processes to exchange data.
+
+---
+
+## 1. Pipes: The Kernel Ring Buffer
+
+Pipes are the oldest and most fundamental IPC mechanism in Unix. While they appear as simple file descriptors to user space, their internal implementation reveals sophisticated kernel buffer management.
+
+### 1.1 Pipe Fundamentals
+
+A pipe is a **unidirectional** communication channel with:
+- **Write end**: One process writes data
+- **Read end**: Another process reads data
+- **FIFO ordering**: First In, First Out
+- **Byte stream**: No message boundaries
 
 ```c
 #include <unistd.h>
+#include <stdio.h>
+#include <string.h>
 
 int main() {
-    int pipefd[2];  // [0] = read end, [1] = write end
-    
+    int pipefd[2];  // pipefd[0] = read end, pipefd[1] = write end
+    char buffer[128];
+
+    // Create pipe
     if (pipe(pipefd) == -1) {
         perror("pipe");
         return 1;
     }
-    
+
     pid_t pid = fork();
-    
+
     if (pid == 0) {
-        // Child: read from pipe
-        close(pipefd[1]);  // Close unused write end
-        
-        char buffer[100];
-        ssize_t n = read(pipefd[0], buffer, sizeof(buffer));
-        printf("Child received: %.*s\n", (int)n, buffer);
-        
-        close(pipefd[0]);
-    } else {
-        // Parent: write to pipe
+        // Child process - writer
         close(pipefd[0]);  // Close unused read end
-        
-        const char *msg = "Hello from parent!";
-        write(pipefd[1], msg, strlen(msg));
-        
+
+        const char *msg = "Hello from child!";
+        write(pipefd[1], msg, strlen(msg) + 1);
         close(pipefd[1]);
-        wait(NULL);
+    } else {
+        // Parent process - reader
+        close(pipefd[1]);  // Close unused write end
+
+        ssize_t n = read(pipefd[0], buffer, sizeof(buffer));
+        printf("Parent received: %s (%zd bytes)\n", buffer, n);
+        close(pipefd[0]);
     }
-    
+
     return 0;
 }
 ```
 
-### Named Pipes (FIFOs)
+**Critical Design Pattern**: Always close unused pipe ends. If the parent keeps `pipefd[1]` open, the `read()` call will never return 0 (EOF) because the kernel sees there's still a potential writer.
 
-For unrelated processes:
+### 1.2 Kernel Implementation Deep Dive
+
+#### The Pipe Buffer Structure
+
+In the Linux kernel, a pipe is implemented using a circular buffer structure (`struct pipe_inode_info`):
+
+```c
+// Simplified kernel structure (from fs/pipe.c)
+struct pipe_buffer {
+    struct page *page;      // Points to a physical page
+    unsigned int offset;    // Offset within the page
+    unsigned int len;       // Length of data in this buffer
+    const struct pipe_buf_operations *ops;
+    unsigned int flags;
+};
+
+struct pipe_inode_info {
+    struct mutex mutex;               // Protects the pipe
+    wait_queue_head_t rd_wait;       // Reader wait queue
+    wait_queue_head_t wr_wait;       // Writer wait queue
+    unsigned int head;               // Write position
+    unsigned int tail;               // Read position
+    unsigned int max_usage;          // Max buffers (usually 16)
+    unsigned int ring_size;          // Number of buffer slots
+    struct pipe_buffer *bufs;        // Array of pipe buffers
+    struct user_struct *user;        // Owner
+};
+```
+
+**Memory Layout**:
+
+```
+Pipe Ring Buffer (16 pages × 4KB = 64KB default capacity)
+
+   head = 5                           tail = 2
+      ↓                                  ↓
+┌─────┬─────┬─────┬─────┬─────┬─────┬─────┬─────┐
+│  8  │  9  │ 10  │ 11  │ 12  │ 13  │ 14  │ 15  │
+└─────┴─────┴─────┴─────┴─────┴─────┴─────┴─────┘
+┌─────┬─────┬─────┬─────┬─────┬─────┬─────┬─────┐
+│  0  │  1  │  2  │  3  │  4  │  5  │  6  │  7  │
+└─────┴─────┴─────┴─────┴─────┴─────┴─────┴─────┘
+               ↑                       ↑
+            Reader                  Writer
+         (consumes)              (produces)
+
+Current data: buffers 2, 3, 4 (3 pages = 12KB of data)
+```
+
+#### Write Operation Flow
+
+When a process calls `write(pipefd[1], data, size)`:
+
+```
+1. System Call Entry
+   ├─> User space → Kernel space transition
+   └─> syscall handler: sys_write() → vfs_write() → pipe_write()
+
+2. Acquire Pipe Mutex
+   ├─> mutex_lock(&pipe->mutex)
+   └─> Prevents concurrent access
+
+3. Check Capacity
+   ├─> if ((head - tail) >= ring_size)  // Pipe is full
+   │   ├─> if (O_NONBLOCK) return -EAGAIN
+   │   └─> else: wait_event_interruptible(pipe->wr_wait)
+   └─> Process sleeps in TASK_INTERRUPTIBLE state
+
+4. Write Data to Buffer
+   ├─> Allocate new pipe_buffer if needed
+   ├─> Get page: alloc_page(GFP_HIGHUSER)
+   ├─> Copy from user space: copy_from_user(page, data, size)
+   └─> Update head pointer: pipe->head++
+
+5. Wake Readers
+   ├─> wake_up_interruptible(&pipe->rd_wait)
+   └─> Reader process moves to run queue
+
+6. Release Mutex & Return
+   ├─> mutex_unlock(&pipe->mutex)
+   └─> Return bytes written
+```
+
+**Key Kernel Functions**:
+
+```c
+// Simplified from fs/pipe.c
+static ssize_t pipe_write(struct kiocb *iocb, struct iov_iter *from) {
+    struct file *filp = iocb->ki_filp;
+    struct pipe_inode_info *pipe = filp->private_data;
+    ssize_t ret = 0;
+    size_t total_len = iov_iter_count(from);
+
+    mutex_lock(&pipe->mutex);
+
+    for (;;) {
+        unsigned int head = pipe->head;
+        unsigned int tail = pipe->tail;
+        unsigned int mask = pipe->ring_size - 1;
+
+        if (!pipe_full(head, tail, pipe->max_usage)) {
+            struct pipe_buffer *buf = &pipe->bufs[head & mask];
+            struct page *page = alloc_page(GFP_HIGHUSER);
+
+            if (!page) {
+                ret = -ENOMEM;
+                break;
+            }
+
+            // Copy data from user space
+            size_t chunk = min_t(size_t, total_len, PAGE_SIZE);
+            if (copy_from_iter(page_address(page), chunk, from) != chunk) {
+                __free_page(page);
+                ret = -EFAULT;
+                break;
+            }
+
+            buf->page = page;
+            buf->offset = 0;
+            buf->len = chunk;
+
+            pipe->head = head + 1;
+            ret += chunk;
+
+            // Wake up readers
+            wake_up_interruptible_sync_poll(&pipe->rd_wait, EPOLLIN);
+
+            if (ret >= total_len)
+                break;
+        } else {
+            // Pipe is full
+            if (filp->f_flags & O_NONBLOCK) {
+                ret = -EAGAIN;
+                break;
+            }
+
+            // Sleep until space available
+            mutex_unlock(&pipe->mutex);
+            wait_event_interruptible(pipe->wr_wait,
+                                     !pipe_full(pipe->head, pipe->tail, pipe->max_usage));
+            mutex_lock(&pipe->mutex);
+        }
+    }
+
+    mutex_unlock(&pipe->mutex);
+    return ret;
+}
+```
+
+### 1.3 Atomicity and PIPE_BUF
+
+**Critical Guarantee**: Writes of size ≤ `PIPE_BUF` (4096 bytes on Linux) are **atomic**.
+
+What does atomic mean?
+
+```c
+// Two processes writing simultaneously
+
+// Process A
+write(pipe_fd, "AAAA...AAAA", 3000);  // 3000 A's
+
+// Process B
+write(pipe_fd, "BBBB...BBBB", 3000);  // 3000 B's
+
+// Result in pipe (GUARANTEED):
+// Either: AAAA...AAAA (3000 A's) BBBB...BBBB (3000 B's)
+// Or:     BBBB...BBBB (3000 B's) AAAA...AAAA (3000 A's)
+
+// NEVER: AABBABBA... (interleaved)
+```
+
+**What happens with writes > PIPE_BUF?**
+
+```c
+// Process A
+write(pipe_fd, "AAAA...AAAA", 8000);  // 8000 A's
+
+// Process B
+write(pipe_fd, "BBBB...BBBB", 8000);  // 8000 B's
+
+// Result (POSSIBLE):
+// AAAA...AAAA (4096 A's) BBBB...BBBB (4096 B's) AAAA...AAAA (remaining A's) ...
+// Data is interleaved!
+```
+
+**Kernel Implementation**:
+
+The atomicity guarantee is enforced by holding the pipe mutex for the entire write operation when `size <= PIPE_BUF`:
+
+```c
+if (total_len <= PIPE_BUF) {
+    // Atomic write: hold mutex for entire operation
+    mutex_lock(&pipe->mutex);
+    // ... perform entire write ...
+    mutex_unlock(&pipe->mutex);
+} else {
+    // Non-atomic: may release mutex between chunks
+    while (bytes_remaining > 0) {
+        mutex_lock(&pipe->mutex);
+        // ... write chunk ...
+        mutex_unlock(&pipe->mutex);
+        // Another process can write here!
+    }
+}
+```
+
+### 1.4 Named Pipes (FIFOs)
+
+Regular pipes only work between related processes (parent-child via `fork()`). Named pipes (FIFOs) allow unrelated processes to communicate.
 
 ```c
 #include <sys/stat.h>
 #include <fcntl.h>
+#include <unistd.h>
+#include <stdio.h>
+#include <string.h>
 
 // Writer process
-int writer() {
-    mkfifo("/tmp/myfifo", 0666);  // Create FIFO
-    
-    int fd = open("/tmp/myfifo", O_WRONLY);
-    write(fd, "Hello FIFO!", 11);
+int main() {
+    const char *fifo_path = "/tmp/my_fifo";
+
+    // Create FIFO (like a file in the filesystem)
+    if (mkfifo(fifo_path, 0666) == -1) {
+        perror("mkfifo");
+        return 1;
+    }
+
+    int fd = open(fifo_path, O_WRONLY);  // Blocks until reader opens
+
+    const char *msg = "Hello via FIFO!";
+    write(fd, msg, strlen(msg) + 1);
+
     close(fd);
-    
+    unlink(fifo_path);  // Remove FIFO file
     return 0;
 }
 
 // Reader process (separate program)
-int reader() {
-    int fd = open("/tmp/myfifo", O_RDONLY);
-    
-    char buffer[100];
+int main() {
+    const char *fifo_path = "/tmp/my_fifo";
+    char buffer[128];
+
+    int fd = open(fifo_path, O_RDONLY);  // Blocks until writer opens
+
     ssize_t n = read(fd, buffer, sizeof(buffer));
-    printf("Received: %.*s\n", (int)n, buffer);
-    
+    printf("Received: %s\n", buffer);
+
     close(fd);
     return 0;
 }
 ```
 
-### Pipe Characteristics
+**Kernel Implementation**: A FIFO is represented by an inode with type `S_IFIFO`. The inode's `i_pipe` field points to the same `struct pipe_inode_info` as regular pipes.
 
-| Property | Value |
-|----------|-------|
-| Capacity | 64KB typical (Linux) |
-| Ordering | FIFO |
-| Persistence | Kernel buffer only |
-| Blocking | Yes (when full/empty) |
-| Direction | Unidirectional |
+```
+Filesystem View              Kernel Internal View
+─────────────────            ────────────────────
+/tmp/my_fifo                 struct inode
+(special file)               ├─> i_mode = S_IFIFO
+                             └─> i_pipe ──> struct pipe_inode_info
+                                                  (ring buffer)
+```
+
+### 1.5 Pipe Performance Characteristics
+
+<Tabs>
+  <Tab title="Throughput Test">
+```c
+#include <unistd.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <time.h>
+#include <string.h>
+
+#define DATA_SIZE (1024 * 1024 * 100)  // 100 MB
+
+int main() {
+    int pipefd[2];
+    pipe(pipefd);
+
+    pid_t pid = fork();
+
+    if (pid == 0) {
+        // Child - writer
+        close(pipefd[0]);
+
+        char *data = malloc(4096);
+        memset(data, 'A', 4096);
+
+        size_t written = 0;
+        struct timespec start, end;
+        clock_gettime(CLOCK_MONOTONIC, &start);
+
+        while (written < DATA_SIZE) {
+            ssize_t n = write(pipefd[1], data, 4096);
+            if (n > 0) written += n;
+        }
+
+        clock_gettime(CLOCK_MONOTONIC, &end);
+        double elapsed = (end.tv_sec - start.tv_sec) +
+                        (end.tv_nsec - start.tv_nsec) / 1e9;
+
+        printf("Wrote %zu bytes in %.3f seconds\n", written, elapsed);
+        printf("Throughput: %.2f MB/s\n", (DATA_SIZE / (1024.0 * 1024.0)) / elapsed);
+
+        close(pipefd[1]);
+        free(data);
+        exit(0);
+    } else {
+        // Parent - reader
+        close(pipefd[1]);
+
+        char buffer[4096];
+        size_t total_read = 0;
+
+        while (1) {
+            ssize_t n = read(pipefd[0], buffer, sizeof(buffer));
+            if (n <= 0) break;
+            total_read += n;
+        }
+
+        printf("Read %zu bytes\n", total_read);
+        close(pipefd[0]);
+        wait(NULL);
+    }
+
+    return 0;
+}
+```
+**Typical Results**: 2-5 GB/s on modern hardware (limited by memory copy speed)
+  </Tab>
+
+  <Tab title="Latency Test">
+```c
+#include <unistd.h>
+#include <stdio.h>
+#include <time.h>
+
+#define ITERATIONS 10000
+
+int main() {
+    int pipe_c2p[2], pipe_p2c[2];  // child-to-parent, parent-to-child
+    pipe(pipe_c2p);
+    pipe(pipe_p2c);
+
+    pid_t pid = fork();
+
+    if (pid == 0) {
+        // Child - ping-pong responder
+        close(pipe_c2p[0]);
+        close(pipe_p2c[1]);
+
+        char byte;
+        for (int i = 0; i < ITERATIONS; i++) {
+            read(pipe_p2c[0], &byte, 1);   // Wait for ping
+            write(pipe_c2p[1], &byte, 1);  // Send pong
+        }
+
+        exit(0);
+    } else {
+        // Parent - measure round-trip time
+        close(pipe_c2p[1]);
+        close(pipe_p2c[0]);
+
+        struct timespec start, end;
+        char byte = 'X';
+
+        clock_gettime(CLOCK_MONOTONIC, &start);
+
+        for (int i = 0; i < ITERATIONS; i++) {
+            write(pipe_p2c[1], &byte, 1);  // Ping
+            read(pipe_c2p[0], &byte, 1);   // Wait for pong
+        }
+
+        clock_gettime(CLOCK_MONOTONIC, &end);
+
+        double elapsed = (end.tv_sec - start.tv_sec) +
+                        (end.tv_nsec - start.tv_nsec) / 1e9;
+        double avg_latency_us = (elapsed / ITERATIONS) * 1e6;
+
+        printf("Average round-trip latency: %.2f µs\n", avg_latency_us);
+
+        wait(NULL);
+    }
+
+    return 0;
+}
+```
+**Typical Results**: 1-3 µs round-trip (includes 2 context switches + 2 copies)
+  </Tab>
+</Tabs>
+
+### 1.6 The Self-Pipe Trick (Advanced Pattern)
+
+**Problem**: Signal handlers are asynchronous and severely limited in what they can do (async-signal-safe functions only). How do you integrate signals with an event loop?
+
+**Solution**: The self-pipe trick.
+
+```c
+#include <unistd.h>
+#include <signal.h>
+#include <poll.h>
+#include <stdio.h>
+#include <string.h>
+
+static int signal_pipe[2];
+
+void signal_handler(int sig) {
+    // Only async-signal-safe operations allowed here
+    char byte = sig;
+    write(signal_pipe[1], &byte, 1);  // Write is async-signal-safe
+}
+
+int main() {
+    pipe(signal_pipe);
+
+    // Set up signal handler
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = signal_handler;
+    sigaction(SIGINT, &sa, NULL);
+    sigaction(SIGTERM, &sa, NULL);
+
+    // Event loop using poll()
+    struct pollfd fds[2];
+    fds[0].fd = STDIN_FILENO;
+    fds[0].events = POLLIN;
+    fds[1].fd = signal_pipe[0];
+    fds[1].events = POLLIN;
+
+    printf("Event loop running. Press Ctrl+C to test...\n");
+
+    while (1) {
+        int ret = poll(fds, 2, -1);
+
+        if (ret > 0) {
+            if (fds[0].revents & POLLIN) {
+                // Handle stdin
+                char buf[128];
+                ssize_t n = read(STDIN_FILENO, buf, sizeof(buf));
+                printf("Got input: %.*s", (int)n, buf);
+            }
+
+            if (fds[1].revents & POLLIN) {
+                // Handle signal
+                char sig;
+                read(signal_pipe[0], &sig, 1);
+                printf("Received signal %d in main loop!\n", sig);
+
+                if (sig == SIGINT || sig == SIGTERM) {
+                    printf("Cleaning up and exiting...\n");
+                    break;
+                }
+            }
+        }
+    }
+
+    close(signal_pipe[0]);
+    close(signal_pipe[1]);
+    return 0;
+}
+```
+
+**Why it works**:
+1. Signal handler executes in async context (can't safely do much)
+2. Handler writes 1 byte to pipe (write is async-signal-safe)
+3. Main event loop wakes up from `poll()`
+4. Main loop reads signal number and handles it safely
+5. Signal handling is now integrated with other I/O events
+
+**Used in**: Redis, Nginx, Node.js event loops
 
 ---
 
-## Shared Memory
+## 2. Shared Memory: The Zero-Copy Holy Grail
 
-The fastest IPC — no kernel involvement for data transfer:
+Shared Memory is the fastest IPC mechanism because it completely eliminates kernel involvement in data transfer. Once set up, processes communicate at memory speed.
 
-### POSIX Shared Memory
+### 2.1 The Fundamental Concept
+
+**Traditional IPC (pipe/socket) data flow**:
+
+```
+Process A                 Kernel                Process B
+┌─────────┐              ┌──────┐              ┌─────────┐
+│  User   │  write()     │      │  read()      │  User   │
+│ Buffer  │ ──────────>  │ Pipe │ ──────────>  │ Buffer  │
+│ [DATA]  │   copy 1     │Buffer│   copy 2     │ [DATA]  │
+└─────────┘              │[DATA]│              └─────────┘
+                         └──────┘
+Total: 2 memory copies + 2 syscalls + 2 context switches
+```
+
+**Shared Memory data flow**:
+
+```
+Process A                                      Process B
+┌─────────┐                                    ┌─────────┐
+│  User   │    No kernel involvement!         │  User   │
+│ Buffer  │ ──────────────────────────────>   │ Buffer  │
+│ [DATA]  │    Direct memory access           │ [DATA]  │
+└─────────┘                                    └─────────┘
+     ↓                                              ↓
+     └────────────> Same Physical Memory <──────────┘
+
+Total: 0 copies (after initial setup)
+```
+
+### 2.2 POSIX Shared Memory Implementation
+
+```c
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <stdio.h>
+#include <string.h>
+#include <semaphore.h>
+
+#define SHM_NAME "/my_shm"
+#define SHM_SIZE 4096
+
+// Shared data structure
+struct shared_data {
+    sem_t mutex;      // Synchronization primitive
+    int counter;
+    char message[256];
+};
+
+// Writer process
+int main() {
+    // Create shared memory object
+    int shm_fd = shm_open(SHM_NAME, O_CREAT | O_RDWR, 0666);
+    if (shm_fd == -1) {
+        perror("shm_open");
+        return 1;
+    }
+
+    // Set size
+    if (ftruncate(shm_fd, SHM_SIZE) == -1) {
+        perror("ftruncate");
+        return 1;
+    }
+
+    // Map shared memory into address space
+    struct shared_data *shm = mmap(NULL, SHM_SIZE,
+                                   PROT_READ | PROT_WRITE,
+                                   MAP_SHARED, shm_fd, 0);
+    if (shm == MAP_FAILED) {
+        perror("mmap");
+        return 1;
+    }
+
+    // Initialize semaphore (process-shared)
+    sem_init(&shm->mutex, 1, 1);  // pshared=1 means process-shared
+
+    // Write data
+    sem_wait(&shm->mutex);  // Acquire lock
+    shm->counter = 42;
+    strcpy(shm->message, "Hello from writer!");
+    sem_post(&shm->mutex);  // Release lock
+
+    printf("Data written to shared memory\n");
+
+    // Keep memory mapped for reader
+    sleep(5);
+
+    munmap(shm, SHM_SIZE);
+    close(shm_fd);
+    shm_unlink(SHM_NAME);  // Remove shared memory object
+
+    return 0;
+}
+
+// Reader process (separate program)
+int main() {
+    // Open existing shared memory
+    int shm_fd = shm_open(SHM_NAME, O_RDONLY, 0666);
+    if (shm_fd == -1) {
+        perror("shm_open");
+        return 1;
+    }
+
+    // Map shared memory (read-only)
+    struct shared_data *shm = mmap(NULL, SHM_SIZE,
+                                   PROT_READ,
+                                   MAP_SHARED, shm_fd, 0);
+    if (shm == MAP_FAILED) {
+        perror("mmap");
+        return 1;
+    }
+
+    // Read data
+    sem_wait((sem_t*)&shm->mutex);  // Acquire lock
+    printf("Counter: %d\n", shm->counter);
+    printf("Message: %s\n", shm->message);
+    sem_post((sem_t*)&shm->mutex);  // Release lock
+
+    munmap(shm, SHM_SIZE);
+    close(shm_fd);
+
+    return 0;
+}
+```
+
+### 2.3 The MMU Magic: Page Table Aliasing
+
+**How the kernel makes shared memory work**:
+
+```
+Process A Virtual Memory          Process B Virtual Memory
+┌────────────────────┐           ┌────────────────────┐
+│  0x7000: [shm map] │           │  0x9000: [shm map] │
+└────────────────────┘           └────────────────────┘
+         ↓                                ↓
+    Page Table A                     Page Table B
+         ↓                                ↓
+    VPN: 0x7    →  PFN: 0x5000      VPN: 0x9    →  PFN: 0x5000
+                         ↓                               ↓
+                         └───────────────────────────────┘
+                                        ↓
+                         Physical Frame 0x5000
+                         ┌────────────────────┐
+                         │  Actual data here  │
+                         │  counter = 42      │
+                         │  message = "..."   │
+                         └────────────────────┘
+```
+
+**Kernel Implementation**:
+
+When Process A calls `mmap(MAP_SHARED)`:
+
+```c
+// Simplified from mm/mmap.c and mm/shmem.c
+
+// 1. Create VMA (Virtual Memory Area)
+struct vm_area_struct *vma = vm_area_alloc(mm);
+vma->vm_start = 0x7000;  // Virtual address (example)
+vma->vm_end = 0x8000;
+vma->vm_flags = VM_SHARED | VM_READ | VM_WRITE;
+vma->vm_file = shm_file;  // Points to shared memory file
+
+// 2. Install page table entries
+for (unsigned long addr = vma->vm_start; addr < vma->vm_end; addr += PAGE_SIZE) {
+    struct page *page = shmem_get_page(shm_file, offset);  // Get shared page
+    unsigned long pfn = page_to_pfn(page);  // Physical frame number
+
+    // Install PTE: Virtual Page → Physical Frame
+    pte_t *pte = get_pte(mm, addr);
+    set_pte(pte, pfn_pte(pfn, vma->vm_page_prot));
+}
+```
+
+When Process B calls `mmap(MAP_SHARED)` on the **same** shared memory object:
+
+```c
+// Process B gets DIFFERENT virtual address (0x9000)
+// But kernel maps it to SAME physical frames (0x5000)
+
+struct vm_area_struct *vma_b = vm_area_alloc(mm_b);
+vma_b->vm_start = 0x9000;
+vma_b->vm_file = shm_file;  // SAME file object!
+
+// Map to SAME physical pages
+for (unsigned long addr = vma_b->vm_start; addr < vma_b->vm_end; addr += PAGE_SIZE) {
+    struct page *page = shmem_get_page(shm_file, offset);  // SAME pages!
+    unsigned long pfn = page_to_pfn(page);
+
+    pte_t *pte = get_pte(mm_b, addr);
+    set_pte(pte, pfn_pte(pfn, vma_b->vm_page_prot));
+}
+```
+
+**Result**: Two different virtual addresses (0x7000 and 0x9000) both resolve to the same physical memory (0x5000). This is **page table aliasing**.
+
+### 2.4 System V Shared Memory (Legacy API)
+
+```c
+#include <sys/ipc.h>
+#include <sys/shm.h>
+#include <stdio.h>
+#include <string.h>
+
+#define SHM_KEY 1234
+#define SHM_SIZE 4096
+
+// Creator process
+int main() {
+    // Create shared memory segment
+    int shmid = shmget(SHM_KEY, SHM_SIZE, IPC_CREAT | 0666);
+    if (shmid == -1) {
+        perror("shmget");
+        return 1;
+    }
+
+    // Attach to address space
+    char *shm = shmat(shmid, NULL, 0);
+    if (shm == (char*)-1) {
+        perror("shmat");
+        return 1;
+    }
+
+    // Write data
+    strcpy(shm, "System V shared memory!");
+
+    printf("Data written, shmid: %d\n", shmid);
+
+    // Detach
+    shmdt(shm);
+
+    // Don't delete yet - let reader access it
+    sleep(5);
+
+    // Mark for deletion (actual deletion happens when all detach)
+    shmctl(shmid, IPC_RMID, NULL);
+
+    return 0;
+}
+
+// Reader process
+int main() {
+    int shmid = shmget(SHM_KEY, SHM_SIZE, 0666);
+    if (shmid == -1) {
+        perror("shmget");
+        return 1;
+    }
+
+    char *shm = shmat(shmid, NULL, SHM_RDONLY);
+    printf("Read: %s\n", shm);
+
+    shmdt(shm);
+    return 0;
+}
+```
+
+**Persistence**: System V shared memory persists until explicitly deleted with `IPC_RMID` or system reboot. Use `ipcs -m` to list and `ipcrm -m <shmid>` to delete orphaned segments.
+
+### 2.5 Synchronization: The Critical Challenge
+
+**Problem**: Shared memory provides NO synchronization. Multiple processes accessing the same memory simultaneously will corrupt data.
+
+<CardGroup cols={2}>
+  <Card title="Race Condition Example" icon="triangle-exclamation">
+```c
+// BROKEN CODE - Race condition
+struct shared_data {
+    int counter;  // Shared counter
+};
+
+// Both Process A and B execute this:
+shm->counter++;  // NOT ATOMIC!
+
+// Assembly (what actually happens):
+// 1. mov eax, [counter]  ; Read
+// 2. inc eax             ; Increment
+// 3. mov [counter], eax  ; Write
+
+// If both processes interleave:
+// A: Read (0)
+// B: Read (0)
+// A: Inc (1)
+// B: Inc (1)
+// A: Write (1)
+// B: Write (1)
+// Result: 1 (should be 2!)
+```
+  </Card>
+
+  <Card title="Correct Solution" icon="check">
+```c
+// CORRECT - Using semaphore
+struct shared_data {
+    sem_t mutex;
+    int counter;
+};
+
+// Initialize (once)
+sem_init(&shm->mutex, 1, 1);
+
+// Each process does:
+sem_wait(&shm->mutex);  // Lock
+shm->counter++;
+sem_post(&shm->mutex);  // Unlock
+
+// Or using atomic operations:
+__sync_fetch_and_add(&shm->counter, 1);
+// or C11 atomics:
+atomic_fetch_add(&shm->counter, 1);
+```
+  </Card>
+</CardGroup>
+
+**Producer-Consumer with Shared Memory**:
 
 ```c
 #include <sys/mman.h>
 #include <fcntl.h>
 #include <semaphore.h>
+#include <stdio.h>
+#include <string.h>
+#include <unistd.h>
 
-typedef struct {
-    sem_t sem;
-    int counter;
-    char data[1024];
-} shared_data_t;
+#define SHM_NAME "/pc_shm"
+#define BUFFER_SIZE 10
 
-// Process 1: Create and write
-int producer() {
-    // Create shared memory object
-    int fd = shm_open("/myshm", O_CREAT | O_RDWR, 0666);
-    ftruncate(fd, sizeof(shared_data_t));
-    
-    // Map into address space
-    shared_data_t *shared = mmap(NULL, sizeof(shared_data_t),
-                                  PROT_READ | PROT_WRITE,
-                                  MAP_SHARED, fd, 0);
-    
-    // Initialize
-    sem_init(&shared->sem, 1, 1);  // 1 = shared between processes
-    shared->counter = 0;
-    
-    // Write data
-    sem_wait(&shared->sem);
-    strcpy(shared->data, "Hello shared memory!");
-    shared->counter++;
-    sem_post(&shared->sem);
-    
-    // Keep running or cleanup
-    munmap(shared, sizeof(shared_data_t));
-    close(fd);
+struct shared_buffer {
+    sem_t mutex;      // Mutual exclusion
+    sem_t empty;      // Count of empty slots
+    sem_t full;       // Count of full slots
+    int buffer[BUFFER_SIZE];
+    int in;           // Producer index
+    int out;          // Consumer index
+};
+
+// Producer
+int main() {
+    int shm_fd = shm_open(SHM_NAME, O_CREAT | O_RDWR, 0666);
+    ftruncate(shm_fd, sizeof(struct shared_buffer));
+
+    struct shared_buffer *shm = mmap(NULL, sizeof(struct shared_buffer),
+                                     PROT_READ | PROT_WRITE,
+                                     MAP_SHARED, shm_fd, 0);
+
+    // Initialize semaphores
+    sem_init(&shm->mutex, 1, 1);
+    sem_init(&shm->empty, 1, BUFFER_SIZE);  // Initially all empty
+    sem_init(&shm->full, 1, 0);             // Initially none full
+    shm->in = 0;
+    shm->out = 0;
+
+    // Produce items
+    for (int item = 0; item < 20; item++) {
+        sem_wait(&shm->empty);  // Wait for empty slot
+        sem_wait(&shm->mutex);  // Lock
+
+        shm->buffer[shm->in] = item;
+        printf("Produced: %d\n", item);
+        shm->in = (shm->in + 1) % BUFFER_SIZE;
+
+        sem_post(&shm->mutex);  // Unlock
+        sem_post(&shm->full);   // Signal new full slot
+
+        usleep(100000);  // Simulate work
+    }
+
+    munmap(shm, sizeof(struct shared_buffer));
     return 0;
 }
 
-// Process 2: Read
-int consumer() {
-    int fd = shm_open("/myshm", O_RDWR, 0666);
-    
-    shared_data_t *shared = mmap(NULL, sizeof(shared_data_t),
-                                  PROT_READ | PROT_WRITE,
-                                  MAP_SHARED, fd, 0);
-    
-    sem_wait(&shared->sem);
-    printf("Data: %s, Counter: %d\n", shared->data, shared->counter);
-    sem_post(&shared->sem);
-    
-    munmap(shared, sizeof(shared_data_t));
-    close(fd);
-    
-    // Cleanup when done
-    shm_unlink("/myshm");
+// Consumer
+int main() {
+    int shm_fd = shm_open(SHM_NAME, O_RDWR, 0666);
+    struct shared_buffer *shm = mmap(NULL, sizeof(struct shared_buffer),
+                                     PROT_READ | PROT_WRITE,
+                                     MAP_SHARED, shm_fd, 0);
+
+    // Consume items
+    for (int i = 0; i < 20; i++) {
+        sem_wait(&shm->full);   // Wait for full slot
+        sem_wait(&shm->mutex);  // Lock
+
+        int item = shm->buffer[shm->out];
+        printf("Consumed: %d\n", item);
+        shm->out = (shm->out + 1) % BUFFER_SIZE;
+
+        sem_post(&shm->mutex);  // Unlock
+        sem_post(&shm->empty);  // Signal new empty slot
+
+        usleep(150000);  // Simulate work
+    }
+
+    munmap(shm, sizeof(struct shared_buffer));
+    shm_unlink(SHM_NAME);
     return 0;
 }
 ```
 
-### mmap for Shared Memory
+### 2.6 Huge Pages for Shared Memory
+
+For large shared memory regions (GB+), using huge pages (2MB or 1GB instead of 4KB) reduces TLB pressure and improves performance.
 
 ```c
-// Anonymous shared mapping (for related processes)
-void *shared = mmap(NULL, size,
-                    PROT_READ | PROT_WRITE,
-                    MAP_SHARED | MAP_ANONYMOUS,
-                    -1, 0);
+#include <sys/mman.h>
+#include <stdio.h>
 
-// File-backed shared mapping
-int fd = open("shared_file", O_RDWR);
-void *shared = mmap(NULL, file_size,
-                    PROT_READ | PROT_WRITE,
-                    MAP_SHARED,
-                    fd, 0);
-// Changes written back to file
+#define SHM_SIZE (2 * 1024 * 1024)  // 2 MB
+
+int main() {
+    // Allocate using huge pages
+    void *shm = mmap(NULL, SHM_SIZE,
+                     PROT_READ | PROT_WRITE,
+                     MAP_SHARED | MAP_ANONYMOUS | MAP_HUGETLB,
+                     -1, 0);
+
+    if (shm == MAP_FAILED) {
+        perror("mmap huge pages");
+        // Fall back to regular pages
+        shm = mmap(NULL, SHM_SIZE,
+                   PROT_READ | PROT_WRITE,
+                   MAP_SHARED | MAP_ANONYMOUS,
+                   -1, 0);
+    } else {
+        printf("Allocated 2MB huge page\n");
+    }
+
+    // Use shared memory...
+
+    munmap(shm, SHM_SIZE);
+    return 0;
+}
 ```
 
-### Shared Memory Synchronization
-
-<Warning>
-**Critical**: Shared memory requires explicit synchronization!
-</Warning>
-
-```c
-// Options for synchronization:
-
-// 1. POSIX semaphores (in shared memory)
-sem_t *sem = sem_open("/mysem", O_CREAT, 0666, 1);
-
-// 2. pthread mutex with PTHREAD_PROCESS_SHARED
-pthread_mutexattr_t attr;
-pthread_mutexattr_init(&attr);
-pthread_mutexattr_setpshared(&attr, PTHREAD_PROCESS_SHARED);
-pthread_mutex_init(&shared->mutex, &attr);
-
-// 3. Atomic operations
-#include <stdatomic.h>
-atomic_fetch_add(&shared->counter, 1);
-```
+**Performance Impact**:
+- **Regular 4KB pages**: 1 GB = 262,144 page table entries
+- **2MB huge pages**: 1 GB = 512 page table entries
+- **TLB misses**: Reduced by ~99%
 
 ---
 
-## Message Queues
+## 3. Message Queues: Structured Communication
 
-Structured message passing with priority support:
+Message Queues provide **message-oriented** communication with built-in synchronization and priority handling.
 
-### POSIX Message Queues
+### 3.1 POSIX Message Queues
 
 ```c
 #include <mqueue.h>
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
 
-#define QUEUE_NAME "/myqueue"
+#define QUEUE_NAME "/my_queue"
 #define MAX_MSG_SIZE 256
-#define MAX_MSGS 10
+#define MAX_MESSAGES 10
 
 // Sender
-int sender() {
-    struct mq_attr attr = {
-        .mq_flags = 0,
-        .mq_maxmsg = MAX_MSGS,
-        .mq_msgsize = MAX_MSG_SIZE,
-        .mq_curmsgs = 0
-    };
-    
-    mqd_t mq = mq_open(QUEUE_NAME, O_CREAT | O_WRONLY, 0666, &attr);
-    
-    // Send with priority (higher = more urgent)
-    mq_send(mq, "High priority!", 14, 10);
-    mq_send(mq, "Low priority", 12, 1);
-    
+int main() {
+    struct mq_attr attr;
+    attr.mq_flags = 0;
+    attr.mq_maxmsg = MAX_MESSAGES;
+    attr.mq_msgsize = MAX_MSG_SIZE;
+    attr.mq_curmsgs = 0;
+
+    mqd_t mq = mq_open(QUEUE_NAME, O_CREAT | O_WRONLY, 0644, &attr);
+    if (mq == (mqd_t)-1) {
+        perror("mq_open");
+        return 1;
+    }
+
+    // Send messages with different priorities
+    const char *msg1 = "Low priority message";
+    const char *msg2 = "High priority message";
+    const char *msg3 = "Medium priority message";
+
+    mq_send(mq, msg1, strlen(msg1) + 1, 1);   // Priority 1
+    mq_send(mq, msg2, strlen(msg2) + 1, 10);  // Priority 10
+    mq_send(mq, msg3, strlen(msg3) + 1, 5);   // Priority 5
+
+    printf("Messages sent\n");
+
     mq_close(mq);
     return 0;
 }
 
 // Receiver
-int receiver() {
+int main() {
     mqd_t mq = mq_open(QUEUE_NAME, O_RDONLY);
-    
-    char buffer[MAX_MSG_SIZE];
-    unsigned int priority;
-    
-    // Receives highest priority first
-    while (1) {
-        ssize_t bytes = mq_receive(mq, buffer, MAX_MSG_SIZE, &priority);
-        if (bytes > 0) {
-            printf("Priority %u: %.*s\n", priority, (int)bytes, buffer);
-        }
+    if (mq == (mqd_t)-1) {
+        perror("mq_open");
+        return 1;
     }
-    
+
+    struct mq_attr attr;
+    mq_getattr(mq, &attr);
+
+    char *buffer = malloc(attr.mq_msgsize);
+    unsigned int prio;
+
+    // Receive messages (highest priority first)
+    while (mq_receive(mq, buffer, attr.mq_msgsize, &prio) >= 0) {
+        printf("Received (priority %u): %s\n", prio, buffer);
+    }
+
+    free(buffer);
     mq_close(mq);
     mq_unlink(QUEUE_NAME);
     return 0;
 }
 ```
 
-### Message Queue vs Pipe
+**Output**:
+```
+Received (priority 10): High priority message
+Received (priority 5): Medium priority message
+Received (priority 1): Low priority message
+```
 
-| Feature | Pipe | Message Queue |
-|---------|------|---------------|
-| Structure | Byte stream | Discrete messages |
-| Priority | No | Yes |
-| Multiple readers | No | Yes |
-| Persistence | Kernel only | Can survive process |
-| Size limit | ~64KB | Configurable |
+### 3.2 Kernel Implementation
 
----
-
-## Signals
-
-Asynchronous notification mechanism:
+POSIX message queues are implemented in the kernel as a priority-sorted list:
 
 ```c
+// Simplified from ipc/mqueue.c
+
+struct mqueue_inode_info {
+    spinlock_t lock;
+    struct inode vfs_inode;
+    wait_queue_head_t wait_q;
+
+    struct msg_msg **messages;  // Array of messages
+    struct mq_attr attr;
+
+    struct list_head e_wait_q[2];  // 0=recv waiters, 1=send waiters
+};
+
+struct msg_msg {
+    struct list_head m_list;
+    long m_type;          // Priority
+    size_t m_ts;          // Message size
+    void *m_data;         // Message data
+    // Followed by actual message data
+};
+
+// Send operation
+static int do_mq_timedsend(mqd_t mqdes, const char *msg_ptr,
+                           size_t msg_len, unsigned int msg_prio) {
+    struct mqueue_inode_info *info = get_mqueue_info(mqdes);
+
+    spin_lock(&info->lock);
+
+    if (info->attr.mq_curmsgs >= info->attr.mq_maxmsg) {
+        // Queue full - block or return error
+        if (mqdes->f_flags & O_NONBLOCK) {
+            spin_unlock(&info->lock);
+            return -EAGAIN;
+        }
+        // Wait for space...
+    }
+
+    // Allocate message
+    struct msg_msg *msg = alloc_msg(msg_len);
+    copy_from_user(msg->m_data, msg_ptr, msg_len);
+    msg->m_type = msg_prio;
+
+    // Insert in priority order
+    insert_message_sorted(info->messages, msg, msg_prio);
+    info->attr.mq_curmsgs++;
+
+    // Wake up receivers
+    wake_up(&info->wait_q);
+
+    spin_unlock(&info->lock);
+    return 0;
+}
+```
+
+**Priority Queue Implementation**: Messages are stored in a sorted array or priority queue. When receiving, the kernel returns the highest priority message in O(1) or O(log N) time.
+
+### 3.3 Asynchronous Notification
+
+Message queues support asynchronous notification via signals:
+
+```c
+#include <mqueue.h>
 #include <signal.h>
+#include <stdio.h>
+#include <string.h>
 
-volatile sig_atomic_t got_signal = 0;
+mqd_t mq;
 
-void handler(int sig) {
-    got_signal = 1;
-    // Keep handler simple! Only async-signal-safe functions
+void message_handler(int sig, siginfo_t *info, void *context) {
+    // Called when message arrives
+    printf("Message arrived! Reading...\n");
+
+    char buffer[256];
+    unsigned int prio;
+
+    ssize_t bytes = mq_receive(mq, buffer, sizeof(buffer), &prio);
+    if (bytes >= 0) {
+        printf("Received: %s\n", buffer);
+    }
+
+    // Re-register for next notification
+    struct sigevent sev;
+    sev.sigev_notify = SIGEV_SIGNAL;
+    sev.sigev_signo = SIGUSR1;
+    mq_notify(mq, &sev);
 }
 
 int main() {
-    // Set up handler
-    struct sigaction sa = {
-        .sa_handler = handler,
-        .sa_flags = SA_RESTART,  // Restart interrupted syscalls
-    };
+    // Set up signal handler
+    struct sigaction sa;
+    sa.sa_flags = SA_SIGINFO;
+    sa.sa_sigaction = message_handler;
     sigemptyset(&sa.sa_mask);
     sigaction(SIGUSR1, &sa, NULL);
-    
-    printf("PID: %d, waiting for SIGUSR1...\n", getpid());
-    
-    while (!got_signal) {
-        pause();  // Wait for signal
+
+    // Open queue
+    mq = mq_open("/my_queue", O_RDONLY | O_CREAT, 0644, NULL);
+
+    // Register for notification
+    struct sigevent sev;
+    sev.sigev_notify = SIGEV_SIGNAL;
+    sev.sigev_signo = SIGUSR1;
+    mq_notify(mq, &sev);
+
+    printf("Waiting for messages...\n");
+
+    // Main loop can do other work
+    while (1) {
+        sleep(1);
     }
-    
-    printf("Received signal!\n");
+
+    mq_close(mq);
+    return 0;
+}
+```
+
+### 3.4 Performance Comparison
+
+<Tabs>
+  <Tab title="Message Queue vs Pipe">
+```c
+// Benchmark: Send 100,000 messages
+
+// Using Pipe (byte stream)
+// - No message boundaries
+// - Must implement framing protocol
+// - Throughput: ~3 GB/s
+// - Latency: ~2 µs
+
+// Using Message Queue
+// - Built-in message boundaries
+// - Priority support
+// - Throughput: ~500 MB/s (slower due to overhead)
+// - Latency: ~5 µs
+```
+  </Tab>
+
+  <Tab title="When to Use Each">
+**Use Pipes when**:
+- Simple byte stream communication
+- Maximum throughput needed
+- No priority requirements
+- Related processes (parent-child)
+
+**Use Message Queues when**:
+- Discrete messages with boundaries
+- Priority-based delivery needed
+- Asynchronous notification desired
+- Unrelated processes (via named queues)
+- Message persistence during no readers
+  </Tab>
+</Tabs>
+
+---
+
+## 4. Signals: Asynchronous Interrupts
+
+Signals are "software interrupts" that allow asynchronous notification of events.
+
+### 4.1 Signal Fundamentals
+
+**Standard Signals**:
+
+| Signal | Number | Default | Description |
+|--------|---------|---------|-------------|
+| SIGHUP | 1 | Term | Hangup (terminal closed) |
+| SIGINT | 2 | Term | Interrupt (Ctrl+C) |
+| SIGQUIT | 3 | Core | Quit (Ctrl+\\) |
+| SIGILL | 4 | Core | Illegal instruction |
+| SIGTRAP | 5 | Core | Trace/breakpoint trap |
+| SIGABRT | 6 | Core | Abort signal |
+| SIGBUS | 7 | Core | Bus error |
+| SIGFPE | 8 | Core | Floating-point exception |
+| SIGKILL | 9 | Term | **Cannot be caught** |
+| SIGSEGV | 11 | Core | Segmentation fault |
+| SIGPIPE | 13 | Term | Broken pipe |
+| SIGALRM | 14 | Term | Timer expired |
+| SIGTERM | 15 | Term | Termination signal |
+| SIGUSR1 | 10 | Term | User-defined 1 |
+| SIGUSR2 | 12 | Term | User-defined 2 |
+| SIGCHLD | 17 | Ign | Child stopped/terminated |
+| SIGCONT | 18 | Cont | Continue if stopped |
+| SIGSTOP | 19 | Stop | **Cannot be caught** |
+
+### 4.2 Signal Handler Installation
+
+```c
+#include <signal.h>
+#include <stdio.h>
+#include <unistd.h>
+#include <string.h>
+
+void sigint_handler(int sig) {
+    // Async-signal-safe: only use safe functions!
+    const char msg[] = "Caught SIGINT!\n";
+    write(STDOUT_FILENO, msg, sizeof(msg) - 1);
+
+    // Re-install handler (for old signal() API)
+    // Not needed with sigaction()
+}
+
+void sigterm_handler(int sig) {
+    const char msg[] = "Caught SIGTERM, cleaning up...\n";
+    write(STDOUT_FILENO, msg, sizeof(msg) - 1);
+    _exit(0);  // _exit is async-signal-safe (exit is NOT)
+}
+
+int main() {
+    // Modern way: sigaction (preferred)
+    struct sigaction sa_int;
+    memset(&sa_int, 0, sizeof(sa_int));
+    sa_int.sa_handler = sigint_handler;
+    sigemptyset(&sa_int.sa_mask);  // Don't block other signals
+    sa_int.sa_flags = 0;
+
+    if (sigaction(SIGINT, &sa_int, NULL) == -1) {
+        perror("sigaction SIGINT");
+        return 1;
+    }
+
+    struct sigaction sa_term;
+    memset(&sa_term, 0, sizeof(sa_term));
+    sa_term.sa_handler = sigterm_handler;
+    sigemptyset(&sa_term.sa_mask);
+    sigaddset(&sa_term.sa_mask, SIGINT);  // Block SIGINT during SIGTERM handler
+    sa_term.sa_flags = 0;
+
+    if (sigaction(SIGTERM, &sa_term, NULL) == -1) {
+        perror("sigaction SIGTERM");
+        return 1;
+    }
+
+    printf("PID: %d\n", getpid());
+    printf("Send signals: kill -INT %d  or  kill -TERM %d\n", getpid(), getpid());
+
+    // Main loop
+    while (1) {
+        printf("Working...\n");
+        sleep(2);
+    }
+
+    return 0;
+}
+```
+
+### 4.3 The Signal Delivery Mechanism (Deep Dive)
+
+**What happens when Process B sends a signal to Process A?**
+
+```
+1. Process B calls kill(pid_A, SIGINT)
+   ├─> Syscall entry: sys_kill()
+   └─> Kernel validates permission (same user or root)
+
+2. Kernel sets pending signal bit
+   ├─> task_struct *task_A = find_task_by_pid(pid_A)
+   ├─> sigaddset(&task_A->pending.signal, SIGINT)
+   └─> If task_A is sleeping, wake it up
+
+3. Context switch to Process A
+   ├─> Before returning to user space, kernel checks pending signals
+   └─> do_signal() is called
+
+4. Signal frame construction
+   ├─> Save current context (registers, stack pointer, instruction pointer)
+   ├─> Allocate signal frame on user stack:
+   │   ┌─────────────────┐  ← Original stack pointer
+   │   │  Return address │  (to __restore_rt)
+   │   ├─────────────────┤
+   │   │  Signal number  │  (SIGINT = 2)
+   │   ├─────────────────┤
+   │   │  siginfo_t      │  (signal info)
+   │   ├─────────────────┤
+   │   │  ucontext_t     │  (saved registers)
+   │   │   - RIP (PC)    │
+   │   │   - RSP (SP)    │
+   │   │   - RAX, RBX... │
+   │   └─────────────────┘  ← New stack pointer
+   │
+   ├─> Modify saved user RIP to point to signal handler
+   └─> Return to user space
+
+5. Signal handler executes
+   ├─> Process A "resumes" at handler address
+   ├─> Handler runs: sigint_handler(2)
+   └─> Handler returns
+
+6. Signal return trampoline
+   ├─> Return address points to __restore_rt (kernel-provided code)
+   ├─> __restore_rt calls rt_sigreturn() syscall
+   └─> Kernel restores original context from signal frame
+
+7. Resume normal execution
+   └─> Process A continues where it was interrupted
+```
+
+**Kernel Code** (simplified from `kernel/signal.c`):
+
+```c
+// Step 2: Send signal
+int kill_something_info(int sig, struct siginfo *info, pid_t pid) {
+    struct task_struct *p = find_task_by_vpid(pid);
+
+    // Check permission
+    if (!kill_ok_by_cred(p))
+        return -EPERM;
+
+    // Add to pending signals
+    sigaddset(&p->pending.signal, sig);
+
+    // Wake up if sleeping
+    signal_wake_up(p, sig == SIGKILL || sig == SIGSTOP);
+
     return 0;
 }
 
-// Send from another process:
-// kill -USR1 <pid>
+// Step 3-4: Deliver signal
+static void handle_signal(struct ksignal *ksig, struct pt_regs *regs) {
+    struct task_struct *task = current;
+    sigset_t *oldset = sigmask_to_save();
+
+    // Build signal frame on user stack
+    if (setup_rt_frame(ksig, oldset, regs) < 0) {
+        // Failed - force SIGSEGV
+        force_sig(SIGSEGV);
+        return;
+    }
+
+    // Clear handled signal from pending
+    sigdelset(&task->pending.signal, ksig->sig);
+}
+
+// Build signal frame
+static int setup_rt_frame(struct ksignal *ksig, sigset_t *set,
+                          struct pt_regs *regs) {
+    struct rt_sigframe __user *frame;
+
+    // Allocate frame on user stack
+    frame = get_sigframe(&ksig->ka, regs, sizeof(*frame));
+
+    // Fill in signal frame
+    put_user(ksig->sig, &frame->sig);
+    copy_siginfo_to_user(&frame->info, &ksig->info);
+
+    // Save register context
+    frame->uc.uc_mcontext.rip = regs->ip;
+    frame->uc.uc_mcontext.rsp = regs->sp;
+    frame->uc.uc_mcontext.rax = regs->ax;
+    // ... save all registers ...
+
+    // Set return address to restorer
+    put_user(__NR_rt_sigreturn, &frame->retcode);
+
+    // Modify user-space RIP to point to handler
+    regs->ip = (unsigned long)ksig->ka.sa.sa_handler;
+    regs->sp = (unsigned long)frame;
+
+    return 0;
+}
+
+// Step 6: Return from signal handler
+SYSCALL_DEFINE0(rt_sigreturn) {
+    struct pt_regs *regs = current_pt_regs();
+    struct rt_sigframe __user *frame;
+
+    frame = (struct rt_sigframe __user *)(regs->sp - sizeof(long));
+
+    // Restore register context
+    regs->ip = frame->uc.uc_mcontext.rip;
+    regs->sp = frame->uc.uc_mcontext.rsp;
+    regs->ax = frame->uc.uc_mcontext.rax;
+    // ... restore all registers ...
+
+    return regs->ax;  // Return value of interrupted syscall
+}
 ```
 
-### Common Signals
+### 4.4 Async-Signal-Safety: The Critical Constraint
 
-| Signal | Default Action | Use Case |
-|--------|---------------|----------|
-| `SIGINT` | Terminate | Ctrl+C |
-| `SIGTERM` | Terminate | Graceful shutdown request |
-| `SIGKILL` | Terminate | Forceful kill (can't catch) |
-| `SIGSTOP` | Stop | Pause process (can't catch) |
-| `SIGCONT` | Continue | Resume paused process |
-| `SIGUSR1/2` | Terminate | User-defined |
-| `SIGCHLD` | Ignore | Child process state change |
-| `SIGPIPE` | Terminate | Write to closed pipe |
-
-### Signal Safety
-
-<Warning>
-**Only call async-signal-safe functions in handlers!**
-</Warning>
+**Problem**: A signal can interrupt a process **anywhere**, including inside non-reentrant functions.
 
 ```c
-// UNSAFE - can cause deadlock/corruption
-void bad_handler(int sig) {
-    printf("Signal received\n");  // NOT safe!
-    malloc(100);                   // NOT safe!
+// DANGEROUS CODE
+char *global_buffer = NULL;
+
+void signal_handler(int sig) {
+    // WRONG: malloc is NOT async-signal-safe
+    global_buffer = malloc(100);
+    sprintf(global_buffer, "Signal %d", sig);  // Also wrong
+    printf("Handled: %s\n", global_buffer);    // Also wrong
+    free(global_buffer);  // Also wrong
 }
 
-// SAFE - minimal work
-void good_handler(int sig) {
-    // Set flag only
-    got_signal = 1;
-    // Or write to pipe for self-pipe trick
-    write(signal_pipe[1], "x", 1);  // write() is safe
+int main() {
+    signal(SIGINT, signal_handler);
+
+    // What if SIGINT arrives HERE?
+    global_buffer = malloc(200);  // Holding malloc's internal lock
+    // Signal handler interrupts, tries to call malloc()
+    // → DEADLOCK (waiting for lock it already holds)
+
+    free(global_buffer);
+    return 0;
 }
+```
+
+**Why this deadlocks**:
+
+```
+Thread execution timeline:
+
+Time    Main Thread              Signal Handler
+────────────────────────────────────────────────
+  1     malloc(200)
+  2       acquire(heap_lock)
+  3       [allocating memory...]
+
+  4     ← SIGINT arrives! →      signal_handler()
+  5                               malloc(100)
+  6                                 try acquire(heap_lock)
+  7                                 ⏸️  BLOCKED (waiting for lock)
+  8     ⏸️  Cannot continue        ⏸️  Still blocked
+  9     (handler must finish)
+
+DEADLOCK: Main thread waiting for handler to finish
+          Handler waiting for main thread to release lock
+```
+
+**Async-Signal-Safe Functions** (partial list from POSIX):
+
+```c
+// Safe to call from signal handlers:
+_exit()    // NOT exit()
+write()
+read()
+open()
+close()
+signal()   // Signal manipulation
+sigaction()
+kill()
+getpid()
+alarm()
+pause()
+// ... about 100 total
+```
+
+**Correct Pattern 1**: Use only write()
+
+```c
+void signal_handler(int sig) {
+    const char msg[] = "Signal received\n";
+    write(STDOUT_FILENO, msg, sizeof(msg) - 1);
+}
+```
+
+**Correct Pattern 2**: Set a flag, check in main loop
+
+```c
+volatile sig_atomic_t got_signal = 0;
+
+void signal_handler(int sig) {
+    got_signal = sig;  // sig_atomic_t writes are atomic
+}
+
+int main() {
+    signal(SIGINT, signal_handler);
+
+    while (!got_signal) {
+        // Do work...
+    }
+
+    printf("Received signal %d\n", got_signal);  // Safe: in main context
+    return 0;
+}
+```
+
+### 4.5 Realtime Signals (SIGRTMIN - SIGRTMAX)
+
+Realtime signals (32-64 on Linux) have additional features:
+
+```c
+#include <signal.h>
+#include <stdio.h>
+#include <string.h>
+#include <unistd.h>
+
+void rt_signal_handler(int sig, siginfo_t *info, void *context) {
+    printf("Received signal %d\n", sig);
+    printf("  Sender PID: %d\n", info->si_pid);
+    printf("  Sender UID: %d\n", info->si_uid);
+    printf("  Value (int): %d\n", info->si_value.sival_int);
+    printf("  Value (ptr): %p\n", info->si_value.sival_ptr);
+}
+
+int main() {
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_flags = SA_SIGINFO;  // Use extended handler
+    sa.sa_sigaction = rt_signal_handler;
+
+    sigaction(SIGRTMIN, &sa, NULL);
+    sigaction(SIGRTMIN + 1, &sa, NULL);
+
+    printf("PID: %d\n", getpid());
+    printf("Waiting for realtime signals...\n");
+
+    while (1) {
+        pause();
+    }
+
+    return 0;
+}
+
+// Sending realtime signals with data:
+// sigqueue(pid, SIGRTMIN, (union sigval){.sival_int = 42});
+```
+
+**Realtime Signal Features**:
+1. **Queued**: Multiple instances of the same signal are queued (standard signals are not)
+2. **Ordered**: Delivered in priority order (lower signal numbers first)
+3. **Data**: Can send an integer or pointer with the signal
+
+```c
+// Sender
+union sigval value;
+value.sival_int = 12345;
+sigqueue(target_pid, SIGRTMIN, value);
+
+value.sival_int = 67890;
+sigqueue(target_pid, SIGRTMIN, value);  // Both will be delivered
+
+// Receiver gets both signals with their respective values
+```
+
+### 4.6 Signal Masking and Blocking
+
+```c
+#include <signal.h>
+#include <stdio.h>
+#include <unistd.h>
+
+void handler(int sig) {
+    printf("Handler started for signal %d\n", sig);
+    sleep(3);  // Simulate long-running handler
+    printf("Handler finished for signal %d\n", sig);
+}
+
+int main() {
+    signal(SIGUSR1, handler);
+    signal(SIGUSR2, handler);
+
+    sigset_t mask, oldmask;
+
+    // Block SIGUSR2
+    sigemptyset(&mask);
+    sigaddset(&mask, SIGUSR2);
+    sigprocmask(SIG_BLOCK, &mask, &oldmask);
+
+    printf("SIGUSR2 is now blocked\n");
+    printf("PID: %d\n", getpid());
+
+    // SIGUSR1 will be handled, SIGUSR2 will be pending
+    sleep(10);
+
+    printf("Unblocking SIGUSR2...\n");
+    sigprocmask(SIG_SETMASK, &oldmask, NULL);
+
+    // Pending SIGUSR2 signals now delivered
+    sleep(5);
+
+    return 0;
+}
+```
+
+**Test**:
+```bash
+# Terminal 1
+./signal_mask
+# Note the PID
+
+# Terminal 2
+kill -USR1 <pid>  # Handled immediately
+kill -USR2 <pid>  # Blocked, becomes pending
+kill -USR2 <pid>  # Another one (but standard signals don't queue)
+# After program unblocks, only ONE SIGUSR2 is delivered
 ```
 
 ---
 
-## Unix Domain Sockets
+## 5. Unix Domain Sockets: High-Speed Local IPC
 
-For high-performance local IPC:
+Unix Domain Sockets (UDS) provide socket API semantics for local IPC with superior performance compared to network sockets.
+
+### 5.1 Stream Sockets (SOCK_STREAM)
 
 ```c
 #include <sys/socket.h>
 #include <sys/un.h>
+#include <stdio.h>
+#include <string.h>
+#include <unistd.h>
 
-#define SOCKET_PATH "/tmp/mysocket"
+#define SOCKET_PATH "/tmp/my_socket"
 
 // Server
-int server() {
+int main() {
     int server_fd = socket(AF_UNIX, SOCK_STREAM, 0);
-    
-    struct sockaddr_un addr = {
-        .sun_family = AF_UNIX,
-    };
+
+    struct sockaddr_un addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
     strncpy(addr.sun_path, SOCKET_PATH, sizeof(addr.sun_path) - 1);
-    
-    unlink(SOCKET_PATH);
-    bind(server_fd, (struct sockaddr *)&addr, sizeof(addr));
-    listen(server_fd, 5);
-    
-    while (1) {
-        int client_fd = accept(server_fd, NULL, NULL);
-        
-        char buffer[1024];
-        ssize_t n = read(client_fd, buffer, sizeof(buffer));
-        write(client_fd, "ACK", 3);
-        
-        close(client_fd);
+
+    unlink(SOCKET_PATH);  // Remove if exists
+
+    if (bind(server_fd, (struct sockaddr*)&addr, sizeof(addr)) == -1) {
+        perror("bind");
+        return 1;
     }
-    
+
+    listen(server_fd, 5);
+    printf("Server listening on %s\n", SOCKET_PATH);
+
+    int client_fd = accept(server_fd, NULL, NULL);
+    printf("Client connected\n");
+
+    char buffer[256];
+    ssize_t n = recv(client_fd, buffer, sizeof(buffer), 0);
+    printf("Received: %s\n", buffer);
+
+    const char *response = "Hello from server!";
+    send(client_fd, response, strlen(response) + 1, 0);
+
+    close(client_fd);
     close(server_fd);
     unlink(SOCKET_PATH);
+
     return 0;
 }
 
 // Client
-int client() {
-    int sock = socket(AF_UNIX, SOCK_STREAM, 0);
-    
-    struct sockaddr_un addr = {
-        .sun_family = AF_UNIX,
-    };
+int main() {
+    int sock_fd = socket(AF_UNIX, SOCK_STREAM, 0);
+
+    struct sockaddr_un addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
     strncpy(addr.sun_path, SOCKET_PATH, sizeof(addr.sun_path) - 1);
-    
-    connect(sock, (struct sockaddr *)&addr, sizeof(addr));
-    
-    write(sock, "Hello server!", 13);
-    
-    char buffer[1024];
-    read(sock, buffer, sizeof(buffer));
-    
-    close(sock);
+
+    if (connect(sock_fd, (struct sockaddr*)&addr, sizeof(addr)) == -1) {
+        perror("connect");
+        return 1;
+    }
+
+    const char *msg = "Hello from client!";
+    send(sock_fd, msg, strlen(msg) + 1, 0);
+
+    char buffer[256];
+    recv(sock_fd, buffer, sizeof(buffer), 0);
+    printf("Received: %s\n", buffer);
+
+    close(sock_fd);
     return 0;
 }
 ```
 
-### Unix Sockets vs Network Sockets
-
-| Aspect | Unix Domain | TCP/IP |
-|--------|-------------|--------|
-| Speed | 2-3x faster | Network overhead |
-| Scope | Same machine | Network-wide |
-| File descriptors | Can pass FDs! | No |
-| Credentials | Can verify | Harder |
-| Address | Filesystem path | IP:port |
-
-### Passing File Descriptors
+### 5.2 Datagram Sockets (SOCK_DGRAM)
 
 ```c
-// Send a file descriptor to another process!
-void send_fd(int sock, int fd_to_send) {
+// Server
+int main() {
+    int sock_fd = socket(AF_UNIX, SOCK_DGRAM, 0);
+
+    struct sockaddr_un addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    strncpy(addr.sun_path, "/tmp/server_socket", sizeof(addr.sun_path) - 1);
+
+    unlink("/tmp/server_socket");
+    bind(sock_fd, (struct sockaddr*)&addr, sizeof(addr));
+
+    char buffer[256];
+    struct sockaddr_un client_addr;
+    socklen_t client_len = sizeof(client_addr);
+
+    ssize_t n = recvfrom(sock_fd, buffer, sizeof(buffer), 0,
+                         (struct sockaddr*)&client_addr, &client_len);
+    printf("Received: %s from %s\n", buffer, client_addr.sun_path);
+
+    // Send response
+    const char *response = "Server response";
+    sendto(sock_fd, response, strlen(response) + 1, 0,
+           (struct sockaddr*)&client_addr, client_len);
+
+    close(sock_fd);
+    unlink("/tmp/server_socket");
+    return 0;
+}
+
+// Client
+int main() {
+    int sock_fd = socket(AF_UNIX, SOCK_DGRAM, 0);
+
+    // Client needs to bind too (for return address)
+    struct sockaddr_un client_addr;
+    memset(&client_addr, 0, sizeof(client_addr));
+    client_addr.sun_family = AF_UNIX;
+    snprintf(client_addr.sun_path, sizeof(client_addr.sun_path),
+             "/tmp/client_%d", getpid());
+
+    unlink(client_addr.sun_path);
+    bind(sock_fd, (struct sockaddr*)&client_addr, sizeof(client_addr));
+
+    struct sockaddr_un server_addr;
+    memset(&server_addr, 0, sizeof(server_addr));
+    server_addr.sun_family = AF_UNIX;
+    strncpy(server_addr.sun_path, "/tmp/server_socket",
+            sizeof(server_addr.sun_path) - 1);
+
+    const char *msg = "Client message";
+    sendto(sock_fd, msg, strlen(msg) + 1, 0,
+           (struct sockaddr*)&server_addr, sizeof(server_addr));
+
+    char buffer[256];
+    recvfrom(sock_fd, buffer, sizeof(buffer), 0, NULL, NULL);
+    printf("Received: %s\n", buffer);
+
+    close(sock_fd);
+    unlink(client_addr.sun_path);
+    return 0;
+}
+```
+
+### 5.3 Passing File Descriptors (SCM_RIGHTS)
+
+This is the "superpower" of Unix Domain Sockets - the ability to pass open file descriptors between processes.
+
+```c
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <fcntl.h>
+#include <stdio.h>
+#include <string.h>
+#include <unistd.h>
+
+#define SOCKET_PATH "/tmp/fd_socket"
+
+// Send FD
+void send_fd(int sock_fd, int fd_to_send) {
     struct msghdr msg = {0};
-    struct cmsghdr *cmsg;
-    char buf[CMSG_SPACE(sizeof(int))];
-    
-    msg.msg_control = buf;
-    msg.msg_controllen = sizeof(buf);
-    
-    cmsg = CMSG_FIRSTHDR(&msg);
+    struct iovec iov[1];
+    char buf[1] = {'X'};  // Dummy data
+
+    iov[0].iov_base = buf;
+    iov[0].iov_len = 1;
+    msg.msg_iov = iov;
+    msg.msg_iovlen = 1;
+
+    // Control message for FD
+    char cmsg_buf[CMSG_SPACE(sizeof(int))];
+    msg.msg_control = cmsg_buf;
+    msg.msg_controllen = sizeof(cmsg_buf);
+
+    struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg);
     cmsg->cmsg_level = SOL_SOCKET;
     cmsg->cmsg_type = SCM_RIGHTS;
     cmsg->cmsg_len = CMSG_LEN(sizeof(int));
-    
-    *((int *)CMSG_DATA(cmsg)) = fd_to_send;
-    
-    sendmsg(sock, &msg, 0);
+
+    memcpy(CMSG_DATA(cmsg), &fd_to_send, sizeof(int));
+
+    if (sendmsg(sock_fd, &msg, 0) == -1) {
+        perror("sendmsg");
+    } else {
+        printf("Sent FD %d\n", fd_to_send);
+    }
 }
 
-// Receive the file descriptor
-int receive_fd(int sock) {
+// Receive FD
+int recv_fd(int sock_fd) {
     struct msghdr msg = {0};
-    char buf[CMSG_SPACE(sizeof(int))];
-    
-    msg.msg_control = buf;
-    msg.msg_controllen = sizeof(buf);
-    
-    recvmsg(sock, &msg, 0);
-    
+    struct iovec iov[1];
+    char buf[1];
+
+    iov[0].iov_base = buf;
+    iov[0].iov_len = 1;
+    msg.msg_iov = iov;
+    msg.msg_iovlen = 1;
+
+    char cmsg_buf[CMSG_SPACE(sizeof(int))];
+    msg.msg_control = cmsg_buf;
+    msg.msg_controllen = sizeof(cmsg_buf);
+
+    if (recvmsg(sock_fd, &msg, 0) == -1) {
+        perror("recvmsg");
+        return -1;
+    }
+
     struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg);
-    return *((int *)CMSG_DATA(cmsg));
+    if (cmsg && cmsg->cmsg_type == SCM_RIGHTS) {
+        int received_fd;
+        memcpy(&received_fd, CMSG_DATA(cmsg), sizeof(int));
+        printf("Received FD %d\n", received_fd);
+        return received_fd;
+    }
+
+    return -1;
+}
+
+// Sender (privileged process)
+int main() {
+    int sock_fd = socket(AF_UNIX, SOCK_STREAM, 0);
+
+    struct sockaddr_un addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    strncpy(addr.sun_path, SOCKET_PATH, sizeof(addr.sun_path) - 1);
+
+    unlink(SOCKET_PATH);
+    bind(sock_fd, (struct sockaddr*)&addr, sizeof(addr));
+    listen(sock_fd, 1);
+
+    printf("Waiting for connection...\n");
+    int client_fd = accept(sock_fd, NULL, NULL);
+
+    // Open a file (this process has permission)
+    int file_fd = open("/var/log/syslog", O_RDONLY);
+    if (file_fd == -1) {
+        perror("open");
+        return 1;
+    }
+
+    printf("Opened /var/log/syslog with FD %d\n", file_fd);
+
+    // Send FD to unprivileged process
+    send_fd(client_fd, file_fd);
+
+    close(file_fd);
+    close(client_fd);
+    close(sock_fd);
+    unlink(SOCKET_PATH);
+
+    return 0;
+}
+
+// Receiver (unprivileged process)
+int main() {
+    int sock_fd = socket(AF_UNIX, SOCK_STREAM, 0);
+
+    struct sockaddr_un addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    strncpy(addr.sun_path, SOCKET_PATH, sizeof(addr.sun_path) - 1);
+
+    if (connect(sock_fd, (struct sockaddr*)&addr, sizeof(addr)) == -1) {
+        perror("connect");
+        return 1;
+    }
+
+    // Receive file descriptor
+    int received_fd = recv_fd(sock_fd);
+
+    if (received_fd >= 0) {
+        // Now we can read the file, even though we don't have permission!
+        char buffer[256];
+        ssize_t n = read(received_fd, buffer, sizeof(buffer) - 1);
+        if (n > 0) {
+            buffer[n] = '\0';
+            printf("Read from file:\n%s\n", buffer);
+        }
+
+        close(received_fd);
+    }
+
+    close(sock_fd);
+    return 0;
 }
 ```
 
----
+**Kernel Magic**: When sending a FD via `SCM_RIGHTS`:
 
-## D-Bus
+```
+Sender Process                 Kernel                  Receiver Process
+┌──────────────┐              ┌──────┐                ┌──────────────┐
+│ FD Table     │              │      │                │ FD Table     │
+│  3 → file_A  │──sendmsg()──>│      │                │              │
+│  4 → file_B  │              │      │                │              │
+└──────────────┘              │      │                └──────────────┘
+                              │      │
+                              │ 1. Get struct file*   │
+                              │    from sender FD     │
+                              │ 2. Increment refcount │
+                              │ 3. Find free FD in    │
+                              │    receiver's table   │
+                              │ 4. Install struct file*│
+                              │    in receiver's table│
+                              │      │                │
+                              │      │<─recvmsg()─────┤
+                              └──────┘                │
+                                                      │ FD Table     │
+                                                      │  5 → file_A  │
+                                                      └──────────────┘
 
-Modern IPC for desktop/system services:
+Both FD 3 (sender) and FD 5 (receiver) now point to the SAME kernel file object!
+```
+
+**Use Cases**:
+- **Privilege separation**: Privileged broker passes FDs to sandboxed workers (Chrome, systemd)
+- **Zero-copy**: Pass a socket FD to another process for load balancing
+- **Capability-based security**: Grant access to specific resources without filesystem permissions
+
+### 5.4 Credentials Passing (SO_PEERCRED)
 
 ```c
-// D-Bus is typically used via libraries
-// Example concept (not complete code):
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <stdio.h>
+#include <string.h>
+#include <unistd.h>
 
-// Service: Register a method
-void register_method() {
-    // "org.example.MyService" provides "Hello" method
-    // Other processes can call it
+#define SOCKET_PATH "/tmp/cred_socket"
+
+// Server
+int main() {
+    int server_fd = socket(AF_UNIX, SOCK_STREAM, 0);
+
+    struct sockaddr_un addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    strncpy(addr.sun_path, SOCKET_PATH, sizeof(addr.sun_path) - 1);
+
+    unlink(SOCKET_PATH);
+    bind(server_fd, (struct sockaddr*)&addr, sizeof(addr));
+    listen(server_fd, 1);
+
+    printf("Server waiting for connection...\n");
+    int client_fd = accept(server_fd, NULL, NULL);
+
+    // Get peer credentials
+    struct ucred cred;
+    socklen_t len = sizeof(cred);
+
+    if (getsockopt(client_fd, SOL_SOCKET, SO_PEERCRED, &cred, &len) == 0) {
+        printf("Client credentials:\n");
+        printf("  PID: %d\n", cred.pid);
+        printf("  UID: %d\n", cred.uid);
+        printf("  GID: %d\n", cred.gid);
+
+        // Authorization decision
+        if (cred.uid == 0) {
+            printf("Access granted (root user)\n");
+        } else {
+            printf("Access denied (non-root user)\n");
+        }
+    }
+
+    close(client_fd);
+    close(server_fd);
+    unlink(SOCKET_PATH);
+
+    return 0;
 }
 
-// Client: Call the method
-void call_method() {
-    // Call org.example.MyService.Hello("World")
-    // Returns "Hello, World!"
+// Client (just connects)
+int main() {
+    int sock_fd = socket(AF_UNIX, SOCK_STREAM, 0);
+
+    struct sockaddr_un addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    strncpy(addr.sun_path, SOCKET_PATH, sizeof(addr.sun_path) - 1);
+
+    if (connect(sock_fd, (struct sockaddr*)&addr, sizeof(addr)) == 0) {
+        printf("Connected to server\n");
+        sleep(2);  // Let server check credentials
+    }
+
+    close(sock_fd);
+    return 0;
+}
+```
+
+**Security**: The kernel provides these credentials, so they cannot be forged (unlike network protocols where client can claim any identity).
+
+### 5.5 Abstract Namespace Sockets
+
+Linux supports "abstract" Unix sockets that don't exist in the filesystem:
+
+```c
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <stdio.h>
+#include <string.h>
+
+int main() {
+    int sock_fd = socket(AF_UNIX, SOCK_STREAM, 0);
+
+    struct sockaddr_un addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+
+    // Abstract socket: first byte is '\0'
+    addr.sun_path[0] = '\0';
+    strncpy(addr.sun_path + 1, "my_abstract_socket", sizeof(addr.sun_path) - 2);
+
+    // No unlink() needed - doesn't exist in filesystem!
+    bind(sock_fd, (struct sockaddr*)&addr,
+         sizeof(sa_family_t) + strlen(addr.sun_path + 1) + 1);
+
+    listen(sock_fd, 5);
+    printf("Abstract socket bound\n");
+
+    // Check with: netstat -lnpx | grep my_abstract
+
+    // ...
+
+    close(sock_fd);
+    // No unlink() needed!
+
+    return 0;
+}
+```
+
+**Advantages**:
+- No filesystem clutter
+- No permission/ownership issues
+- Automatically cleaned up on close
+- No race conditions with unlink()
+
+**Disadvantages**:
+- Linux-specific (not portable)
+- Can't use filesystem permissions for access control
+
+---
+
+## 6. Performance Comparison & Selection Guide
+
+### 6.1 Throughput Benchmark
+
+<Tabs>
+  <Tab title="Benchmark Code">
+```c
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <sys/mman.h>
+#include <semaphore.h>
+#include <unistd.h>
+#include <stdio.h>
+#include <string.h>
+#include <time.h>
+
+#define DATA_SIZE (100 * 1024 * 1024)  // 100 MB
+#define CHUNK_SIZE 4096
+
+double benchmark_pipe() {
+    int pipefd[2];
+    pipe(pipefd);
+
+    if (fork() == 0) {
+        close(pipefd[0]);
+        char data[CHUNK_SIZE];
+        for (size_t i = 0; i < DATA_SIZE; i += CHUNK_SIZE) {
+            write(pipefd[1], data, CHUNK_SIZE);
+        }
+        close(pipefd[1]);
+        _exit(0);
+    } else {
+        close(pipefd[1]);
+        char buffer[CHUNK_SIZE];
+
+        struct timespec start, end;
+        clock_gettime(CLOCK_MONOTONIC, &start);
+
+        size_t total = 0;
+        while (total < DATA_SIZE) {
+            ssize_t n = read(pipefd[0], buffer, CHUNK_SIZE);
+            if (n <= 0) break;
+            total += n;
+        }
+
+        clock_gettime(CLOCK_MONOTONIC, &end);
+        close(pipefd[0]);
+        wait(NULL);
+
+        double elapsed = (end.tv_sec - start.tv_sec) +
+                        (end.tv_nsec - start.tv_nsec) / 1e9;
+        return DATA_SIZE / (1024.0 * 1024.0) / elapsed;
+    }
 }
 
-// Used by: systemd, GNOME, KDE, many desktop apps
+double benchmark_unix_socket() {
+    int sv[2];
+    socketpair(AF_UNIX, SOCK_STREAM, 0, sv);
+
+    if (fork() == 0) {
+        close(sv[0]);
+        char data[CHUNK_SIZE];
+        for (size_t i = 0; i < DATA_SIZE; i += CHUNK_SIZE) {
+            send(sv[1], data, CHUNK_SIZE, 0);
+        }
+        close(sv[1]);
+        _exit(0);
+    } else {
+        close(sv[1]);
+        char buffer[CHUNK_SIZE];
+
+        struct timespec start, end;
+        clock_gettime(CLOCK_MONOTONIC, &start);
+
+        size_t total = 0;
+        while (total < DATA_SIZE) {
+            ssize_t n = recv(sv[0], buffer, CHUNK_SIZE, 0);
+            if (n <= 0) break;
+            total += n;
+        }
+
+        clock_gettime(CLOCK_MONOTONIC, &end);
+        close(sv[0]);
+        wait(NULL);
+
+        double elapsed = (end.tv_sec - start.tv_sec) +
+                        (end.tv_nsec - start.tv_nsec) / 1e9;
+        return DATA_SIZE / (1024.0 * 1024.0) / elapsed;
+    }
+}
+
+double benchmark_shared_memory() {
+    struct shared_data {
+        sem_t sem_empty;
+        sem_t sem_full;
+        char buffer[CHUNK_SIZE];
+    };
+
+    struct shared_data *shm = mmap(NULL, sizeof(struct shared_data),
+                                   PROT_READ | PROT_WRITE,
+                                   MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+
+    sem_init(&shm->sem_empty, 1, 1);
+    sem_init(&shm->sem_full, 1, 0);
+
+    if (fork() == 0) {
+        for (size_t i = 0; i < DATA_SIZE; i += CHUNK_SIZE) {
+            sem_wait(&shm->sem_empty);
+            // Data already in shared memory
+            sem_post(&shm->sem_full);
+        }
+        _exit(0);
+    } else {
+        struct timespec start, end;
+        clock_gettime(CLOCK_MONOTONIC, &start);
+
+        for (size_t i = 0; i < DATA_SIZE; i += CHUNK_SIZE) {
+            sem_wait(&shm->sem_full);
+            // Read data from shared memory
+            volatile char x = shm->buffer[0];  // Force read
+            sem_post(&shm->sem_empty);
+        }
+
+        clock_gettime(CLOCK_MONOTONIC, &end);
+        wait(NULL);
+
+        double elapsed = (end.tv_sec - start.tv_sec) +
+                        (end.tv_nsec - start.tv_nsec) / 1e9;
+        munmap(shm, sizeof(struct shared_data));
+        return DATA_SIZE / (1024.0 * 1024.0) / elapsed;
+    }
+}
+
+int main() {
+    printf("Pipe:           %.2f MB/s\n", benchmark_pipe());
+    printf("Unix Socket:    %.2f MB/s\n", benchmark_unix_socket());
+    printf("Shared Memory:  %.2f MB/s\n", benchmark_shared_memory());
+    return 0;
+}
+```
+  </Tab>
+
+  <Tab title="Typical Results">
+**Modern Linux System** (Intel i7, 16GB RAM):
+
+```
+Pipe:           2,800 MB/s
+Unix Socket:    3,200 MB/s
+Shared Memory:  28,000 MB/s (10x faster!)
+```
+
+**Why the differences?**:
+
+1. **Shared Memory**: True zero-copy. Data never leaves L1/L2 cache.
+   - Bottleneck: Semaphore synchronization overhead
+
+2. **Unix Socket**: Optimized kernel path, single copy
+   - Bottleneck: Memory copy (user → kernel → user)
+
+3. **Pipe**: Ring buffer management overhead
+   - Bottleneck: Memory copy + buffer management
+
+**Context Switches**:
+- All three: ~2 context switches per transaction
+- Shared memory can reduce this with batching
+  </Tab>
+</Tabs>
+
+### 6.2 Selection Decision Tree
+
+```
+Need IPC?
+  │
+  ├─ Is it local-only? (same machine)
+  │  │
+  │  ├─ YES: Continue below
+  │  │
+  │  └─ NO: Must use Network Sockets (TCP/UDP)
+  │
+  ├─ Need maximum throughput? (>1 GB/s)
+  │  │
+  │  ├─ YES: Shared Memory
+  │  │       ⚠️  Requires manual synchronization
+  │  │       ⚠️  More complex programming model
+  │  │
+  │  └─ NO: Continue below
+  │
+  ├─ Need to pass file descriptors?
+  │  │
+  │  ├─ YES: Unix Domain Sockets (SCM_RIGHTS)
+  │  │       Use case: Privilege separation, sandboxing
+  │  │
+  │  └─ NO: Continue below
+  │
+  ├─ Need message boundaries?
+  │  │
+  │  ├─ YES: Need priority support?
+  │  │  │
+  │  │  ├─ YES: Message Queues (POSIX or System V)
+  │  │  │
+  │  │  └─ NO: Unix Domain Sockets (SOCK_DGRAM)
+  │  │
+  │  └─ NO: Stream-based communication
+  │         │
+  │         ├─ Related processes (parent-child)?
+  │         │  │
+  │         │  ├─ YES: Pipe (simplest)
+  │         │  │
+  │         │  └─ NO: Unix Domain Sockets (SOCK_STREAM)
+  │         │         or Named Pipe (FIFO)
+  │
+  └─ Asynchronous notification only?
+     │
+     └─ Signals (but consider self-pipe trick for event loops)
 ```
 
 ---
 
-## IPC Performance Comparison
+## 7. Advanced Topics
 
-![IPC Performance Comparison](/images/courses/ipc-performance.svg)
+### 7.1 splice() and vmsplice() - Zero-Copy Pipes
+
+Linux provides `splice()` and `vmsplice()` for zero-copy operations:
+
+```c
+#include <fcntl.h>
+#include <unistd.h>
+#include <stdio.h>
+
+#define SPLICE_SIZE (64 * 1024)
+
+int main() {
+    int pipefd[2];
+    pipe(pipefd);
+
+    int file_fd = open("large_file.bin", O_RDONLY);
+    int out_fd = open("copy.bin", O_WRONLY | O_CREAT, 0644);
+
+    // Zero-copy: file → pipe → file (no user-space copy!)
+    while (1) {
+        ssize_t n = splice(file_fd, NULL, pipefd[1], NULL,
+                          SPLICE_SIZE, SPLICE_F_MOVE);
+        if (n <= 0) break;
+
+        splice(pipefd[0], NULL, out_fd, NULL,
+               n, SPLICE_F_MOVE);
+    }
+
+    close(file_fd);
+    close(out_fd);
+    close(pipefd[0]);
+    close(pipefd[1]);
+
+    return 0;
+}
+```
+
+**How it works**:
+
+```
+Traditional copy:
+File → [Kernel buffer] → [User buffer] → [Kernel buffer] → File
+       (copy 1)          (copy 2)         (copy 3)
+
+splice():
+File → [Pipe buffer] → File
+       (page remap)    (page remap)
+
+No user-space copies! Kernel just moves page pointers.
+```
+
+### 7.2 memfd and File Sealing
+
+`memfd_create()` creates anonymous file descriptors that can be shared and sealed:
+
+```c
+#include <sys/mman.h>
+#include <sys/syscall.h>
+#include <linux/memfd.h>
+#include <unistd.h>
+#include <string.h>
+#include <stdio.h>
+
+int main() {
+    // Create memory-backed file descriptor
+    int memfd = syscall(SYS_memfd_create, "my_memfd", MFD_ALLOW_SEALING);
+
+    const char *data = "Shared data";
+    write(memfd, data, strlen(data));
+
+    // Seal to prevent further writes (security)
+    fcntl(memfd, F_ADD_SEALS, F_SEAL_WRITE | F_SEAL_SHRINK | F_SEAL_GROW);
+
+    // Now share this FD via Unix socket
+    // Receiver cannot modify the contents!
+
+    // Map into memory
+    void *addr = mmap(NULL, 4096, PROT_READ, MAP_SHARED, memfd, 0);
+    printf("Data: %s\n", (char*)addr);
+
+    // Try to write (will fail due to seal)
+    if (write(memfd, "X", 1) == -1) {
+        printf("Write failed (sealed)\n");
+    }
+
+    munmap(addr, 4096);
+    close(memfd);
+    return 0;
+}
+```
+
+**Use case**: Wayland compositor sharing pixmaps with clients. Sealing prevents malicious client from modifying the buffer after sharing.
 
 ---
 
-## Interview Deep Dive Questions
+## 8. Real-World Architecture Patterns
+
+### 8.1 Chrome Multi-Process Architecture
+
+```
+┌─────────────────────────────────────────────────┐
+│             Browser Process (Privileged)         │
+│  - Creates renderer processes                   │
+│  - Opens files, sockets, devices                │
+│  - Passes FDs via Unix sockets (SCM_RIGHTS)     │
+└─────────┬───────────────────────────────────────┘
+          │ Unix Sockets + SCM_RIGHTS
+          ├──────────────┬──────────────┬─────────────┐
+          │              │              │             │
+┌─────────▼───────┐ ┌───▼──────┐ ┌────▼─────┐ ┌─────▼─────┐
+│ Renderer (tab1) │ │ Renderer │ │ Renderer │ │    GPU    │
+│   Sandboxed     │ │  (tab2)  │ │  (tab3)  │ │  Process  │
+│ - No filesystem │ │Sandboxed │ │Sandboxed │ │           │
+│   access        │ │          │ │          │ │           │
+│ - Receives FDs  │ └──────────┘ └──────────┘ └───────────┘
+│   from broker   │
+└─────────────────┘
+
+IPC Mechanisms:
+1. Mojo (message passing framework over Unix sockets)
+2. Shared memory for large data (bitmaps, etc.)
+3. SCM_RIGHTS for capability transfer
+```
+
+### 8.2 systemd Socket Activation
+
+```c
+// systemd passes activated socket FDs to service
+// Service receives pre-bound socket (FD 3+)
+
+#include <systemd/sd-daemon.h>
+#include <sys/socket.h>
+#include <stdio.h>
+
+int main() {
+    int n = sd_listen_fds(0);
+
+    if (n > 0) {
+        // systemd passed us activated sockets
+        int listen_fd = SD_LISTEN_FDS_START + 0;  // First socket
+
+        printf("Received socket FD %d from systemd\n", listen_fd);
+
+        // No need to socket(), bind(), listen()!
+        // Just accept() connections
+        while (1) {
+            int client_fd = accept(listen_fd, NULL, NULL);
+            // Handle client...
+            close(client_fd);
+        }
+    } else {
+        printf("Not socket-activated, manual setup needed\n");
+    }
+
+    return 0;
+}
+```
+
+**Benefits**:
+- Zero-downtime restarts (systemd holds socket)
+- On-demand activation
+- Privilege separation (systemd binds privileged port, passes FD to unprivileged service)
+
+---
+
+## 9. Interview Questions & Answers
 
 <AccordionGroup>
-  <Accordion title="Q1: Design IPC for a web server with worker processes">
-    **Answer:**
-    
-    **Architecture** (like Nginx):
-    ![Web Server IPC Architecture](/images/courses/web-server-ipc.svg)
-    
-    **IPC choices**:
-    
-    1. **Shared memory for hot data**:
-       - Configuration
-       - Stats counters
-       - Shared cache (with locking)
-    
-    2. **Unix sockets for control**:
-       - Master → Worker commands
-       - Passing file descriptors (socket passing)
-    
-    3. **Signals for lifecycle**:
-       - SIGTERM: Graceful shutdown
-       - SIGHUP: Reload config
-       - SIGCHLD: Worker died
-    
-    **Implementation**:
-    ```c
-    // Master creates shared memory
-    shared_state_t *state = mmap(NULL, sizeof(shared_state_t),
-                                  PROT_READ | PROT_WRITE,
-                                  MAP_SHARED | MAP_ANONYMOUS,
-                                  -1, 0);
-    
-    // Fork workers
-    for (int i = 0; i < num_workers; i++) {
-        if (fork() == 0) {
-            // Worker inherits shared memory mapping
-            worker_main(state, i);
-            exit(0);
-        }
-    }
-    
-    // For socket passing: master accepts, passes to least loaded worker
-    void pass_connection(int worker_socket, int client_fd) {
-        send_fd(worker_socket, client_fd);
-        close(client_fd);  // Worker now owns it
-    }
-    ```
+  <Accordion title="Q1: Explain the 'self-pipe trick' and why it's necessary.">
+**Problem**: Signal handlers can interrupt a process anywhere, including inside non-reentrant functions like `malloc()`. This severely limits what you can do in a signal handler.
+
+**Solution**: The self-pipe trick:
+
+1. Create a pipe: `pipe(signal_pipe)`
+2. In signal handler: `write(signal_pipe[1], &sig, 1)` (write is async-signal-safe)
+3. Add `signal_pipe[0]` to your event loop (`epoll`, `select`, `poll`)
+4. When pipe becomes readable, main loop reads signal number and handles it safely
+
+**Why it works**: The signal handler only does minimal work (one async-signal-safe write). The actual signal handling happens in the main event loop where all functions are safe to call.
+
+**Used in**: Redis, Nginx, Node.js, any event-driven server.
   </Accordion>
-  
-  <Accordion title="Q2: When would you use shared memory vs message passing?">
-    **Answer:**
-    
-    **Use Shared Memory when**:
-    - Maximum performance is critical
-    - Large data volumes
-    - Frequent access to same data
-    - Can implement synchronization correctly
-    - Processes on same machine
-    
-    **Use Message Passing when**:
-    - Simpler programming model
-    - Natural request-response pattern
-    - Processes may be on different machines
-    - Message boundaries important
-    - Don't want to deal with sync primitives
-    
-    **Comparison**:
-    
-    | Aspect | Shared Memory | Message Passing |
-    |--------|---------------|-----------------|
-    | Speed | Fastest | Slower (copy) |
-    | Sync | Manual | Built-in |
-    | Coupling | Tight | Loose |
-    | Debugging | Harder | Easier |
-    | Scaling | Single machine | Distributed |
-    
-    **Real examples**:
-    - Database buffer pool: Shared memory
-    - Microservices: Message queues
-    - Chrome tabs: Combination (shared for bitmaps, messages for control)
+
+  <Accordion title="Q2: How does the kernel implement shared memory? Explain page table aliasing.">
+**Concept**: Two different processes map the same physical memory pages into their virtual address spaces.
+
+**Mechanism**:
+1. Process A calls `mmap(MAP_SHARED)` on shared memory object
+2. Kernel creates VMA (Virtual Memory Area) in Process A's address space
+3. Kernel allocates physical pages (or uses existing ones for the shared memory object)
+4. Kernel updates Process A's page tables: Virtual Page → Physical Frame
+
+5. Process B calls `mmap(MAP_SHARED)` on the SAME shared memory object
+6. Kernel creates VMA in Process B's address space (different virtual address)
+7. Kernel updates Process B's page tables to point to the SAME physical frames
+
+**Result**: Two different virtual addresses resolve to the same physical memory. This is page table aliasing.
+
+**Example**:
+```
+Process A: Virtual 0x7000 → Physical Frame 0x5000
+Process B: Virtual 0x9000 → Physical Frame 0x5000
+
+Write by A to 0x7000 is immediately visible to B at 0x9000.
+```
+
+**Key insight**: The kernel doesn't copy data. It just manipulates page table entries to create multiple mappings to the same physical pages.
   </Accordion>
-  
-  <Accordion title="Q3: Implement a producer-consumer with shared memory">
-    **Answer:**
-    
-    ```c
-    #include <sys/mman.h>
-    #include <semaphore.h>
-    #include <fcntl.h>
-    
-    #define BUFFER_SIZE 10
-    
-    typedef struct {
-        int buffer[BUFFER_SIZE];
-        int in;
-        int out;
-        sem_t empty;  // Counts empty slots
-        sem_t full;   // Counts full slots
-        sem_t mutex;  // Protects buffer access
-    } shared_buffer_t;
-    
-    shared_buffer_t *create_shared_buffer() {
-        int fd = shm_open("/buffer", O_CREAT | O_RDWR, 0666);
-        ftruncate(fd, sizeof(shared_buffer_t));
-        
-        shared_buffer_t *buf = mmap(NULL, sizeof(shared_buffer_t),
-                                     PROT_READ | PROT_WRITE,
-                                     MAP_SHARED, fd, 0);
-        
-        buf->in = buf->out = 0;
-        sem_init(&buf->empty, 1, BUFFER_SIZE);
-        sem_init(&buf->full, 1, 0);
-        sem_init(&buf->mutex, 1, 1);
-        
-        return buf;
-    }
-    
-    void producer(shared_buffer_t *buf) {
-        while (1) {
-            int item = produce_item();
-            
-            sem_wait(&buf->empty);
-            sem_wait(&buf->mutex);
-            
-            buf->buffer[buf->in] = item;
-            buf->in = (buf->in + 1) % BUFFER_SIZE;
-            
-            sem_post(&buf->mutex);
-            sem_post(&buf->full);
-        }
-    }
-    
-    void consumer(shared_buffer_t *buf) {
-        while (1) {
-            sem_wait(&buf->full);
-            sem_wait(&buf->mutex);
-            
-            int item = buf->buffer[buf->out];
-            buf->out = (buf->out + 1) % BUFFER_SIZE;
-            
-            sem_post(&buf->mutex);
-            sem_post(&buf->empty);
-            
-            consume_item(item);
-        }
-    }
-    ```
+
+  <Accordion title="Q3: What is SCM_RIGHTS and how does it enable privilege separation?">
+**SCM_RIGHTS**: A Unix Domain Socket control message type that allows passing open file descriptors between processes.
+
+**Kernel Operation**:
+1. Sender has FD 3 → struct file* (kernel object)
+2. Sender calls `sendmsg()` with SCM_RIGHTS control message containing FD 3
+3. Kernel increments reference count of the struct file object
+4. Kernel finds free FD slot in receiver's FD table (e.g., FD 5)
+5. Kernel installs same struct file* pointer in receiver's FD table at slot 5
+6. Receiver now has FD 5 pointing to the same kernel file object
+
+**Privilege Separation Pattern**:
+
+```
+Privileged Broker Process:
+- Runs as root or with capabilities
+- Opens protected resources (files, sockets, devices)
+- Validates requests from workers
+- Passes FDs to workers via SCM_RIGHTS
+
+Unprivileged Worker Process:
+- Runs with minimal privileges (nobody user, chroot jail)
+- Cannot open files directly
+- Requests resources from broker
+- Receives FDs and can use them (read/write)
+```
+
+**Example**: Chrome browser process (privileged) opens files and passes FDs to renderer processes (sandboxed, no filesystem access).
+
+**Security benefit**: Capability-based security. Worker gets access to specific resource instances, not broad permissions.
   </Accordion>
-  
-  <Accordion title="Q4: How does Chrome isolate tabs using IPC?">
-    **Answer:**
-    
-    **Chrome's multi-process architecture**:
-    
-    ![Chrome Multi-Process Architecture](/images/courses/chrome-architecture.svg)
-    
-    **IPC mechanisms used**:
-    
-    1. **Mojo** (Chrome's IPC framework):
-       - Message pipes for bidirectional communication
-       - Shared memory for large data (images, video frames)
-       - Type-safe interfaces defined in Mojo IDL
-    
-    2. **Named pipes** (Windows) / **Unix sockets** (Linux/Mac):
-       - Base transport layer
-       - Renderer connects to browser on startup
-    
-    3. **Shared memory** for:
-       - Rendered page bitmaps
-       - Video frames
-       - Audio buffers
-    
-    **Why this design**:
-    - **Security**: Renderer crash doesn't take down browser
-    - **Stability**: One bad tab doesn't crash others
-    - **Sandbox**: Renderers have minimal OS access
-    - **Parallelism**: Tabs can use multiple CPUs
-    
-    **Example message flow**:
-    ```
-    Renderer wants to fetch URL:
-    1. Renderer → IPC → Browser: "Fetch https://..."
-    2. Browser performs network request (renderer can't)
-    3. Browser → IPC → Renderer: Response data
-    4. Renderer processes HTML (sandboxed)
-    5. Renderer → IPC → Browser: "Render this bitmap"
-    ```
+
+  <Accordion title="Q4: Why are writes ≤ PIPE_BUF atomic, and what happens for larger writes?">
+**PIPE_BUF**: Linux defines it as 4096 bytes (one page).
+
+**Atomicity Guarantee**: If two processes write ≤ 4096 bytes simultaneously, the kernel guarantees the data won't interleave.
+
+**Implementation**:
+```c
+// Kernel holds pipe mutex for entire write when size <= PIPE_BUF
+if (len <= PIPE_BUF) {
+    mutex_lock(&pipe->mutex);
+    // Copy entire write to pipe buffer
+    // No other process can write during this time
+    mutex_unlock(&pipe->mutex);
+}
+```
+
+**For writes > PIPE_BUF**:
+```c
+// Kernel may release mutex between chunks
+while (bytes_remaining > 0) {
+    mutex_lock(&pipe->mutex);
+    copy_chunk_to_pipe_buffer();
+    mutex_unlock(&pipe->mutex);
+    // Another process can write here!
+}
+```
+
+**Example**:
+```
+Process A writes 8000 bytes "AAA..."
+Process B writes 8000 bytes "BBB..."
+
+Possible result in pipe:
+AAAA (4096) BBBB (4096) AAAA (remainder) BBBB (remainder)
+
+Data is interleaved!
+```
+
+**Solution**: If you need atomicity for large messages:
+1. Use message queues (message-oriented)
+2. Use Unix sockets with framing protocol
+3. Use shared memory with proper locking
+4. Break into ≤4096 byte messages with sequence numbers
   </Accordion>
-  
-  <Accordion title="Q5: Implement self-pipe trick for signal handling">
-    **Answer:**
-    
-    **Problem**: Need to handle signals in event loop (select/poll/epoll)
-    
-    **Solution**: Write to pipe from signal handler, read in event loop
-    
-    ```c
-    #include <signal.h>
-    #include <sys/select.h>
-    #include <unistd.h>
-    
-    int signal_pipe[2];
-    
-    void signal_handler(int sig) {
-        // write() is async-signal-safe
-        char c = sig;
-        write(signal_pipe[1], &c, 1);
-    }
-    
-    int main() {
-        pipe(signal_pipe);
-        
-        // Make write end non-blocking
-        fcntl(signal_pipe[1], F_SETFL, O_NONBLOCK);
-        
-        // Set up signal handler
-        struct sigaction sa = {
-            .sa_handler = signal_handler,
-            .sa_flags = SA_RESTART,
-        };
-        sigemptyset(&sa.sa_mask);
-        sigaction(SIGINT, &sa, NULL);
-        sigaction(SIGTERM, &sa, NULL);
-        
-        // Main event loop
-        while (1) {
-            fd_set readfds;
-            FD_ZERO(&readfds);
-            FD_SET(signal_pipe[0], &readfds);
-            FD_SET(client_socket, &readfds);
-            
-            int max_fd = (signal_pipe[0] > client_socket) 
-                         ? signal_pipe[0] : client_socket;
-            
-            int ready = select(max_fd + 1, &readfds, NULL, NULL, NULL);
-            
-            if (FD_ISSET(signal_pipe[0], &readfds)) {
-                char sig;
-                read(signal_pipe[0], &sig, 1);
-                
-                if (sig == SIGINT || sig == SIGTERM) {
-                    printf("Shutting down gracefully...\n");
-                    break;
-                }
-            }
-            
-            if (FD_ISSET(client_socket, &readfds)) {
-                handle_client();
-            }
-        }
-        
-        cleanup();
-        return 0;
-    }
-    ```
-    
-    **Modern alternative**: `signalfd()` on Linux
-    ```c
-    sigset_t mask;
-    sigemptyset(&mask);
-    sigaddset(&mask, SIGINT);
-    sigprocmask(SIG_BLOCK, &mask, NULL);
-    
-    int sfd = signalfd(-1, &mask, 0);
-    // Now read signals from sfd like a regular file descriptor
-    ```
+
+  <Accordion title="Q5: Compare System V vs POSIX IPC. When would you use each?">
+**System V IPC** (shmget, semget, msgget):
+
+**Pros**:
+- Kernel-persistent (survives process death until reboot or manual deletion)
+- Well-established, available on all Unix systems
+- Atomic operations (semop with multiple sem ops)
+
+**Cons**:
+- Awkward API (ftok for key generation, numeric IDs)
+- No integration with file descriptors (can't poll/select)
+- Requires manual cleanup (orphaned segments persist)
+- Global namespace (key collisions possible)
+
+**POSIX IPC** (shm_open, sem_open, mq_open):
+
+**Pros**:
+- Clean API (name-based, like files)
+- FD-based (can use poll/select on message queues)
+- Better integration with modern APIs
+- Filesystem-like semantics (/dev/shm)
+
+**Cons**:
+- Not truly kernel-persistent (typically backed by tmpfs)
+- Less widely available on old Unix systems
+- Platform differences (macOS limits)
+
+**Decision Matrix**:
+
+| Requirement | Choice |
+|------------|--------|
+| Need to survive process crashes | System V |
+| Integration with event loops | POSIX (FD-based) |
+| Modern codebase | POSIX |
+| Legacy Unix compatibility | System V |
+| Need poll/select on message queue | POSIX |
+| Complex semaphore operations | System V (semop) |
+
+**Recommendation**: Use POSIX IPC for new projects unless you specifically need System V features.
+  </Accordion>
+
+  <Accordion title="Q6: Explain the security implications of shared memory and how to mitigate risks.">
+**Risks**:
+
+1. **Race Conditions**:
+   - Problem: Multiple processes accessing shared memory without synchronization
+   - Result: Data corruption, security-critical state corruption
+   - Example: Authentication flag flipped by race condition
+
+2. **Information Leakage**:
+   - Problem: Uninitialized memory in shared region
+   - Result: Process A's secrets leaked to Process B
+   - Example: Crypto keys left in shared buffer
+
+3. **Unauthorized Access**:
+   - Problem: Permissive shm permissions (0666)
+   - Result: Any process can attach and read/write
+
+4. **Memory Exhaustion**:
+   - Problem: Process allocates huge shared memory segments
+   - Result: Denial of service (no memory for other processes)
+
+5. **Persistence Issues** (System V):
+   - Problem: Orphaned shared memory segments
+   - Result: Memory leak, potential reuse by attacker
+
+**Mitigations**:
+
+```c
+// 1. Proper synchronization
+sem_t *sem = sem_open("/my_sem", O_CREAT, 0600, 1);
+sem_wait(sem);
+// Critical section
+sem_post(sem);
+
+// 2. Zero/initialize memory
+memset(shm, 0, shm_size);
+
+// 3. Restrict permissions
+int fd = shm_open("/my_shm", O_CREAT | O_RDWR, 0600);  // Owner only
+
+// 4. Check size limits
+struct rlimit limit;
+getrlimit(RLIMIT_MEMLOCK, &limit);
+
+// 5. Explicit cleanup
+shm_unlink("/my_shm");
+
+// 6. Use memfd with sealing (Linux)
+int memfd = memfd_create("sealed", MFD_ALLOW_SEALING);
+fcntl(memfd, F_ADD_SEALS, F_SEAL_WRITE | F_SEAL_SHRINK | F_SEAL_GROW);
+// Now share FD - receiver cannot modify
+
+// 7. Validate all shared data (trust nothing)
+if (shm->size > MAX_ALLOWED_SIZE) {
+    // Attacker may have corrupted size field
+    error("Invalid size");
+}
+```
+
+**Best Practices**:
+- Treat shared memory as untrusted input (even from "trusted" processes)
+- Use capabilities/SELinux to limit which processes can access shared memory
+- Monitor for orphaned segments (`ipcs -m`, `/dev/shm`)
+- Consider using Unix sockets instead (better isolation, kernel-mediated)
+  </Accordion>
+
+  <Accordion title="Q7: How does the kernel deliver signals? Explain the signal frame and rt_sigreturn.">
+**Signal Delivery Process**:
+
+```
+1. Signal Generation:
+   - kill(pid, SIGINT) syscall
+   - Hardware exception (SIGSEGV)
+   - Timer expiration (SIGALRM)
+
+2. Kernel marks signal pending:
+   sigaddset(&task->pending.signal, SIGINT)
+
+3. Before returning to user space:
+   - Kernel checks for pending signals
+   - Calls do_signal()
+
+4. Signal Frame Construction:
+   ┌─── User Stack ──┐
+   │   ...           │  ← Original SP
+   ├─────────────────┤
+   │  Return addr    │  → Points to __restore_rt
+   ├─────────────────┤
+   │  sig (int)      │  Signal number
+   ├─────────────────┤
+   │  siginfo_t      │  Signal info
+   ├─────────────────┤
+   │  ucontext_t     │  Saved context:
+   │   uc_mcontext:  │
+   │     rip = 0x... │  Instruction pointer
+   │     rsp = 0x... │  Stack pointer
+   │     rax = 0x... │  All registers
+   │     rbx = 0x... │
+   │     ...         │
+   └─────────────────┘  ← New SP
+
+5. Modify user context:
+   regs->ip = handler_address;
+   regs->sp = &signal_frame;
+
+6. Return to user space:
+   - Process "resumes" at handler
+   - Handler executes
+   - Handler returns
+
+7. Trampoline (__restore_rt):
+   - Automatically called when handler returns
+   - Calls rt_sigreturn() syscall
+
+8. rt_sigreturn syscall:
+   - Restores registers from signal frame
+   - Restores original RIP, RSP
+   - Process continues where interrupted
+```
+
+**Code**:
+
+```c
+// Kernel builds frame (simplified)
+struct rt_sigframe *frame = (void*)(user_sp - sizeof(*frame));
+
+frame->uc.uc_mcontext.rip = regs->ip;  // Save current PC
+frame->uc.uc_mcontext.rsp = regs->sp;  // Save current SP
+// ... save all registers ...
+
+regs->ip = (unsigned long)handler;      // Jump to handler
+regs->sp = (unsigned long)frame;        // New stack
+
+// Handler finishes, returns to __restore_rt:
+__asm__("mov $15, %rax");  // __NR_rt_sigreturn
+__asm__("syscall");
+
+// Kernel restores:
+regs->ip = frame->uc.uc_mcontext.rip;  // Restore original PC
+regs->sp = frame->uc.uc_mcontext.rsp;  // Restore original SP
+```
+
+**Key Insight**: The signal frame is a "snapshot" of the process state that allows the kernel to resume execution exactly where it was interrupted.
+  </Accordion>
+
+  <Accordion title="Q8: What is the performance difference between pipes, Unix sockets, and shared memory?">
+**Benchmark Results** (100 MB data transfer):
+
+| Mechanism | Throughput | Latency (RTT) | Copies | Syscalls |
+|-----------|-----------|---------------|---------|----------|
+| Shared Memory | 28,000 MB/s | 0.5 µs | 0 | 2 (sem) |
+| Unix Socket | 3,200 MB/s | 2 µs | 1 | 2 |
+| Pipe | 2,800 MB/s | 2 µs | 1 | 2 |
+| TCP Localhost | 1,500 MB/s | 8 µs | 2 | 2 |
+
+**Why Shared Memory is Fastest**:
+```
+Pipe/Socket:
+User A Buffer → [Kernel Copy] → User B Buffer
+              ↑                ↑
+           write()          read()
+
+Shared Memory:
+User A Buffer ← Same Physical Memory → User B Buffer
+                (No copies!)
+```
+
+**When NOT to use shared memory**:
+- Small messages (<4KB): Synchronization overhead dominates
+- Infrequent communication: Setup cost not amortized
+- Simple protocols: Complexity not worth it
+- Need message boundaries: Pipes/sockets handle this
+
+**Optimization Tips**:
+
+1. **For Pipes/Sockets**:
+   ```c
+   // Use larger buffer sizes
+   int sndbuf = 1024 * 1024;  // 1 MB
+   setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
+
+   // Batch writes
+   struct iovec iov[10];
+   writev(fd, iov, 10);  // One syscall for multiple buffers
+   ```
+
+2. **For Shared Memory**:
+   ```c
+   // Use lock-free data structures
+   atomic_int head, tail;
+
+   // Batch operations to amortize synchronization
+   while (count < BATCH_SIZE) {
+       shm->buffer[count++] = data;
+   }
+   sem_post(&full);  // One signal for batch
+   ```
+
+3. **Use splice() for zero-copy**:
+   ```c
+   splice(in_fd, NULL, pipe_fd[1], NULL, size, 0);
+   splice(pipe_fd[0], NULL, out_fd, NULL, size, 0);
+   // No user-space copy!
+   ```
   </Accordion>
 </AccordionGroup>
 
 ---
 
-## Practice Exercises
+## 10. Debugging IPC
 
-<Steps>
-  <Step title="Chat Application">
-    Build a multi-user chat using Unix domain sockets.
-  </Step>
-  <Step title="Shared Memory Cache">
-    Implement a shared memory hash table with reader-writer locks.
-  </Step>
-  <Step title="Signal-Based Watchdog">
-    Create a watchdog process that monitors children via signals.
-  </Step>
-  <Step title="Message Queue Priority">
-    Build a task queue with priority support using POSIX mqueues.
-  </Step>
-</Steps>
+### Listing Active IPC Objects
+
+```bash
+# System V IPC
+ipcs -a           # All IPC objects
+ipcs -m           # Shared memory segments
+ipcs -q           # Message queues
+ipcs -s           # Semaphore arrays
+
+# POSIX IPC
+ls -la /dev/shm   # POSIX shared memory
+ls -la /dev/mqueue # POSIX message queues
+
+# Unix sockets
+netstat -lnpx     # Listening Unix sockets
+ss -xlp           # Unix sockets (modern)
+
+# Pipes
+lsof -p <pid> | grep pipe
+```
+
+### Cleaning Orphaned IPC
+
+```bash
+# Remove System V shared memory
+ipcrm -m <shmid>
+
+# Remove System V message queue
+ipcrm -q <msqid>
+
+# Remove POSIX shared memory
+rm /dev/shm/my_shm
+
+# Remove POSIX message queue
+rm /dev/mqueue/my_queue
+```
+
+### Tracing IPC with strace
+
+```bash
+# Trace all IPC-related syscalls
+strace -e trace=ipc <command>
+
+# Trace pipe operations
+strace -e trace=pipe,pipe2,read,write <command>
+
+# Trace shared memory
+strace -e trace=shmat,shmdt,shmget,mmap,munmap <command>
+
+# Trace Unix sockets
+strace -e trace=socket,connect,bind,listen,accept,sendmsg,recvmsg <command>
+
+# Trace signals
+strace -e trace=signal,kill,rt_sigreturn <command>
+```
 
 ---
 
-## Key Takeaways
+## Multi-Mechanism Lab: Producer–Consumer Three Ways
 
-<CardGroup cols={2}>
-  <Card title="Shared Memory is Fastest" icon="bolt">
-    But requires careful synchronization. Best for high-volume data.
-  </Card>
-  <Card title="Pipes are Simple" icon="pipe-section">
-    Byte streams, good for parent-child. FIFOs for unrelated processes.
-  </Card>
-  <Card title="Sockets are Flexible" icon="plug">
-    Unix domain for local (fast), TCP for network. Can pass FDs!
-  </Card>
-  <Card title="Signals are Tricky" icon="triangle-exclamation">
-    Only for notification. Use self-pipe trick for event loops.
-  </Card>
-</CardGroup>
+Implement the same producer–consumer pattern using three different IPC mechanisms to feel the differences firsthand.
+
+### Variant A: Pipe
+
+```c
+// pipe_prodcons.c
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <sys/wait.h>
+
+int main() {
+    int fd[2];
+    pipe(fd);
+    if (fork() == 0) {
+        close(fd[1]);
+        char buf[64];
+        ssize_t n;
+        while ((n = read(fd[0], buf, sizeof(buf))) > 0) {
+            printf("Consumer got: %.*s\n", (int)n, buf);
+        }
+        exit(0);
+    }
+    close(fd[0]);
+    for (int i = 0; i < 5; i++) {
+        char msg[64];
+        snprintf(msg, sizeof(msg), "Message %d", i);
+        write(fd[1], msg, strlen(msg) + 1);
+    }
+    close(fd[1]);
+    wait(NULL);
+    return 0;
+}
+```
+
+### Variant B: Shared Memory + Semaphore
+
+```c
+// shm_prodcons.c (simplified skeleton)
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <semaphore.h>
+#include <unistd.h>
+#include <string.h>
+
+int main() {
+    int fd = shm_open("/prodcons", O_CREAT | O_RDWR, 0600);
+    ftruncate(fd, 4096);
+    char *buf = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    sem_t *sem = sem_open("/prodcons_sem", O_CREAT, 0600, 0);
+
+    if (fork() == 0) {
+        for (int i = 0; i < 5; i++) {
+            sem_wait(sem);
+            printf("Consumer: %s\n", buf);
+        }
+        exit(0);
+    }
+    for (int i = 0; i < 5; i++) {
+        snprintf(buf, 4096, "Message %d", i);
+        sem_post(sem);
+        usleep(100000);
+    }
+    wait(NULL);
+    shm_unlink("/prodcons");
+    sem_unlink("/prodcons_sem");
+    return 0;
+}
+```
+
+Key difference: **Zero copy**, but you must manage synchronization yourself.
+
+### Variant C: Unix Domain Socket
+
+```c
+// uds_prodcons.c (producer side)
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <unistd.h>
+#include <string.h>
+#include <stdio.h>
+
+int main() {
+    int sock = socket(AF_UNIX, SOCK_STREAM, 0);
+    struct sockaddr_un addr = { .sun_family = AF_UNIX };
+    strcpy(addr.sun_path, "/tmp/prodcons.sock");
+    unlink(addr.sun_path);
+    bind(sock, (struct sockaddr *)&addr, sizeof(addr));
+    listen(sock, 1);
+
+    int client = accept(sock, NULL, NULL);
+    for (int i = 0; i < 5; i++) {
+        char msg[64];
+        snprintf(msg, sizeof(msg), "Message %d", i);
+        send(client, msg, strlen(msg) + 1, 0);
+    }
+    close(client);
+    close(sock);
+    unlink(addr.sun_path);
+    return 0;
+}
+```
+
+Key difference: **FD passing** is possible, and you get stream/datagram semantics.
+
+### What to Observe
+
+- **Latency**: Shared memory is fastest (no kernel copy).
+- **Complexity**: Pipe is simplest; shared memory requires explicit sync.
+- **Flexibility**: Unix sockets support FD passing and can be converted to network sockets easily.
 
 ---
 
-Next: [Linux Kernel](/operating-systems/linux-kernel) →
+## Summary
+
+**IPC Mechanisms**:
+
+| Mechanism | Speed | Use Case |
+|-----------|-------|----------|
+| **Pipes** | Fast | Parent-child, byte streams |
+| **FIFOs** | Fast | Unrelated processes, byte streams |
+| **Shared Memory** | Fastest | High throughput, zero-copy |
+| **Message Queues** | Medium | Structured messages, priorities |
+| **Signals** | Slow | Asynchronous notifications |
+| **Unix Sockets** | Fast | FD passing, credentials, flexibility |
+
+**Key Takeaways**:
+
+1. **Pipes**: Simple but powerful. Remember PIPE_BUF atomicity and closing unused ends.
+
+2. **Shared Memory**: Fastest IPC via page table aliasing. Requires manual synchronization. Security-critical applications must validate all shared data.
+
+3. **Message Queues**: Built-in priority and message boundaries. Overhead makes them slower than pipes for high throughput.
+
+4. **Signals**: Async-signal-safety is critical. Use self-pipe trick for event loops. Modern apps prefer signalfd (Linux).
+
+5. **Unix Sockets**: Versatile. SCM_RIGHTS enables capability-based security. SO_PEERCRED provides kernel-verified credentials.
+
+6. **Performance**: Shared memory > Unix sockets > Pipes > TCP. But complexity also increases in that order.
+
+**Real-World Patterns**:
+- Chrome: Unix sockets + SCM_RIGHTS for sandboxing
+- X11/Wayland: Shared memory for pixmap transfer
+- systemd: Socket activation with FD passing
+- Databases: Shared memory for buffer pools
+
+---
+
+**Next**: [Synchronization & Locks](/operating-systems/synchronization) →

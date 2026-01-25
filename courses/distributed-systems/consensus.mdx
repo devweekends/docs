@@ -367,6 +367,11 @@ Basic Paxos decides ONE value. Multi-Paxos decides a SEQUENCE:
 **Most Asked in Interviews**: Raft is designed to be understandable. You MUST be able to explain it clearly.
 </Warning>
 
+<Info>
+For a full, implementation-focused treatment with invariants, failure scenarios, and a build-from-scratch roadmap,
+see the dedicated [Raft Deep Dive](courses/distributed-systems/raft-deep-dive).
+</Info>
+
 ### Why Raft?
 
 ```
@@ -1005,6 +1010,152 @@ Result: 4 message delays (slower, but still correct)
 
 ---
 
+## Advanced: Pipelining & Batching Optimizations
+
+Production consensus systems use several optimizations to achieve high throughput despite the fundamental requirement of disk I/O and network round-trips.
+
+### 1. Request Pipelining
+
+Instead of waiting for each request to commit before starting the next, leaders can process multiple requests concurrently.
+
+```
+SEQUENTIAL (Slow):
+┌──────────────────────────────────────────────────────────────────┐
+│  Req1: [Append] → [Replicate] → [Commit] → [Respond]             │
+│  Req2:                                      [Append] → ...       │
+│  Time: ═══════════════════════════════════════════════════════►  │
+└──────────────────────────────────────────────────────────────────┘
+
+PIPELINED (Fast):
+┌──────────────────────────────────────────────────────────────────┐
+│  Req1: [Append] → [Replicate] → [Commit] → [Respond]             │
+│  Req2:    [Append] → [Replicate] → [Commit] → [Respond]          │
+│  Req3:       [Append] → [Replicate] → [Commit] → [Respond]       │
+│  Time: ══════════════════════►                                   │
+│        (3x throughput!)                                          │
+└──────────────────────────────────────────────────────────────────┘
+```
+
+**Key Insight**: Requests at different pipeline stages use different resources (CPU for append, network for replicate, disk for commit). Pipelining maximizes resource utilization.
+
+### 2. Batching Log Entries
+
+Instead of one network round-trip per entry, batch multiple entries into a single `AppendEntries` RPC.
+
+```python
+# Without Batching: 1000 entries = 1000 RPCs
+for entry in entries:
+    send_append_entries([entry])  # Slow!
+
+# With Batching: 1000 entries = 10 RPCs (batch size 100)
+for batch in chunks(entries, size=100):
+    send_append_entries(batch)    # 100x fewer RPCs!
+```
+
+**Batching Trade-offs**:
+| Parameter | Small Batch | Large Batch |
+|-----------|-------------|-------------|
+| Latency   | Lower (per-request) | Higher (wait for batch) |
+| Throughput | Lower | Higher |
+| Memory    | Lower | Higher |
+
+**Adaptive Batching**: Modern systems (TiKV, etcd) use adaptive batching:
+- Low load: Send immediately (minimize latency)
+- High load: Batch aggressively (maximize throughput)
+
+### 3. Parallel Disk I/O
+
+The leader can write to its own log while simultaneously sending `AppendEntries` to followers.
+
+```
+SEQUENTIAL:
+Leader:   [Write to Disk] ──────────► [Send to Followers]
+                                          ↓
+Followers:                            [Receive] → [Write to Disk]
+
+PARALLEL:
+Leader:   [Write to Disk] ─────┐
+                               ├─► [Wait for both]
+          [Send to Followers] ─┘
+                   ↓
+Followers: [Receive] → [Write to Disk]
+
+Savings: Hides leader's disk latency behind network latency
+```
+
+### 4. Group Commit (fsync Batching)
+
+`fsync()` is expensive (~10ms on HDD, ~0.1ms on NVMe). Instead of fsync per entry, batch multiple entries into one fsync.
+
+```python
+class GroupCommitter:
+    def __init__(self, max_wait_ms=1, max_batch=100):
+        self.pending = []
+        self.lock = Lock()
+    
+    def append_and_sync(self, entry):
+        with self.lock:
+            self.pending.append(entry)
+            if len(self.pending) >= max_batch:
+                self._flush()
+        
+        # Or wait for timer-based flush
+        wait_for_flush_complete()
+    
+    def _flush(self):
+        # Write all pending entries
+        for entry in self.pending:
+            log_file.write(entry)
+        
+        # Single fsync for all entries!
+        log_file.fsync()  # One fsync instead of N
+        
+        # Notify all waiters
+        notify_all_complete()
+```
+
+**Result**: 1000 entries with 1 fsync instead of 1000 fsyncs = ~1000x throughput improvement for disk-bound workloads.
+
+### 5. Flow Control & Backpressure
+
+Prevent slow followers from causing unbounded memory growth on the leader.
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  FLOW CONTROL STRATEGY                                          │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  Leader tracks per-follower state:                              │
+│  • nextIndex: Next entry to send                                │
+│  • matchIndex: Highest replicated entry                         │
+│  • inflight: Entries sent but not ACKed                         │
+│                                                                  │
+│  Flow Control Rules:                                            │
+│  IF inflight > MAX_INFLIGHT:                                    │
+│      Pause sending to this follower                             │
+│      (prevents OOM on leader)                                   │
+│                                                                  │
+│  IF matchIndex too far behind:                                  │
+│      Send snapshot instead of entries                           │
+│      (prevents unbounded log growth)                            │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### Performance Numbers (etcd Benchmarks)
+
+| Optimization | Throughput | Latency (p99) |
+|--------------|------------|---------------|
+| Baseline     | 10K ops/s  | 50ms          |
+| + Batching   | 50K ops/s  | 20ms          |
+| + Pipelining | 80K ops/s  | 15ms          |
+| + Group Commit | 100K ops/s | 10ms        |
+| + Parallel I/O | 120K ops/s | 8ms         |
+
+**Staff Tip**: In interviews, mention that "naive Raft" achieves ~1000 ops/s, but production systems like etcd/TiKV achieve 100K+ ops/s through these optimizations. This shows you understand the gap between textbook algorithms and production systems.
+
+---
+
 ## Practical Implementation Guide
 
 ### Building a Production Consensus System
@@ -1112,6 +1263,35 @@ def append_entries(request):
         # If local log has different term at same index,
         # delete it and all following entries
 ```
+
+---
+
+## Module 11: Quorum Loss & Disaster Recovery
+
+A critical "Principal Level" operational reality: **What happens when you lose a majority of your nodes forever?** (e.g., a region outage or physical data corruption).
+
+### The Quorum Loss Problem
+Consensus protocols (Paxos/Raft) are designed to block when a majority is lost. This is **Safe** but leads to **Permanent Unavailability**.
+- In a 3-node cluster, if 2 nodes are destroyed, the remaining node cannot reach consensus.
+- You cannot simply "add new nodes" because adding nodes requires a consensus vote, which you can't get.
+
+### Recovery Strategies
+
+#### 1. Forced Reconfiguration (The "God Mode" fix)
+Most production implementations (etcd, Consul, Zookeeper) provide a tool to manually override the configuration.
+- **Process**:
+  1. Stop the remaining node.
+  2. Use a tool to rewrite the `conf` file or metadata on disk to say: "The cluster now only consists of ME."
+  3. Restart the node. It now has a majority (1/1) and can process writes.
+  4. Gradually add new nodes to rebuild the cluster to $N=3$ or $N=5$.
+
+#### 2. Seed-based Recovery
+In systems like **Cassandra** or **FoundationDB**, you can bootstrap a new cluster from a snapshot of the surviving node's data and "re-seed" the consensus state.
+
+#### 3. The "Stale Read" Escape Hatch
+If you only need to recover data (not resume writes), you can often perform **Stale Reads** from the remaining nodes by bypassing the consensus layer and reading directly from the state machine (SSTables/RocksDB).
+
+**Staff Tip:** Disaster recovery is the only time you should **ever** touch the internal state of a consensus engine. Mention the "etcd disaster recovery" guide in interviews to show you understand that safety isn't just about code, but about operational survival.
 
 ---
 

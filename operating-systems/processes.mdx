@@ -184,7 +184,95 @@ All running the same program, but different processes with different roles!
 
 ---
 
-## Process Memory Layout
+## Process Lifecycle Story: From Birth to Zombie
+
+To build intuition, follow a single process from creation to termination.
+
+### 1. Birth: `fork()` + `execve()`
+
+Consider running a web server worker:
+
+```bash
+$ nginx -g 'daemon off;'
+```
+
+1. The **master process** starts (PID 100).
+2. It **forks** several worker processes (PIDs 101, 102, 103...).
+3. Each worker `execve()`s the same nginx binary but handles its own subset of connections.
+
+At this point, each worker has:
+
+- Its own **PID** and PCB.
+- Its own **address space** (code, heap, stack).
+- Shared open file descriptors inherited from the master (e.g., listening sockets).
+
+### 2. Life: Running, Ready, and Waiting
+
+Over its lifetime, a worker process moves between classic states:
+
+- **Running**: Actively executing on a CPU.
+- **Ready (Runnable)**: Eligible to run but waiting in the scheduler’s queue.
+- **Blocked/Waiting**: Sleeping on I/O (e.g., `read()` on a socket) or waiting on a lock.
+
+You can observe this directly:
+
+```bash
+$ ps -o pid,ppid,state,cmd | grep nginx
+  100     1 S nginx: master process
+  101   100 S nginx: worker process
+```
+
+- `S` = sleeping (waiting on I/O or events).
+- Under load, you may see `R` (running) when workers are actively handling requests.
+
+### 3. Aging: Resource Usage and Limits
+
+As the process runs, the kernel tracks:
+
+- **CPU time**: `utime` (user) and `stime` (system) in the PCB.
+- **Memory**: RSS, virtual size, page faults.
+- **Open files**: Counted against per-process and system-wide limits.
+
+Tools to explore:
+
+```bash
+$ ps -p 101 -o pid,etime,rss,pcpu,cmd
+$ cat /proc/101/status
+$ cat /proc/101/limits
+```
+
+These reflect the fields you see in the `task_struct` (PCB) described earlier.
+
+### 4. Death: Exit and Zombie State
+
+When a process finishes:
+
+1. It calls `exit()` (explicitly or by returning from `main`).
+2. The kernel:
+   - Closes file descriptors.
+   - Frees the address space.
+   - Marks the PCB as a **zombie**: minimal entry remains so the parent can read the exit status.
+
+A zombie process:
+
+- Has released almost all resources (no memory, no open files).
+- Still occupies a PID and a small PCB entry.
+- Shows as `Z` in tools:
+
+```bash
+$ ps -o pid,ppid,state,cmd | grep Z
+  4242  100 Z [my_child] <defunct>
+```
+
+### 5. Reaping: Orphans and Init
+
+- The parent must call `wait()` / `waitpid()` to **reap** the child (remove the zombie entry and free the PID).
+- If the parent dies without reaping, the child becomes an **orphan** and is re-parented to PID 1 (`systemd` or `init`), which periodically calls `wait()` to clean up.
+
+This lifecycle story is what underlies many interview questions about zombies, orphans, and process trees.
+
+---
+
 
 Every process has a well-defined memory layout, typically divided into segments. In a 32-bit architecture, this totals 4GB of address space (2^32), usually split into **User Space** (low memory) and **Kernel Space** (high memory).
 
@@ -1035,6 +1123,127 @@ clone(fn, stack, CLONE_NEWPID | CLONE_NEWNS | CLONE_NEWNET, arg);
 
 ---
 
+## PCB Management: How the Kernel Tracks Processes
+
+The kernel doesn't just store a `task_struct` for every process; it must be able to find, create, and destroy them efficiently. This is done through several kernel data structures.
+
+### 1. The Process Table (The Global Registry)
+
+In early operating systems, the process table was a fixed-size array. If the array had 64 slots, you could only run 64 processes. Modern kernels like Linux use a more dynamic approach:
+
+- **Circular Doubly Linked List:** All `task_struct` objects are linked together. This allows the kernel to iterate through every process in the system (e.g., for the `ps` command).
+- **PID Hash Table:** Iterating through a list to find a specific PID would be slow ($O(N)$). Instead, the kernel maintains a hash table that maps a PID to a pointer to its `task_struct`, allowing for $O(1)$ lookups.
+
+### 2. The PID Allocator
+
+When you call `fork()`, the kernel needs to give the new process a unique ID.
+- **PID Namespace:** Each container (like Docker) can have its own PID 1, but globally they have different PIDs.
+- **Bitmap Management:** The kernel often uses a bitmap where each bit represents a PID. To find a free PID, it looks for the first 0 bit.
+- **PID Wrap-around:** When PIDs reach the maximum value (e.g., 32768 by default on Linux), the kernel wraps around and starts looking for unused low numbers.
+
+---
+
+## Detailed Process State Transitions
+
+A process is almost never just "Running" or "Ready." It spends most of its time in complex waiting states.
+
+### The Lifecycle of a Request
+
+1. **Ready → Running:** The Scheduler picks the process. The CPU context is loaded.
+2. **Running → Blocked (Waiting):** The process makes a blocking system call (e.g., `read()` from a slow disk).
+   - The kernel moves the process from the **Run Queue** to a **Wait Queue** associated with that specific disk device.
+   - The process state changes to `TASK_INTERRUPTIBLE`.
+3. **Blocked → Ready:** The disk finishes reading. The disk controller triggers a **Hardware Interrupt**.
+   - The kernel's interrupt handler runs.
+   - It identifies which process was waiting for this data.
+   - It moves that process from the **Wait Queue** back to the **Run Queue**.
+   - The state changes to `TASK_RUNNING` (Ready).
+4. **Running → Ready (Preemption):** The process has used its entire "Time Slice" (e.g., 10ms).
+   - The **Timer Interrupt** fires.
+   - The kernel decides this process has had enough time.
+   - It saves the context and puts the process at the end of the Ready queue.
+
+### Why "Uninterruptible" (TASK_UNINTERRUPTIBLE) Exists
+
+You may have seen processes in `ps` with state `D`. These are in "Deep Sleep."
+- **TASK_INTERRUPTIBLE:** The process can be woken up by a signal (like `Ctrl+C`).
+- **TASK_UNINTERRUPTIBLE:** The process **cannot** be woken up by any signal until the I/O finishes.
+- **Why?** Some kernel operations (like writing critical metadata to disk) are so sensitive that interrupting them halfway would leave the kernel or file system in an inconsistent state. This is why you sometimes can't `kill -9` a process that is stuck waiting for a failing network drive.
+
+---
+
+## The Mechanics of a Context Switch: A Hardware Perspective
+
+A context switch is the most critical "magic trick" an OS performs. Let's look at what happens at the assembly level during a switch from Process A to Process B.
+
+### Step 1: Entering the Kernel
+
+A context switch usually starts with an **Interrupt** (Timer) or a **System Call**.
+1. The CPU saves the User Stack Pointer (RSP) and Instruction Pointer (RIP).
+2. The CPU switches to the **Kernel Stack** of Process A.
+3. The kernel's entry code saves all general-purpose registers (RAX, RBX, etc.) onto Process A's kernel stack.
+
+### Step 2: The Switch Call
+
+The scheduler decides to run Process B. It calls a function (in Linux, `__switch_to`).
+
+1. **Save Floating Point State:** If Process A was using the GPU or doing heavy math, the large XMM/YMM registers (AVX/SSE) must be saved. This is expensive, so kernels often use "Lazy FPU Switching."
+2. **Switch Page Tables (CR3):** The kernel writes the physical address of Process B's Page Global Directory into the `CR3` register.
+   - **Effect:** The CPU's Memory Management Unit (MMU) now sees a completely different world. Addresses that meant "Process A's data" now mean "Process B's data."
+3. **Switch Kernel Stacks:** The kernel changes its internal "Current Task" pointer to Process B. It loads Process B's saved Kernel Stack Pointer into the CPU's `RSP` register.
+
+### Step 3: Returning to User Space
+
+1. The kernel pops Process B's saved registers from *its* kernel stack.
+2. The kernel executes the `sysret` or `iret` instruction.
+3. The CPU hardware restores the User RIP and User RSP from the stack.
+4. **Result:** The CPU is now executing Process B's code exactly where it left off.
+
+---
+
+## Signal Management: Communication via Interruption
+
+Signals are the "software interrupts" of the OS. They allow the kernel or other processes to notify a process of an event.
+
+### How Signals are Delivered
+
+Each process has two bitmasks in its PCB:
+- **Pending Mask:** Which signals have arrived but haven't been handled yet?
+- **Blocked Mask:** Which signals is the process currently ignoring?
+
+**The Delivery Flow:**
+1. Process A calls `kill(PID_B, SIGTERM)`.
+2. The kernel sets the `SIGTERM` bit in Process B's **Pending Mask**.
+3. The kernel checks if B is currently running. If not, it marks B as "Ready" so it can wake up and handle the signal.
+4. When Process B is about to return from the kernel to user mode (after its next time slice or syscall), the kernel checks the Pending mask.
+5. If a signal is pending and not blocked, the kernel **hijacks** the process's execution:
+   - It pushes a "Signal Frame" onto the user stack.
+   - It changes the Instruction Pointer (RIP) to the address of the **Signal Handler** function.
+6. The user's handler runs. When it finishes, it calls a special `sigreturn` syscall to tell the kernel to restore the original execution state.
+
+---
+
+## Process Groups, Sessions, and Job Control
+
+Operating systems organize processes into hierarchies for management (especially in terminal sessions).
+
+- **Process Group:** A collection of related processes (e.g., `cat file | grep "str"`). All processes in a pipeline share a Process Group ID (PGID). This allows you to send a signal (like `SIGINT` via `Ctrl+C`) to the entire group at once.
+- **Session:** A collection of process groups. Usually, one terminal window = one session.
+- **Foreground vs. Background:** Only one process group in a session can be the "Foreground" group. It is the only one that can read from the keyboard. If a background process tries to read from the terminal, the kernel sends it a `SIGTTIN` signal, which suspends it.
+
+---
+
+## Summary: The Cost of a Process
+
+When you create a process, you are allocating:
+1. **Memory:** A new Page Table, unique Stack, and unique Heap.
+2. **Kernel Objects:** A `task_struct`, entries in the PID hash table, and an Open File Table.
+3. **Time:** The overhead of `fork()` (COW management) and the ongoing cost of context switching.
+
+This high cost is why modern high-performance applications (like web servers or databases) often use **Threads** or **Asynchronous I/O** to handle many tasks within a single process.
+
+---
+
 ## Interview Deep Dive Questions
 
 <AccordionGroup>
@@ -1165,6 +1374,124 @@ clone(fn, stack, CLONE_NEWPID | CLONE_NEWNS | CLONE_NEWNET, arg);
     Implement a simple shell that can run commands, handle pipes, and manage background processes.
   </Step>
 </Steps>
+
+---
+
+## Hands-on Lab: Exploring Processes with fork, exec, wait
+
+These exercises help you see the kernel internals through real system calls.
+
+### Lab 1: Basic fork/exec/wait
+
+```c
+// lab_fork.c
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <sys/wait.h>
+
+int main() {
+    printf("Parent PID: %d\n", getpid());
+
+    pid_t child = fork();
+    if (child == 0) {
+        // Child: replace ourselves with /bin/ls
+        printf("Child PID: %d, Parent: %d\n", getpid(), getppid());
+        execlp("ls", "ls", "-la", "/proc/self", NULL);
+        perror("exec failed");
+        exit(1);
+    }
+
+    // Parent: wait for child
+    int status;
+    waitpid(child, &status, 0);
+    printf("Child exited with status %d\n", WEXITSTATUS(status));
+    return 0;
+}
+```
+
+Compile and run: `gcc -o lab_fork lab_fork.c && ./lab_fork`
+
+### Lab 2: Inspect /proc while running
+
+Run a long-lived process:
+
+```c
+// lab_proc.c
+#include <stdio.h>
+#include <unistd.h>
+
+int main() {
+    printf("PID: %d — inspect /proc/%d/* in another terminal\n", getpid(), getpid());
+    pause();  // sleep forever
+    return 0;
+}
+```
+
+In another terminal:
+
+```bash
+PID=<the printed pid>
+cat /proc/$PID/status      # state, memory, signals
+cat /proc/$PID/maps        # memory mappings
+cat /proc/$PID/fd          # open file descriptors
+ls -l /proc/$PID/fd/       # see what FDs point to
+cat /proc/$PID/stack       # kernel stack (may need root)
+```
+
+### Lab 3: Observing Zombies
+
+```c
+// lab_zombie.c
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+
+int main() {
+    pid_t child = fork();
+    if (child == 0) {
+        printf("Child exiting now\n");
+        exit(0);
+    }
+    // Parent does NOT call wait()
+    printf("Parent sleeping... child is now a zombie\n");
+    sleep(60);  // In another terminal: ps aux | grep Z
+    return 0;
+}
+```
+
+While sleeping, run `ps aux | grep Z` to see the zombie. Then kill the parent and watch the zombie disappear (reaped by init).
+
+### Lab 4: Measuring fork() cost
+
+```c
+// lab_fork_time.c
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <sys/wait.h>
+#include <time.h>
+
+#define ITERATIONS 1000
+
+int main() {
+    struct timespec start, end;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+
+    for (int i = 0; i < ITERATIONS; i++) {
+        pid_t child = fork();
+        if (child == 0) _exit(0);
+        waitpid(child, NULL, 0);
+    }
+
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    double elapsed = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
+    printf("Avg fork+wait: %.2f µs\n", (elapsed / ITERATIONS) * 1e6);
+    return 0;
+}
+```
+
+This gives you a real measurement of fork overhead on your system.
 
 ---
 

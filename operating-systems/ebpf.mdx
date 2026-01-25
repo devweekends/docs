@@ -1,0 +1,1849 @@
+---
+title: "Modern Observability: The eBPF Revolution"
+sidebarTitle: "eBPF"
+description: "A deep dive into the eBPF VM, Verifier safety, Maps, and Kernel/User space tracing"
+icon: "microscope"
+---
+
+# eBPF: Programmable Kernel Internals
+
+eBPF (Extended Berkeley Packet Filter) is arguably the most significant change to the Linux kernel in the last decade. It allows developers to run sandboxed programs inside the kernel without changing kernel source code or loading a kernel module. It is the "JavaScript of the Kernel."
+
+<Info>
+**Mastery Level**: Senior Systems Engineer / Observability Architect
+**Key Internals**: eBPF VM Registers, DAG Verifier, JIT Compilation, Ring Buffers, Kprobes/Uprobes
+**Prerequisites**: [Kernel Memory](/operating-systems/kernel-memory), [Device Drivers](/operating-systems/device-drivers)
+</Info>
+
+---
+
+## 1. The eBPF Virtual Machine
+
+eBPF is a **Register-Based Virtual Machine** that runs inside the kernel. Unlike traditional BPF which was limited to network packet filtering, eBPF is Turing-complete (with bounded loops) and can be used for tracing, security, networking, and performance monitoring.
+
+### 1.1 The Register Set
+
+eBPF has 11 64-bit registers mapped to native CPU registers for maximum performance:
+
+```
+┌─────────────────────────────────────────┐
+│      eBPF Register Architecture         │
+├─────────────────────────────────────────┤
+│ R0  - Return value from functions       │
+│       and program exit code             │
+│                                         │
+│ R1  - First argument to helpers         │
+│ R2  - Second argument                   │
+│ R3  - Third argument                    │
+│ R4  - Fourth argument                   │
+│ R5  - Fifth argument                    │
+│                                         │
+│ R6  - Callee-saved (preserved)          │
+│ R7  - Callee-saved                      │
+│ R8  - Callee-saved                      │
+│ R9  - Callee-saved                      │
+│                                         │
+│ R10 - Read-only frame pointer           │
+│       (points to 512-byte stack)        │
+└─────────────────────────────────────────┘
+```
+
+**x86-64 Mapping:**
+```
+eBPF R0  → RAX
+eBPF R1  → RDI
+eBPF R2  → RSI
+eBPF R3  → RDX
+eBPF R4  → RCX
+eBPF R5  → R8
+eBPF R6  → RBX
+eBPF R7  → R13
+eBPF R8  → R14
+eBPF R9  → R15
+eBPF R10 → RBP
+```
+
+### 1.2 The Instruction Set
+
+Each eBPF instruction is 64 bits (8 bytes):
+
+```c
+struct bpf_insn {
+    __u8    code;        // opcode
+    __u8    dst_reg:4;   // destination register (0-10)
+    __u8    src_reg:4;   // source register (0-10)
+    __s16   off;         // signed offset
+    __s32   imm;         // signed immediate constant
+};
+```
+
+**Example eBPF bytecode:**
+```
+// r1 = *(u64 *)(r10 - 8)   Load from stack
+0x79 0x11 0xf8 0xff 0x00 0x00 0x00 0x00
+
+// r0 = 0                    Set return value
+0xb7 0x00 0x00 0x00 0x00 0x00 0x00 0x00
+
+// exit                      Return from program
+0x95 0x00 0x00 0x00 0x00 0x00 0x00 0x00
+```
+
+### 1.3 The JIT (Just-In-Time) Compiler
+
+The kernel contains architecture-specific JIT compilers that translate eBPF bytecode to native machine code:
+
+```
+┌──────────────────────────────────────────────┐
+│          eBPF Program Lifecycle              │
+├──────────────────────────────────────────────┤
+│                                              │
+│  1. C Source Code                            │
+│     ↓                                        │
+│  2. Clang/LLVM Compilation                   │
+│     ↓                                        │
+│  3. eBPF Bytecode (.o ELF object)            │
+│     ↓                                        │
+│  4. Userspace: bpf() syscall                 │
+│     ↓                                        │
+│  ┌─────────────────────────────────┐         │
+│  │  Kernel: Verifier               │         │
+│  │  - Control flow analysis        │         │
+│  │  - Memory safety checks         │         │
+│  │  - Register tracking            │         │
+│  │  - Bounded loop validation      │         │
+│  └─────────────────────────────────┘         │
+│     ↓                                        │
+│  5. JIT Compilation                          │
+│     - x86-64 codegen                         │
+│     - ARM64 codegen                          │
+│     - s390x codegen                          │
+│     ↓                                        │
+│  6. Native machine code in kernel memory     │
+│     - Executable, non-writable pages         │
+│     - Performance: ~95% of native C          │
+│     ↓                                        │
+│  7. Program attached to hook point           │
+│     - Kprobe, Tracepoint, XDP, etc.          │
+│                                              │
+└──────────────────────────────────────────────┘
+```
+
+**JIT Benefits:**
+- **Performance**: Near-native speed (no interpretation overhead)
+- **Security**: JIT code is mapped as read-execute only
+- **Efficiency**: Direct register mapping eliminates translation overhead
+
+**Checking JIT status:**
+```bash
+# Enable JIT (requires root)
+echo 1 > /proc/sys/net/core/bpf_jit_enable
+
+# Enable JIT with debug output
+echo 2 > /proc/sys/net/core/bpf_jit_enable
+
+# View JIT'd code
+bpftool prog dump jited id <prog_id>
+```
+
+---
+
+## 2. The Verifier: Guaranteeing Safety
+
+The BPF verifier is the gatekeeper that ensures loaded programs cannot crash the kernel, leak data, or cause security vulnerabilities. It performs static analysis on the eBPF bytecode before JIT compilation.
+
+### 2.1 The Verifier Architecture
+
+```
+┌─────────────────────────────────────────────────────┐
+│              BPF Verifier Pipeline                  │
+├─────────────────────────────────────────────────────┤
+│                                                     │
+│  Step 1: DAG Validation                             │
+│  ┌───────────────────────────────────────┐          │
+│  │ • Detect infinite loops               │          │
+│  │ • Verify all paths reach exit         │          │
+│  │ • Check unreachable code              │          │
+│  │ • Bounded loop complexity (5.3+)      │          │
+│  └───────────────────────────────────────┘          │
+│                ↓                                    │
+│  Step 2: Register State Tracking                    │
+│  ┌───────────────────────────────────────┐          │
+│  │ For each instruction, track:          │          │
+│  │ • Register types (scalar, ptr, etc.)  │          │
+│  │ • Value ranges (min/max bounds)       │          │
+│  │ • Null-ness                           │          │
+│  │ • Alignment constraints               │          │
+│  └───────────────────────────────────────┘          │
+│                ↓                                    │
+│  Step 3: Memory Access Validation                   │
+│  ┌───────────────────────────────────────┐          │
+│  │ • Verify pointer types                │          │
+│  │ • Check bounds for map access         │          │
+│  │ • Validate stack reads/writes         │          │
+│  │ • Prevent kernel address leaks        │          │
+│  └───────────────────────────────────────┘          │
+│                ↓                                    │
+│  Step 4: Helper Function Validation                 │
+│  ┌───────────────────────────────────────┐          │
+│  │ • Check argument types                │          │
+│  │ • Verify capabilities                 │          │
+│  │ • Ensure return values handled        │          │
+│  └───────────────────────────────────────┘          │
+│                ↓                                    │
+│  Step 5: Complexity Checks                          │
+│  ┌───────────────────────────────────────┐          │
+│  │ • Instruction count limit (1M)        │          │
+│  │ • Stack depth limit (512 bytes)       │          │
+│  │ • Tail call chain depth (33)          │          │
+│  │ • Map nesting depth                   │          │
+│  └───────────────────────────────────────┘          │
+│                                                     │
+└─────────────────────────────────────────────────────┘
+```
+
+### 2.2 Register Type System
+
+The verifier tracks sophisticated type information for each register:
+
+```c
+// Register types (kernel internal)
+enum bpf_reg_type {
+    NOT_INIT,              // Uninitialized register
+    SCALAR_VALUE,          // Unknown scalar value
+    PTR_TO_CTX,            // Pointer to bpf_context
+    PTR_TO_MAP_VALUE,      // Pointer to map value
+    PTR_TO_MAP_KEY,        // Pointer to map key
+    PTR_TO_STACK,          // Pointer to stack frame
+    PTR_TO_PACKET,         // Pointer to packet data (XDP)
+    PTR_TO_PACKET_END,     // Pointer past last packet byte
+    PTR_TO_SOCKET,         // Pointer to socket
+    PTR_TO_TCP_SOCK,       // Pointer to TCP socket
+    // ... many more types
+};
+
+// Register state tracking
+struct bpf_reg_state {
+    enum bpf_reg_type type;
+    s64 smin_value;        // Minimum signed value
+    s64 smax_value;        // Maximum signed value
+    u64 umin_value;        // Minimum unsigned value
+    u64 umax_value;        // Maximum unsigned value
+    u32 id;                // Unique ID for this value
+    u32 ref_obj_id;        // Reference tracking
+    // ... more tracking fields
+};
+```
+
+### 2.3 Verifier Example: Range Tracking
+
+```c
+// BPF program snippet
+int my_prog(struct __sk_buff *skb) {
+    __u32 index;
+
+    // Read packet length
+    index = skb->len;         // Verifier: index = [0, U32_MAX]
+
+    // Bounds check
+    if (index >= 100)         // Verifier: creates two branches
+        return 0;
+
+    // In this branch: index = [0, 99]
+    // Now safe to use as array index
+    return my_array[index];   // Verifier: OK! index < 100
+}
+```
+
+**Verifier log output:**
+```
+0: (61) r1 = *(u32 *)(r1 +0)          // r1 = skb->len
+1: (25) if r1 > 99 goto pc+2          // range split
+2: (67) r1 <<= 32
+3: (c7) r1 s>>= 32                     // sign extension
+   R1_w=inv(id=0,umax_value=99)        // verified range!
+4: (18) r2 = 0xffff888100001000        // map address
+6: (0f) r2 += r1                       // safe pointer arithmetic
+7: (71) r0 = *(u8 *)(r2 +0)            // verified memory access
+8: (95) exit
+```
+
+### 2.4 Bounded Loops (Linux 5.3+)
+
+Modern kernels allow loops if the verifier can prove they are bounded:
+
+```c
+// Valid bounded loop
+#pragma unroll
+for (int i = 0; i < 10; i++) {
+    // Process data
+}
+
+// The verifier will:
+// 1. Unroll the loop up to a limit
+// 2. Track the loop variable range
+// 3. Ensure no infinite paths exist
+```
+
+**Complexity limits:**
+- Max verified instructions: 1 million
+- Max loop iterations (unrolled): ~8192
+- Max program size: 1 million instructions
+- Stack size: 512 bytes
+
+### 2.5 Memory Safety Guarantees
+
+```
+┌─────────────────────────────────────────┐
+│     Memory Access Rules                 │
+├─────────────────────────────────────────┤
+│                                         │
+│ 1. Stack Access                         │
+│    ✓ Must be within [R10-512, R10)      │
+│    ✗ Cannot read uninitialized data     │
+│    ✗ Cannot leak stack pointers         │
+│                                         │
+│ 2. Map Access                           │
+│    ✓ Must use bpf_map_lookup_elem()     │
+│    ✓ Must check for NULL return         │
+│    ✗ Cannot access out-of-bounds        │
+│                                         │
+│ 3. Packet Access (XDP)                  │
+│    ✓ Must bounds-check against end      │
+│    ✓ If (ptr + offset < end) then OK    │
+│    ✗ Cannot access after packet end     │
+│                                         │
+│ 4. Context Access                       │
+│    ✓ Only allowed fields (via BTF)      │
+│    ✗ Cannot write to read-only fields   │
+│    ✗ Cannot leak kernel pointers        │
+│                                         │
+└─────────────────────────────────────────┘
+```
+
+---
+
+## 3. eBPF Maps: Persistent Data Structures
+
+Maps are the primary mechanism for eBPF programs to store state and communicate with userspace.
+
+### 3.1 Map Types
+
+```c
+// Hash map - key/value store
+BPF_MAP_TYPE_HASH
+- Use case: PID → counter, IP → stats
+- Lookup: O(1) average
+- Memory: Dynamic allocation
+
+// Array map - fixed size indexed array
+BPF_MAP_TYPE_ARRAY
+- Use case: Per-CPU stats, histogram buckets
+- Lookup: O(1)
+- Memory: Pre-allocated
+
+// Per-CPU hash/array
+BPF_MAP_TYPE_PERCPU_HASH
+BPF_MAP_TYPE_PERCPU_ARRAY
+- Use case: Lock-free aggregation
+- Benefit: No synchronization overhead
+
+// Ring buffer (preferred over perf buffer)
+BPF_MAP_TYPE_RINGBUF
+- Use case: Streaming events to userspace
+- Memory: Efficient page-aligned buffer
+- Ordering: Maintains event ordering
+
+// LRU Hash map
+BPF_MAP_TYPE_LRU_HASH
+- Use case: Caching, connection tracking
+- Eviction: Automatic LRU policy
+
+// Stack trace map
+BPF_MAP_TYPE_STACK_TRACE
+- Use case: Store kernel/user stack traces
+- Format: Array of instruction pointers
+
+// Program array (tail calls)
+BPF_MAP_TYPE_PROG_ARRAY
+- Use case: Jump table for complex programs
+- Limit: 33 chained tail calls
+```
+
+### 3.2 Map Definition Example
+
+```c
+// Kernel-side BPF program
+#include <linux/bpf.h>
+#include <bpf/bpf_helpers.h>
+
+// Define a hash map
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 10240);
+    __type(key, u32);                 // PID
+    __type(value, u64);               // Count
+} syscall_count SEC(".maps");
+
+// Trace syscall entry
+SEC("tracepoint/raw_syscalls/sys_enter")
+int trace_syscall(struct trace_event_raw_sys_enter *ctx) {
+    u32 pid = bpf_get_current_pid_tgid() >> 32;
+    u64 *count, one = 1;
+
+    // Lookup or create entry
+    count = bpf_map_lookup_elem(&syscall_count, &pid);
+    if (count) {
+        __sync_fetch_and_add(count, 1);  // Atomic increment
+    } else {
+        bpf_map_update_elem(&syscall_count, &pid, &one, BPF_ANY);
+    }
+
+    return 0;
+}
+
+char LICENSE[] SEC("license") = "GPL";
+```
+
+**Userspace interaction:**
+```c
+// Load and attach program (using libbpf)
+#include <bpf/libbpf.h>
+
+int main() {
+    struct bpf_object *obj;
+    struct bpf_link *link;
+    int map_fd;
+
+    // Load BPF object
+    obj = bpf_object__open_file("program.o", NULL);
+    bpf_object__load(obj);
+
+    // Attach to tracepoint
+    link = bpf_program__attach(
+        bpf_object__find_program_by_name(obj, "trace_syscall")
+    );
+
+    // Get map file descriptor
+    map_fd = bpf_object__find_map_fd_by_name(obj, "syscall_count");
+
+    // Read map data
+    u32 key, next_key;
+    u64 value;
+
+    key = 0;
+    while (bpf_map_get_next_key(map_fd, &key, &next_key) == 0) {
+        bpf_map_lookup_elem(map_fd, &next_key, &value);
+        printf("PID %u: %llu syscalls\n", next_key, value);
+        key = next_key;
+    }
+
+    return 0;
+}
+```
+
+### 3.3 Ring Buffer Architecture
+
+Ring buffers replaced perf buffers as the preferred event streaming mechanism:
+
+```
+┌────────────────────────────────────────────────────┐
+│         BPF Ring Buffer Architecture               │
+├────────────────────────────────────────────────────┤
+│                                                    │
+│  Kernel Space (BPF Program)                        │
+│  ┌──────────────────────────────────────┐          │
+│  │  Producer: bpf_ringbuf_reserve()     │          │
+│  │           bpf_ringbuf_submit()       │          │
+│  │                                      │          │
+│  │  ┌────────────────────────────┐      │          │
+│  │  │   Ring Buffer (mmap'd)     │      │          │
+│  │  │                            │      │          │
+│  │  │  [E1][E2][E3][ ][ ][ ][E7] │      │          │
+│  │  │    ^           ^            │      │          │
+│  │  │    consumer    producer     │      │          │
+│  │  └────────────────────────────┘      │          │
+│  └──────────────────────────────────────┘          │
+│                ↓ mmap                              │
+│  User Space                                        │
+│  ┌──────────────────────────────────────┐          │
+│  │  Consumer: ring_buffer__consume()    │          │
+│  │           ring_buffer__poll()        │          │
+│  │                                      │          │
+│  │  Callback for each event             │          │
+│  └──────────────────────────────────────┘          │
+│                                                    │
+│  Advantages over Perf Buffer:                      │
+│  ✓ Better memory efficiency                        │
+│  ✓ Event ordering guarantees                       │
+│  ✓ No per-CPU fragmentation                        │
+│  ✓ Variable-length records                         │
+│                                                    │
+└────────────────────────────────────────────────────┘
+```
+
+**Ring buffer usage:**
+```c
+// Kernel side
+SEC("kprobe/do_sys_open")
+int BPF_KPROBE(trace_open, const char *filename) {
+    struct event {
+        u32 pid;
+        char filename[256];
+    } *e;
+
+    // Reserve space
+    e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
+    if (!e)
+        return 0;
+
+    // Fill event
+    e->pid = bpf_get_current_pid_tgid() >> 32;
+    bpf_probe_read_str(&e->filename, sizeof(e->filename), filename);
+
+    // Submit to userspace
+    bpf_ringbuf_submit(e, 0);
+
+    return 0;
+}
+
+// Userspace side
+static int handle_event(void *ctx, void *data, size_t len) {
+    struct event *e = data;
+    printf("PID %d opened: %s\n", e->pid, e->filename);
+    return 0;
+}
+
+int main() {
+    struct ring_buffer *rb;
+
+    rb = ring_buffer__new(map_fd, handle_event, NULL, NULL);
+
+    // Poll for events
+    while (running) {
+        ring_buffer__poll(rb, 100 /* timeout ms */);
+    }
+
+    return 0;
+}
+```
+
+---
+
+## 4. Hook Points and Program Types
+
+eBPF programs are event-driven and attach to specific kernel hooks.
+
+### 4.1 Tracing Program Types
+
+```
+┌─────────────────────────────────────────────────────┐
+│           eBPF Hook Point Landscape                 │
+├─────────────────────────────────────────────────────┤
+│                                                     │
+│  TRACING                                            │
+│  ├─ Kprobes (BPF_PROG_TYPE_KPROBE)                  │
+│  │  • Attach to any kernel function                 │
+│  │  • Entry: function arguments in registers        │
+│  │  • Return: return value in R0/RAX                │
+│  │  • Unstable: function signatures change          │
+│  │                                                  │
+│  ├─ Kretprobes                                      │
+│  │  • Intercept function return                     │
+│  │  • Access return value                           │
+│  │                                                  │
+│  ├─ Uprobes (BPF_PROG_TYPE_KPROBE)                  │
+│  │  • Attach to userspace functions                 │
+│  │  • Libraries: libc, libssl, custom                │
+│  │  • Dynamic languages: Python, Node.js            │
+│  │                                                  │
+│  ├─ Tracepoints (BPF_PROG_TYPE_TRACEPOINT)          │
+│  │  • Stable kernel ABI                             │
+│  │  • Structured arguments via BTF                  │
+│  │  • Categories: sched, net, block, syscalls       │
+│  │                                                  │
+│  ├─ Raw Tracepoints (BPF_PROG_TYPE_RAW_TRACEPOINT)  │
+│  │  • Lower overhead than regular tracepoints       │
+│  │  • Access to raw kernel structures               │
+│  │                                                  │
+│  └─ Fentry/Fexit (BPF_PROG_TYPE_TRACING)            │
+│     • Faster than kprobes (no breakpoint)           │
+│     • Type-safe access to function arguments        │
+│     • Requires BTF and kernel 5.5+                  │
+│                                                     │
+│  NETWORKING                                         │
+│  ├─ XDP (BPF_PROG_TYPE_XDP)                         │
+│  │  • Runs in network driver                        │
+│  │  • Before sk_buff allocation                     │
+│  │  • Actions: PASS, DROP, TX, REDIRECT             │
+│  │                                                  │
+│  ├─ TC (Traffic Control)                            │
+│  │  • Ingress/Egress packet processing              │
+│  │  • Full sk_buff access                           │
+│  │  • QoS, routing, filtering                       │
+│  │                                                  │
+│  ├─ Socket Filters                                  │
+│  │  • Per-socket packet filtering                   │
+│  │  • tcpdump replacement                           │
+│  │                                                  │
+│  └─ Sockops / SK_SKB                                │
+│     • Socket-level operations                       │
+│     • Connection tracking                           │
+│     • Service mesh acceleration                     │
+│                                                     │
+│  SECURITY                                           │
+│  ├─ LSM (BPF_PROG_TYPE_LSM)                         │
+│  │  • Linux Security Module hooks                   │
+│  │  • MAC policy enforcement                        │
+│  │  • File, network, capability hooks               │
+│  │                                                  │
+│  └─ Seccomp                                         │
+│     • Syscall filtering                             │
+│     • Container security                            │
+│                                                     │
+│  CGROUPS                                            │
+│  └─ Cgroup SKB/Sock/Device                          │
+│     • Per-cgroup network/device control             │
+│     • Container resource management                 │
+│                                                     │
+└─────────────────────────────────────────────────────┘
+```
+
+### 4.2 Kprobes vs Tracepoints vs Fentry
+
+```c
+// KPROBE - Dynamic instrumentation (any function)
+SEC("kprobe/do_sys_openat2")
+int BPF_KPROBE(trace_openat_kprobe,
+               int dfd, const char *filename,
+               struct open_how *how)
+{
+    // Access via PT_REGS_PARM macros
+    char fname[64];
+    bpf_probe_read_str(fname, sizeof(fname), filename);
+    bpf_printk("kprobe: %s\n", fname);
+    return 0;
+}
+
+// TRACEPOINT - Stable ABI
+SEC("tracepoint/syscalls/sys_enter_openat")
+int trace_openat_tp(struct trace_event_raw_sys_enter *ctx) {
+    // Structured access via BTF
+    char *filename = (char *)ctx->args[1];
+    bpf_printk("tracepoint: %s\n", filename);
+    return 0;
+}
+
+// FENTRY - Fast and type-safe (5.5+)
+SEC("fentry/do_sys_openat2")
+int BPF_PROG(trace_openat_fentry,
+             int dfd, const char *filename,
+             struct open_how *how)
+{
+    // Direct argument access (type-checked!)
+    bpf_printk("fentry: %s\n", filename);
+    return 0;
+}
+
+// FEXIT - Access return value
+SEC("fexit/do_sys_openat2")
+int BPF_PROG(trace_openat_fexit,
+             int dfd, const char *filename,
+             struct open_how *how,
+             long ret)  // Return value
+{
+    bpf_printk("fexit: returned %ld\n", ret);
+    return 0;
+}
+```
+
+**Performance comparison:**
+```
+Hook Type      | Overhead    | Stability | Type Safety
+---------------|-------------|-----------|-------------
+Kprobe         | ~1-2μs      | Unstable  | Manual
+Kretprobe      | ~2-4μs      | Unstable  | Manual
+Tracepoint     | ~500-800ns  | Stable    | Partial
+Fentry         | ~200-400ns  | Unstable  | Full (BTF)
+Fexit          | ~200-400ns  | Unstable  | Full (BTF)
+```
+
+### 4.3 Uprobes: Userspace Tracing
+
+```c
+// Trace SSL library to see encrypted data before encryption
+SEC("uprobe/usr/lib/x86_64-linux-gnu/libssl.so.1.1/SSL_write")
+int BPF_KPROBE(trace_ssl_write, void *ssl, const void *buf, int num) {
+    char data[64];
+
+    // Read from userspace memory
+    bpf_probe_read_user(data, sizeof(data), buf);
+
+    bpf_printk("SSL_write: %d bytes\n", num);
+    // Could export full data via ring buffer
+
+    return 0;
+}
+
+// Trace Python function calls
+SEC("uprobe/usr/bin/python3.9")
+int trace_python_func(struct pt_regs *ctx) {
+    // Parse Python stack frame
+    // Extract function name and arguments
+    // This requires understanding Python internals
+    return 0;
+}
+```
+
+**Attaching uprobes:**
+```bash
+# Using bpftrace
+bpftrace -e 'uprobe:/lib/x86_64-linux-gnu/libc.so.6:malloc {
+    printf("malloc(%d) from %s\n", arg0, comm);
+}'
+
+# Using bpftool
+bpftool prog load prog.o /sys/fs/bpf/myprog
+bpftool prog attach id <prog_id> uprobe \
+    /lib/x86_64-linux-gnu/libc.so.6 malloc
+```
+
+---
+
+## 5. XDP: eXpress Data Path
+
+XDP is the fastest packet processing framework in Linux, running eBPF programs in the network driver.
+
+### 5.1 XDP Architecture
+
+```
+┌───────────────────────────────────────────────────┐
+│         XDP Packet Processing Pipeline            │
+├───────────────────────────────────────────────────┤
+│                                                   │
+│  NIC Hardware                                     │
+│  ┌─────────────────────────────┐                  │
+│  │  Packet arrives → DMA        │                  │
+│  │  into RX ring buffer         │                  │
+│  └─────────────────────────────┘                  │
+│              ↓                                    │
+│  Driver: XDP Hook (EARLIEST possible point)       │
+│  ┌─────────────────────────────────────────────┐  │
+│  │  eBPF Program runs on raw packet buffer    │  │
+│  │  - No sk_buff allocated yet!                │  │
+│  │  - Linear packet data                       │  │
+│  │  - Can modify packet in-place               │  │
+│  │                                             │  │
+│  │  Return Actions:                            │  │
+│  │  ┌──────────────────────────────────────┐   │  │
+│  │  │  XDP_PASS  → Continue to stack       │   │  │
+│  │  │  XDP_DROP  → Drop (DDoS mitigation)  │   │  │
+│  │  │  XDP_TX    → Send back out same NIC  │   │  │
+│  │  │  XDP_REDIRECT → Send to other NIC    │   │  │
+│  │  │  XDP_ABORTED → Drop with trace       │   │  │
+│  │  └──────────────────────────────────────┘   │  │
+│  └─────────────────────────────────────────────┘  │
+│              ↓ (if XDP_PASS)                      │
+│  sk_buff Allocation                               │
+│  ┌─────────────────────────────┐                  │
+│  │  Kernel allocates sk_buff   │                  │
+│  │  Copies metadata             │                  │
+│  └─────────────────────────────┘                  │
+│              ↓                                    │
+│  Linux Network Stack                              │
+│  (IP, TCP, routing, iptables, etc.)               │
+│                                                   │
+│  Performance at 100Gbps:                          │
+│  - DROP: ~25M pps per core                        │
+│  - TX: ~20M pps (hairpin)                         │
+│  - REDIRECT: ~15M pps                             │
+│                                                   │
+└───────────────────────────────────────────────────┘
+```
+
+### 5.2 XDP Program Example: DDoS Mitigation
+
+```c
+#include <linux/bpf.h>
+#include <linux/if_ether.h>
+#include <linux/ip.h>
+#include <linux/tcp.h>
+#include <bpf/bpf_helpers.h>
+
+// Rate limiting map: IP → packet count
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 1000000);
+    __type(key, __u32);         // Source IP
+    __type(value, __u64);       // Packet count
+} rate_limit SEC(".maps");
+
+SEC("xdp")
+int xdp_filter(struct xdp_md *ctx) {
+    void *data_end = (void *)(long)ctx->data_end;
+    void *data = (void *)(long)ctx->data;
+
+    // Parse Ethernet header
+    struct ethhdr *eth = data;
+    if ((void *)(eth + 1) > data_end)
+        return XDP_PASS;
+
+    // Only process IPv4
+    if (eth->h_proto != __constant_htons(ETH_P_IP))
+        return XDP_PASS;
+
+    // Parse IP header
+    struct iphdr *ip = (void *)(eth + 1);
+    if ((void *)(ip + 1) > data_end)
+        return XDP_PASS;
+
+    // Rate limit by source IP
+    __u32 src_ip = ip->saddr;
+    __u64 *count = bpf_map_lookup_elem(&rate_limit, &src_ip);
+
+    if (count) {
+        *count += 1;
+
+        // Drop if exceeds 10K pps (simplified)
+        if (*count > 10000) {
+            return XDP_DROP;
+        }
+    } else {
+        __u64 init = 1;
+        bpf_map_update_elem(&rate_limit, &src_ip, &init, BPF_ANY);
+    }
+
+    // Pass to kernel stack
+    return XDP_PASS;
+}
+
+char LICENSE[] SEC("license") = "GPL";
+```
+
+**Loading XDP program:**
+```bash
+# Compile
+clang -O2 -target bpf -c xdp_filter.c -o xdp_filter.o
+
+# Load and attach to interface
+ip link set dev eth0 xdp obj xdp_filter.o sec xdp
+
+# Check status
+ip link show dev eth0
+
+# Remove
+ip link set dev eth0 xdp off
+```
+
+### 5.3 XDP Redirect for Load Balancing
+
+```c
+// Load balancer using XDP_REDIRECT
+SEC("xdp")
+int xdp_loadbalancer(struct xdp_md *ctx) {
+    // Parse packet to extract 5-tuple
+    // Hash to select backend server
+    __u32 backend_idx = hash % num_backends;
+
+    // Rewrite destination MAC/IP
+    // ...
+
+    // Redirect to backend NIC
+    return bpf_redirect(backend_ifindex, 0);
+}
+```
+
+**Use cases:**
+- DDoS mitigation (100Gbps capable)
+- Load balancing (Facebook Katran)
+- Packet filtering (faster than iptables)
+- Packet mangling and encapsulation
+- Sampling and monitoring
+
+---
+
+## 6. BTF and CO-RE: Portable eBPF
+
+BTF (BPF Type Format) enables portable eBPF programs that work across kernel versions.
+
+### 6.1 The Portability Problem
+
+```
+Problem: Kernel struct layout changes between versions
+
+Linux 5.10:                    Linux 5.15:
+struct task_struct {           struct task_struct {
+    int pid;         // +0         int tgid;        // +0
+    int tgid;        // +4         int pid;         // +4  ← MOVED!
+    char comm[16];   // +8         int real_parent; // +8  ← NEW!
+    ...                            char comm[16];   // +12 ← MOVED!
+}                                  ...
+                                }
+
+Traditional BPF: Hardcoded offset → BREAKS!
+CO-RE BPF: Runtime relocation → WORKS!
+```
+
+### 6.2 BTF Format
+
+BTF is a compact metadata format describing kernel types:
+
+```c
+// Kernel exports BTF at /sys/kernel/btf/vmlinux
+
+// Example: struct task_struct BTF representation
+[1] STRUCT 'task_struct' size=9472 vlen=238
+    'thread_info' type_id=2 bits_offset=0
+    'state' type_id=3 bits_offset=192
+    'stack' type_id=4 bits_offset=256
+    'flags' type_id=5 bits_offset=320
+    'pid' type_id=6 bits_offset=352        ← Offset in bits!
+    'tgid' type_id=6 bits_offset=384
+    ...
+```
+
+**Viewing BTF:**
+```bash
+# Dump kernel BTF
+bpftool btf dump file /sys/kernel/btf/vmlinux format c
+
+# Generate vmlinux.h (all kernel types)
+bpftool btf dump file /sys/kernel/btf/vmlinux format c > vmlinux.h
+```
+
+### 6.3 CO-RE (Compile Once - Run Everywhere)
+
+```c
+#include "vmlinux.h"  // BTF-generated kernel headers
+#include <bpf/bpf_core_read.h>
+
+SEC("kprobe/wake_up_new_task")
+int BPF_KPROBE(trace_new_task, struct task_struct *task) {
+    // OLD WAY (breaks on kernel updates):
+    // pid = *(int *)((void *)task + 1234);  // hardcoded offset
+
+    // CO-RE WAY (portable across kernels):
+    pid_t pid = BPF_CORE_READ(task, pid);
+    char comm[16];
+    BPF_CORE_READ_STR_INTO(&comm, task, comm);
+
+    bpf_printk("New task: %s (PID %d)\n", comm, pid);
+    return 0;
+}
+```
+
+**How CO-RE works:**
+```
+1. Compile time (developer machine):
+   - Clang embeds relocation info in .BTF.ext section
+   - "Field 'pid' at offset UNKNOWN"
+
+2. Load time (target machine):
+   - libbpf reads /sys/kernel/btf/vmlinux
+   - Finds actual offset of task_struct->pid
+   - Patches eBPF instructions with correct offset
+
+3. Runtime:
+   - Program uses correct offset for this kernel!
+```
+
+**Core macros:**
+```c
+// Field read with NULL check
+BPF_CORE_READ(src, field1, field2)
+
+// String read
+BPF_CORE_READ_STR_INTO(&dst, src, field)
+
+// Field existence check (compile-time)
+if (bpf_core_field_exists(task->some_new_field)) {
+    // Use field only on newer kernels
+}
+
+// Type existence check
+if (bpf_core_type_exists(struct some_new_struct)) {
+    // Use type only if available
+}
+```
+
+---
+
+## 7. BCC vs bpftrace vs libbpf
+
+Three main frameworks for writing eBPF programs:
+
+### 7.1 BCC (BPF Compiler Collection)
+
+Python/C++ framework with runtime compilation:
+
+```python
+#!/usr/bin/env python3
+from bcc import BPF
+
+# BPF program embedded as string
+prog = """
+#include <uapi/linux/ptrace.h>
+
+BPF_HASH(counts, u32, u64);
+
+int count_syscall(struct pt_regs *ctx) {
+    u32 pid = bpf_get_current_pid_tgid() >> 32;
+    u64 *count, one = 1;
+
+    count = counts.lookup(&pid);
+    if (count)
+        (*count)++;
+    else
+        counts.update(&pid, &one);
+
+    return 0;
+}
+"""
+
+# Compile and load
+b = BPF(text=prog)
+b.attach_kprobe(event=b.get_syscall_fnname("open"), fn_name="count_syscall")
+
+# Read map
+print("%-8s %-16s %s" % ("PID", "COMM", "COUNT"))
+for k, v in sorted(b["counts"].items(), key=lambda x: x[1].value):
+    print("%-8d %-16s %d" % (k.value, b.get_pid_comm(k.value), v.value))
+```
+
+**Pros:**
+- Easy Python/C++ integration
+- Rich helper libraries
+- Good for prototyping
+
+**Cons:**
+- Requires LLVM/Clang at runtime
+- Slower startup (compilation)
+- No CO-RE support
+
+### 7.2 bpftrace
+
+High-level tracing language (awk-like):
+
+```bash
+# One-liner to trace TCP connections
+bpftrace -e 'tracepoint:syscalls:sys_enter_connect {
+    printf("%s connecting to %s\n", comm,
+           ntop(args->uservaddr->sa_data));
+}'
+
+# Count syscalls by name
+bpftrace -e 'tracepoint:raw_syscalls:sys_enter {
+    @[args->id] = count();
+}'
+
+# Histogram of read sizes
+bpftrace -e 'tracepoint:syscalls:sys_exit_read /args->ret > 0/ {
+    @bytes = hist(args->ret);
+}'
+
+# Stack trace on memory allocation
+bpftrace -e 'kprobe:kmalloc {
+    @[kstack] = count();
+}'
+```
+
+**Built-in functions:**
+```
+printf()        - Formatted output
+kstack          - Kernel stack trace
+ustack          - Userspace stack trace
+@map = count()  - Increment counter
+@map = sum(x)   - Sum values
+@map = hist(x)  - Power-of-2 histogram
+ntop()          - Network address to string
+str()           - Pointer to string
+```
+
+**Pros:**
+- Fastest for ad-hoc analysis
+- No compilation needed
+- Concise syntax
+
+**Cons:**
+- Limited for complex programs
+- Less control than C
+
+### 7.3 libbpf + CO-RE (Modern Approach)
+
+Compile once, run everywhere with skeleton:
+
+```c
+// prog.bpf.c
+#include "vmlinux.h"
+#include <bpf/bpf_helpers.h>
+
+struct event {
+    u32 pid;
+    char comm[16];
+};
+
+struct {
+    __uint(type, BPF_MAP_TYPE_RINGBUF);
+    __uint(max_entries, 256 * 1024);
+} events SEC(".maps");
+
+SEC("kprobe/do_sys_openat2")
+int BPF_KPROBE(trace_open) {
+    struct event *e;
+
+    e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
+    if (!e)
+        return 0;
+
+    e->pid = bpf_get_current_pid_tgid() >> 32;
+    bpf_get_current_comm(&e->comm, sizeof(e->comm));
+
+    bpf_ringbuf_submit(e, 0);
+    return 0;
+}
+
+char LICENSE[] SEC("license") = "GPL";
+```
+
+**Generate skeleton:**
+```bash
+# Compile
+clang -g -O2 -target bpf -D__TARGET_ARCH_x86_64 \
+    -c prog.bpf.c -o prog.bpf.o
+
+# Generate skeleton
+bpftool gen skeleton prog.bpf.o > prog.skel.h
+```
+
+**Userspace loader:**
+```c
+#include "prog.skel.h"
+
+static int handle_event(void *ctx, void *data, size_t len) {
+    struct event *e = data;
+    printf("PID %d (%s) opened file\n", e->pid, e->comm);
+    return 0;
+}
+
+int main() {
+    struct prog_bpf *skel;
+    struct ring_buffer *rb;
+
+    // Load and verify
+    skel = prog_bpf__open_and_load();
+    if (!skel)
+        return 1;
+
+    // Attach
+    prog_bpf__attach(skel);
+
+    // Setup ringbuf
+    rb = ring_buffer__new(
+        bpf_map__fd(skel->maps.events),
+        handle_event, NULL, NULL
+    );
+
+    // Poll
+    while (running)
+        ring_buffer__poll(rb, 100);
+
+    // Cleanup
+    ring_buffer__free(rb);
+    prog_bpf__destroy(skel);
+    return 0;
+}
+```
+
+**Pros:**
+- Production-ready
+- CO-RE portable
+- No runtime dependencies
+- Best performance
+
+**Cons:**
+- More boilerplate
+- Steeper learning curve
+
+---
+
+## 8. Security and LSM Hooks
+
+eBPF can enforce security policies via LSM (Linux Security Module) hooks.
+
+### 8.1 LSM BPF Program
+
+```c
+#include "vmlinux.h"
+#include <bpf/bpf_helpers.h>
+#include <bpf/bpf_core_read.h>
+
+// Deny writes to /etc/shadow
+SEC("lsm/file_open")
+int BPF_PROG(restrict_file_open, struct file *file) {
+    const char *filename;
+    char path[256];
+
+    filename = BPF_CORE_READ(file, f_path.dentry, d_name.name);
+    bpf_probe_read_kernel_str(path, sizeof(path), filename);
+
+    // Block access to /etc/shadow
+    if (__builtin_memcmp(path, "/etc/shadow", 11) == 0) {
+        return -EPERM;  // Permission denied
+    }
+
+    return 0;  // Allow
+}
+
+// Deny execution of /tmp binaries
+SEC("lsm/bprm_check_security")
+int BPF_PROG(restrict_exec, struct linux_binprm *bprm) {
+    const char *filename;
+    char path[256];
+
+    filename = BPF_CORE_READ(bprm, file, f_path.dentry, d_name.name);
+    bpf_probe_read_kernel_str(path, sizeof(path), filename);
+
+    // Check if path starts with /tmp/
+    if (path[0] == '/' && path[1] == 't' &&
+        path[2] == 'm' && path[3] == 'p' && path[4] == '/') {
+        bpf_printk("Blocked execution from /tmp: %s\n", path);
+        return -EACCES;
+    }
+
+    return 0;
+}
+```
+
+**LSM hook points:**
+- file_open, file_permission
+- bprm_check_security (exec)
+- task_alloc, task_kill
+- socket_create, socket_connect
+- inode_create, inode_unlink
+
+---
+
+## 9. Networking Use Cases
+
+### 9.1 Service Mesh Acceleration (Cilium)
+
+```
+Traditional Service Mesh (Envoy/Istio):
+    App → TCP Socket → Userspace Proxy → TCP Socket → App
+    - Overhead: 2x context switches per packet
+    - Latency: +1-2ms
+
+eBPF Service Mesh (Cilium):
+    App → Kernel TCP → eBPF redirect → Kernel TCP → App
+    - Overhead: Zero context switches
+    - Latency: +50μs
+```
+
+### 9.2 Transparent Encryption
+
+```c
+// Encrypt packets between specific pods using BPF_PROG_TYPE_SK_MSG
+SEC("sk_msg")
+int bpf_encrypt(struct sk_msg_md *msg) {
+    // Read source/dest IPs from msg
+    // Encrypt payload using map-stored keys
+    // Redirect to encrypted connection
+    return SK_PASS;
+}
+```
+
+### 9.3 L4 Load Balancing (Facebook Katran)
+
+```c
+SEC("xdp")
+int katran_lb(struct xdp_md *ctx) {
+    // 1. Parse 5-tuple (src/dst IP, src/dst port, proto)
+    // 2. Consistent hash to select backend
+    // 3. Encapsulate in IPIP/GUE tunnel
+    // 4. XDP_TX back to send
+
+    // Achieves 100Gbps throughput on commodity hardware
+    return XDP_TX;
+}
+```
+
+---
+
+## 10. Performance Analysis Tools
+
+### 10.1 bpftrace Scripts
+
+**opensnoop - trace file opens:**
+```bash
+bpftrace -e '
+tracepoint:syscalls:sys_enter_openat {
+    printf("%-6d %-16s %s\n",
+           pid, comm, str(args->filename));
+}'
+```
+
+**biolatency - block I/O latency histogram:**
+```bash
+bpftrace -e '
+kprobe:blk_account_io_start {
+    @start[arg0] = nsecs;
+}
+
+kprobe:blk_account_io_done /@start[arg0]/ {
+    @usecs = hist((nsecs - @start[arg0]) / 1000);
+    delete(@start[arg0]);
+}'
+```
+
+**tcplife - track TCP session lifetimes:**
+```bash
+bpftrace -e '
+#include <net/sock.h>
+
+kprobe:tcp_set_state {
+    $sk = (struct sock *)arg0;
+    $newstate = arg1;
+
+    if ($newstate == TCP_CLOSE) {
+        printf("%-6d %-16s %-15s:%d → %-15s:%d\n",
+            pid, comm,
+            ntop($sk->__sk_common.skc_rcv_saddr),
+            $sk->__sk_common.skc_num,
+            ntop($sk->__sk_common.skc_daddr),
+            $sk->__sk_common.skc_dport);
+    }
+}'
+```
+
+### 10.2 BCC Tools
+
+Essential BCC tools installed via `bcc-tools`:
+
+```bash
+# Trace slow syscalls
+funclatency sys_read
+
+# Count function calls
+funccount 'vfs_*'
+
+# Profile on-CPU stack traces (flame graph)
+profile -F 99 -f 30 > out.stacks
+
+# Trace TCP retransmits
+tcpretrans
+
+# Monitor slab memory allocation
+slabratetop
+
+# Trace MySQL queries
+dbslower mysql 100  # queries slower than 100ms
+```
+
+---
+
+## 11. Common Pitfalls and Best Practices
+
+### 11.1 Verifier Rejection Issues
+
+**Problem: Unbounded loops**
+```c
+// BAD - Verifier rejects
+for (int i = 0; i < data_len; i++) {  // data_len unknown!
+    process(data[i]);
+}
+
+// GOOD - Bounded loop
+#define MAX_LOOP 100
+for (int i = 0; i < MAX_LOOP && i < data_len; i++) {
+    process(data[i]);
+}
+```
+
+**Problem: Unverified NULL pointer**
+```c
+// BAD - Verifier rejects
+value = bpf_map_lookup_elem(&map, &key);
+*value += 1;  // Verifier: "R1 could be NULL!"
+
+// GOOD - Check for NULL
+value = bpf_map_lookup_elem(&map, &key);
+if (!value)
+    return 0;
+*value += 1;  // Verifier: OK
+```
+
+**Problem: Invalid memory access**
+```c
+// BAD - Verifier rejects
+char *str = (char *)ctx->arg1;
+if (str[100] == 'x')  // Unchecked read!
+    return 1;
+
+// GOOD - Use helper
+char str[101];
+bpf_probe_read_kernel_str(str, sizeof(str), (char *)ctx->arg1);
+if (str[100] == 'x')
+    return 1;
+```
+
+### 11.2 Performance Best Practices
+
+**Use per-CPU maps to avoid contention:**
+```c
+// BAD - Lock contention on shared map
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    // ...
+} shared_map SEC(".maps");
+
+// GOOD - No locks needed
+struct {
+    __uint(type, BPF_MAP_TYPE_PERCPU_HASH);
+    // ...
+} percpu_map SEC(".maps");
+```
+
+**Minimize helper calls:**
+```c
+// BAD - Helper call in loop
+for (int i = 0; i < 10; i++) {
+    u64 ts = bpf_ktime_get_ns();  // Expensive!
+    process(ts);
+}
+
+// GOOD - Call once
+u64 ts = bpf_ktime_get_ns();
+for (int i = 0; i < 10; i++) {
+    process(ts);
+}
+```
+
+**Use tail calls for complex logic:**
+```c
+// Program exceeds instruction limit?
+// Split into multiple programs:
+
+SEC("xdp")
+int stage1(struct xdp_md *ctx) {
+    // Process part 1
+    bpf_tail_call(ctx, &prog_array, 1);  // Jump to stage2
+    return XDP_PASS;  // Fallback if tail call fails
+}
+
+SEC("xdp")
+int stage2(struct xdp_md *ctx) {
+    // Process part 2
+    return XDP_PASS;
+}
+```
+
+### 11.3 Debugging Techniques
+
+**Enable verifier logs:**
+```bash
+# Detailed verifier output
+bpftool prog load prog.o /sys/fs/bpf/prog type xdp \
+    log_level 2 > verifier.log 2>&1
+```
+
+**Use bpf_printk for debugging:**
+```c
+bpf_printk("Debug: value=%llu\n", value);
+
+// View output
+sudo cat /sys/kernel/debug/tracing/trace_pipe
+```
+
+**Check map contents:**
+```bash
+# List maps
+bpftool map list
+
+# Dump map contents
+bpftool map dump id <map_id>
+
+# Update map from userspace
+bpftool map update id <map_id> key 0x01 0x02 value 0x0a 0x0b
+```
+
+---
+
+## 12. Real-World Case Studies
+
+### 12.1 Netflix: Container Security with eBPF
+
+Netflix uses eBPF LSM programs to enforce security policies:
+- Block container escapes
+- Prevent privilege escalation
+- Audit sensitive syscalls
+- Zero performance overhead vs traditional LSMs
+
+### 12.2 Facebook: XDP Load Balancing (Katran)
+
+Facebook's Katran handles:
+- 100+ Gbps throughput
+- Sub-microsecond latency
+- Millions of connections per second
+- DDoS mitigation at wire speed
+
+### 12.3 Cloudflare: DDoS Protection
+
+Cloudflare uses XDP to drop attack traffic:
+- Drops malicious packets before kernel processing
+- Handles 26M+ requests/second per core
+- Customizable filtering logic updated live
+- No downtime for rule updates
+
+---
+
+## 13. Interview Questions
+
+<AccordionGroup>
+  <Accordion title="Q1: What is the 'BTF' (BPF Type Format) and why is it important for CO-RE?">
+    **BTF (BPF Type Format)** is a compact metadata format that describes the structure of kernel types. It's crucial for **CO-RE (Compile Once – Run Everywhere)** because:
+
+    1. **Problem**: Kernel structures like `task_struct` change offsets between kernel versions
+    2. **Solution**: BTF provides type information at runtime
+    3. **Process**:
+       - Developer compiles BPF program with relocations
+       - libbpf reads BTF from `/sys/kernel/btf/vmlinux` at load time
+       - Field accesses are patched with correct offsets for the running kernel
+
+    **Example**: Access `task->pid` works on any kernel 4.18+ without recompiling, even though the offset of `pid` field varies.
+
+    Without BTF/CO-RE, you'd need kernel headers and recompilation for each kernel version.
+  </Accordion>
+
+  <Accordion title="Q2: Explain the difference between XDP and standard Linux Networking.">
+    **Standard Linux Networking:**
+    - Packet arrives → Driver allocates `sk_buff` → Copies packet data → Network stack processing
+    - `sk_buff` allocation is expensive (metadata, cloning, refcounting)
+    - Processes through netfilter, routing, TCP stack
+    - Throughput: ~1-5M pps per core
+
+    **XDP (eXpress Data Path):**
+    - Packet arrives → eBPF runs on raw DMA buffer → Decision (PASS/DROP/TX/REDIRECT)
+    - No `sk_buff` allocation for dropped/redirected packets
+    - Runs before any kernel processing
+    - Throughput: ~25M pps per core (DROP), ~20M pps (TX)
+
+    **Use cases where XDP wins:**
+    - DDoS mitigation (drop at wire speed)
+    - Load balancing (redirect without stack)
+    - Packet filtering (faster than iptables)
+
+    **When to use standard networking:**
+    - Complex protocol processing
+    - Need full TCP stack features
+    - Application-level filtering
+  </Accordion>
+
+  <Accordion title="Q3: How does eBPF handle 'Tail Calls' and why are they useful?">
+    **Tail Calls** allow one eBPF program to jump to another, replacing its execution context:
+
+    ```c
+    // Jump to program at index 1
+    bpf_tail_call(ctx, &prog_array, 1);
+    // This line never executes if tail call succeeds
+    ```
+
+    **How they work:**
+    - Current program context is replaced (not a function call)
+    - Same stack frame is reused
+    - R1 (context pointer) preserved
+    - No return to original program
+
+    **Why useful:**
+    1. **Overcome complexity limit**: Split large program into smaller pieces
+    2. **Dynamic behavior**: Load different "stages" based on packet type
+    3. **Verifier happiness**: Each program verified independently
+
+    **Limitations:**
+    - Max chain depth: 33 tail calls
+    - Overhead: ~10-20ns per tail call
+    - Debugging harder (no single stack trace)
+
+    **Example use**: Packet parser with per-protocol handlers (stage1: L2 → stage2: IPv4 → stage3: TCP)
+  </Accordion>
+
+  <Accordion title="Q4: What are the main differences between kprobes, tracepoints, and fentry/fexit?">
+    **Kprobes:**
+    - Attach to any kernel function dynamically
+    - Uses int3 breakpoint mechanism (slow)
+    - Unstable: function signatures can change
+    - Access args via `PT_REGS_PARM` macros (architecture-specific)
+    - Overhead: ~1-2μs
+
+    **Tracepoints:**
+    - Predefined stable hooks in kernel code
+    - Compiled into kernel (no breakpoint)
+    - Stable ABI: safe across kernel versions
+    - Structured arguments via BTF
+    - Overhead: ~500-800ns
+    - Limited to existing tracepoints (~1500 in kernel)
+
+    **Fentry/Fexit (5.5+):**
+    - Attach to any kernel function (like kprobes)
+    - Uses function trampolines (no breakpoint)
+    - Type-safe argument access via BTF
+    - Fexit can access return value
+    - Overhead: ~200-400ns
+    - Requires BTF and CONFIG_DEBUG_INFO_BTF
+
+    **Decision matrix:**
+    - Production + stability needed → Tracepoints
+    - Newest kernels + performance → Fentry/Fexit
+    - Broad compatibility → Kprobes
+  </Accordion>
+
+  <Accordion title="Q5: How does the eBPF verifier prevent infinite loops while allowing bounded loops?">
+    The verifier uses **static analysis** to ensure termination:
+
+    **Pre-5.3 (No loops allowed):**
+    - Verifier built DAG (Directed Acyclic Graph)
+    - Any back-edge rejected
+    - Solution: Loop unrolling via `#pragma unroll`
+
+    **Post-5.3 (Bounded loops):**
+    1. **Loop detection**: Identify back-edges in CFG
+    2. **Iteration tracking**: Track loop counter in register state
+    3. **Bounds proving**:
+       ```c
+       for (i = 0; i < 100; i++) { ... }
+       // Verifier tracks: i ∈ [0, 99]
+       ```
+    4. **Complexity limit**: Max iterations before verifier gives up
+    5. **Verification**: Simulates execution paths, pruning equivalent states
+
+    **Requirements for loops:**
+    - Loop variable must have provable upper bound
+    - Bound must be constant or map value with known range
+    - Total complexity stays under 1M instructions
+
+    **Example rejection:**
+    ```c
+    while (condition) { ... }  // Rejected: no provable bound
+    for (i = 0; i < len; i++)  // Rejected: len unknown
+    ```
+
+    **Workaround:**
+    ```c
+    #define MAX 100
+    for (i = 0; i < MAX && i < len; i++)  // OK: bounded by MAX
+    ```
+  </Accordion>
+
+  <Accordion title="Q6: Explain eBPF ring buffers and how they differ from perf buffers.">
+    **Perf Buffer (older):**
+    ```
+    Architecture:
+    - Per-CPU circular buffers
+    - Each CPU has separate buffer
+    - Events can be reordered across CPUs
+    - Lost events if buffer full (can't reserve)
+
+    Problems:
+    - Memory fragmentation (must size all per-CPU buffers)
+    - No ordering guarantees
+    - Wasteful on CPU imbalance
+    ```
+
+    **Ring Buffer (modern, 5.8+):**
+    ```
+    Architecture:
+    - Single shared buffer (multi-producer, single-consumer)
+    - Lock-free using atomics
+    - Maintains global ordering
+    - Can reserve space before writing
+
+    Advantages:
+    ✓ Better memory efficiency
+    ✓ Event ordering preserved
+    ✓ Reserve/commit model (no lost events)
+    ✓ Variable-length records
+    ✓ Lower overhead
+    ```
+
+    **API difference:**
+    ```c
+    // Perf buffer
+    e = bpf_perf_event_output(ctx, &events, BPF_F_CURRENT_CPU,
+                               &data, sizeof(data));
+
+    // Ring buffer
+    e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
+    if (e) {
+        // fill e
+        bpf_ringbuf_submit(e, 0);
+    }
+    ```
+
+    **When to use ring buffer:** Always, unless kernel <5.8
+  </Accordion>
+
+  <Accordion title="Q7: How would you debug an eBPF program that passes the verifier but crashes the kernel?">
+    This is rare but critical. Debugging steps:
+
+    **1. Check Verifier Logs:**
+    ```bash
+    bpftool prog load prog.o /sys/fs/bpf/prog log_level 2 log_size 1000000
+    ```
+
+    **2. Enable Debug Output:**
+    ```c
+    // Add bpf_printk before crash point
+    bpf_printk("Checkpoint 1: value=%llu\n", value);
+    // Monitor: sudo cat /sys/kernel/debug/tracing/trace_pipe
+    ```
+
+    **3. Check Kernel Logs:**
+    ```bash
+    dmesg | tail -100
+    # Look for: "BPF:xxx", "RIP:", "Call Trace:"
+    ```
+
+    **4. Inspect JIT Code:**
+    ```bash
+    bpftool prog dump jited id <id>
+    # Look for invalid memory access patterns
+    ```
+
+    **5. Common Crash Causes:**
+    - Helper function called with invalid args (verifier missed edge case)
+    - Race condition in map access
+    - Kernel version mismatch with helpers
+    - Stack corruption (exceeding 512 bytes)
+    - Invalid pointer arithmetic that verifier approved
+
+    **6. Isolation:**
+    ```bash
+    # Test on non-production system
+    # Use ftrace to identify exact crash point
+    echo function > /sys/kernel/debug/tracing/current_tracer
+    ```
+
+    **7. Kernel Debugging:**
+    ```bash
+    # If reproducible, use kgdb/crash dump analysis
+    crash vmlinux vmcore
+    ```
+
+    **Prevention:**
+    - Always check helper return values
+    - Use bounded operations
+    - Test on multiple kernel versions
+    - Run in safe environment first
+  </Accordion>
+
+  <Accordion title="Q8: What is the performance overhead of eBPF tracing compared to alternatives?">
+    **Comparison of tracing overhead:**
+
+    **strace (ptrace-based):**
+    - Overhead: 100-300x slowdown
+    - Mechanism: 2 context switches per syscall
+    - Use case: Only for debugging, never production
+
+    **SystemTap:**
+    - Overhead: 10-50x slowdown
+    - Mechanism: Kernel module with safety checks
+    - Use case: Complex analysis, but risky in production
+
+    **perf probe (kprobes):**
+    - Overhead: 5-20x for traced functions
+    - Mechanism: int3 breakpoint
+    - Use case: Short-term analysis
+
+    **eBPF (kprobes):**
+    - Overhead: 2-10x for traced functions
+    - Mechanism: JIT'd code at breakpoint
+    - In-kernel aggregation: <1% total overhead
+
+    **eBPF (tracepoints):**
+    - Overhead: 1-3x for traced functions
+    - Mechanism: No breakpoint, direct call
+    - In-kernel aggregation: <0.5% total overhead
+
+    **eBPF (fentry/fexit):**
+    - Overhead: <2x for traced functions
+    - Mechanism: Direct function trampoline
+    - In-kernel aggregation: <0.3% total overhead
+
+    **Key factors:**
+    1. **Aggregation**: eBPF aggregates in kernel, others send every event to userspace
+    2. **Context switches**: eBPF avoids userspace trips
+    3. **JIT**: Near-native code execution
+
+    **Real example:**
+    ```
+    Trace all open() syscalls on busy server:
+    - strace: System becomes unusable
+    - perf: 20% CPU overhead
+    - eBPF: <1% CPU overhead
+    ```
+  </Accordion>
+</AccordionGroup>
+
+---
+
+## 14. Hands-On Exercises
+
+### Exercise 1: Write a File Access Monitor
+
+Create an eBPF program that:
+1. Traces all file open operations
+2. Records which process accessed which file
+3. Exports data via ring buffer to userspace
+4. Filters by specific directory (e.g., /etc/)
+
+### Exercise 2: Build a Network Latency Tracker
+
+Create an XDP program that:
+1. Timestamps incoming packets
+2. Matches with outgoing responses
+3. Calculates round-trip time
+4. Maintains histogram in eBPF map
+
+### Exercise 3: Implement a Simple Firewall
+
+Create an eBPF firewall that:
+1. Blocks connections to specific ports
+2. Rate-limits per source IP
+3. Logs blocked attempts
+4. Allows dynamic rule updates via map
+
+### Exercise 4: CPU Profiler
+
+Create a profiling tool that:
+1. Samples CPU stack traces every 10ms
+2. Aggregates by function name
+3. Generates flame graph data
+4. Handles both kernel and userspace stacks
+
+---
+
+## 15. Advanced Resources
+
+**Documentation:**
+- Kernel BPF documentation: `Documentation/bpf/` in Linux source
+- BTF specification: https://www.kernel.org/doc/html/latest/bpf/btf.html
+- Linux BPF mailing list archives
+
+**Books:**
+- "BPF Performance Tools" by Brendan Gregg
+- "Learning eBPF" by Liz Rice
+- "Linux Observability with BPF" by David Calavera
+
+**Tools:**
+- libbpf: https://github.com/libbpf/libbpf
+- bcc: https://github.com/iovisor/bcc
+- bpftrace: https://github.com/iovisor/bpftrace
+- Cilium: https://cilium.io/
+
+**Learning:**
+- eBPF Summit (annual conference)
+- Cilium eBPF labs
+- Brendan Gregg's blog and tools
+
+---
+
+Next: [The Linux VFS & Advanced File Systems](/operating-systems/file-systems) →

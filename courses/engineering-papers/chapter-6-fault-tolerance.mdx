@@ -1,0 +1,1816 @@
+---
+title: "Fault Tolerance"
+sidebarTitle: "Chapter 6: Fault Tolerance"
+description: "Comprehensive exploration of GFS fault tolerance mechanisms, failure handling, master and chunk replication, and recovery strategies"
+icon: "shield-halved"
+---
+
+# Chapter 6: Fault Tolerance
+
+Fault tolerance is at the heart of GFS's design. Built for commodity hardware where failures are the norm, not the exception, GFS employs multiple layers of redundancy and recovery mechanisms. This chapter explores how GFS handles failures at every level, from disk corruption to datacenter outages.
+
+<Info>
+**Chapter Goals**:
+- Understand GFS's multi-layered fault tolerance approach
+- Master chunk replication and re-replication strategies
+- Learn master replication and fast recovery mechanisms
+- Explore failure detection and handling procedures
+- Grasp data integrity maintenance across failures
+</Info>
+
+---
+
+## Failure Assumptions
+
+GFS was designed with specific failure assumptions based on Google's operational experience.
+
+### Expected Failure Rates
+
+```text
+FAILURE STATISTICS (Google's 2003 Experience)
+─────────────────────────────────────────────
+
+Cluster: 1000 commodity machines
+
+DAILY FAILURES:
+──────────────
+
+Component          Frequency        MTBF         Impact
+─────────────────────────────────────────────────────────
+Disk failure       2-4/day          ~1 year      1 chunk lost
+Machine crash      1-2/day          ~3 years     All chunks inaccessible
+Network issue      1-3/day          Varies       Partial cluster partition
+Power supply       ~1/day           ~2 years     Machine down
+Memory error       ~5/week          Varies       Corruption or crash
+
+MONTHLY FAILURES:
+────────────────
+
+Network switch     ~1/month         ~10 years    Rack isolated
+Cooling problem    ~1/month         Varies       Rack overheating
+Operator error     ~2/month         N/A          Configuration issues
+
+YEARLY FAILURES:
+───────────────
+
+Rack power         ~1/year          N/A          Entire rack down
+Datacenter event   Rare             N/A          Regional outage
+
+
+IMPLICATIONS:
+────────────
+
+1. Component failures are CONTINUOUS
+   • At least one failure per day
+   • Multiple concurrent failures common
+   • Must handle gracefully
+
+2. MTBF for cluster << individual component
+   • Single machine: ~3 years
+   • 1000 machines: ~1 day
+   • "Failures are the norm, not the exception"
+
+3. Fast failure detection required
+   • Heartbeat: 30-60 seconds
+   • Multiple missed heartbeats: declare dead
+   • False positives acceptable (re-replication cheap)
+
+4. Automatic recovery essential
+   • No manual intervention for common failures
+   • Self-healing system
+   • Monitoring and alerting for trends
+```
+
+### Design for Failure
+
+<CardGroup cols={2}>
+  <Card title="Assume Everything Fails" icon="triangle-exclamation">
+    **Core Philosophy**:
+
+    - Disks fail continuously
+    - Machines crash regularly
+    - Network partitions happen
+    - Silent data corruption occurs
+    - Plan for all failure scenarios
+  </Card>
+
+  <Card title="Fast Detection" icon="radar">
+    **Quick Discovery**:
+
+    - Heartbeat every 30-60 seconds
+    - Checksum verification on reads
+    - Version number staleness detection
+    - Client-reported errors
+    - Background scrubbing
+  </Card>
+
+  <Card title="Automatic Recovery" icon="rotate">
+    **Self-Healing**:
+
+    - Re-replication on detection
+    - Master failover automated
+    - Chunk migration for balance
+    - Garbage collection cleanup
+    - No manual intervention
+  </Card>
+
+  <Card title="Multiple Replicas" icon="copy">
+    **Redundancy**:
+
+    - 3 replicas default per chunk
+    - Cross-rack placement
+    - Independent failure domains
+    - Can tolerate 2 failures
+    - Configurable replication factor
+  </Card>
+</CardGroup>
+
+---
+
+## Chunk Replication
+
+Chunk replication is the primary defense against data loss.
+
+### Replication Strategy
+
+<Tabs>
+  <Tab title="Placement Policy">
+    **Initial Replica Placement**:
+
+    ```text
+    REPLICA PLACEMENT ALGORITHM
+    ──────────────────────────
+
+    Goal: Maximize reliability and bandwidth
+
+    When creating new chunk replica:
+    ────────────────────────────────
+
+    1. SELECT FIRST REPLICA
+       ──────────────────
+
+       Factors considered:
+       • Below-average disk utilization
+       • Limit recent chunk creations
+         (new chunks → writes soon)
+       • Spread across racks
+
+       Algorithm:
+       ─────────
+       candidates = filter_servers(
+           disk_usage < average,
+           recent_creations < threshold
+       )
+
+       selected = pick_random(candidates)
+
+    2. SELECT SECOND REPLICA
+       ─────────────────────
+
+       Must be on DIFFERENT RACK from first
+
+       Why different rack?
+       • Rack failure tolerance
+       • Switch failure tolerance
+       • Power/cooling failure tolerance
+
+       ┌─────────────┐  ┌─────────────┐
+       │  Rack A     │  │  Rack B     │
+       │  Replica 1  │  │  Replica 2  │
+       └─────────────┘  └─────────────┘
+
+       Rack fails? Still have copy
+
+       Algorithm:
+       ─────────
+       candidates = filter_servers(
+           rack != rack_of_replica1,
+           disk_usage < average
+       )
+
+       selected = pick_random(candidates)
+
+    3. SELECT THIRD REPLICA
+       ────────────────────
+
+       Two strategies:
+
+       Strategy A: Same rack as replica 1
+       ──────────────────────────────────
+       ┌─────────────┐  ┌─────────────┐
+       │  Rack A     │  │  Rack B     │
+       │  Replica 1  │  │  Replica 2  │
+       │  Replica 3  │  │             │
+       └─────────────┘  └─────────────┘
+
+       Benefits:
+       • 2 in Rack A: intra-rack bandwidth
+       • Faster replica recovery
+       • Cheaper network for writes
+
+       Strategy B: Third rack
+       ──────────────────────
+       ┌──────┐  ┌──────┐  ┌──────┐
+       │Rack A│  │Rack B│  │Rack C│
+       │Rep 1 │  │Rep 2 │  │Rep 3 │
+       └──────┘  └──────┘  └──────┘
+
+       Benefits:
+       • Maximum reliability
+       • Tolerates 2 rack failures
+       • Used for critical data
+
+       GFS typically uses Strategy A:
+       • 2 in one rack, 1 in another
+       • Balance reliability and bandwidth
+
+
+    EXAMPLE EXECUTION:
+    ─────────────────
+
+    Creating chunk 0x1a2b:
+
+    Step 1: Pick first replica
+    ──────────────────────────
+    All servers:
+    cs-1 (Rack A): 45% full, 2 recent creations
+    cs-2 (Rack A): 78% full, 5 recent creations ✗ (high util)
+    cs-3 (Rack B): 34% full, 1 recent creation  ✓
+    cs-4 (Rack B): 56% full, 0 recent creations ✓
+    cs-5 (Rack C): 90% full, 1 recent creation  ✗ (high util)
+
+    Candidates: cs-3, cs-4
+    Selected: cs-3 (random)
+
+    Step 2: Pick second replica (different rack)
+    ────────────────────────────────────────────
+    Must be != Rack B
+
+    Candidates:
+    cs-1 (Rack A): 45% full ✓
+    cs-5 (Rack C): 90% full ✗
+
+    Selected: cs-1
+
+    Step 3: Pick third replica
+    ──────────────────────────
+    Strategy A: Same as cs-1 (Rack A)
+
+    Candidates in Rack A:
+    cs-2 (Rack A): 78% full ✗
+    cs-6 (Rack A): 42% full ✓
+
+    Selected: cs-6
+
+    Final placement:
+    ────────────────
+    Chunk 0x1a2b:
+    • Replica 1: cs-1 (Rack A)
+    • Replica 2: cs-3 (Rack B)
+    • Replica 3: cs-6 (Rack A)
+
+    Properties:
+    • Survives Rack B failure
+    • Survives any single rack failure
+    • 2 in Rack A for intra-rack bandwidth
+    ```
+  </Tab>
+
+  <Tab title="Re-replication">
+    **Restoring Replica Count**:
+
+    ```text
+    RE-REPLICATION WORKFLOW
+    ──────────────────────
+
+    Trigger: Replica count falls below target
+
+    CAUSES:
+    ──────
+
+    1. Chunkserver failure (most common)
+    2. Disk failure
+    3. Corruption detected
+    4. Replica unreachable
+    5. Replica version is stale
+
+
+    DETECTION:
+    ─────────
+
+    Master tracks replica count for each chunk
+
+    Heartbeat from chunkservers:
+    ───────────────────────────
+
+    Every 30-60 seconds:
+
+    cs-5 → Master:
+      "I'm alive, I have chunks: [0x1a2b, 0x2c3d, ...]"
+
+    Master updates:
+      chunk_replicas[0x1a2b] = [..., cs-5, ...]
+
+    When chunkserver fails:
+    ──────────────────────
+
+    cs-5 misses 3 heartbeats (90-180 seconds)
+
+    Master marks cs-5 as dead:
+      dead_servers.add(cs-5)
+
+    Master scans all chunks:
+      for chunk in all_chunks:
+          chunk.replicas.remove(cs-5)
+          if len(chunk.replicas) < REPLICATION_GOAL:
+              schedule_re_replication(chunk)
+
+
+    PRIORITIZATION:
+    ──────────────
+
+    Not all chunks re-replicated immediately
+    Prioritize by urgency:
+
+    Priority Levels:
+    ───────────────
+
+    P0 (CRITICAL): 0 replicas
+    • Data loss imminent!
+    • Re-replicate immediately
+    • Rare (usually have 1+ replica)
+
+    P1 (URGENT): 1 replica
+    • One failure away from data loss
+    • High priority
+    • Re-replicate within minutes
+
+    P2 (HIGH): 2 replicas (target is 3)
+    • Below target but safe
+    • Re-replicate within hours
+    • Most common case
+
+    P3 (NORMAL): 3+ replicas
+    • Above or at target
+    • May reduce replicas if too many
+
+    Additionally boost priority:
+    ──────────────────────────
+    • Recently accessed (hot data)
+    • Blocking client operations
+    • Important system files
+
+    Priority queue:
+    ──────────────
+
+    re_replication_queue = PriorityQueue()
+
+    Chunk 0x1a2b: 1 replica, recently accessed
+    → Priority: P1 + hot data bonus = 1000
+
+    Chunk 0x2c3d: 2 replicas, cold data
+    → Priority: P2 = 100
+
+    Chunk 0x3e4f: 2 replicas, blocking write
+    → Priority: P2 + blocking bonus = 500
+
+    Process queue in order: 0x1a2b, 0x3e4f, 0x2c3d
+
+
+    EXECUTION:
+    ─────────
+
+    For each chunk in priority queue:
+
+    1. Select source chunkserver
+       ──────────────────────
+       • Must have valid replica
+       • Prefer low load
+       • Prefer near destination
+
+    2. Select destination chunkserver
+       ──────────────────────────────
+       • Same criteria as new placement
+       • Respect rack diversity
+       • Balance load
+
+    3. Issue clone command
+       ──────────────────
+       Master → destination:
+         "Clone chunk 0x1a2b from cs-3"
+
+       Destination → source:
+         "Send me chunk 0x1a2b"
+
+       Source → destination:
+         [64MB of chunk data + checksums]
+
+       Destination:
+         • Writes to disk
+         • Verifies checksums
+         • Reports to master
+
+    4. Update metadata
+       ──────────────
+       Master updates:
+         chunk_replicas[0x1a2b].add(destination)
+
+    5. Mark complete
+       ────────────
+       Chunk now back to 3 replicas ✓
+
+
+    RATE LIMITING:
+    ─────────────
+
+    Master limits concurrent re-replications:
+
+    Limits:
+    ──────
+    • Max concurrent: 50-100 cluster-wide
+    • Max per chunkserver: 1-2 as source
+    • Max per chunkserver: 1-2 as destination
+    • Throttle if cluster load high
+
+    Why limit?
+    ─────────
+    • Avoid network saturation
+    • Avoid overwhelming chunkservers
+    • Background process, not urgent
+    • Gradual restoration OK
+
+    Typical rates:
+    ─────────────
+    • P1 chunks: ~10 minutes to restore
+    • P2 chunks: ~hours to restore
+    • Full cluster re-balance: ~days
+
+
+    EXAMPLE SCENARIO:
+    ────────────────
+
+    cs-12 fails (had 10,000 chunks)
+
+    Master scans chunks on cs-12:
+    ────────────────────────────
+
+    Chunk 0x1111: Now 1 replica  → P1 (urgent)
+    Chunk 0x2222: Now 2 replicas → P2 (normal)
+    Chunk 0x3333: Now 2 replicas → P2
+    ...
+    (10,000 chunks affected)
+
+    Priority queue:
+    ──────────────
+    P1: 100 chunks (1 replica remaining)
+    P2: 9,900 chunks (2 replicas remaining)
+
+    Re-replication timeline:
+    ───────────────────────
+
+    T+0:     Failure detected
+    T+2min:  P1 chunks start re-replicating
+    T+15min: P1 chunks complete (100 chunks)
+    T+30min: P2 chunks at 50% (5,000 done)
+    T+2hr:   P2 chunks at 90% (9,000 done)
+    T+4hr:   All chunks restored to 3 replicas
+
+    During this time:
+    ────────────────
+    • All data accessible (2+ replicas)
+    • Read performance slightly degraded
+    • Write performance normal
+    • No data loss
+    • Automatic recovery
+    ```
+  </Tab>
+
+  <Tab title="Rebalancing">
+    **Load Balancing**:
+
+    ```text
+    CHUNK REBALANCING
+    ────────────────
+
+    Goal: Even distribution of chunks across servers
+
+    TRIGGERS:
+    ────────
+
+    1. New chunkserver added
+       • Has 0% disk usage
+       • Should receive new chunks
+       • Gradually fill to average
+
+    2. Uneven distribution detected
+       • Some servers > 80% full
+       • Some servers < 40% full
+       • Rebalance to average
+
+    3. Performance imbalance
+       • Some servers high load
+       • Some servers idle
+       • Migrate hot chunks
+
+
+    REBALANCING ALGORITHM:
+    ─────────────────────
+
+    Background process runs periodically:
+
+    def rebalance_chunks():
+        # Calculate statistics
+        avg_usage = calculate_average_disk_usage()
+        avg_load = calculate_average_load()
+
+        # Find imbalanced servers
+        overloaded = find_servers(
+            disk_usage > avg + THRESHOLD
+        )
+        underloaded = find_servers(
+            disk_usage < avg - THRESHOLD
+        )
+
+        if not overloaded or not underloaded:
+            return  # Balanced
+
+        # Select chunks to move
+        for src in overloaded:
+            for dst in underloaded:
+                # Pick chunk to migrate
+                chunk = select_chunk_to_move(
+                    src, dst,
+                    prefer_cold_chunks=True,
+                    respect_rack_diversity=True
+                )
+
+                if chunk:
+                    migrate_chunk(chunk, src, dst)
+
+                    if servers_balanced():
+                        return
+
+
+    EXAMPLE:
+    ───────
+
+    Cluster state:
+    ─────────────
+    cs-1: 90% full  (overloaded)
+    cs-2: 85% full  (overloaded)
+    cs-3: 40% full  (underloaded)
+    cs-4: 45% full  (underloaded)
+    cs-5: 35% full  (underloaded)
+
+    Average: 59% full
+    Threshold: ±20%
+
+    Overloaded: cs-1, cs-2
+    Underloaded: cs-3, cs-4, cs-5
+
+    Migration plan:
+    ──────────────
+
+    Move chunks from cs-1:
+    • Chunk 0x1111 → cs-3
+    • Chunk 0x2222 → cs-4
+    • Chunk 0x3333 → cs-5
+
+    Move chunks from cs-2:
+    • Chunk 0x4444 → cs-3
+    • Chunk 0x5555 → cs-5
+
+    After migration:
+    ───────────────
+    cs-1: 70% full  (balanced)
+    cs-2: 72% full  (balanced)
+    cs-3: 55% full  (balanced)
+    cs-4: 52% full  (balanced)
+    cs-5: 50% full  (balanced)
+
+    All within threshold ✓
+
+
+    CONSTRAINTS:
+    ───────────
+
+    When migrating, must maintain:
+
+    1. Rack diversity
+       • Don't move to same rack
+       • Maintain cross-rack replicas
+
+    2. Replication count
+       • Don't reduce below target
+       • Temporarily may have 4 replicas
+       • Delete old after new confirmed
+
+    3. Rate limits
+       • Background process
+       • Low priority
+       • Don't impact foreground I/O
+       • Typical: 1-5 chunks/minute
+
+    4. Load considerations
+       • Don't overload destination
+       • Avoid moving hot chunks
+       • Prefer cold chunks for migration
+    ```
+  </Tab>
+</Tabs>
+
+### The "External Watchdog" (Chubby)
+While GFS is self-contained for data, its **Master Election** is often coordinated by an external distributed locking service called **Chubby**.
+
+1. **Master Election**: When the master starts, it attempts to acquire a specific lock in Chubby. Only one process can hold this lock at a time, becoming the "Primary Master".
+2. **Monitoring**: If the Primary Master crashes, its Chubby session expires and the lock is released.
+3. **Failover**: A waiting "Shadow Master" or a new process detects the released lock, acquires it, and promotes itself to Primary Master.
+
+**Why this matters**: It prevents **Split-Brain** scenarios where two masters think they are in charge, which would lead to catastrophic metadata corruption.
+
+---
+
+## Data Integrity: The Checksumming Trade-off
+
+GFS chooses to verify data integrity only at the **endpoints** (Chunkservers) rather than during every hop in the network.
+
+### No Inter-Replica Checksumming
+- **The Decision**: GFS does not compare checksums between replicas during write operations.
+- **The Reason**: Network bandwidth is expensive. Comparing 64MB of data across 3 replicas every time a chunk is copied would consume massive aggregate bandwidth.
+- **The Risk**: If a chunk is corrupted *during* a copy from one server to another, the destination might store corrupted data.
+- **The Mitigation**: The destination chunkserver computes its own checksum *after* receiving the data. On the next read, the corruption will be detected, and the master will schedule a repair from a different, healthy replica.
+
+### Silent Data Corruption (Bit Rot)
+Chunkservers don't just wait for reads. They cycle through **inactive chunks** in the background to detect bit rot on aging disks. This "Scrubbing" ensures that a rarely-accessed archive doesn't slowly decay into unreadability.
+
+---
+
+## Master Fault Tolerance
+
+The master is the most critical component—its failure requires special handling.
+
+### Master Replication
+
+<Steps>
+  <Step title="Operation Log Replication">
+    ```text
+    OPERATION LOG REPLICATION
+    ────────────────────────
+
+    Every metadata mutation is logged and replicated
+
+    Operation Log Write:
+    ───────────────────
+
+    Client → Master: create("/data/file1")
+
+    Master process:
+    ──────────────
+
+    1. Create log entry:
+       ┌──────────────────────────────┐
+       │ Timestamp: 1234567890         │
+       │ Operation: CREATE_FILE        │
+       │ Path: /data/file1             │
+       │ Owner: user_x                 │
+       │ Permissions: 0644             │
+       └──────────────────────────────┘
+
+    2. Write to local disk:
+       append_to_log(log_entry)
+
+    3. Replicate to shadow masters:
+       for shadow in shadow_masters:
+           shadow.replicate_log(log_entry)
+
+    4. Replicate to remote disks:
+       for remote_disk in remote_disks:
+           remote_disk.write_log(log_entry)
+
+    5. Wait for ACKs from ALL:
+       wait_for_acks([shadows, remote_disks])
+
+    6. If all ACK:
+       apply_to_memory(log_entry)
+       return SUCCESS to client
+
+    7. If any fail:
+       retry or abort
+
+
+    Guarantees:
+    ──────────
+
+    • Client sees success → operation is durable
+    • Replicated to multiple machines
+    • Different failure domains
+    • Can reconstruct from any copy
+    • Shadow masters stay synchronized
+
+
+    Replication Locations:
+    ─────────────────────
+
+    • Primary master local disk
+    • Shadow master 1 (same datacenter)
+    • Shadow master 2 (same datacenter)
+    • Remote disk 1 (different datacenter)
+    • Remote disk 2 (different datacenter)
+
+    → Can survive datacenter failure!
+    ```
+  </Step>
+
+  <Step title="Shadow Masters">
+    ```text
+    SHADOW MASTER OPERATION
+    ──────────────────────
+
+    Purpose: Read-only replicas for failover
+
+    Shadow master continuously:
+    ─────────────────────────
+
+    1. Receive operation log entries
+       (replicated from primary)
+
+    2. Apply to local state:
+       replay_operation(log_entry)
+
+    3. Build same in-memory metadata:
+       • Namespace
+       • Chunk handles
+       • File metadata
+
+    4. Poll chunkservers:
+       (just like primary, but read-only)
+
+    5. Serve read requests:
+       • File listings
+       • Chunk location queries
+       • Metadata lookups
+
+    6. Cannot serve:
+       • Writes (redirect to primary)
+       • Lease grants
+       • Chunk creation
+       • Mutations
+
+
+    Lag Behind Primary:
+    ──────────────────
+
+    Shadow typically lags by seconds:
+
+    • Primary applies immediately
+    • Replication: ~100ms
+    • Shadow applies: ~1 second
+
+    Acceptable for reads:
+    • Metadata queries slightly stale
+    • Client cache may be stale anyway
+    • Eventually consistent
+
+
+    Failover Process:
+    ────────────────
+
+    Primary master fails:
+
+    T+0:    Primary crashes
+    T+10s:  Monitoring detects (missed heartbeats)
+    T+15s:  External coordination service
+            (e.g., Chubby) triggers failover
+
+    T+20s:  Promote shadow to primary:
+            1. Stop accepting reads
+            2. Apply any pending log entries
+            3. Enable write mode
+            4. Start granting leases
+            5. Begin accepting writes
+
+    T+30s:  Update DNS/configuration
+            Clients redirect to new primary
+
+    T+60s:  System fully operational
+
+    Downtime: ~1 minute
+    Data loss: None (log replicated)
+    ```
+  </Step>
+
+  <Step title="Fast Recovery">
+    ```text
+    MASTER RECOVERY PROCESS
+    ──────────────────────
+
+    Master starts (after crash or restart)
+
+    Phase 1: Load Checkpoint
+    ────────────────────────
+
+    • Load latest checkpoint from disk
+    • Compact B-tree format
+    • Contains:
+      - Full namespace
+      - Chunk handles
+      - Version numbers
+      - File metadata
+
+    • Size: <1 GB typically
+    • Load time: 1-2 seconds
+
+    After Phase 1:
+    • Namespace in memory
+    • File → chunk mappings known
+    • But: chunk locations unknown
+
+
+    Phase 2: Replay Operation Log
+    ─────────────────────────────
+
+    • Read log entries since checkpoint
+    • Apply each operation in order
+    • Updates in-memory state
+
+    • Typical: 100K-1M operations
+    • Replay rate: 100K ops/second
+    • Time: 1-10 seconds
+
+    After Phase 2:
+    • Namespace fully updated
+    • All metadata current
+    • Still: chunk locations unknown
+
+
+    Phase 3: Chunk Location Discovery
+    ─────────────────────────────────
+
+    Master → all chunkservers:
+      "Tell me what chunks you have"
+
+    Each chunkserver → Master:
+      "I have: [chunk_handle, version] list"
+
+    Example response from cs-5:
+    ──────────────────────────
+    [
+      (0x1a2b, version=3),
+      (0x2c3d, version=5),
+      (0x3e4f, version=2),
+      ...
+      (10,000 chunks total)
+    ]
+
+    Master builds location map:
+    ──────────────────────────
+
+    chunk_locations = {}
+    for chunk, version in chunkserver_report:
+        if version >= expected_version[chunk]:
+            chunk_locations[chunk].add(chunkserver)
+        else:
+            # Stale replica, mark for deletion
+            mark_garbage(chunkserver, chunk)
+
+    Poll time:
+    • 1000 chunkservers
+    • Each reports 10K chunks
+    • Network transfer: 10-30 seconds
+    • Processing: few seconds
+
+    After Phase 3:
+    • Master knows all chunk locations
+    • Can serve requests
+    • Stale replicas identified
+
+
+    Phase 4: Resume Operations
+    ──────────────────────────
+
+    Master now ready:
+
+    • Accepts client requests
+    • Grants leases
+    • Creates chunks
+    • Fully operational
+
+    Total recovery time:
+    ───────────────────
+
+    Phase 1: 1-2 seconds
+    Phase 2: 1-10 seconds
+    Phase 3: 10-30 seconds
+    Phase 4: Ready
+
+    Total: 15-45 seconds typically
+    Maximum: ~60 seconds
+
+    During recovery:
+    ───────────────
+
+    • Shadow masters serve reads
+    • Writes queued or failed
+    • Clients retry automatically
+    • Minimal user impact
+    ```
+  </Step>
+</Steps>
+
+### Checkpointing
+
+```text
+CHECKPOINT MECHANISM
+───────────────────
+
+Purpose: Faster recovery than replaying full log
+
+Checkpoint Creation:
+───────────────────
+
+Background thread (while master operational):
+
+1. Master switches to new log file:
+   current_log = new_log_file()
+
+2. Background thread snapshots state:
+   snapshot = serialize_namespace()
+   • All files and directories
+   • Chunk handles
+   • Version numbers
+   • Metadata
+
+3. Write compact B-tree to disk:
+   write_checkpoint(snapshot)
+
+4. Doesn't block ongoing operations!
+   Master continues serving requests
+
+5. Complete:
+   • Old log file can be deleted
+   • Checkpoint is new baseline
+
+
+Checkpoint Frequency:
+────────────────────
+
+Trigger conditions:
+• Log file reaches size limit (e.g., 64MB)
+• Time since last checkpoint (e.g., 1 hour)
+• Master startup (after crash)
+
+Typical: Every 1-2 hours in steady state
+
+
+Checkpoint Format:
+─────────────────
+
+Compact B-tree (on disk):
+
+• Efficient prefix compression
+• Fast random access
+• Small size (<1 GB for 100M chunks)
+• Quick to load (1-2 seconds)
+
+
+Recovery with Checkpoints:
+──────────────────────────
+
+Without checkpoint:
+• Must replay entire history
+• Millions of operations
+• Minutes to hours
+
+With checkpoint:
+• Load checkpoint (seconds)
+• Replay since checkpoint (seconds)
+• Total: <1 minute
+
+
+Example Timeline:
+────────────────
+
+T0:      Master creates checkpoint_A
+T0-T1:   Operations logged to log_B
+T1:      Master creates checkpoint_B
+         (log_B incorporated)
+T1-T2:   Operations logged to log_C
+T2:      Master crashes
+
+Recovery:
+─────────
+• Load checkpoint_B (latest)
+• Replay log_C (since checkpoint_B)
+• Fast recovery!
+
+Without checkpoints:
+───────────────────
+• Replay all logs since system start
+• Could be days/weeks of operations
+• Impractical
+```
+
+---
+
+## Failure Scenarios
+
+How GFS handles different failure types:
+
+<AccordionGroup>
+  <Accordion title="Chunkserver Failure" icon="server">
+    **Most Common Failure**:
+
+    ```text
+    CHUNKSERVER FAILURE HANDLING
+    ───────────────────────────
+
+    Scenario: cs-12 crashes
+
+    Detection:
+    ─────────
+
+    T+0:    cs-12 crashes
+    T+30s:  Master expects heartbeat, none arrives
+    T+60s:  Master expects heartbeat, none arrives
+    T+90s:  Master declares cs-12 dead
+            (3 missed heartbeats)
+
+    Master Action:
+    ─────────────
+
+    1. Mark cs-12 as dead:
+       dead_servers.add(cs-12)
+
+    2. Scan all chunks:
+       for chunk in all_chunks:
+           if cs-12 in chunk.replicas:
+               chunk.replicas.remove(cs-12)
+               if len(chunk.replicas) < 3:
+                   schedule_re_replication(chunk)
+
+    3. Identify affected chunks:
+       • 10,000 chunks on cs-12
+       • All now under-replicated
+
+    4. Prioritize re-replication:
+       • 1 replica: URGENT
+       • 2 replicas: NORMAL
+       • Already covered above
+
+    5. Execute re-replication:
+       (covered in re-replication section)
+
+
+    Client Impact:
+    ─────────────
+
+    Reads from cs-12:
+    • Fail immediately (connection error)
+    • Client retries with different replica
+    • Transparent to application
+    • Slight latency spike
+
+    Writes to cs-12:
+    • Primary (cs-12) is dead
+    • Lease expires (60 seconds max)
+    • Master grants lease to different replica
+    • Client retries, succeeds
+
+
+    Recovery if cs-12 Comes Back:
+    ─────────────────────────────
+
+    Scenario: cs-12 was network partition, not dead
+
+    T+300s: cs-12 reconnects
+
+    cs-12 → Master: Heartbeat with chunk list
+
+    Master checks:
+    ─────────────
+
+    For each chunk cs-12 reports:
+    1. Is version stale?
+       → Mark for garbage collection
+
+    2. Is chunk already re-replicated?
+       → Now have 4 replicas
+       → Delete one (rebalancing)
+
+    3. Is chunk still under-replicated?
+       → Count cs-12's copy
+       → May cancel pending re-replication
+
+
+    False Positive Handling:
+    ───────────────────────
+
+    Network partition caused false positive:
+
+    • cs-12 was alive, just unreachable
+    • Master re-replicated chunks
+    • Now have extra copies
+    • Rebalancing cleans up
+
+    Cost of false positive:
+    • Extra network bandwidth
+    • Extra disk space temporarily
+    • Acceptable (safety first)
+    ```
+  </Accordion>
+
+  <Accordion title="Disk Failure" icon="hard-drive">
+    **Disk Corruption or Failure**:
+
+    ```text
+    DISK FAILURE HANDLING
+    ────────────────────
+
+    Scenario: Disk fails on cs-5
+
+    Detection:
+    ─────────
+
+    Method 1: Read Error
+    ───────────────────
+
+    Client reads chunk 0x1a2b from cs-5
+    cs-5 attempts read from disk
+    → I/O error from disk
+
+    cs-5 → Master:
+      "Chunk 0x1a2b is unreadable (I/O error)"
+
+    cs-5 → Client:
+      "ERROR: Cannot read chunk"
+
+    Method 2: Checksum Mismatch
+    ──────────────────────────
+
+    cs-5 reads block from disk
+    Computes checksum
+    Compares with stored checksum
+    → MISMATCH (silent corruption)
+
+    cs-5 → Master:
+      "Chunk 0x1a2b is corrupted"
+
+    cs-5 → Client:
+      "ERROR: Corruption detected"
+
+    Method 3: Background Scrubbing
+    ──────────────────────────────
+
+    cs-5 background task verifies chunks
+    Detects corruption before client reads
+
+    cs-5 → Master:
+      "Chunk 0x1a2b is corrupted"
+
+
+    Master Response:
+    ───────────────
+
+    1. Mark cs-5's replica as corrupted:
+       chunk_replicas[0x1a2b].mark_corrupted(cs-5)
+
+    2. Schedule re-replication:
+       re_replication_queue.add(
+           chunk=0x1a2b,
+           priority=HIGH
+       )
+
+    3. Select source (good replica):
+       source = pick_random([cs-12, cs-23])
+       (Other replicas of 0x1a2b)
+
+    4. Select destination:
+       destination = pick_server(
+           low_load=True,
+           different_rack=True
+       )
+
+    5. Execute re-replication:
+       (standard process)
+
+    6. After new replica confirmed:
+       Master → cs-5: "Delete chunk 0x1a2b"
+
+
+    Client Handling:
+    ───────────────
+
+    Client receives error from cs-5
+    Client retries with different replica (cs-12)
+    cs-12 serves data successfully
+    Transparent to application
+
+
+    Multiple Disk Failures:
+    ──────────────────────
+
+    Scenario: Disk fails on cs-5 (has 1000 chunks)
+
+    cs-5 → Master:
+      "Chunks [0x1111, 0x2222, ..., 1000 total] failed"
+
+    Master:
+    • Marks all 1000 as corrupted on cs-5
+    • Schedules 1000 re-replications
+    • High priority (data at risk)
+    • Executes over hours
+
+
+    Entire Chunkserver Disk Fails:
+    ─────────────────────────────
+
+    If all chunks on cs-5 fail:
+    • Equivalent to chunkserver failure
+    • All chunks re-replicated
+    • cs-5 may be taken out of service
+    • Human intervention to replace disk
+    ```
+  </Accordion>
+
+  <Accordion title="Network Partition" icon="network-wired">
+    **Network Isolation**:
+
+    ```text
+    NETWORK PARTITION HANDLING
+    ─────────────────────────
+
+    Scenario: Network switch fails, isolating Rack A
+
+    Partition:
+    ─────────
+
+    ┌─────────────────────┐
+    │  Master + Most      │
+    │  of cluster         │
+    │  (Rack B, C, D)     │
+    └─────────────────────┘
+              ✗
+              ✗  Network partition
+              ✗
+    ┌─────────────────────┐
+    │  Rack A             │
+    │  (Isolated)         │
+    │  cs-1, cs-2, cs-3   │
+    └─────────────────────┘
+
+
+    Master Perspective:
+    ──────────────────
+
+    Rack A chunkservers miss heartbeats
+    Master declares them dead
+    Schedules re-replication for all chunks
+
+
+    Rack A Perspective:
+    ──────────────────
+
+    Cannot reach master
+    Leases expire (60 seconds)
+    Cannot serve writes (no primary)
+    Can still serve reads (from cache)
+
+
+    When Partition Heals:
+    ────────────────────
+
+    T+0:    Partition begins
+    T+90s:  Master declares Rack A dead
+    T+120s: Master begins re-replication
+    T+300s: Partition heals
+            Rack A reconnects
+
+    Rack A → Master: Heartbeats with chunk lists
+
+    Master discovers:
+    ────────────────
+
+    1. Rack A servers were alive (false positive)
+    2. Some chunks already re-replicated (4 replicas now)
+    3. Some chunks in progress
+    4. Some chunks not yet started
+
+    Master reconciles:
+    ─────────────────
+
+    • Cancel pending re-replications
+    • Keep extra replicas temporarily
+    • Rebalancing removes extras later
+    • Update chunk location maps
+    • Resume normal operations
+
+
+    Split-Brain Prevention:
+    ──────────────────────
+
+    Can Rack A serve writes during partition?
+
+    NO! Here's why:
+    ──────────────
+
+    1. Leases expire after 60 seconds
+    2. Cannot renew lease (no master contact)
+    3. Cannot grant new leases
+    4. Cannot become primary
+    5. Writes fail
+
+    Primary authority requires master contact
+    → No split-brain possible
+
+    Clients:
+    • Writes fail (lease expired)
+    • Retry → master redirects to working replicas
+    • Reads succeed (from Rack A or other racks)
+
+
+    Cost of Partition:
+    ─────────────────
+
+    • Write unavailable for affected chunks
+      (during partition)
+    • Unnecessary re-replication
+      (bandwidth, storage waste)
+    • Extra cleanup after healing
+    • Acceptable (safety first)
+    ```
+  </Accordion>
+
+  <Accordion title="Master Failure" icon="crown">
+    **Most Critical Failure**:
+
+    ```text
+    MASTER FAILURE HANDLING
+    ──────────────────────
+
+    Scenario: Primary master crashes
+
+    Impact:
+    ──────
+
+    • Cannot create files
+    • Cannot delete files
+    • Cannot grant leases
+    • Cannot get chunk locations (if not cached)
+    • WRITES BLOCKED
+    • Reads continue (if metadata cached)
+
+
+    Detection:
+    ─────────
+
+    T+0:    Master crashes
+    T+10s:  Monitoring service detects
+            (heartbeat failure)
+
+
+    Failover Process:
+    ────────────────
+
+    T+15s:  External coordination service
+            (e.g., Chubby lock service)
+            triggers failover
+
+    T+20s:  Promote shadow master:
+
+    1. Stop accepting read requests
+    2. Apply any pending log entries
+    3. Flush in-memory state
+    4. Switch to write mode:
+       • Enable lease grants
+       • Enable chunk creation
+       • Enable writes
+
+    T+30s:  Update DNS entry:
+       gfs-master.google.com → new_master_ip
+
+    T+45s:  Clients detect change:
+       • Cached master IP fails
+       • DNS lookup gets new IP
+       • Retry operations
+
+    T+60s:  System fully operational
+
+
+    During Failover (T+0 to T+60s):
+    ───────────────────────────────
+
+    Reads:
+    • Shadow masters serve reads
+    • Slightly stale (seconds old)
+    • Most clients have cached metadata anyway
+
+    Writes:
+    • Fail (no primary master)
+    • Clients retry
+    • Eventually succeed when new master ready
+
+    New File Operations:
+    • Fail during failover
+    • Succeed after new master ready
+
+
+    Data Loss:
+    ─────────
+
+    Operation log replicated → NO DATA LOSS
+
+    • All mutations in operation log
+    • Replicated before client sees success
+    • New master has full log
+    • Replays and continues
+
+
+    Recovery Details:
+    ────────────────
+
+    New master startup:
+    (See "Fast Recovery" section)
+
+    1. Load checkpoint
+    2. Replay log
+    3. Poll chunkservers
+    4. Resume operations
+
+    Total: ~60 seconds
+
+
+    If Shadow Also Fails:
+    ────────────────────
+
+    Both primary and shadow crash:
+
+    • Start new master from scratch
+    • Load latest checkpoint
+    • Replay full operation log
+    • Poll all chunkservers
+    • Takes longer (~few minutes)
+    • But still recoverable
+    • No data loss
+
+
+    Disaster: All Masters Gone
+    ──────────────────────────
+
+    Extremely rare (datacenter failure):
+
+    • Operation logs in multiple datacenters
+    • Load from remote datacenter
+    • Start master in different location
+    • Recovery takes longer (10-30 minutes)
+    • Still no data loss (logs persistent)
+
+
+    Client Behavior During Failover:
+    ────────────────────────────────
+
+    Built-in retry logic:
+
+    def gfs_operation_with_retry(op):
+        max_retries = 10
+        for i in range(max_retries):
+            try:
+                return op()
+            except MasterUnreachable:
+                sleep(exponential_backoff(i))
+                continue  # Retry
+        raise Exception("Master unavailable")
+
+    Transparent to most applications
+    Brief unavailability acceptable
+    ```
+  </Accordion>
+</AccordionGroup>
+
+---
+
+## Data Integrity
+
+Multiple layers ensure data correctness:
+
+### Integrity Mechanisms
+
+<CardGroup cols={2}>
+  <Card title="Checksums" icon="shield-check">
+    **Chunk-Level Verification**:
+
+    - 64KB blocks with CRC32
+    - Verified on every read
+    - Updated on every write
+    - Background scrubbing
+    - Detects silent corruption
+  </Card>
+
+  <Card title="Version Numbers" icon="tag">
+    **Staleness Detection**:
+
+    - Incremented on lease grant
+    - Stored in metadata
+    - Checked on every operation
+    - Stale replicas garbage collected
+    - Prevents reading old data
+  </Card>
+
+  <Card title="Replication" icon="copy">
+    **Redundancy**:
+
+    - 3 copies minimum
+    - Cross-rack placement
+    - Independent failures
+    - Can lose 2 copies safely
+    - Automatic restoration
+  </Card>
+
+  <Card title="Application Validation" icon="check-double">
+    **Application-Level**:
+
+    - Record checksums
+    - Unique identifiers
+    - Magic numbers
+    - Length markers
+    - De-duplication
+  </Card>
+</CardGroup>
+
+---
+
+## Interview Questions
+
+<AccordionGroup>
+  <Accordion title="Basic: Why does GFS use 3 replicas by default?" icon="circle-question">
+    **Expected Answer**:
+
+    GFS uses 3 replicas to balance durability, availability, and cost:
+
+    **Why 3?**
+
+    1. **Fault Tolerance**: Can lose 2 replicas and still have data
+       - Common scenario: 1 server down for maintenance, 1 unexpected failure
+       - With 3 replicas, still have 1 copy available
+       - 2 replicas: Single failure away from data loss
+
+    2. **Availability**: Read from any replica
+       - Load balancing across 3 servers
+       - Better performance than 2
+       - Diminishing returns after 3
+
+    3. **Cost**: Storage overhead
+       - 3x storage cost
+       - 4 or 5 replicas → higher cost
+       - 3 is sweet spot for Google's workload
+
+    **Comparison**:
+    - 1 replica: No fault tolerance, disaster
+    - 2 replicas: One failure away from data loss, insufficient
+    - 3 replicas: Can tolerate 2 failures, good balance
+    - 5 replicas: Higher availability but 67% more storage cost
+
+    **Cross-Rack Placement**:
+    - 2 in one rack, 1 in another (typical)
+    - Survives rack failure
+    - Optimizes intra-rack bandwidth
+
+    For critical data, Google used higher replication (5-7 replicas).
+  </Accordion>
+
+  <Accordion title="Intermediate: How does GFS detect and handle stale replicas?" icon="diagram-project">
+    **Expected Answer**:
+
+    GFS uses version numbers to detect stale replicas:
+
+    **Version Number System**:
+    - Each chunk has version number
+    - Stored in master metadata and on chunkserver
+    - Incremented when master grants new lease
+    - All current replicas updated to new version
+
+    **Staleness Detection**:
+
+    1. **Lease Grant** (version increment):
+       - Master grants lease to primary
+       - Increments version: v3 → v4
+       - Updates all available replicas to v4
+       - Replica that's down stays at v3 (STALE)
+
+    2. **Heartbeat Report**:
+       - Chunkserver reports: "I have chunk X, version 3"
+       - Master knows current version is 4
+       - Master identifies replica as stale
+
+    3. **Client Request**:
+       - Master returns replica locations with version 4
+       - Client contacts replica, sends expected version
+       - If replica has v3, client knows it's stale
+       - Tries different replica
+
+    **Handling Stale Replicas**:
+
+    1. **Mark for Deletion**:
+       - Master tells chunkserver: "Delete chunk X (stale)"
+       - Garbage collection cleanup
+       - Not immediate (lazy deletion)
+
+    2. **Re-replication**:
+       - Chunk now has fewer valid replicas
+       - Schedule re-replication from good replica
+       - Restore to target count
+
+    3. **Never Served**:
+       - Stale replicas never returned to clients
+       - Master only returns current version
+       - Prevents reading old data
+
+    **Example**:
+    - Chunk v3 on [cs-1, cs-2, cs-3]
+    - cs-3 goes offline
+    - Client writes → master grants lease → v4
+    - cs-1, cs-2 updated to v4
+    - cs-3 comes back with v3
+    - Master: "Delete v3, re-replicate v4"
+
+    Version numbers provide simple, reliable staleness detection without complex distributed state.
+  </Accordion>
+
+  <Accordion title="Advanced: Explain GFS's master recovery process in detail" icon="rocket">
+    **Expected Answer**:
+
+    GFS master recovery is designed for speed (under 1 minute) with no data loss:
+
+    **Phase 1: Checkpoint Load** (~1-2 seconds):
+    - Load most recent checkpoint from disk
+    - Checkpoint contains:
+      - Full namespace (files, directories)
+      - Chunk handles for each file
+      - Version numbers
+      - File metadata (permissions, timestamps)
+    - Compact B-tree format (~1GB)
+    - Loaded into memory quickly
+
+    **Phase 2: Log Replay** (~1-10 seconds):
+    - Read operation log since last checkpoint
+    - Apply operations sequentially:
+      - File creates/deletes
+      - Chunk allocations
+      - Version increments
+      - Metadata updates
+    - Typical: 100K-1M operations
+    - Rate: 100K ops/second
+    - Brings namespace to current state
+
+    **Phase 3: Chunk Location Discovery** (~10-30 seconds):
+    - Chunk locations NOT persisted (by design)
+    - Master polls all chunkservers: "What chunks do you have?"
+    - Each chunkserver reports:
+      - Chunk handles
+      - Version numbers
+    - Master builds in-memory location map
+    - Identifies stale replicas (version mismatch)
+    - Marks stale replicas for deletion
+
+    **Phase 4: Resume Operations** (immediate):
+    - Master now has:
+      - Complete namespace
+      - All chunk locations
+      - Version information
+    - Begins accepting requests:
+      - Grants leases
+      - Serves metadata queries
+      - Creates chunks
+    - Fully operational
+
+    **Why Fast?**:
+    1. Checkpoint eliminates long log replay
+    2. All metadata in memory (no disk I/O for operations)
+    3. Chunk locations discovered in parallel
+    4. Simple, single-master design
+
+    **Data Loss Prevention**:
+    - Operation log replicated before client sees success
+    - Multiple copies (shadows, remote disks)
+    - Different failure domains/datacenters
+    - If master fails, log intact
+    - Replay gives exact state
+
+    **During Recovery**:
+    - Shadow masters serve read requests
+    - Writes blocked temporarily
+    - Clients retry automatically
+    - Minimal user impact
+
+    Total downtime: 30-60 seconds typical, acceptable for Google's workload.
+  </Accordion>
+
+  <Accordion title="System Design: Design a more fault-tolerant master for GFS" icon="wrench">
+    **Expected Answer**:
+
+    Several approaches to improve GFS master fault tolerance beyond shadow masters:
+
+    **Approach 1: Multi-Master with Consensus** (like Colossus):
+    - Multiple active masters using Paxos/Raft
+    - Shared replicated state machine
+    - Any master can handle requests
+    - Benefits:
+      - No failover delay (masters always available)
+      - Higher read throughput (load balanced)
+      - Better fault tolerance (majority quorum)
+    - Challenges:
+      - Complex consensus protocol
+      - Higher write latency (consensus overhead)
+      - More difficult to implement/debug
+
+    **Approach 2: Metadata Sharding**:
+    - Partition namespace across multiple masters
+    - Each master handles subset of files
+    - Example: Hash(filename) % num_masters
+    - Benefits:
+      - Scales metadata capacity
+      - Scales throughput
+      - Failure affects subset
+    - Challenges:
+      - Cross-shard operations complex
+      - Rebalancing difficult
+      - Client routing logic
+
+    **Approach 3: Hierarchical Masters**:
+    - Root master for namespace
+    - Leaf masters for chunk management
+    - Separate concerns
+    - Benefits:
+      - Scales chunk operations
+      - Root master simpler (less load)
+    - Challenges:
+      - Two-level coordination
+      - Partial failures complex
+
+    **Approach 4: Active-Active Masters**:
+    - Multiple masters with optimistic concurrency
+    - Eventually consistent
+    - Conflict resolution protocol
+    - Benefits:
+      - No failover needed
+      - Higher availability
+    - Challenges:
+      - Consistency corner cases
+      - Conflict resolution complexity
+
+    **Recommendation for GFS Workload**:
+    Use Approach 1 (Multi-Master with Consensus):
+    - Colossus (GFS successor) uses this
+    - Paxos provides strong consistency
+    - Multiple masters for availability
+    - Acceptable latency increase (metadata ops less frequent)
+    - Worth complexity for zero-downtime failover
+
+    **Implementation Details**:
+    - 5-7 master servers (quorum=3-4)
+    - Consensus on operation log
+    - Replicated state machine
+    - Any master can serve requests
+    - Automatic leader election
+    - Client tries multiple masters
+
+    **Trade-offs**:
+    - Complexity: Higher (consensus protocol)
+    - Performance: Slightly lower write latency
+    - Availability: Much higher (no failover delay)
+    - Consistency: Stronger (linearizable)
+
+    For GFS 2003, single master with shadows was correct choice (simplicity). For modern systems, multi-master with consensus is standard (Spanner, CockroachDB, etcd).
+  </Accordion>
+</AccordionGroup>
+
+---
+
+## Key Takeaways
+
+<Note>
+**Fault Tolerance Summary**:
+
+1. **Design for Failure**: Assume constant component failures
+2. **Replication**: 3 copies across racks for durability
+3. **Fast Detection**: Heartbeats every 30-60s, declare dead after 3 misses
+4. **Automatic Recovery**: Re-replication without human intervention
+5. **Prioritization**: Urgent chunks (1 replica) before normal (2 replicas)
+6. **Master Replication**: Operation log replicated, shadow masters for failover
+7. **Fast Recovery**: under 1 minute master restart via checkpoint + log
+8. **Version Numbers**: Simple, effective staleness detection
+9. **No Split-Brain**: Lease expiration prevents divergent writes
+10. **Lazy Cleanup**: Garbage collection handles deleted/stale chunks
+</Note>
+
+---
+
+## Up Next
+
+In **Chapter 7: Performance & Optimizations**, we'll explore:
+- Real-world GFS benchmarks and measurements
+- Performance characteristics and bottlenecks
+- Optimization techniques Google employed
+- Workload analysis and tuning strategies
+- Lessons learned from production deployment
+
+We've seen how GFS survives failures—now we'll see how it performs under real workloads.

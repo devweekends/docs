@@ -1,0 +1,657 @@
+---
+title: "Raft Consensus Deep Dive"
+sidebarTitle: "Raft Deep Dive"
+description: "Implementation-oriented, interview-level deep dive into the Raft consensus algorithm with invariants, failure scenarios, and step-by-step reasoning"
+icon: "star"
+---
+
+# Raft Consensus Deep Dive
+
+This chapter is designed as a **from-scratch Raft mastery guide**. The goal is that after working through it, you can:
+
+- **Explain Raft on a whiteboard** under interview pressure
+- **Reason about safety and liveness** properties formally
+- **Implement Raft** in a language of your choice (Go, Java, Rust, etc.)
+- **Debug real-world Raft issues** (e.g., in etcd, Consul, TiKV)
+
+<Info>
+**Target Audience**: Senior / Staff engineers
+
+**Prerequisites**:
+- You have already read the high-level [Consensus](courses/distributed-systems/consensus) chapter
+- You understand logs, replication, and basic reliability concepts
+</Info>
+
+---
+
+## 1. Problem Setting and Mental Model
+
+Before code, internalize the **mental model** Raft operates in.
+
+### 1.1 System Model
+
+- **Nodes**: `N` servers, typically `N = 3 or 5`
+- **Failures**: Crash-stop failures (no Byzantine behavior)
+- **Network**:
+  - Messages may be **delayed**, **reordered**, or **dropped**
+  - Messages are **not corrupted** (we rely on lower layers for that)
+- **Assumption**: The system is **asynchronous most of the time**, but there are **periods of partial synchrony** where
+  timeouts are meaningful (this is how we dodge FLP in practice).
+
+We want to implement a **Replicated State Machine (RSM)**:
+
+```text
+Clients  ─▶  Raft Cluster  ─▶  Application State Machine
+             (3–5 nodes)
+```
+
+**Goal**: All non-faulty nodes **apply the same sequence of commands** in the same order, even if leaders crash, nodes
+restart, and the network is unreliable.
+
+### 1.2 Safety vs Liveness in Raft
+
+- **Safety (never bad)**:
+  - At most one value is committed at index `i`
+  - A committed log entry is **never lost or changed**
+  - All committed entries are **applied in order** on every server
+- **Liveness (eventually good)**:
+  - As long as a majority of nodes are available and the network is stable enough,
+    the system continues to elect leaders and process client commands.
+
+Design rule: **Raft always chooses safety over liveness**.
+If the cluster is too unstable, it will prefer to not make progress rather than risk data corruption.
+
+---
+
+## 2. High-Level Design
+
+### 2.1 Node Roles
+
+Each Raft server is always in exactly one of three roles:
+
+- **Follower**: Passive, responds to requests from others
+- **Candidate**: Tries to become leader
+- **Leader**: Handles client writes and manages log replication
+
+A typical timeline:
+
+```text
+Follower ──(timeout)──▶ Candidate ──(wins election)──▶ Leader
+      ▲                                      │
+      └─────────────(receives heartbeat)────┘
+```
+
+### 2.2 Terms as a Logical Clock
+
+Time is divided into **terms**:
+
+- Each term starts with an **election**
+- At most **one leader per term**
+- Terms are monotonically increasing integers
+
+Nodes store `currentTerm`. Whenever they see a **higher term** in a message, they immediately:
+
+1. Update their `currentTerm`
+2. Step down to **Follower**
+
+**Rule of thumb**: *“Higher term wins.”*
+
+### 2.3 Persistent and Volatile State
+
+On each server, Raft separates **persistent** (must survive crash) and **volatile** state.
+
+- **Persistent state (stored on stable storage)**:
+  - `currentTerm` – latest term this server has seen
+  - `votedFor` – candidate ID that received this server's vote in current term (or `null`)
+  - `log[]` – array of log entries; each entry has `{term, command}`
+
+- **Volatile state on all servers**:
+  - `commitIndex` – index of highest log entry known to be committed
+  - `lastApplied` – index of highest log entry applied to state machine
+
+- **Volatile state on leaders (reinitialized after election)**:
+  - `nextIndex[peer]` – index of the next log entry to send to that follower
+  - `matchIndex[peer]` – index of highest log entry known to be replicated on that follower
+
+These variables are key to both **safety proofs** and **implementation**.
+
+---
+
+## 3. The Raft Log and State Machine
+
+### 3.1 Log Structure
+
+Each server keeps a log:
+
+```text
+Index:  1    2    3    4    5    6
+Term:   1    1    2    2    3    3
+Cmd:   op1  op2  op3  op4  op5  op6
+```
+
+- Index grows monotonically as new entries are appended
+- Each entry is tagged with the **term** in which it was created by the leader
+
+### 3.2 Commit Index and Application
+
+- An entry at index `i` is **committed** when it is stored on **a majority of servers** and is known to be durable
+- Once committed, leaders and followers **apply entries in order** to their state machine:
+
+```pseudo
+while commitIndex > lastApplied:
+    lastApplied += 1
+    apply(log[lastApplied].command)
+```
+
+**Safety property**: Once an entry is committed, **no future leader will overwrite it**.
+Much of Raft's design is built around enforcing this property.
+
+---
+
+## 4. RPCs Overview
+
+Raft only uses **two RPCs** in steady-state operation:
+
+- **`RequestVote`** – used during elections
+- **`AppendEntries`** – used for both heartbeats and log replication
+
+We'll examine them in the context of each role.
+
+---
+
+## 5. Leader Election in Depth
+
+### 5.1 Election Timeouts and Heartbeats
+
+- Followers expect to hear from a leader via **AppendEntries heartbeats** at regular intervals (e.g., 100–150 ms)
+- If a follower does **not** receive a heartbeat within its **election timeout** (e.g., 150–300 ms, randomized), it
+  converts to a **Candidate** and starts an election.
+
+Randomized timeouts are critical: they make it unlikely that multiple followers start elections at exactly
+the same time, which would cause **split votes**.
+
+### 5.2 Becoming a Candidate
+
+When a follower times out:
+
+```pseudo
+currentTerm += 1
+role = Candidate
+votedFor = self
+resetElectionTimer()
+send RequestVote(term=currentTerm, candidateId=self, lastLogIndex, lastLogTerm) to all other servers
+votesReceived = 1   // self-vote
+```
+
+### 5.3 RequestVote RPC Logic
+
+**RequestVote args**:
+
+- `term` – candidate's term
+- `candidateId` – candidate requesting vote
+- `lastLogIndex` – index of candidate's last log entry
+- `lastLogTerm` – term of candidate's last log entry
+
+**Receiver side logic** (simplified):
+
+```pseudo
+on RequestVote(term, candidateId, lastLogIndex, lastLogTerm):
+    if term < currentTerm:
+        return (currentTerm, voteGranted=false)
+
+    if term > currentTerm:
+        currentTerm = term
+        votedFor = null
+        role = Follower
+
+    logIsUpToDate = (lastLogTerm > lastLogTermLocal) or
+                    (lastLogTerm == lastLogTermLocal and
+                     lastLogIndex >= lastLogIndexLocal)
+
+    if (votedFor == null or votedFor == candidateId) and logIsUpToDate:
+        votedFor = candidateId
+        resetElectionTimer()
+        return (currentTerm, voteGranted=true)
+    else:
+        return (currentTerm, voteGranted=false)
+```
+
+This enforces the **Election Safety** and **Leader Completeness** properties:
+
+- Each server votes **at most once per term**
+- A leader must have a log that is at least as up to date as any follower
+
+### 5.4 Election Outcomes
+
+A candidate continues the election until one of three outcomes happens:
+
+1. **Candidate receives votes from a majority** → becomes **Leader**
+2. **Candidate receives AppendEntries from another server with a newer or equal term** → steps down to **Follower**
+3. **Election times out** without a winner → increments term and starts a new election
+
+### 5.5 Failure Scenario: Split Vote
+
+Imagine 5 servers: S1–S5. S1 and S2 time out at nearly the same time and both become candidates.
+
+- S1 sends RequestVote(term=5) to everyone
+- S2 sends RequestVote(term=5) to everyone
+- Voting pattern might end up:
+  - S1 votes for S1
+  - S2 votes for S2
+  - S3 votes for S1
+  - S4 votes for S2
+  - S5 hasn't responded in time
+
+Both candidates have 2 votes; majority is 3 → **no leader**.
+
+Because timeouts are **randomized**, they will likely time out at **different times** next round and one will win.
+
+---
+
+## 6. Log Replication in Depth
+
+Once a leader is elected, it takes over the cluster:
+
+- **Clients send all writes to the leader**
+- Leader appends commands to its log and replicates them via `AppendEntries`
+
+### 6.1 AppendEntries RPC
+
+**AppendEntries args**:
+
+- `term` – leader's term
+- `leaderId` – leader's ID (for redirects)
+- `prevLogIndex` – index of log entry immediately preceding new ones
+- `prevLogTerm` – term of entry at `prevLogIndex`
+- `entries[]` – list of new log entries (empty for heartbeat)
+- `leaderCommit` – leader's `commitIndex`
+
+**Follower logic** (simplified):
+
+```pseudo
+on AppendEntries(term, leaderId, prevLogIndex, prevLogTerm, entries[], leaderCommit):
+    if term < currentTerm:
+        return (currentTerm, success=false)
+
+    if term > currentTerm:
+        currentTerm = term
+        role = Follower
+
+    resetElectionTimer()   // leader is alive
+
+    // 1. Log consistency check
+    if !logContains(prevLogIndex, prevLogTerm):
+        return (currentTerm, success=false)
+
+    // 2. Delete conflicting entries and append new ones
+    delete any entries from index > prevLogIndex that conflict with new entries
+    append any new entries not already in the log
+
+    // 3. Update commit index
+    if leaderCommit > commitIndex:
+        commitIndex = min(leaderCommit, indexOfLastNewEntry)
+        applyCommittedEntries()
+
+    return (currentTerm, success=true)
+```
+
+### 6.2 Log Matching Property
+
+**Log Matching Property**:
+
+> If two logs contain an entry with the same index and term, then the logs are **identical in all preceding entries**.
+
+How Raft enforces it:
+
+1. Leader always includes `(prevLogIndex, prevLogTerm)` when sending entries
+2. Follower rejects AppendEntries if it does not have an entry at `prevLogIndex` with term `prevLogTerm`
+3. On rejection, leader **backs up** `nextIndex[follower]` and retries until logs match
+
+This is critical to ensure that once logs match at a given point, they are perfectly aligned up to that point.
+
+### 6.3 Leader’s Bookkeeping: nextIndex and matchIndex
+
+On election, the leader initializes:
+
+```pseudo
+for each follower i:
+    nextIndex[i] = lastLogIndex + 1
+    matchIndex[i] = 0
+```
+
+- `nextIndex[i]` – the next log index the leader will send to follower i
+- `matchIndex[i]` – highest index known to be replicated on follower i
+
+When a follower responds with `success=false`, the leader **decrements** `nextIndex[i]` and retries.
+
+When a follower responds with `success=true`, the leader:
+
+```pseudo
+matchIndex[i] = index of last entry sent successfully
+nextIndex[i] = matchIndex[i] + 1
+```
+
+### 6.4 Advancing commitIndex on the Leader
+
+The leader periodically checks whether some log index `N` can be considered **committed**:
+
+```pseudo
+for N from lastLogIndex down to commitIndex+1:
+    count = number of servers with matchIndex[i] >= N
+    if count >= majority and log[N].term == currentTerm:
+        commitIndex = N
+        applyCommittedEntries()
+        break
+```
+
+Note the extra condition `log[N].term == currentTerm` – this is essential for **Leader Completeness**.
+
+---
+
+## 7. Safety Invariants and Intuition
+
+Raft’s safety comes from a few core invariants.
+
+### 7.1 Election Safety
+
+> For a given term, at most one leader can be elected.
+
+- Each server votes at most once per term (`votedFor`)
+- A candidate must receive votes from a **majority** to become leader
+- Two distinct candidates cannot both receive votes from a majority because majorities intersect
+
+### 7.2 Leader Completeness
+
+> If a log entry is committed in term `T`, then that entry will be present in the logs of all leaders for all terms `> T`.
+
+Key mechanisms:
+
+1. **Commit rule on leaders**: A leader only considers entries from its **current term** when deciding new `commitIndex`
+2. **Election restriction**: A server only grants its vote to candidates whose log is **at least as up-to-date** as its own
+
+Intuition:
+
+- Suppose entry `(index X, term T)` is committed
+- That means a majority of servers have it in their log
+- Any future leader must get votes from a majority; thus, at least one server that has the entry must vote
+- Due to the "up-to-date" rule, a candidate missing this entry cannot gain that vote
+- Therefore any new leader must also contain this entry
+
+### 7.3 State Machine Safety
+
+> If any server has applied a log entry at index `i` to its state machine, then **no other server** will ever apply a **different** command at index `i`.
+
+Combination of previous invariants + log matching ensures this.
+
+---
+
+## 8. Handling Failures and Partitions
+
+Let's walk through concrete failure scenarios – the kind you’ll get in interviews.
+
+### 8.1 Leader Crashes Before Replication
+
+Scenario:
+
+1. Leader L (term 5) appends entry at index 10
+2. It sends AppendEntries to followers, but **crashes** before any follower stores the entry
+3. A new leader L2 (term 6) is elected, without that entry
+
+Result:
+
+- Entry at index 10 in L’s log is never committed
+- New leader's log does **not** contain entry 10; it will overwrite L’s uncommitted entry during log repair
+
+**Safety preserved**: Uncommitted entries may be lost – this is allowed.
+
+### 8.2 Leader Crashes After Partial Replication
+
+Scenario:
+
+1. Leader L (term 5) appends entry at index 10
+2. Two out of three followers store entry 10
+3. Leader crashes **before** updating commitIndex or responding to the client
+
+Later:
+
+- A follower **that has entry 10** becomes new leader
+- Because of the "up-to-date" voting rule, a candidate missing entry 10 **cannot** become leader
+
+Result:
+
+- Entry 10 eventually becomes committed and applied
+- Client may need to retry the request, but system behaves as if it executed exactly once
+
+### 8.3 Network Partition: Leader Isolated in Minority
+
+Scenario (5-node cluster):
+
+- Partition: `{S1, S2}` vs `{S3, S4, S5}`
+- S1 is the leader but ends up in the **minority** partition
+
+Behavior:
+
+- S1 continues to think it is leader but cannot replicate to a majority
+- It cannot commit new entries → **no progress** in minority partition
+- In majority partition, followers time out and elect a **new leader**, S3 (higher term)
+
+When partition heals:
+
+- S1 receives AppendEntries with higher term from S3
+- S1 steps down to follower and updates its log to match the majority
+
+**Important**: No committed entries are lost; minority writes remain uncommitted.
+
+---
+
+## 9. Advanced Production Features
+
+While the basic Raft protocol is correct, production systems (like etcd, TiDB, or CockroachDB) require several optimizations for performance and robustness.
+
+### 9.1 Linearizable Reads
+A naive read (reading from the current leader) can be stale if the leader has been partitioned away but doesn't know it yet (zombie leader).
+
+**Solution 1: Read Index**
+1. Leader receives read request.
+2. Leader records current `commitIndex` as `readIndex`.
+3. Leader sends heartbeats to a majority to confirm it's still the leader.
+4. Once confirmed, leader waits until its `lastApplied` $\geq$ `readIndex`.
+5. Leader returns the value from its state machine.
+
+**Solution 2: Lease Reads**
+1. Leader maintains a "leader lease" (time-based).
+2. As long as the lease is active, the leader knows no other leader can be elected.
+3. Leader can serve reads locally without heartbeats.
+4. **Risk**: Relies on synchronized physical clocks (though less strictly than Spanner).
+
+### 9.2 Pre-Vote Protocol
+A node partitioned away from the cluster will keep incrementing its `currentTerm` as it fails to win elections. When it rejoins, it has a very high term, causing the current leader to step down unnecessarily.
+
+**Pre-Vote**:
+- Before incrementing its term, a candidate sends a **Pre-Vote** RPC.
+- Peers only vote "Yes" if they haven't heard from a leader in their election timeout.
+- This prevents a "disruptive" node from triggering unnecessary elections.
+
+### 9.3 CheckQuorum
+To prevent a leader in a minority partition from continuing to serve reads (if using leases), the leader periodically checks if it can still reach a majority.
+- If it hasn't heard from a majority of nodes for an election timeout, it **steps down** to follower.
+
+### 9.4 Learner Nodes (Non-Voting Replicas)
+
+In a standard Raft cluster, every node is a voter. This means every node must participate in elections and every write must wait for a majority. However, sometimes you want to add replicas for **read-scaling** or **geo-distribution** without increasing the quorum size.
+
+**Learner Nodes** are replicas that:
+1.  Receive log entries from the leader like followers.
+2.  Apply entries to their local state machine.
+3.  **Do not vote** in elections.
+4.  **Do not count** toward the write majority.
+
+#### Use Case: Cold Booting a New Node
+If you add a new node to a 5-node cluster, it starts with an empty log. If you immediately make it a voter, the quorum $(N=6, Q=4)$ becomes harder to reach. Instead:
+1.  Add the node as a **Learner**.
+2.  Let it "catch up" by receiving the snapshot and replaying the log.
+3.  Once it is "caught up" (lag is small), promote it to a **Voter** using a configuration change.
+
+---
+
+## 10. Joint Consensus: Safe Configuration Changes
+
+Changing the set of servers (e.g., from 3 to 5 nodes) is one of the most dangerous operations in distributed systems. If not done carefully, two independent majorities can exist during the transition, leading to a split-brain.
+
+### 10.1 The Two-Phase Transition
+Raft uses **Joint Consensus** to ensure safety during reconfiguration.
+
+1.  **Phase 1: $C_{old,new}$**:
+    - The leader appends a special configuration entry to its log that contains both the old membership ($C_{old}$) and the new one ($C_{new}$).
+    - For any commit or election to succeed, it must receive a majority from **BOTH** $C_{old}$ and $C_{new}$.
+    - This is the "Joint" state. Even if the leader crashes, any successor must have this entry to win the double-majority.
+2.  **Phase 2: $C_{new}$**:
+    - Once $C_{old,new}$ is committed (stored on a majority of both groups), the leader appends a $C_{new}$ entry.
+    - From this point on, only $C_{new}$ majorities are required.
+    - Nodes removed in $C_{new}$ eventually see the entry and shut themselves down.
+
+### 10.2 Staff Tip: The Single-Server Change Optimization
+Many modern Raft implementations (like **etcd**) prefer **Single-Server Changes**. By adding or removing only **one node at a time**, you can skip the complex Joint Consensus.
+- Proof: If you add exactly 1 node to a 3-node cluster, any majority of 3 and any majority of 4 are guaranteed to intersect.
+- This is much simpler to implement but requires sequential changes (you can't add 10 nodes at once).
+
+---
+
+## 11. Log Compaction and Snapshots (Deep Dive)
+
+The log cannot grow forever. Snapshots are the solution, but they introduce complexity.
+
+### 11.1 Concurrent Snapshotting
+Taking a snapshot takes time. The state machine should not be blocked during this process.
+- **Copy-on-Write**: Many systems use CoW data structures or OS-level `fork()` to create a point-in-time view of the state machine while continuing to process writes.
+
+### 11.2 Installing Snapshots
+If a follower is so far behind that the leader has already discarded the necessary log entries:
+1. Leader sends `InstallSnapshot` RPC.
+2. Follower replaces its entire log and state machine with the snapshot.
+3. Follower resumes normal replication from the snapshot's `lastIncludedIndex`.
+
+---
+
+## 12. Implementation Strategy (Step-by-Step)
+
+Here is a suggested order to **implement Raft from scratch**.
+
+### 10.1 Step 1: Data Structures
+
+Define the core types (in pseudocode):
+
+```pseudo
+type LogEntry struct {
+    term: int
+    command: Command
+}
+
+type RaftServer struct {
+    mu: Mutex
+
+    // Persistent state
+    currentTerm: int
+    votedFor: ServerId | null
+    log: []LogEntry
+
+    // Volatile state
+    commitIndex: int
+    lastApplied: int
+
+    // Volatile on leaders
+    nextIndex: map[ServerId]int
+    matchIndex: map[ServerId]int
+
+    // Role
+    role: {Follower, Candidate, Leader}
+    id: ServerId
+}
+```
+
+### 10.2 Step 2: Timers and Role Transitions
+
+- Implement an **event loop** or goroutines that handle:
+  - Election timer (randomized)
+  - Heartbeat timer on the leader
+  - RPC handlers for RequestVote and AppendEntries
+
+Test just **leader election** first:
+
+- Kill random nodes
+- Add artificial delays
+- Ensure the cluster eventually elects a leader and keeps one leader at a time
+
+### 10.3 Step 3: Log Replication
+
+- After leader election stabilizes, implement AppendEntries for both heartbeats and log entries
+- Ensure that followers **repair divergent logs** correctly via `(prevLogIndex, prevLogTerm)` and backtracking
+
+Useful tests:
+
+- Start cluster, write commands while killing and restarting nodes
+- After stabilization, check that **all logs are identical** on all non-faulty nodes
+
+### 10.4 Step 4: Commit Rules and State Machine
+
+- Implement the leader’s logic for advancing `commitIndex` based on `matchIndex`
+- Implement application of committed entries to your state machine (e.g., a key-value store)
+
+At this point you have a working **basic Raft** with correctness but no snapshots or membership changes.
+
+### 10.5 Step 5: Persistence and Crash Recovery
+
+- Before responding to RPCs or clients, ensure you **fsync** persistent state
+  (`currentTerm`, `votedFor`, and `log`)
+- On restart, reload these from disk and resume operation
+
+Crash tests:
+
+- Kill a leader suddenly
+- Restart it after some time
+- Verify that it rejoins as a follower and converges to the majority log
+
+### 10.6 Step 6: Advanced Features (Optional)
+
+- **Snapshots** for log compaction
+- **Dynamic membership changes**
+- **Read-only optimizations** (e.g., linearizable reads using leader leases or read-index)
+
+---
+
+## 11. Interview Playbook: Explaining Raft
+
+When asked about Raft in an interview, structure your answer:
+
+1. **Problem statement** – replicated state machine; need to keep nodes in sync across failures
+2. **Roles** – leader, followers, candidates
+3. **Terms and elections** – logical clock, one leader per term, randomized timeouts
+4. **Log replication** – AppendEntries, log matching property, commitIndex
+5. **Safety guarantees** – leader completeness, state machine safety
+6. **Failure handling** – leader crash, partition where leader is in minority
+7. **Optional advanced topics** – snapshots, membership changes, linearizable reads
+
+Example 30–60 second summary:
+
+> "Raft is a consensus algorithm that maintains a replicated log across multiple servers. Time is split into terms,
+> each with at most one leader. Followers convert to candidates and start elections if they don't hear from a leader.
+> The leader accepts client commands, appends them to its log, and uses AppendEntries RPCs to replicate them to followers.
+> Entries are considered committed once they're stored on a majority and are then applied in order to a state machine.
+> Raft guarantees that committed entries are never lost and that all non-faulty servers eventually apply the same
+> sequence of commands, even across crashes and network partitions, as long as a majority is available."
+
+---
+
+## 12. Next Steps
+
+- **Implement a toy Raft**:
+  - Start with in-memory data structures and in-process message passing
+  - Then separate processes and real RPC
+- **Read the original paper**: *"In Search of an Understandable Consensus Algorithm"* (Ongaro & Ousterhout)
+- **Study production implementations**:
+  - etcd (Go)
+  - HashiCorp Raft (Go)
+  - TiKV (Rust)
+
+Once Raft feels *boringly obvious* to you, you're ready to tackle Paxos at the same depth and compare trade-offs in real
+system designs.

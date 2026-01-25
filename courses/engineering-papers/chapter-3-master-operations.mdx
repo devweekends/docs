@@ -1,0 +1,1535 @@
+---
+title: "Master Operations"
+sidebarTitle: "Chapter 3: Master Operations"
+description: "Deep dive into master operations: namespace management, metadata storage, chunk leases, replica placement, and garbage collection"
+icon: "crown"
+---
+
+# Chapter 3: Master Operations
+
+The master is the brain of GFS, orchestrating all metadata operations and coordinating the distributed system. This chapter explores how the master manages the namespace, allocates chunks, grants leases, places replicas, and maintains system health through garbage collection.
+
+<Info>
+**Chapter Goals**:
+- Understand namespace management with coarse-grained locking
+- Learn chunk lease mechanism for consistency
+- Explore replica placement strategies
+- Master garbage collection techniques
+- Grasp master fault tolerance mechanisms
+</Info>
+
+---
+
+## Namespace Management
+
+Unlike traditional file systems with per-directory data structures, GFS uses a flat namespace with efficient path-to-metadata lookups.
+
+### Namespace Structure
+
+```text
+GFS NAMESPACE DESIGN
+────────────────────
+
+Traditional FS:           GFS:
+──────────────           ─────
+
+Directory tree:          Flat lookup table:
+/                        ┌─────────────────────────────────┐
+├── home                 │ Full Path → Metadata            │
+│   ├── user1            ├─────────────────────────────────┤
+│   └── user2            │ /home → {dir metadata}          │
+└── data                 │ /home/user1 → {dir metadata}    │
+    └── files            │ /data/files/log1 → {file meta}  │
+                         └─────────────────────────────────┘
+
+Each dir has            Single prefix-compressed
+list of children        table (efficient)
+
+Problem:                Benefit:
+- Tree traversal        - O(1) lookup
+- Lock contention       - Fine-grained locking
+                        - Parallel operations
+
+
+IMPLEMENTATION:
+──────────────
+
+Data Structure: Prefix-compressed lookup table
+
+Example:
+────────
+/home/alice/data/file1.txt
+/home/alice/data/file2.txt
+/home/bob/logs/access.log
+
+Stored as:
+──────────
+Common prefixes compressed:
+↓
+Efficient memory usage
+Fast lookups
+Support for snapshots
+```
+
+### Coarse-Grained Locking
+
+GFS uses namespace locks to allow concurrent operations:
+
+<Tabs>
+  <Tab title="Lock Types">
+    **Read-Write Locks on Paths**:
+
+    ```text
+    NAMESPACE LOCKING STRATEGY
+    ─────────────────────────
+
+    Each namespace node (file/directory) has:
+    • One read-write lock
+
+    Lock Granularity: Per full pathname
+
+    Example Operations:
+    ──────────────────
+
+    1. Create /home/user1/file1
+       Locks acquired:
+       • /home          → Read lock
+       • /home/user1    → Read lock
+       • /home/user1/file1 → Write lock
+
+    2. Delete /home/user2
+       Locks acquired:
+       • /home          → Read lock
+       • /home/user2    → Write lock
+
+    3. Snapshot /home/user1 → /save/snapshot1
+       Locks acquired:
+       • /home          → Read lock
+       • /home/user1    → Write lock (prevent changes)
+       • /save          → Read lock
+       • /save/snapshot1 → Write lock
+
+
+    KEY INSIGHT: No parent directory locks needed!
+    ────────────────────────────────────────────
+
+    Traditional FS:
+    - Need parent directory lock to modify children
+    - Serialization bottleneck
+
+    GFS:
+    - Lock full path only
+    - Parallel operations in same directory
+    - Scales beautifully
+    ```
+  </Tab>
+
+  <Tab title="Concurrent Operations">
+    **Enabling Parallelism**:
+
+    ```text
+    CONCURRENT OPERATIONS EXAMPLE
+    ────────────────────────────
+
+    Scenario: Same directory, different files
+
+    Thread 1: Create /data/logs/file1
+    Thread 2: Create /data/logs/file2
+    Thread 3: Read /data/logs/file3
+
+    Lock Acquisition:
+    ────────────────
+
+    Thread 1:
+      /data      → Read lock ✓
+      /data/logs → Read lock ✓
+      /data/logs/file1 → Write lock ✓
+
+    Thread 2:
+      /data      → Read lock ✓ (shared)
+      /data/logs → Read lock ✓ (shared)
+      /data/logs/file2 → Write lock ✓ (different file)
+
+    Thread 3:
+      /data      → Read lock ✓ (shared)
+      /data/logs → Read lock ✓ (shared)
+      /data/logs/file3 → Read lock ✓
+
+    ALL THREE PROCEED IN PARALLEL!
+
+    Traditional approach:
+    ─────────────────────
+    Would lock /data/logs directory
+    → Serializes all operations
+    → Poor scalability
+
+
+    CONFLICT SCENARIO:
+    ─────────────────
+
+    Thread A: Delete /home/user1
+    Thread B: Create /home/user1/newfile
+
+    Thread A:
+      /home → Read lock ✓
+      /home/user1 → Write lock ✓
+
+    Thread B:
+      /home → Read lock ✓
+      /home/user1 → Read lock ✗ (BLOCKED)
+      (waits for Thread A)
+
+    Correct serialization maintained!
+    ```
+  </Tab>
+
+  <Tab title="Lock Ordering">
+    **Preventing Deadlocks**:
+
+    ```text
+    LOCK ORDERING PROTOCOL
+    ─────────────────────
+
+    Rule: Always acquire locks in consistent order
+
+    Order: Lexicographic order by full pathname
+
+    Example:
+    ────────
+
+    Operation: Rename /a/x to /b/y
+
+    Incorrect:
+      /a/x lock (write)
+      /b/y lock (write)
+      → If another thread does /b/... first → DEADLOCK!
+
+    Correct:
+      Sort: [/a, /a/x, /b, /b/y]
+      Acquire in order:
+        /a   → read
+        /a/x → write
+        /b   → read
+        /b/y → write
+
+    Deadlock impossible!
+
+
+    IMPLEMENTATION:
+    ──────────────
+
+    Algorithm:
+    ──────────
+    1. Collect all paths needed for operation
+    2. Sort lexicographically
+    3. Acquire locks in sorted order
+    4. Perform operation
+    5. Release all locks
+
+    Example with snapshot:
+    ─────────────────────
+
+    Snapshot /home/alice to /backup/alice_snap
+
+    Paths needed:
+    - /home         (read)
+    - /home/alice   (write - prevent changes)
+    - /backup       (read)
+    - /backup/alice_snap (write)
+
+    Sorted order:
+    1. /backup (read)
+    2. /backup/alice_snap (write)
+    3. /home (read)
+    4. /home/alice (write)
+
+    Acquire in this order → No deadlock possible
+    ```
+  </Tab>
+
+  <Tab title="Performance Impact">
+    **Scalability Benefits**:
+
+    ```text
+    PERFORMANCE COMPARISON
+    ─────────────────────
+
+    Metric: Operations per second on /data/logs/
+
+    Traditional (directory-level locking):
+    ──────────────────────────────────────
+    1 thread:  1000 creates/sec
+    2 threads: 1000 creates/sec (serialized!)
+    4 threads: 1000 creates/sec (serialized!)
+    8 threads: 1000 creates/sec (serialized!)
+
+    GFS (fine-grained path locking):
+    ────────────────────────────────
+    1 thread:  1000 creates/sec
+    2 threads: 2000 creates/sec (parallel!)
+    4 threads: 4000 creates/sec (parallel!)
+    8 threads: 8000 creates/sec (parallel!)
+
+    → Linear scaling with parallelism
+
+
+    REAL-WORLD IMPACT:
+    ─────────────────
+
+    MapReduce with 1000 mappers:
+    • All write to /output/intermediate/
+    • Each creates file with unique name
+    • All proceed in parallel
+    • No lock contention!
+
+    Without fine-grained locking:
+    • Serialized on directory lock
+    • 1000x slower
+    • System unusable
+    ```
+  </Tab>
+</Tabs>
+
+### Metadata Storage
+
+The master keeps three types of metadata, all in memory:
+
+<CardGroup cols={3}>
+  <Card title="File Namespace" icon="folder-tree">
+    **Directory and File Names**
+
+    - Full pathname → metadata
+    - Persistent (operation log)
+    - Modification times
+    - Owner/permissions
+    - List of chunk handles
+  </Card>
+
+  <Card title="Chunk Metadata" icon="cube">
+    **Chunk Handle → Info**
+
+    - Chunk version number
+    - List of replica locations
+    - Primary (if leased)
+    - Lease expiration
+    - Partially persistent
+  </Card>
+
+  <Card title="Server State" icon="server">
+    **Chunkserver Info**
+
+    - Available disk space
+    - Current load (CPU, I/O)
+    - Chunks stored
+    - Last heartbeat time
+    - Not persistent
+  </Card>
+</CardGroup>
+
+```text
+METADATA MEMORY LAYOUT
+─────────────────────
+
+For 100 million chunks (several petabytes):
+
+File Namespace:
+──────────────
+• ~10 million files
+• ~100 bytes per file
+• Total: ~1 GB
+
+Chunk Metadata:
+──────────────
+• 100 million chunks
+• ~64 bytes per chunk
+  - Chunk handle (8 bytes)
+  - Version number (8 bytes)
+  - Replica locations (3-5 locations × 8 bytes)
+  - Lease info (16 bytes)
+• Total: ~6 GB
+
+Chunkserver State:
+─────────────────
+• ~1000 chunkservers
+• ~1 KB per server
+• Total: ~1 MB
+
+TOTAL: < 10 GB (easily fits in RAM of modern server)
+
+Benefits:
+────────
+✓ Fast operations (no disk I/O)
+✓ Simple consistency
+✓ Global view for decisions
+✓ Easy to scan entire namespace
+```
+
+---
+
+## Chunk Lease Mechanism
+
+Leases are central to GFS's consistency model, enabling mutations without distributed consensus.
+
+### How Leases Work
+
+<Steps>
+  <Step title="Master Grants Lease">
+    ```text
+    LEASE GRANT PROCESS
+    ──────────────────
+
+    Client requests write to chunk X
+
+    Master checks:
+    1. Does chunk X have current primary?
+       NO → Select one replica as primary
+
+    2. Grant lease:
+       ┌──────────────────────────────┐
+       │ Chunk: X                     │
+       │ Primary: chunkserver-5       │
+       │ Lease expiration: T+60sec    │
+       │ Version: 7                   │
+       └──────────────────────────────┘
+
+    3. Send to chunkserver-5:
+       "You are primary for chunk X until T+60"
+
+    4. Increment chunk version to 8
+
+    5. Return to client:
+       Primary: cs-5
+       Secondaries: [cs-2, cs-9]
+       Version: 8
+    ```
+  </Step>
+
+  <Step title="Primary Orders Mutations">
+    ```text
+    PRIMARY ROLE
+    ───────────
+
+    While lease held, primary has authority:
+
+    Multiple clients send writes:
+
+    Client A: Write(offset=1000, len=100)
+    Client B: Append(len=200)
+    Client C: Write(offset=5000, len=50)
+
+    Primary receives all three:
+    ─────────────────────────
+
+    1. Assign serial numbers:
+       A → Serial #1
+       B → Serial #2
+       C → Serial #3
+
+    2. Apply to local chunk in order:
+       #1: Write at 1000
+       #2: Append at end
+       #3: Write at 5000
+
+    3. Send to secondaries:
+       "Apply operations in order: #1, #2, #3"
+
+    4. Wait for ACKs
+
+    5. Reply to clients
+
+    Result: Consistent ordering across all replicas!
+    ```
+  </Step>
+
+  <Step title="Lease Renewal">
+    ```text
+    LEASE LIFECYCLE
+    ──────────────
+
+    Initial lease: 60 seconds
+
+    Renewal (if writes ongoing):
+    ────────────────────────────
+
+    Every ~10-15 seconds:
+
+    Primary → Master:
+      "Heartbeat: Still active, renew lease for chunk X"
+
+    Master → Primary:
+      "Lease extended to T+60"
+
+    This continues while writes happen
+
+    Expiration:
+    ──────────
+
+    No renewal for 60 seconds?
+    → Lease expires
+    → Master can grant to different replica
+    → Or same replica (if still alive)
+
+
+    REVOCATION:
+    ──────────
+
+    Master needs to revoke lease:
+    (e.g., client requested chunk deletion)
+
+    1. Master sends revoke message to primary
+    2. Primary stops accepting new mutations
+    3. Completes in-flight operations
+    4. ACKs revocation to master
+    5. Master can now delete chunk
+
+    If primary unreachable?
+    → Wait for 60sec expiration
+    → Then proceed
+    ```
+  </Step>
+</Steps>
+
+### Lease Benefits
+
+```text
+WHY LEASES?
+──────────
+
+Problem Without Leases:
+───────────────────────
+
+Distributed consensus for every write:
+
+Client → Replica 1 ┐
+Client → Replica 2 ┼→ Agree on order? (Paxos/Raft)
+Client → Replica 3 ┘   Slow! Complex!
+
+For each write:
+- Multiple round trips
+- Consensus protocol
+- Failure handling
+→ 10-100ms latency per operation
+
+
+With Leases:
+───────────
+
+One-time setup (lease grant):
+Master → Primary: "You order operations for 60sec"
+
+Then for each write:
+Client → Primary: "Write this"
+Primary → Secondaries: "Apply in this order"
+→ ~1ms latency per operation
+
+Benefits:
+────────
+✓ No distributed consensus per operation
+✓ Primary makes serialization decision
+✓ Low latency writes
+✓ Simple protocol
+✓ Automatic timeout (no need for perfect failure detection)
+
+
+LEASE VS LOCK:
+─────────────
+
+Lock:
+- Must explicitly release
+- Failure? → Deadlock or complex recovery
+
+Lease:
+- Automatic timeout
+- Failure? → Expires naturally
+- Master can wait or revoke
+- No distributed state
+```
+
+## Snapshot Mechanics (Copy-on-Write)
+
+Snapshots in GFS are nearly instantaneous and allow users to create a copy of a file or a directory tree without copying data.
+
+### How it Works (The Metadata-Only Copy)
+GFS uses **Copy-on-Write (CoW)** at the chunk level to implement snapshots efficiently.
+
+1. **Lease Revocation**: When the master receives a snapshot request, it first revokes any outstanding leases on the chunks of the files to be snapshotted. This ensures that any subsequent writes will require a new lease, giving the master a chance to intercept and create a copy.
+2. **Log & Copy Metadata**: The master logs the snapshot operation to disk. It then applies the operation to its in-memory state by duplicating the metadata for the file or directory. The new "snapshot" file points to the **same chunk handles** as the original.
+3. **Reference Counting**: Each chunk handle now has a reference count > 1.
+
+### The First Write After Snapshot
+When a client wants to write to a chunk that has been snapshotted:
+
+```text
+1. Client asks Master for lease: "Write to Chunk C (ref_count=2)"
+2. Master sees ref_count > 1:
+   a) Pick new chunk handle C'
+   b) Tell chunkservers holding C: "Copy C to C' locally"
+   c) Update metadata: Current file now points to C' (ref_count=1)
+   d) Snapshot still points to C (ref_count=1)
+3. Master grants lease for C' to client.
+4. Client writes to C' normally.
+```
+
+**Key Benefit**: The initial snapshot is just a metadata operation (copying pointers). The actual data copying is deferred until a write occurs, and only for the specific chunks being modified.
+
+---
+
+## Replica Placement
+
+The master decides where to place chunk replicas, optimizing for reliability, bandwidth, and load balancing.
+
+### Placement Goals
+
+<AccordionGroup>
+  <Accordion title="Maximize Reliability" icon="shield-check">
+    **Survive Multiple Failures**:
+
+    ```text
+    FAILURE DOMAIN HIERARCHY
+    ───────────────────────
+
+    Datacenter
+    ├── Rack 1
+    │   ├── Switch 1A
+    │   │   ├── Machine 1
+    │   │   ├── Machine 2
+    │   │   └── Machine 3
+    │   └── Switch 1B
+    │       ├── Machine 4
+    │       └── Machine 5
+    └── Rack 2
+        └── Switch 2A
+            ├── Machine 6
+            └── Machine 7
+
+    Failure Scenarios:
+    ─────────────────
+
+    1. Disk failure: One machine
+       Probability: High (daily)
+
+    2. Machine failure: One machine
+       Probability: Medium (weekly)
+
+    3. Switch failure: All machines under switch
+       Probability: Low (monthly)
+
+    4. Rack failure: Power/cooling/network
+       Probability: Very low (yearly)
+
+
+    PLACEMENT STRATEGY:
+    ──────────────────
+
+    Bad: All replicas on same rack
+    ┌────────────────────────────┐
+    │ Rack 1                     │
+    │  Replica 1 (machine 1)     │
+    │  Replica 2 (machine 2)     │
+    │  Replica 3 (machine 3)     │
+    └────────────────────────────┘
+    → Rack failure = Data loss!
+
+    Good: Replicas across racks
+    ┌────────────┐  ┌────────────┐
+    │ Rack 1     │  │ Rack 2     │
+    │ Replica 1  │  │ Replica 3  │
+    │ Replica 2  │  │            │
+    └────────────┘  └────────────┘
+    → Survives rack failure
+    → 2 in one rack for intra-rack bandwidth
+    ```
+  </Accordion>
+
+  <Accordion title="Maximize Bandwidth" icon="gauge-high">
+    **Network Topology Awareness**:
+
+    ```text
+    NETWORK BANDWIDTH HIERARCHY
+    ──────────────────────────
+
+    Within machine:      1000+ MB/s (disk)
+    Within rack:         100-1000 MB/s (1-10 Gbps)
+    Cross-rack:          10-100 MB/s (limited by uplink)
+    Cross-datacenter:    1-10 MB/s (WAN)
+
+
+    READ OPTIMIZATION:
+    ─────────────────
+
+    Client wants to read chunk X
+    Replicas: [rack1-machine5, rack2-machine3, rack3-machine1]
+
+    Client is in rack1
+    ↓
+    Prefer rack1-machine5 (100-1000 MB/s)
+    Over rack2-machine3 (10-100 MB/s)
+
+    → 10x faster read!
+
+
+    WRITE OPTIMIZATION:
+    ──────────────────
+
+    Chain replicas by network distance:
+
+    Client in rack1 writes:
+    ───────────────────────
+
+    Bad chaining:
+    Client → Rack3 → Rack1 → Rack2
+    (cross-rack × 3 = slow)
+
+    Good chaining:
+    Client → Rack1 → Rack2 → Rack3
+    (one intra-rack, then fan out)
+
+    → Exploits full network bandwidth
+    → Pipelined transfers
+    ```
+  </Accordion>
+
+  <Accordion title="Balance Load" icon="scale-balanced">
+    **Distribute Storage and I/O**:
+
+    ```text
+    LOAD BALANCING FACTORS
+    ──────────────────────
+
+    Master tracks for each chunkserver:
+
+    1. Disk space utilization
+       ┌─────────────────────────┐
+       │ cs-1: 45% full          │
+       │ cs-2: 89% full ← Avoid  │
+       │ cs-3: 23% full ← Prefer │
+       └─────────────────────────┘
+
+    2. Recent write load
+       ┌─────────────────────────┐
+       │ cs-1: 50 writes/min     │
+       │ cs-2: 200 writes/min ←  │
+       │ cs-3: 10 writes/min     │
+       └─────────────────────────┘
+
+    3. Number of chunks stored
+       (proxy for future load)
+
+    4. Recent chunk creations
+       (newly created chunks → writes soon)
+
+
+    PLACEMENT ALGORITHM:
+    ───────────────────
+
+    When creating new chunk replica:
+
+    1. Filter candidates:
+       • Enough free space (> chunk size)
+       • Not in same rack as existing replica
+       • Below average load
+
+    2. Sort by:
+       • Disk space (prefer emptier)
+       • Recent chunk creations (prefer fewer)
+
+    3. Select top candidate
+
+    4. Update tracking info
+
+
+    REBALANCING:
+    ───────────
+
+    Background process (periodic):
+
+    Detect imbalance:
+    - cs-2: 90% full
+    - cs-3: 20% full
+    - Difference > threshold
+
+    Action:
+    → Move some chunks from cs-2 to cs-3
+    → Gradual process (limit impact)
+    → Respect rack diversity
+    ```
+  </Accordion>
+</AccordionGroup>
+
+### Chunk Creation
+
+```text
+CHUNK CREATION WORKFLOW
+──────────────────────
+
+Scenario: Client creates new file and writes first chunk
+
+1. CLIENT CREATES FILE
+   ──────────────────
+
+   Client: "Create file /data/logs/2003-10-15"
+   Master:
+     a) Create namespace entry
+     b) Log operation to disk
+     c) Return success
+
+2. CLIENT WRITES DATA
+   ──────────────────
+
+   Client: "Write to /data/logs/2003-10-15, offset 0, 1MB"
+   Master:
+     a) File has no chunks yet
+     b) Need to create chunk 0
+
+3. MASTER ALLOCATES CHUNK
+   ──────────────────────
+
+   a) Generate chunk handle (globally unique 64-bit)
+      chunk_handle = 0x1a2b3c4d5e6f7g8h
+
+   b) Select 3 chunkservers:
+
+      Available servers: [cs-1, cs-2, ..., cs-50]
+
+      Filter:
+      • Enough disk space
+      • Below average utilization
+      • Rack diversity
+
+      Selected: [cs-5, cs-12, cs-23]
+      (cs-5 and cs-12 in rack-1, cs-23 in rack-2)
+
+   c) Designate primary (lowest load)
+      Primary: cs-5
+
+   d) Grant lease to cs-5 (60 seconds)
+
+   e) Increment version to 1
+
+   f) Log operation:
+      "CHUNK_CREATE: handle=0x1a2b, file=/data/logs/2003-10-15,
+       index=0, version=1, locations=[cs-5, cs-12, cs-23]"
+
+4. MASTER CONTACTS CHUNKSERVERS
+   ────────────────────────────
+
+   Master → cs-5, cs-12, cs-23:
+     "Create chunk 0x1a2b, version 1"
+
+   Each chunkserver:
+     a) Create empty file /gfs/chunks/0x1a2b3c4d5e6f7g8h
+     b) Initialize version to 1
+     c) ACK to master
+
+5. MASTER RETURNS TO CLIENT
+   ────────────────────────
+
+   Master → Client:
+     "Chunk 0 metadata:
+      handle: 0x1a2b3c4d5e6f7g8h
+      primary: cs-5
+      secondaries: [cs-12, cs-23]
+      version: 1
+      lease_expiration: T+60"
+
+6. CLIENT WRITES DATA
+   ──────────────────
+
+   (Normal write flow as described in Chapter 2)
+```
+
+### Re-replication
+
+When replicas fall below target count (e.g., server failure), master re-replicates:
+
+```text
+RE-REPLICATION WORKFLOW
+──────────────────────
+
+Trigger: Chunkserver cs-12 fails
+
+1. DETECTION
+   ─────────
+
+   Master heartbeat timeout:
+   • cs-12 hasn't responded in 10+ seconds
+   • Mark cs-12 as dead
+   • Scan all chunks on cs-12
+
+2. IDENTIFY UNDER-REPLICATED CHUNKS
+   ────────────────────────────────
+
+   Chunks on cs-12:
+   ┌─────────────────────────────────────┐
+   │ Chunk 0x1a2b: [cs-5, cs-12, cs-23]  │
+   │   → Now only 2 replicas (cs-5, cs-23) │
+   │   → Need re-replication!            │
+   │                                     │
+   │ Chunk 0x2c3d: [cs-7, cs-12, cs-15]  │
+   │   → Now only 2 replicas             │
+   │   → Need re-replication!            │
+   └─────────────────────────────────────┘
+
+3. PRIORITIZATION
+   ──────────────
+
+   Sort chunks by priority:
+
+   Priority factors:
+   • Current replication count (1 > 2 > 3)
+   • Recently accessed (hot chunks first)
+   • Blocks client writes (highest priority)
+
+   Example order:
+   1. Chunk 0x9f8e: 1 replica (URGENT!)
+   2. Chunk 0x7d6c: 2 replicas, blocking write
+   3. Chunk 0x1a2b: 2 replicas, recently read
+   4. Chunk 0x5b4a: 2 replicas, cold data
+
+4. SELECT SOURCE AND DESTINATION
+   ──────────────────────────────
+
+   For chunk 0x1a2b:
+
+   Existing replicas: [cs-5, cs-23]
+
+   Select source: cs-5 (lowest load)
+
+   Select destination:
+   • Filter: Not in same rack as cs-5 or cs-23
+   • Prefer: Low disk usage, low load
+   • Result: cs-31 (in rack-3)
+
+5. ISSUE RE-REPLICATION
+   ────────────────────
+
+   Master → cs-31:
+     "Copy chunk 0x1a2b from cs-5, version 1"
+
+   cs-31 → cs-5:
+     "Send me chunk 0x1a2b"
+
+   cs-5 → cs-31:
+     [chunk data, 64MB]
+
+   cs-31:
+     • Writes to local disk
+     • Verifies checksums
+     • ACKs to master
+
+6. UPDATE METADATA
+   ───────────────
+
+   Master updates chunk 0x1a2b:
+   Locations: [cs-5, cs-23, cs-31]
+
+   Chunk now has 3 replicas again ✓
+
+
+RATE LIMITING:
+─────────────
+
+Master limits re-replication rate:
+• Max concurrent re-replications: 50-100
+• Avoids overwhelming network
+• Background process, not urgent
+• Gradually restores replication
+```
+
+---
+
+## Garbage Collection
+
+GFS uses lazy garbage collection instead of immediate deletion.
+
+### Why Lazy Deletion?
+
+<CardGroup cols={2}>
+  <Card title="Benefits" icon="check">
+    **Advantages of Lazy GC**:
+
+    - Simple implementation
+    - Batched operations
+    - No complex distributed deletion
+    - Can recover from accidental deletes
+    - Spreads I/O load over time
+    - Handles failures gracefully
+  </Card>
+
+  <Card title="Trade-offs" icon="scale-balanced">
+    **Considerations**:
+
+    - Storage not freed immediately
+    - May need manual cleanup for urgent cases
+    - Requires background process
+    - Deleted files visible briefly
+    - Not suitable for quota systems
+  </Card>
+</CardGroup>
+
+### Garbage Collection Process
+
+<Tabs>
+  <Tab title="File Deletion">
+    ```text
+    FILE DELETION WORKFLOW
+    ─────────────────────
+
+    1. CLIENT DELETES FILE
+       ──────────────────
+
+       Client: "Delete /data/old/file1"
+
+       Master:
+       ┌──────────────────────────────────┐
+       │ a) Rename file to hidden name:  │
+       │    /data/old/file1               │
+       │    →                             │
+       │    /.trash/file1.deleted.T12345  │
+       │                                  │
+       │ b) Add deletion timestamp        │
+       │                                  │
+       │ c) Log operation                 │
+       │                                  │
+       │ d) Return success                │
+       └──────────────────────────────────┘
+
+       File still exists, just renamed!
+
+       Client can immediately:
+       • Delete again (no-op)
+       • Undelete (rename back)
+
+    2. GRACE PERIOD
+       ───────────
+
+       Hidden file stays for N days (configurable, e.g., 3 days)
+
+       During this time:
+       • File not visible to normal operations
+       • Chunks still exist
+       • Can be recovered if needed
+       • Storage not freed
+
+       After 3 days:
+       → Master's background GC removes it
+
+    3. BACKGROUND SCAN (Master)
+       ───────────────────────
+
+       Periodic scan (e.g., every few hours):
+
+       for each file in /.trash/:
+           if (current_time - deletion_time) > grace_period:
+               # Permanently delete
+               chunk_handles = file.get_chunks()
+               for chunk in chunk_handles:
+                   remove_from_namespace(chunk)
+               delete_namespace_entry(file)
+
+       No rush, happens eventually
+
+    4. CHUNK REMOVAL
+       ─────────────
+
+       Deleted chunks marked in master memory:
+       "Chunk 0x1a2b: DELETED"
+
+       Not immediately removed from chunkservers
+       → Next step handles this
+    ```
+  </Tab>
+
+  <Tab title="Chunk Collection">
+    ```text
+    CHUNK GARBAGE COLLECTION
+    ───────────────────────
+
+    1. HEARTBEAT EXCHANGE
+       ──────────────────
+
+       Regular heartbeat (every ~30 seconds):
+
+       Chunkserver → Master:
+         "I have chunks: [0x1a2b, 0x2c3d, 0x3e4f, ...]"
+
+       Master → Chunkserver:
+         "Delete these: [0x5e6f, 0x7g8h]"
+
+    2. MASTER IDENTIFIES GARBAGE
+       ─────────────────────────
+
+       Master compares chunkserver's list with metadata:
+
+       Chunkserver reports: [0x1a2b, 0x2c3d, 0x9z8y]
+
+       Master's namespace has:
+       • 0x1a2b ✓ (belongs to /data/file1)
+       • 0x2c3d ✓ (belongs to /data/file2)
+       • 0x9z8y ✗ (NOT in namespace)
+
+       → 0x9z8y is orphaned/garbage
+
+       Reasons for garbage:
+       • File was deleted
+       • Chunk creation failed partway
+       • Master crash during operation
+       • Stale replica from old version
+
+    3. CHUNKSERVER DELETES
+       ───────────────────
+
+       Chunkserver receives delete list:
+
+       for chunk in delete_list:
+           os.remove(f"/gfs/chunks/{chunk}")
+           log("Deleted chunk {chunk}")
+
+       Simple, local operation
+       No coordination needed
+
+    4. STALE REPLICA DETECTION
+       ───────────────────────
+
+       Version numbers detect stale replicas:
+
+       Chunk 0x1a2b, current version: 5
+
+       Heartbeat report:
+       cs-5:  "chunk 0x1a2b, version 5" ✓
+       cs-12: "chunk 0x1a2b, version 5" ✓
+       cs-23: "chunk 0x1a2b, version 4" ✗ (STALE!)
+
+       Master → cs-23: "Delete 0x1a2b (stale)"
+
+       How version increases:
+       • Master grants new lease → version++
+       • Chunkserver was down during lease grant
+       • Chunkserver comes back with old version
+       • Master detects and deletes stale replica
+    ```
+  </Tab>
+
+  <Tab title="Background Process">
+    ```text
+    GC BACKGROUND PROCESS
+    ────────────────────
+
+    Master runs continuous background tasks:
+
+    TASK 1: Namespace Scan
+    ──────────────────────
+    Frequency: Every few hours
+    Purpose: Remove old deleted files
+
+    pseudocode:
+    ──────────
+    def namespace_gc():
+        for file in namespace:
+            if file.is_hidden_deleted():
+                age = now() - file.deletion_time
+                if age > GRACE_PERIOD:
+                    permanently_delete(file)
+
+    Impact:
+    • Low priority
+    • Runs when master idle
+    • Rate limited (100s files/sec)
+
+
+    TASK 2: Chunk Accounting
+    ────────────────────────
+    Frequency: Ongoing (via heartbeats)
+    Purpose: Identify orphaned chunks
+
+    pseudocode:
+    ──────────
+    def on_heartbeat(chunkserver, chunk_list):
+        for chunk in chunk_list:
+            if chunk not in namespace:
+                send_delete_command(chunkserver, chunk)
+            elif chunk.version < expected_version:
+                send_delete_command(chunkserver, chunk)
+
+    Impact:
+    • Immediate (next heartbeat)
+    • No extra overhead
+    • Piggybacked on heartbeat
+
+
+    TASK 3: Orphan Detection
+    ────────────────────────
+    Frequency: Daily
+    Purpose: Find chunks that should exist but don't
+
+    pseudocode:
+    ──────────
+    def orphan_detection():
+        for file in namespace:
+            for chunk in file.chunks:
+                replicas = get_chunk_locations(chunk)
+                if len(replicas) < REPLICATION_GOAL:
+                    schedule_replication(chunk)
+
+    Impact:
+    • Ensures all data replicated
+    • Catches missed failures
+    • Safety net
+
+
+    RATE LIMITING:
+    ─────────────
+
+    All GC tasks are rate-limited:
+    • Don't overload master
+    • Don't saturate network
+    • Don't impact foreground ops
+
+    Configuration:
+    • Max deletions per heartbeat: 10
+    • Max namespace scans per sec: 100
+    • Max re-replications concurrent: 50
+    ```
+  </Tab>
+</Tabs>
+
+---
+
+## Master Fault Tolerance
+
+The master is replicated to ensure system availability:
+
+### Replication Strategy
+
+```text
+MASTER REPLICATION
+─────────────────
+
+Primary Master:
+┌──────────────────────────────────────┐
+│ • Handles all operations             │
+│ • In-memory metadata                 │
+│ • Operation log (on disk)            │
+└──────────────────────────────────────┘
+           │
+           │ Replicates to:
+           │
+           ↓
+┌──────────────────────────────────────┐
+│ Shadow Masters (multiple)            │
+│ • Read-only replicas                 │
+│ • Lag slightly behind primary        │
+│ • Can serve reads                    │
+│ • Quick promotion on failure         │
+└──────────────────────────────────────┘
+           │
+           │ Operation log also on:
+           │
+           ↓
+┌──────────────────────────────────────┐
+│ Remote Disks (multiple)              │
+│ • Different failure domains          │
+│ • Different datacenters              │
+│ • Disaster recovery                  │
+└──────────────────────────────────────┘
+
+
+OPERATION LOG REPLICATION:
+─────────────────────────
+
+Every metadata mutation:
+
+1. Primary logs operation
+2. Replicates to shadow masters
+3. Replicates to remote disks
+4. Waits for ACKs from ALL
+5. Then applies to memory
+6. Then returns success to client
+
+Guarantee: If client sees success, operation is durable
+
+
+SHADOW MASTER OPERATION:
+───────────────────────
+
+Shadow continuously:
+• Reads operation log from primary
+• Replays operations locally
+• Builds same in-memory state
+• Lags by ~seconds
+
+Can serve:
+• Read-only operations
+• Metadata queries
+• File listings
+
+Cannot serve:
+• Writes (redirects to primary)
+• Lease grants
+• Chunk creation
+
+
+FAILOVER:
+────────
+
+Primary master fails:
+1. Monitoring detects failure (<10 sec)
+2. External system promotes shadow
+3. Shadow becomes primary
+4. Updates DNS/configuration
+5. Clients redirect to new primary
+
+Downtime: ~1 minute (conservative)
+
+Data loss: None (operation log replicated)
+```
+
+### Fast Recovery
+
+<Steps>
+  <Step title="Checkpoint Loading">
+    ```text
+    Master starts (after crash or planned restart)
+
+    1. Load latest checkpoint from disk
+       • Compact B-tree format
+       • Contains full namespace
+       • Loads in 1-2 seconds
+       • Typically < 1 GB
+
+    2. Result:
+       • Full file namespace in memory
+       • Chunk handle mappings
+       • Version numbers
+    ```
+  </Step>
+
+  <Step title="Log Replay">
+    ```text
+    Replay operation log since checkpoint
+
+    1. Read log file
+    2. Apply each operation in order:
+       • File creates
+       • Chunk allocations
+       • Version updates
+       • Deletions
+
+    3. Typically few seconds (100K ops/sec)
+
+    4. Result: Master has current namespace state
+    ```
+  </Step>
+
+  <Step title="Chunk Location Discovery">
+    ```text
+    Master doesn't persist chunk locations
+    (Chunkservers are source of truth)
+
+    1. Master sends to all chunkservers:
+       "What chunks do you have?"
+
+    2. Each chunkserver replies:
+       "I have: [chunk1, chunk2, ..., chunkN]
+        With versions: [v1, v2, ..., vN]"
+
+    3. Master builds location map in memory
+
+    4. Identifies stale replicas (old versions)
+
+    5. Marks for garbage collection
+
+    Typically completes in 10-30 seconds
+    ```
+  </Step>
+
+  <Step title="Resume Operations">
+    ```text
+    Master is now ready!
+
+    Total recovery time: < 1 minute
+
+    1. Checkpoint load: 1-2 sec
+    2. Log replay: 5-10 sec
+    3. Chunk poll: 10-30 sec
+    4. Ready: 30-60 sec total
+
+    Meanwhile:
+    • Shadow masters can serve reads
+    • System remains partially available
+    • No data loss
+    ```
+  </Step>
+</Steps>
+
+---
+
+## Interview Questions
+
+<AccordionGroup>
+  <Accordion title="Basic: Why does GFS use lazy garbage collection?" icon="circle-question">
+    **Expected Answer**:
+
+    GFS uses lazy garbage collection instead of immediate deletion for several reasons:
+
+    1. **Simplicity**: No complex distributed deletion protocol needed
+    2. **Recovery**: Accidental deletions can be recovered during grace period (e.g., 3 days)
+    3. **Batch Operations**: Deletions batched together, reducing overhead
+    4. **Failure Handling**: If deletion message lost, chunk collected eventually anyway
+    5. **Spread Load**: I/O spread over time, not sudden burst
+    6. **Piggybacking**: Uses existing heartbeat mechanism
+
+    The trade-off is that storage isn't freed immediately, but for Google's workload this was acceptable since storage was relatively cheap and safety was more important.
+
+    Process: File deletion → rename to hidden → wait grace period → background GC removes → heartbeat informs chunkservers → chunkservers delete local chunks
+  </Accordion>
+
+  <Accordion title="Intermediate: Explain GFS's namespace locking mechanism" icon="diagram-project">
+    **Expected Answer**:
+
+    GFS uses fine-grained read-write locks on full pathnames to enable concurrent operations:
+
+    **How it works**:
+    - Each path (file or directory) has a read-write lock
+    - Operations acquire locks on full paths, not just the target
+    - Example: Creating `/home/user1/file` requires:
+      - Read lock on `/home`
+      - Read lock on `/home/user1`
+      - Write lock on `/home/user1/file`
+
+    **Benefits**:
+    - Multiple operations in same directory can proceed in parallel
+    - Example: Creating `/data/file1` and `/data/file2` concurrently
+    - Both acquire read lock on `/data` (shared)
+    - Each acquires write lock on different file (no conflict)
+
+    **Deadlock prevention**:
+    - Locks acquired in lexicographic order
+    - Example: Operation needs `/a/x` and `/b/y`
+    - Always acquire in sorted order: `/a/x` then `/b/y`
+
+    This design enables linear scaling with concurrent operations, unlike directory-level locking which serializes all operations in the same directory.
+  </Accordion>
+
+  <Accordion title="Advanced: How does the chunk lease mechanism ensure consistency?" icon="rocket">
+    **Expected Answer**:
+
+    The lease mechanism provides consistency without distributed consensus:
+
+    **Setup**:
+    1. Master grants 60-second lease to one replica (primary)
+    2. Only primary can order mutations during lease period
+    3. Primary identity cached by clients
+
+    **Write Process**:
+    1. Data pushed to all replicas (in memory, not applied)
+    2. Client sends write request to primary
+    3. Primary assigns serial number (ordering)
+    4. Primary applies to local disk
+    5. Primary sends order to secondaries
+    6. Secondaries apply in same order
+    7. All ACK to primary
+    8. Primary ACKs to client
+
+    **Consistency Guarantee**:
+    - All replicas apply mutations in same order (serialized by primary)
+    - Same serial numbers → same state
+    - No distributed consensus needed
+    - Primary has authority during lease
+
+    **Failure Handling**:
+    - Lease timeout (60 sec) ensures master can regain control
+    - If primary fails, lease expires naturally
+    - Master can grant new lease to different replica
+    - No need for perfect failure detection
+
+    **Why it works**:
+    - Single authority (primary) during lease
+    - Time-bounded authority (60 sec)
+    - Master retains ultimate control
+    - Simple protocol, high performance
+  </Accordion>
+
+  <Accordion title="System Design: How would you improve GFS's single master limitation?" icon="wrench">
+    **Expected Answer**:
+
+    Several approaches to scale beyond single master:
+
+    **1. Metadata Sharding** (like Colossus):
+    - Partition namespace by path prefix
+    - Multiple master shards, each handles subset
+    - Example: Master1 handles `/data/*`, Master2 handles `/logs/*`
+    - Benefits: Scales metadata capacity and throughput
+    - Challenges: Cross-shard operations, rebalancing
+
+    **2. Hierarchical Masters**:
+    - Root master coordinates multiple sub-masters
+    - Each sub-master handles subset of chunkservers
+    - Root handles namespace, sub-masters handle chunks
+    - Benefits: Scales chunk management
+    - Challenges: Two-level hierarchy complexity
+
+    **3. Client-Side Metadata Caching**:
+    - Aggressive client caching with long timeouts
+    - Lease-based cache consistency
+    - Master only for cache misses
+    - Benefits: Reduces master load dramatically
+    - Challenges: Consistency protocol more complex
+
+    **4. Metadata Distribution**:
+    - Distribute master state using consensus (Paxos/Raft)
+    - Read from any replica, write to leader
+    - Benefits: High availability, read scalability
+    - Challenges: Write latency, consistency overhead
+
+    **Real-world Evolution**:
+    - Colossus (GFS successor) uses metadata sharding
+    - HDFS Federation uses multiple namenodes
+    - Both prove that single master can be overcome while maintaining simplicity where possible
+  </Accordion>
+</AccordionGroup>
+
+## Stale Replica Detection (Version Numbers)
+
+In a distributed system, some replicas may miss updates (e.g., if a chunkserver crashes during a write). GFS uses **Chunk Version Numbers** to distinguish between up-to-date and stale replicas.
+
+### The Versioning Protocol
+1. **Lease Granting**: Before granting a lease, the master increments the chunk's version number in its persistent metadata.
+2. **Propagation**: The master notifies the primary and all secondaries of the new version number.
+3. **Persisting**: Both the master and the chunkservers record the new version number on their respective persistent disks *before* the mutation starts.
+4. **Stale Check**: If a chunkserver was down during the update, it will still have the old version number.
+
+### How the Master Uses Versions
+- **During Heartbeats**: Chunkservers report their (handle, version) pairs. If the master sees a version $V < V_{current}$, it knows the replica is stale.
+- **Garbage Collection**: Stale replicas are immediately scheduled for garbage collection.
+- **Client Requests**: When a client asks for chunk locations, the master *never* returns a stale replica, ensuring the client only sees current data.
+
+---
+
+## Key Takeaways
+
+<Note>
+**Master Operations Summary**:
+
+1. **Namespace Locking**: Fine-grained path-based locks enable parallel operations
+2. **Leases for Consistency**: Time-bounded primary authority avoids distributed consensus
+3. **Replica Placement**: Rack-aware placement balances reliability and performance
+4. **Lazy Garbage Collection**: Simple, safe deletion with recovery window
+5. **In-Memory Metadata**: Fast operations, simple consistency, small memory footprint
+6. **Master Replication**: Operation log replication ensures durability and fast recovery
+7. **Background Processes**: GC, re-replication, balancing happen asynchronously
+8. **Version Numbers**: Detect stale replicas reliably without complex protocols
+</Note>
+
+---
+
+## Up Next
+
+In **Chapter 4: Chunkservers & Data Flow**, we'll explore:
+- How chunkservers store and manage chunks
+- Detailed read, write, and record append flows
+- Data integrity mechanisms with checksums
+- Replication pipeline and optimization
+- Handling chunkserver failures
+
+The master orchestrates the system—now we'll see how chunkservers execute the actual data operations.

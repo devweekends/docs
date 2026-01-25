@@ -1,0 +1,1331 @@
+---
+title: "Architecture Overview"
+sidebarTitle: "Chapter 2: Architecture"
+description: "Deep dive into GFS system architecture, components, and data flow patterns"
+icon: "diagram-project"
+---
+
+# Chapter 2: Architecture Overview
+
+The Google File System architecture is elegantly simple: a single master coordinating hundreds of chunkservers, with clients communicating directly with chunkservers for data operations. This chapter explores how these components work together to create a highly scalable distributed file system.
+
+<Info>
+**Chapter Goals**:
+- Understand the three main components: Master, Chunkservers, and Clients
+- Learn how data flows through the system
+- Grasp the separation of control and data flow
+- Appreciate the single-master design choice
+</Info>
+
+---
+
+## System Components
+
+GFS consists of three main types of components:
+
+```text
++---------------------------------------------------------------+
+|                    GFS ARCHITECTURE                           |
++---------------------------------------------------------------+
+|                                                               |
+|                    ┌─────────────────┐                        |
+|                    │  MASTER         │                        |
+|                    │  ┌───────────┐  │                        |
+|                    │  │ Metadata  │  │   • Namespace          |
+|                    │  │ (in-mem)  │  │   • Chunk locations    |
+|                    │  └───────────┘  │   • Leases             |
+|                    │  Operation Log   │   • Garbage collection |
+|                    │  Checkpoints     │                        |
+|                    └─────────────────┘                        |
+|                       ↑    ↑    ↑                             |
+|         Control flow  │    │    │   (metadata only)           |
+|                       │    │    │                             |
+|         ┌─────────────┘    │    └─────────────┐               |
+|         │                  │                  │               |
+|    ┌────────┐         ┌────────┐         ┌────────┐          |
+|    │ CLIENT │         │ CLIENT │         │ CLIENT │          |
+|    └────────┘         └────────┘         └────────┘          |
+|         │                  │                  │               |
+|         │ Data flow        │                  │               |
+|         │ (direct)         │                  │               |
+|         ↓                  ↓                  ↓               |
+|    ┌──────────┐      ┌──────────┐      ┌──────────┐          |
+|    │ CHUNK    │←────→│ CHUNK    │←────→│ CHUNK    │          |
+|    │ SERVER 1 │      │ SERVER 2 │      │ SERVER 3 │          |
+|    │          │      │          │      │          │          |
+|    │ [Chunks] │      │ [Chunks] │      │ [Chunks] │          |
+|    │ Checksums│      │ Checksums│      │ Checksums│          |
+|    └──────────┘      └──────────┘      └──────────┘          |
+|                                                               |
+|    ... hundreds more chunkservers ...                        |
+|                                                               |
++---------------------------------------------------------------+
+
+KEY PRINCIPLE: Control and data flow are separated
+              Master handles metadata, clients talk to chunkservers for data
+```
+
+### The Master
+
+The master is the brain of GFS—a single process that manages all metadata. While it appears to be a bottleneck, the design leverages **Metadata Minimization** and **Direct Data Transfer** to ensure it can manage petabytes of data from thousands of clients.
+
+<Tabs>
+  <Tab title="Namespace & Locking">
+    **Namespace Structure**:
+    Unlike traditional file systems with directory inodes, GFS uses a **lookup table mapping full pathnames to metadata**. This lookup table is stored in a **prefix-compressed Radix Tree (or Hash Table)** for extreme RAM efficiency.
+
+    **The Locking Mechanism**:
+    Since there is no directory structure, operations on `/a/b/c` don't require locking the parent `/a` or `/a/b`. Instead:
+    1. To create `/home/user/foo`, the master acquires **Read Locks** on `/home` and `/home/user`, and a **Write Lock** on `/home/user/foo`.
+    2. This allows concurrent file creations in the same directory (e.g., `/home/user/bar` can be created simultaneously as it only needs a read lock on the parent).
+    3. **No deadlock risk**: Locks are acquired in a consistent lexicographical order.
+
+    **Benefit**: Extreme concurrency for metadata operations compared to traditional POSIX `dentry` locking.
+  </Tab>
+
+  <Tab title="Lease Mechanism">
+    **The Primary Replica**:
+    The master delegates authority for data consistency to a **Primary Chunkserver** using **Leases**.
+
+    1. **Granting**: Master picks a primary and grants a 60-second lease.
+    2. **Primary Role**: The primary defines the **serial order** of all mutations to the chunk.
+    3. **Heartbeat Extensions**: As long as the primary is active, it requests lease extensions via Heartbeat messages.
+    4. **The "Silent Primary" Problem**: If the master loses contact with a primary, it must wait for the 60-second lease to expire before it can safely designate a new primary. This prevents **Split-Brain** scenarios where two servers think they are primary.
+  </Tab>
+  
+  <Tab title="In-Memory State">
+    **Master's Memory Structure (The 64-Byte Rule)**:
+    Every chunk of data (64MB) requires approximately **64 bytes** of metadata on the master.
+
+    ```text
+    METADATA BREAKDOWN (Per Chunk):
+    -------------------------------
+    - Chunk Handle (8 bytes)
+    - Version Number (8 bytes)
+    - List of Replicas (variable, ~24 bytes)
+    - Lease Info (8 bytes)
+    - Checksum/Sync Status (variable)
+    
+    CAPACITY SCALING:
+    1 PB Cluster (16 million chunks) ≈ 1 GB of RAM.
+    100 PB Cluster ≈ 100 GB of RAM.
+    ```
+
+    **Key Insight**: The bottleneck of GFS is not CPU or Network, but the **RAM capacity of the Master** to hold the entire namespace.
+  </Tab>
+</Tabs>
+
+  <Tab title="Persistent State">
+    **What Gets Persisted**:
+
+    ```text
+    OPERATION LOG (Sequential on Disk)
+    ──────────────────────────────────
+
+    Every metadata mutation is logged:
+
+    Example Log Entries:
+    ┌────────────────────────────────────────┐
+    │ Timestamp: 1234567890                  │
+    │ Op: CREATE_FILE                        │
+    │ Path: /data/crawl/20031015             │
+    │ Owner: crawler                         │
+    ├────────────────────────────────────────┤
+    │ Timestamp: 1234567891                  │
+    │ Op: CREATE_CHUNK                       │
+    │ File: /data/crawl/20031015             │
+    │ ChunkHandle: 0x1a2b3c4d                │
+    │ ChunkIndex: 0                          │
+    ├────────────────────────────────────────┤
+    │ Timestamp: 1234567892                  │
+    │ Op: ASSIGN_CHUNK                       │
+    │ ChunkHandle: 0x1a2b3c4d                │
+    │ Servers: [cs1, cs5, cs12]              │
+    └────────────────────────────────────────┘
+
+    CHECKPOINTS (Compact B-tree)
+    ────────────────────────────
+
+    Periodically, master creates checkpoint:
+    • Entire namespace state
+    • All chunk mappings
+    • Compact B-tree format
+    • New operations log after checkpoint
+
+    Recovery:
+    1. Load latest checkpoint
+    2. Replay log entries since checkpoint
+    3. Query chunkservers for chunk locations
+    ```
+  </Tab>
+
+  <Tab title="Why Single Master?">
+    **The Single Master Decision**:
+
+    ```text
+    ADVANTAGES:
+    ──────────
+
+    1. Simplicity
+       • No distributed consensus for metadata
+       • Single source of truth
+       • Simple algorithms
+
+    2. Consistency
+       • Strong metadata consistency
+       • Easy to reason about
+       • No split-brain scenarios
+
+    3. Performance
+       • All metadata in RAM
+       • Fast decisions (chunk placement, etc.)
+       • No coordination overhead
+
+    4. Global Knowledge
+       • Sees entire cluster state
+       • Optimal placement decisions
+       • Better load balancing
+
+    POTENTIAL PROBLEM:
+    ─────────────────
+
+    Single point of failure? Bottleneck?
+
+    SOLUTIONS:
+    ─────────
+
+    1. Shadow Masters (read-only replicas)
+       • Lag slightly behind primary
+       • Available for reads during failures
+       • Quick promotion possible
+
+    2. Minimal Master Involvement
+       • Clients cache metadata
+       • Data flows directly to chunkservers
+       • Master only for control operations
+
+    3. Fast Operations
+       • All metadata in RAM
+       • Can handle 1000s of ops/second
+       • Rarely the bottleneck
+
+    4. Operation Log Replication
+       • Replicated to multiple machines
+       • Remote locations for disaster recovery
+       • Fast recovery from log
+    ```
+  </Tab>
+</Tabs>
+
+### Chunkservers
+
+Chunkservers are the workhorses that store actual data:
+
+<CardGroup cols={2}>
+  <Card title="Storage Model" icon="hard-drive">
+    **How Chunks Are Stored**:
+
+    - Each chunk: 64MB max
+    - Stored as Linux file on local disk
+    - Named by chunk handle (globally unique)
+    - File path: `/gfs/chunks/<chunk_handle>`
+    - Checksums for each 64KB block
+    - Multiple chunks per disk
+  </Card>
+
+  <Card title="Responsibilities" icon="list-check">
+    **What Chunkservers Do**:
+
+    - Store and retrieve chunks
+    - Verify data integrity (checksums)
+    - Replicate chunks to other servers
+    - Report to master via heartbeat
+    - Delete garbage chunks
+    - Handle client read/write requests
+  </Card>
+
+  <Card title="No Metadata Cache" icon="memory">
+    **Simple Design**:
+
+    - Chunkservers don't cache metadata
+    - Don't track which files chunks belong to
+    - Master tells them what to do
+    - Simplifies consistency
+    - Reduces memory requirements
+  </Card>
+
+  <Card title="Replication" icon="copy">
+    **Chunk Copies**:
+
+    - Each chunk replicated 3x (default)
+    - Replicas on different racks
+    - Replicas can serve reads
+    - One primary for writes (leased)
+    - Replicas forward writes in chain
+  </Card>
+</CardGroup>
+
+**Chunkserver State**:
+
+```text
+┌─────────────────────────────────────────────────────────────┐
+│                    CHUNKSERVER                               │
+├─────────────────────────────────────────────────────────────┤
+│                                                              │
+│  Disk Storage:                  Memory:                      │
+│  ─────────────                  ────────                     │
+│                                                              │
+│  /gfs/chunks/                   • Checksums (in-mem)         │
+│  ├── 0x1a2b3c4d                 • Active operations          │
+│  ├── 0x2b3c4d5e                 • Network buffers            │
+│  ├── 0x3c4d5e6f                                              │
+│  └── ...                        No persistent metadata!      │
+│                                                              │
+│  Each chunk file:               Heartbeat to Master:         │
+│  • 64MB max                     ──────────────────           │
+│  • Checksum per 64KB            • Every few seconds          │
+│  • Version number               • "I have chunks X,Y,Z"      │
+│                                 • Disk space available       │
+│                                 • Current load               │
+│                                                              │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### Clients
+
+GFS clients are library code linked into applications:
+
+```text
+CLIENT LIBRARY (GFS API)
+────────────────────────
+
+┌─────────────────────────────────────┐
+│  Application Code                   │
+│  (e.g., MapReduce, Crawler)         │
+├─────────────────────────────────────┤
+│  GFS Client Library                 │
+│                                     │
+│  • File operations API              │
+│  • Metadata caching                 │
+│  • Data buffering                   │
+│  • Checksum validation              │
+│  • Retry logic                      │
+│  • Performance optimizations        │
+└─────────────────────────────────────┘
+         │              │
+         │              │
+         ↓              ↓
+    To Master    To Chunkservers
+   (metadata)        (data)
+
+CLIENT OPTIMIZATIONS:
+─────────────────────
+
+1. Metadata Caching
+   • Cache chunk locations
+   • Reduce master traffic
+   • Timeout-based invalidation
+
+2. Chunk Location Prefetch
+   • Ask for multiple chunks
+   • Batch requests to master
+   • Sequential access optimization
+
+3. Data Buffering
+   • Buffer writes before sending
+   • Combine small appends
+   • Reduce network overhead
+
+4. Checksum Validation
+   • Verify data integrity
+   • Detect corruption early
+   • Avoid propagating bad data
+```
+
+### Data Flow Patterns
+
+Understanding how data flows through GFS is crucial. The key principle is the **Separation of Control Flow and Data Flow**. Control flows from client to master and then to the primary, while data is pushed linearly along a chain of chunkservers to maximize network throughput.
+
+#### The Pipeline Push Mechanism
+To fully utilize each machine's network bandwidth, data is pushed along a chain of chunkservers rather than in a star topology.
+
+```text
+PIPELINE DATA TRANSFER (3 Replicas: A, B, C)
+-------------------------------------------
+Client → A → B → C
+
+Mathematical Optimization:
+Total Time ≈ (Size / Bandwidth) + (N-1) * Latency
+
+Why this is efficient:
+1. Pipelining: Server A starts forwarding data to B as soon as it receives the first packet.
+2. Network Topology: GFS chooses the chain based on IP addresses (network distance) to minimize latency.
+3. Full Duplex: Each server uses its full outgoing bandwidth to push data to the next peer while receiving.
+```
+
+### Read Operation
+
+<Steps>
+  <Step title="Client Requests Metadata">
+    ```text
+    Client                    Master
+      │                         │
+      │  "Where is chunk 0      │
+      │   of /data/file1?"      │
+      │────────────────────────>│
+      │                         │
+      │  Chunk locations:       │
+      │  [cs1, cs5, cs12]       │
+      │<────────────────────────│
+      │                         │
+
+    Client caches this for future reads
+    ```
+  </Step>
+
+  <Step title="Client Contacts Chunkserver">
+    ```text
+    Client                  Chunkserver
+      │                         │
+      │  "Read chunk handle     │
+      │   0x1a2b, offset 10MB,  │
+      │   length 1MB"           │
+      │────────────────────────>│
+      │                         │
+      │  [Data payload]         │
+      │<────────────────────────│
+      │                         │
+
+    Client picks closest chunkserver
+    Master not involved in data transfer!
+    ```
+  </Step>
+
+  <Step title="Data Validation">
+    ```text
+    Client receives data and:
+
+    1. Validates checksums
+    2. Returns to application
+    3. May cache for future reads
+
+    If checksum fails:
+    → Try different replica
+    → Report to master
+    ```
+  </Step>
+</Steps>
+
+**Complete Read Flow**:
+
+```text
+READ OPERATION FLOW
+───────────────────
+
+1. Application calls: read("/data/file1", offset, length)
+
+2. Client Library:
+   ┌────────────────────────────────────────┐
+   │ a) Convert offset to chunk index       │
+   │    offset 100MB = chunk 1 (64MB each)  │
+   │                                        │
+   │ b) Check metadata cache                │
+   │    Cache hit? Skip master request      │
+   │                                        │
+   │ c) Request from master (if miss):      │
+   │    "Give me locations for chunks       │
+   │     [1,2,3] of /data/file1"            │
+   │    (Prefetch multiple chunks)          │
+   │                                        │
+   │ d) Cache response                      │
+   └────────────────────────────────────────┘
+
+3. Master Returns:
+   ┌────────────────────────────────────────┐
+   │ Chunk 1: [cs2, cs7, cs15]              │
+   │ Chunk 2: [cs3, cs9, cs11]              │
+   │ Chunk 3: [cs1, cs8, cs14]              │
+   │ Version: 5                             │
+   └────────────────────────────────────────┘
+
+4. Client Picks Closest Chunkserver:
+   ┌────────────────────────────────────────┐
+   │ Sort by network distance               │
+   │ cs15 is closest → send request there   │
+   └────────────────────────────────────────┘
+
+5. Chunkserver Serves Data:
+   ┌────────────────────────────────────────┐
+   │ • Read from local disk                 │
+   │ • Compute & return checksums           │
+   │ • Stream data to client                │
+   └────────────────────────────────────────┘
+
+6. Client Validates & Returns:
+   ┌────────────────────────────────────────┐
+   │ • Verify checksums                     │
+   │ • Return to application                │
+   │ • On error: try different replica      │
+   └────────────────────────────────────────┘
+```
+
+### Write Operation
+
+Writes are more complex due to maintaining consistency across replicas:
+
+```text
+WRITE OPERATION FLOW
+────────────────────
+
+Setup Phase:
+───────────
+
+Client                Master                Chunkservers
+  │                     │                         │
+  │ 1. "Write to        │                         │
+  │    file /data/f1"   │                         │
+  │────────────────────>│                         │
+  │                     │                         │
+  │                     │ 2. Grant lease to       │
+  │                     │    one replica (primary)│
+  │                     │────────────────────────>│ Primary
+  │                     │                         │
+  │ 3. Return:          │                         │
+  │    Primary: cs2     │                         │
+  │    Secondaries:     │                         │
+  │    [cs5, cs9]       │                         │
+  │<────────────────────│                         │
+
+
+Data Push Phase (SEPARATED FROM CONTROL):
+────────────────────────────────────────
+
+  │                                                │
+  │ 4. Push data to closest replica                │
+  │───────────────────────────────────────────────>│ cs5
+  │                                                │
+  │                                                │
+  │                          5. Forward along      │
+  │                             replica chain      │
+  │                                                │─────> cs2
+  │                                                │
+  │                                                │─────> cs9
+  │                                                │
+  │ 6. All replicas ACK data received              │
+  │    (data in memory, not yet written)           │
+  │<───────────────────────────────────────────────│
+
+
+Control Phase:
+─────────────
+
+  │                                                │
+  │ 7. Send write request to PRIMARY               │
+  │    "Apply buffered data"                       │
+  │───────────────────────────────────────────────>│ Primary (cs2)
+  │                                                │
+  │                                                │
+  │                     8. Primary assigns serial  │
+  │                        number, applies writes  │
+  │                        in order                │
+  │                                                │
+  │                     9. Forward write order     │
+  │                        to secondaries          │
+  │                                                │─────> cs5
+  │                                                │─────> cs9
+  │                                                │
+  │                    10. Secondaries apply       │
+  │                        writes in same order    │
+  │                                                │
+  │                    11. Secondaries reply       │
+  │                        to primary              │
+  │                                                │<───── cs5
+  │                                                │<───── cs9
+  │                                                │
+  │ 12. Primary replies to client                  │
+  │     Success/Failure                            │
+  │<───────────────────────────────────────────────│
+  │                                                │
+
+
+KEY INSIGHTS:
+────────────
+
+1. Data flow decoupled from control flow
+   → Push data along network topology
+   → Send control to primary
+
+2. Pipelining
+   → Replica forwards while receiving
+   → Exploits full network bandwidth
+
+3. Primary serializes operations
+   → Consistent order across replicas
+   → No distributed consensus needed
+```
+
+### Record Append Operation
+
+The record append is GFS's "killer feature":
+
+<Tabs>
+  <Tab title="How It Works">
+    ```text
+    ATOMIC RECORD APPEND
+    ────────────────────
+
+    Problem:
+    ───────
+    Multiple clients want to append to same file
+    (e.g., 1000 mappers writing to shared output)
+
+    Traditional Append:
+    ──────────────────
+    1. Client: "What's current file size?"
+    2. Master: "100MB"
+    3. Client: "Write at offset 100MB"
+    4. RACE: Another client may write there!
+    5. Need distributed locking → slow
+
+    GFS Record Append:
+    ─────────────────
+
+    Client A ──┐
+    Client B ──┼──> "Append this record"
+    Client C ──┘     (no offset specified!)
+               │
+               ↓
+           Primary picks offset atomically
+               │
+               ↓
+           Returns offset to client
+
+    Properties:
+    ──────────
+    ✓ Atomic: All-or-nothing
+    ✓ At-least-once: Guaranteed success
+    ✓ No distributed locks needed
+    ✓ Concurrent from multiple clients
+    ⚠ May have duplicates (retries)
+    ⚠ May have padding (if crosses chunk)
+    ```
+  </Tab>
+
+  <Tab title="Detailed Flow">
+    ```text
+    RECORD APPEND DETAILED FLOW
+    ───────────────────────────
+
+    1. Client pushes data to all replicas
+       (same as write)
+
+    2. Client sends append request to PRIMARY
+
+    3. Primary checks:
+
+       Current chunk offset: 60MB
+       Record size: 2MB
+
+       Case A: Fits in chunk (60+2 < 64)
+       ───────────────────────────────────
+       • Primary appends at 60MB
+       • Tells secondaries: "append at 60MB"
+       • Returns offset 60MB to client
+
+       Case B: Would cross chunk boundary
+       ──────────────────────────────────
+       Current offset: 63MB
+       Record size: 2MB
+       63 + 2 = 65MB > 64MB
+
+       • Primary pads to end of chunk
+       • Tells client: "try next chunk"
+       • Client retries with new chunk
+
+       Result: Some padding at chunk end
+               (acceptable waste)
+
+    4. All replicas apply same operation
+       → Identical chunk contents
+
+    5. If any replica fails:
+       • Client retries entire operation
+       • May result in duplicate records
+       • Application must handle duplicates
+    ```
+  </Tab>
+
+  <Tab title="Consistency Guarantees">
+    ```text
+    RECORD APPEND CONSISTENCY
+    ─────────────────────────
+
+    Guarantees:
+    ──────────
+
+    1. Atomicity
+       • Record written atomically
+       • All replicas get same data
+       • At same offset
+
+    2. At-Least-Once
+       • If append succeeds, record is there
+       • May appear more than once (retries)
+       • Application filters duplicates
+
+    3. Defined Regions
+       • Successful appends create "defined" regions
+       • All replicas identical
+       • Can read same data from any replica
+
+    Possible Issues:
+    ───────────────
+
+    1. Duplicates
+       ┌─────────────────────────────────┐
+       │ Record A                        │
+       │ Record B                        │
+       │ Record B (duplicate from retry) │
+       │ Record C                        │
+       └─────────────────────────────────┘
+
+       Solution: Application includes unique ID
+                Deduplicates during processing
+
+    2. Padding
+       ┌────────────────────────┐
+       │ Record A               │
+       │ Record B               │
+       │ <padding bytes>        │ ← Chunk boundary
+       ├────────────────────────┤
+       │ Record C (new chunk)   │
+       └────────────────────────┘
+
+       Solution: Application skips padding
+                Records have checksums/markers
+
+    3. Inconsistent Regions (rare failures)
+       ┌─────────────────────────────────┐
+       │ Defined (consistent)            │
+       │ Inconsistent (failed append)    │
+       │ Defined (later successful)      │
+       └─────────────────────────────────┘
+
+       Solution: Application validates records
+                Skips inconsistent regions
+    ```
+  </Tab>
+
+  <Tab title="Application Usage">
+    ```text
+    HOW APPLICATIONS USE RECORD APPEND
+    ──────────────────────────────────
+
+    Example: MapReduce Intermediate Data
+    ────────────────────────────────────
+
+    Map Tasks (1000s concurrent):
+
+    for each map_output in task_results:
+        record = {
+            id: unique_id(),        // Deduplication
+            checksum: hash(data),   // Validation
+            data: map_output
+        }
+        GFS.RecordAppend(output_file, record)
+
+    // Each mapper appends independently
+    // No coordination needed!
+    // Fast, scalable
+
+    Reduce Tasks:
+
+    for record in GFS.Read(output_file):
+        if not valid_checksum(record):
+            skip  // Inconsistent region
+
+        if seen(record.id):
+            skip  // Duplicate
+
+        process(record.data)
+
+    // Application handles:
+    // - Duplicates (via ID)
+    // - Inconsistent regions (via checksum)
+    // - Padding (via record markers)
+
+    Why This Works:
+    ──────────────
+
+    ✓ High throughput (no locks)
+    ✓ Simple application logic
+    ✓ Handles failures gracefully
+    ✓ Perfect for append-heavy workloads
+    ```
+  </Tab>
+</Tabs>
+
+---
+
+## Architecture Deep Dive
+
+### Chunk Size: Why 64MB?
+
+The 64MB chunk size is a defining characteristic of GFS:
+
+<AccordionGroup>
+  <Accordion title="Advantages of Large Chunks" icon="plus">
+    **Benefits of 64MB Chunks**:
+
+    1. **Reduced Metadata**:
+       ```text
+       1TB file:
+       - 4KB blocks: 268 million entries
+       - 64MB chunks: 16,384 entries
+       → 16,000x less metadata!
+       ```
+
+    2. **Fewer Network Hops**:
+       - Client requests chunk locations once
+       - Works with chunk for extended period
+       - Reduces master load significantly
+
+    3. **Better TCP Performance**:
+       - Long-lived TCP connections
+       - Connection setup cost amortized
+       - Better throughput utilization
+
+    4. **Data Locality**:
+       - MapReduce can schedule entire chunk to one worker
+       - Reduces network transfer
+       - Better cache utilization
+  </Accordion>
+
+  <Accordion title="Disadvantages and Mitigations" icon="minus">
+    **Problems with Large Chunks**:
+
+    1. **Internal Fragmentation**:
+       ```text
+       Problem:
+       - 1KB file occupies 64MB chunk
+       - Wastes 63.999MB per small file
+
+       Mitigation:
+       - Lazy space allocation
+       - Only allocate actual bytes used
+       - Linux sparse files
+       ```
+
+    2. **Hot Spots**:
+       ```text
+       Problem:
+       - Popular small file (e.g., executable)
+       - All chunks on same 3 chunkservers
+       - All clients hit same servers
+       → Overload!
+
+       Mitigation:
+       - Higher replication for hot files
+       - Client-side retries with backoff
+       - Applications can batch/stagger access
+       ```
+
+    3. **Startup Issues**:
+       - Small configuration files
+       - Many clients read at startup
+       - Temporary hotspot
+
+       Solution: Batch downloads, higher replication
+  </Accordion>
+</AccordionGroup>
+
+### Metadata Design
+
+<Tabs>
+  <Tab title="In-Memory Only">
+    **Why Keep Metadata in RAM?**
+
+    ```text
+    PERFORMANCE BENEFITS:
+    ────────────────────
+
+    Operation          Disk        RAM
+    ──────────────────────────────────
+    Lookup file        10ms        100ns
+    List directory     50ms        500ns
+    Create file        20ms        200ns
+
+    → 100,000x faster!
+
+    SCALABILITY:
+    ───────────
+
+    100 million chunks × 50 bytes = 5GB
+
+    Modern server RAM: 100s of GB
+    → Metadata easily fits
+
+    SIMPLICITY:
+    ──────────
+
+    No cache coherency issues
+    No disk I/O for reads
+    Fast global decisions
+    ```
+  </Tab>
+
+  <Tab title="What's Persistent">
+    **Persistence Strategy**:
+
+    ```text
+    OPERATION LOG:
+    ─────────────
+
+    Every namespace mutation:
+    • File create/delete
+    • Chunk allocation
+    • Attribute changes
+
+    Properties:
+    • Sequential writes (fast)
+    • Replicated to multiple machines
+    • Periodic checkpoints
+
+    Recovery:
+    1. Load latest checkpoint (~1-2 seconds)
+    2. Replay log since checkpoint (~few seconds)
+    3. Done! Master ready
+
+    CHUNK LOCATIONS:
+    ───────────────
+
+    NOT persisted! Why?
+
+    • Chunkservers are source of truth
+    • May change dynamically
+    • Master polls chunkservers at startup
+    • Ongoing heartbeats keep it updated
+
+    Benefit:
+    → No consistency issues between
+       master state and reality
+    ```
+  </Tab>
+
+  <Tab title="Checkpointing">
+    **Checkpoint Mechanism**:
+
+    ```text
+    CREATING CHECKPOINTS:
+    ────────────────────
+
+    Background thread creates checkpoint:
+
+    1. Master switches to new log file
+    2. Background thread scans namespace
+    3. Writes compact B-tree to disk
+    4. Doesn't block ongoing operations
+
+    Checkpoint Contents:
+    ┌──────────────────────────────────┐
+    │ • Full namespace tree            │
+    │ • File metadata                  │
+    │ • Chunk handles                  │
+    │ • Chunk version numbers          │
+    │ • (NOT chunk locations)          │
+    └──────────────────────────────────┘
+
+    Frequency:
+    • After N operations, or
+    • After T time, or
+    • Log file reaches size limit
+
+    Recovery Time:
+    • Checkpoint load: 1-2 seconds
+    • Log replay: Few seconds
+    • Total: < 1 minute typically
+    ```
+  </Tab>
+</Tabs>
+
+### Consistency Without Locks
+
+GFS achieves consistency without distributed locking:
+
+```text
+CONSISTENCY MECHANISMS:
+──────────────────────
+
+1. LEASE MECHANISM
+   ─────────────
+
+   Master grants 60-second lease to one replica (primary)
+
+   ┌─────────────────────────────────────────┐
+   │ Primary has authority to order mutations│
+   │                                         │
+   │ Lease Lifecycle:                        │
+   │ • Master grants                         │
+   │ • Primary orders operations             │
+   │ • Lease expires or renewed              │
+   │ • Master can revoke if needed           │
+   └─────────────────────────────────────────┘
+
+   Benefit: No distributed consensus for each write!
+
+2. VERSION NUMBERS
+   ───────────────
+
+   Each chunk has version number
+
+   Chunk created: version = 1
+   Mutation: version++
+
+   Stale replica detection:
+   • Chunkserver reports chunk version
+   • Master compares to expected
+   • Stale replicas garbage collected
+
+   Benefit: Detect stale replicas reliably
+
+3. CHECKSUMS
+   ──────────
+
+   Each 64KB block has 32-bit checksum
+
+   On write:
+   • Compute checksum
+   • Store with data
+
+   On read:
+   • Recompute checksum
+   • Compare with stored
+   • If mismatch: corruption detected
+
+   Benefit: Detect data corruption
+
+4. APPLICATION-LEVEL VALIDATION
+   ─────────────────────────────
+
+   Applications add:
+   • Unique IDs (deduplication)
+   • Checksums (validation)
+   • Sequence numbers (ordering)
+
+   Benefit: Handle relaxed consistency
+```
+
+---
+
+## Component Interactions
+
+### Master-Chunkserver Communication
+
+```text
+HEARTBEAT PROTOCOL:
+──────────────────
+
+Every few seconds:
+
+Chunkserver                          Master
+    │                                  │
+    │  Heartbeat + Chunk Report        │
+    │─────────────────────────────────>│
+    │                                  │
+    │  Chunks: [0x1a2b, 0x2c3d, ...]   │
+    │  Disk space: 500GB free          │
+    │  Load: 50% CPU                   │
+    │                                  │
+    │  <───────────────────────────────│
+    │      Instructions                │
+    │                                  │
+    │  • Delete chunk 0x5e6f           │
+    │  • Re-replicate 0x7f8g to cs15   │
+    │  • Update version for 0x9a0b     │
+    │                                  │
+
+CHUNK LOCATION UPDATES:
+──────────────────────
+
+Master's view updated continuously:
+
+1. Initial: Startup poll all chunkservers
+2. Ongoing: Heartbeat updates
+3. Additions: New chunks reported
+4. Deletions: Garbage collection confirmed
+
+No persistent state needed!
+→ Chunkservers are source of truth
+```
+
+### Client-Master Communication
+
+```text
+CLIENT METADATA REQUESTS:
+────────────────────────
+
+Optimizations to reduce master load:
+
+1. BATCHING
+   ────────
+
+   Client asks for multiple chunks:
+
+   "Give me chunks [0-10] of /file"
+
+   Instead of 11 separate requests
+
+2. PREFETCHING
+   ───────────
+
+   Client predicts sequential access
+   Asks for future chunks
+
+   Reading chunk 5?
+   → Ask for chunks [5-15]
+
+3. CACHING
+   ────────
+
+   Client caches chunk locations
+   Timeout: few minutes
+
+   Cache hit rate: 95%+
+   → Master sees 5% of reads
+
+4. LEASE TRANSPARENCY
+   ──────────────────
+
+   Master returns:
+   • Primary replica
+   • Secondary replicas
+   • Lease expiration time
+
+   Client caches until expiration
+   → No master contact for writes
+```
+
+---
+
+## Key Architectural Decisions
+
+<CardGroup cols={2}>
+  <Card title="Single Master" icon="crown">
+    **Decision**: One master, many chunkservers
+
+    **Why**:
+    - Simplifies design dramatically
+    - Strong metadata consistency
+    - Global knowledge for decisions
+    - Fast in-memory operations
+
+    **Mitigation**:
+    - Minimize master involvement
+    - Shadow masters for HA
+    - Client caching
+  </Card>
+
+  <Card title="Large Chunks" icon="cube">
+    **Decision**: 64MB chunk size
+
+    **Why**:
+    - Reduces metadata size
+    - Fewer network round trips
+    - Better throughput
+    - Data locality benefits
+
+    **Trade-off**:
+    - Internal fragmentation
+    - Potential hot spots
+    - Not optimal for small files
+  </Card>
+
+  <Card title="Separation of Control/Data" icon="shuffle">
+    **Decision**: Metadata through master, data direct to chunkservers
+
+    **Why**:
+    - Master not bottleneck for data
+    - Scales to GB/s throughput
+    - Parallel data transfers
+    - Flexible data flow routing
+
+    **Benefit**:
+    - Master handles 1000s ops/sec
+    - Data path limited only by network
+  </Card>
+
+  <Card title="Relaxed Consistency" icon="scale-balanced">
+    **Decision**: Defined consistency, not strict
+
+    **Why**:
+    - Higher performance
+    - Simpler implementation
+    - No distributed transactions
+    - Matches application needs
+
+    **Requirement**:
+    - Application-level handling
+    - Deduplication
+    - Validation
+  </Card>
+</CardGroup>
+
+---
+
+## Interview Questions
+
+<AccordionGroup>
+  <Accordion title="Basic: What are the main components of GFS?" icon="circle-question">
+    **Expected Answer**:
+
+    GFS has three main components:
+
+    1. **Master** (single):
+       - Stores all metadata in RAM
+       - Manages namespace (files/directories)
+       - Tracks chunk locations
+       - Makes placement decisions
+       - Coordinates system-wide operations
+
+    2. **Chunkservers** (hundreds/thousands):
+       - Store 64MB chunks as Linux files
+       - Serve read/write requests
+       - Replicate data to other chunkservers
+       - Report status to master via heartbeat
+
+    3. **Clients** (many):
+       - Application library
+       - Caches metadata
+       - Communicates with master for metadata
+       - Talks directly to chunkservers for data
+
+    Key principle: Control and data flow are separated.
+  </Accordion>
+
+  <Accordion title="Intermediate: How does GFS separate control and data flow?" icon="diagram-project">
+    **Expected Answer**:
+
+    GFS separates control (metadata) and data flow for scalability:
+
+    **Control Flow** (Client ↔ Master):
+    - Client asks master for chunk locations
+    - Master returns list of replicas
+    - Client caches this information
+    - Happens only once per chunk/file
+
+    **Data Flow** (Client ↔ Chunkservers):
+    - Client communicates directly with chunkservers
+    - No master involvement for data transfer
+    - Enables massive parallel throughput
+    - Master not a bottleneck
+
+    **Benefits**:
+    - Master handles thousands of metadata ops/sec
+    - Data throughput limited only by network/chunkservers
+    - System scales to hundreds of clients at GB/s aggregate
+
+    Without separation, master would need to handle all data, becoming an immediate bottleneck.
+  </Accordion>
+
+  <Accordion title="Advanced: Explain the write data flow in detail" icon="rocket">
+    **Expected Answer**:
+
+    GFS write operation has three phases:
+
+    **1. Lease Grant**:
+    - Client asks master for chunk replicas
+    - Master grants lease to one replica (primary)
+    - Client caches primary and secondary locations
+
+    **2. Data Push** (decoupled from control):
+    - Client pushes data to closest replica
+    - Each replica forwards to next in chain
+    - Pipelined: forward while receiving
+    - All replicas ACK when data buffered in memory
+    - Data not yet written to disk!
+
+    **3. Control Flow**:
+    - Client sends write command to primary
+    - Primary assigns serial number (ordering)
+    - Primary applies writes to local disk in order
+    - Primary forwards write order to secondaries
+    - Secondaries apply in same order
+    - Secondaries ACK to primary
+    - Primary ACKs success/failure to client
+
+    **Key Insights**:
+    - Data flow optimized for network topology
+    - Control flow ensures consistent ordering
+    - Primary serializes concurrent operations
+    - No distributed consensus needed
+    - If any replica fails, entire write fails (client retries)
+  </Accordion>
+
+  <Accordion title="System Design: Why is chunk location not persisted?" icon="wrench">
+    **Expected Answer**:
+
+    Chunk locations are NOT stored persistently in master, only in-memory. Reasons:
+
+    **Why Not Persist**:
+
+    1. **Chunkservers are source of truth**:
+       - Chunkserver knows what chunks it has (on disk)
+       - No risk of inconsistency between master and reality
+
+    2. **Dynamic nature**:
+       - Chunks added/deleted frequently
+       - Chunkservers may fail
+       - Disks may fail
+       - Replication changes chunk locations
+
+    3. **Simpler consistency**:
+       - No need to keep persistent state in sync
+       - No risk of master having stale information
+       - Master polls chunkservers to rebuild state
+
+    **How It Works**:
+
+    1. **Startup**: Master polls all chunkservers for chunk list
+    2. **Ongoing**: Heartbeat messages update chunk locations
+    3. **Changes**: Chunkservers report additions/deletions
+
+    **Benefits**:
+    - Eliminates entire class of consistency bugs
+    - Faster recovery (no persistent state to reload)
+    - Simpler implementation
+
+    **Trade-off**:
+    - Startup requires polling all chunkservers
+    - Acceptable because happens rarely and completes quickly
+  </Accordion>
+</AccordionGroup>
+
+---
+
+## Summary
+
+<Note>
+**Key Architecture Takeaways**:
+
+1. **Single Master Design**: Simplicity and strong consistency for metadata
+2. **Separation of Concerns**: Control (master) vs. Data (chunkservers) flow
+3. **Large Chunks**: 64MB chunks reduce metadata and network overhead
+4. **In-Memory Metadata**: Fast operations, simple design
+5. **Leases for Consistency**: Primary replica orders operations without consensus
+6. **Direct Client-Chunkserver**: Data flow doesn't involve master
+7. **Relaxed Consistency**: Trade-off for performance, application handles edge cases
+8. **Record Append**: Atomic concurrent appends without locks
+</Note>
+
+---
+
+## Up Next
+
+In **Chapter 3: Master Operations**, we'll explore:
+- Namespace management and locking
+- Chunk creation and allocation
+- Replica placement strategies
+- Lease management in detail
+- Garbage collection mechanism
+
+The architecture provides the foundation—now we'll see how the master orchestrates the entire system.

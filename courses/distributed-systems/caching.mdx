@@ -815,6 +815,44 @@ When one key gets disproportionate traffic.
 
 ---
 
+## Advanced: Sidecar Caching & The "Mesh" Pattern
+
+At **Staff/Principal level**, you must move beyond the "application-manages-cache" (Cache-Aside) model. In a microservices architecture, managing cache logic in every service leads to duplication and inconsistency.
+
+### 1. Sidecar Caching (e.g., Pelikan, Mcrouter)
+Instead of the application connecting directly to Redis, it connects to a **Local Sidecar Proxy**.
+
+- **Benefits**:
+    - **Language Agnostic**: The sidecar handles complex logic (consistent hashing, retries, failover).
+    - **Connection Pooling**: Reduces the number of open connections to the central Redis cluster.
+    - **Request Coalescing**: The sidecar can merge multiple identical requests from the local app into one upstream request.
+
+### 2. EVCache (The Netflix Pattern)
+EVCache is a distributed, sharded, replicated in-memory caching system based on Memcached.
+- **Sidecar-based**: Every EC2 instance has an EVCache sidecar.
+- **Global Replication**: Writes are replicated asynchronously to other AWS regions, allowing for **Local Reads** globally.
+
+### 3. Layered Cache Hierarchy (EVCache vs. Redis)
+
+| Tier | Name | Latency | Scope |
+| :--- | :--- | :--- | :--- |
+| **L1** | **Local Memory** | < 1μs | Per-Process (In-memory) |
+| **L2** | **Sidecar Cache** | < 1ms | Per-Node (Unix Domain Socket) |
+| **L3** | **Regional Cache** | 1-5ms | Per-Region (Shared Redis) |
+| **L4** | **Global Cache** | 50ms+ | Cross-Region (Replicated) |
+
+```text
+[ App ] --- (Unix Socket) ---> [ Sidecar Proxy ] --- (TCP) ---> [ Redis Cluster ]
+                                      │
+                                      └─ (Async Replication) ─► [ Remote Region ]
+```
+
+**Staff Tip:** Sidecar caching is the only way to scale caching in a **Polyglot Microservices** environment. It decouples the "How to cache" (retries, hashing) from the "What to cache" (business logic).
+
+---
+
+---
+
 ## Distributed Cache Architectures
 
 ### Redis Cluster
@@ -978,6 +1016,143 @@ async def _delayed_delete(key: str, delay: float):
     await asyncio.sleep(delay)
     await cache.delete(key)
 ```
+
+---
+
+## Advanced Design Scenarios
+
+### Scenario 1: Multi-Level Caching for Global APIs
+
+Your company exposes a global read-heavy API (product catalog, content, or configuration) with users across multiple regions. You want sub-100ms p99 latencies while still keeping a single source-of-truth database.
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                    MULTI-LEVEL CACHE HIERARCHY                      │
+├─────────────────────────────────────────────────────────────────────┤
+│  Client (Browser/Mobile)                                           │
+│    │                                                               │
+│    ▼                                                               │
+│  CDN / Edge Cache (Level 0)   ← cache static + some JSON          │
+│    │                                                               │
+│    ▼                                                               │
+│  API Gateway / Reverse Proxy (Level 1 - regional)                  │
+│    │  In-memory + Redis/Envoy cache                                │
+│    ▼                                                               │
+│  App Service (Level 2 - per-instance L1)                           │
+│    │                                                               │
+│    ▼                                                               │
+│  Primary Database (source of truth)                                │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+**Core ideas**:
+
+- **Cache as many layers as possible**:
+  - **Edge (CDN)**: cache public, cacheable responses with long TTLs and `ETag`/`Last-Modified` for validation.
+  - **Regional gateway (L1.5)**: shared Redis or Envoy cache per region for JSON APIs.
+  - **App instances (L2)**: small in-process L1 caches for the hottest keys.
+- **Key design**:
+  - Include **versioning** in keys for global invalidation: `product:{id}:v{schema_version}`.
+  - For per-tenant data: `tenant:{tenant_id}:product:{id}:v{version}`.
+- **Invalidation**:
+  - For rarely-changing data, use **long TTLs + explicit purge** when changes happen.
+  - On update, clear from inner layers first (DB → regional Redis → CDN purge API).
+
+**Failure modes & strategies**:
+
+- **CDN down or misbehaving**: have monitoring that can bypass CDN and hit regional gateway directly.
+- **Regional cache cluster degraded**: instances fall back to L1 in-process cache + direct DB reads with **tighter rate limits**.
+- **Schema changes**: bump `schema_version` in cache keys to avoid mixed old/new value formats.
+
+---
+
+### Scenario 2: Configuration and Feature Flag Caching
+
+You have a central configuration/feature flag service that many microservices depend on. Latency spikes or downtime in this service must not take down the entire fleet.
+
+**Requirements**:
+
+- Services should **start** even if the config service is temporarily unavailable.
+- Each service instance should **cache configuration locally** and refresh in the background.
+- Changes should propagate within **seconds**, not minutes.
+
+**Architecture**:
+
+- **Source of truth**: configuration stored in a durable DB (e.g., Postgres) behind a config service.
+- **Distributed cache**: Redis/Etcd used by the config service to cache hot config blobs (`config:service_name`).
+- **Service-local cache**: each microservice maintains an in-process cache of parsed config.
+- **Notification channel**: a message bus (Kafka, SNS/SQS, Redis Pub/Sub) carries "config changed" events.
+
+```python
+# In the config service
+async def update_feature_flags(payload: dict):
+    await db.update_flags(payload)
+    await cache.set("config:features", json.dumps(payload), ttl=300)
+    await event_bus.publish("config.updated", {"keys": ["features"]})
+
+# In each service
+async def config_watcher():
+    async for event in event_bus.subscribe("config.updated"):
+        for key in event["keys"]:
+            await refresh_config_key(key)
+
+async def refresh_config_key(key: str):
+    raw = await cache.get(f"config:{key}")
+    if raw is None:
+        raw = await config_http_client.get(f"/config/{key}")
+    LOCAL_CONFIG[key] = json.loads(raw)
+```
+
+**Design notes**:
+
+- On startup, services **block briefly** to fetch essential config; thereafter they serve from local memory.
+- If the config service and cache are both down, services can keep using the **last known good** config in memory.
+- For safety-sensitive flags, include **expiry timestamps** so services can disable risky behavior if config has not refreshed in too long.
+
+---
+
+### Scenario 3: Bounded-Staleness Caching on Top of a Strong Database
+
+Sometimes you want **strictly serializable writes** but are happy to serve data up to \(T\) seconds old for reads. This is common for dashboards, search results, and secondary views.
+
+**Goal**: "Reads may be stale by at most **T seconds**, never more. Writes must always see their own effect." 
+
+**Design**:
+
+- Keep strong consistency in the primary DB (e.g., Spanner/CockroachDB/Postgres with serializable isolation).
+- Layer a cache in front with **staleness metadata** per key.
+
+```python
+@dataclass
+class CachedValue:
+    value: dict
+    last_write_time: float  # Unix timestamp
+
+MAX_STALENESS_SEC = 5.0
+
+async def get_with_bounded_staleness(key: str) -> dict:
+    now = time.time()
+    wrapped: CachedValue | None = await cache.get(key)
+    
+    if wrapped and now - wrapped.last_write_time <= MAX_STALENESS_SEC:
+        return wrapped.value
+    
+    # Too stale or missing: read from DB
+    row = await db.fetch_row(key)
+    wrapped = CachedValue(value=row, last_write_time=now)
+    await cache.set(key, wrapped, ttl=60)
+    return row
+```
+
+**Write path**:
+
+- On write, **delete** cache (or write a fresh `CachedValue` with current `last_write_time`).
+- If you have a write-heavy workload, combine this with **double-delete** or CDC-backed invalidation to avoid stale repopulation races.
+
+**Trade-offs**:
+
+- You can tighten or loosen `MAX_STALENESS_SEC` per endpoint: 1–2s for user-facing dashboards, 30–60s for admin analytics.
+- Reads that cannot tolerate any staleness bypass cache entirely and always hit the DB.
 
 ---
 

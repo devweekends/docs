@@ -93,6 +93,213 @@ Operating distributed systems at scale requires specialized skills beyond just b
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
 
+#### Advanced: Tail-Based Sampling
+At massive scale (millions of spans/sec), you cannot afford to store every trace. 
+
+- **Head-Based Sampling**: The decision to sample is made at the start of the request (e.g., "Sample 1% of all requests"). 
+  - **The Flaw**: It might discard the 0.01% of requests that actually had an error or a 5-second latency spike.
+- **Tail-Based Sampling**: The sampling decision is delayed until the *entire trace* has been collected.
+  - Spans are buffered in a collector (like the OpenTelemetry Collector).
+  - Once the trace is complete, a policy is applied: "Keep if status is Error OR latency > 500ms OR method is POST".
+  - **Result**: You capture 100% of "interesting" traces while only paying for 1% of "boring" (successful/fast) ones.
+
+### 27.2.1 Advanced: Trace Reconstruction & Causality
+
+At **Staff/Principal level**, you must understand the math behind how traces are reconstructed from a sea of independent spans.
+
+#### 1. W3C Trace Context (The Standard)
+The industry has standardized on the **W3C Trace Context**. It consists of two headers:
+- `traceparent`: Propagates the `trace-id` and `parent-id`.
+    - Format: `00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01`
+- `tracestate`: Propagates vendor-specific metadata (e.g., Datadog or New Relic specific tags).
+
+#### 2. Trace Reconstruction (The DAG Problem)
+When you view a trace in Jaeger or Honeycomb, the backend has to perform a **Distributed Join** to reconstruct the tree:
+1.  **Gathering**: Collect all spans sharing the same `trace-id`.
+2.  **Topological Sort**: Use the `parent-id` to arrange spans into a Directed Acyclic Graph (DAG).
+3.  **Clock Correction**: Since different nodes have different clocks, the backend must adjust span start times so that a child span never starts before its parent (Causality preserved).
+
+#### 3. Tracing through Queues (The "Link" Pattern)
+Standard tracing assumes a parent-child relationship (synchronous RPC). But for asynchronous messages (Kafka/SQS), we use **Links**.
+- **The Problem**: If a consumer processes 100 messages in one batch, who is the "parent"?
+- **The Solution**: The trace has multiple "Links" to the 100 originating traces, allowing you to see the fan-out without breaking the original trace's structure.
+
+| Feature | Child-Of Relationship | Link Relationship |
+| :--- | :--- | :--- |
+| **Model** | Synchronous (RPC) | Asynchronous (Messages) |
+| **Dependency** | Direct parent | Casual link |
+| **Causality** | Strong (Blocked) | Weak (Hand-off) |
+
+**Staff Tip:** When implementing tracing, never use a "global" trace context variable in your code. Always pass the `Context` object explicitly (in Go) or use `ThreadLocal` storage (in Java) to avoid trace leakage between concurrent requests.
+
+### 27.3: Context Propagation Implementation
+
+The hardest part of distributed tracing is ensuring the trace context flows through **every** boundary: HTTP, gRPC, message queues, thread pools, and async callbacks.
+
+#### 1. HTTP Propagation
+
+```python
+# Python: Inject context into outgoing HTTP requests
+from opentelemetry import trace
+from opentelemetry.propagate import inject
+
+def make_http_call(url: str, data: dict):
+    tracer = trace.get_tracer(__name__)
+    
+    with tracer.start_as_current_span("http_call") as span:
+        headers = {}
+        # Inject trace context into headers
+        inject(headers)  # Adds 'traceparent' and 'tracestate'
+        
+        response = requests.post(url, json=data, headers=headers)
+        
+        span.set_attribute("http.status_code", response.status_code)
+        return response
+
+# Server side: Extract context from incoming request
+from opentelemetry.propagate import extract
+
+def handle_request(request):
+    # Extract trace context from headers
+    context = extract(request.headers)
+    
+    tracer = trace.get_tracer(__name__)
+    with tracer.start_span("handle_request", context=context) as span:
+        # Process request - this span is now a child of the caller's span
+        return process(request)
+```
+
+#### 2. Message Queue Propagation (Kafka/SQS)
+
+The trickiest case - async messages break the parent-child relationship.
+
+```python
+# Producer: Inject context into message headers
+def send_to_kafka(topic: str, message: dict):
+    tracer = trace.get_tracer(__name__)
+    
+    with tracer.start_as_current_span("kafka_produce") as span:
+        headers = []
+        carrier = {}
+        inject(carrier)
+        
+        # Convert to Kafka header format
+        for key, value in carrier.items():
+            headers.append((key, value.encode('utf-8')))
+        
+        producer.send(
+            topic,
+            value=json.dumps(message).encode(),
+            headers=headers
+        )
+
+# Consumer: Extract context, but use LINKS not parent
+def consume_from_kafka():
+    tracer = trace.get_tracer(__name__)
+    
+    for message in consumer:
+        # Extract the trace context from producer
+        carrier = {k: v.decode() for k, v in message.headers}
+        producer_context = extract(carrier)
+        
+        # Create LINK to producer span (not parent-child!)
+        producer_span = trace.get_current_span(producer_context)
+        links = [trace.Link(producer_span.get_span_context())]
+        
+        # Start new span with link to producer
+        with tracer.start_span(
+            "kafka_consume",
+            links=links  # Links allow many-to-many relationships
+        ) as span:
+            process_message(message)
+```
+
+**Why Links instead of Parent?**
+- A consumer might process messages from 100 different producers in one batch
+- Using parent-child would create 100 parallel traces
+- Links allow you to see "this processing was triggered by these 100 messages"
+
+#### 3. Thread Pool / Async Context Propagation
+
+Context can be lost when work is submitted to a thread pool.
+
+```python
+# BAD: Context is lost!
+def bad_async_call():
+    with tracer.start_as_current_span("parent"):
+        # Context is NOT automatically copied to the thread pool worker
+        executor.submit(do_work)  # do_work sees NO trace context
+
+# GOOD: Explicitly propagate context
+from opentelemetry.context import attach, detach, get_current
+
+def good_async_call():
+    with tracer.start_as_current_span("parent"):
+        # Capture current context
+        ctx = get_current()
+        
+        def wrapped_work():
+            # Attach captured context in worker thread
+            token = attach(ctx)
+            try:
+                do_work()  # Now sees the trace context!
+            finally:
+                detach(token)
+        
+        executor.submit(wrapped_work)
+
+# Best: Use instrumented executor
+from opentelemetry.instrumentation.threading import ThreadPoolExecutorInstrumentor
+ThreadPoolExecutorInstrumentor().instrument()
+# Now all executor.submit() calls auto-propagate context
+```
+
+#### 4. Context Propagation Matrix
+
+| Boundary Type | Propagation Method | Headers/Carrier | Relationship |
+|--------------|-------------------|-----------------|--------------|
+| HTTP/gRPC | W3C Trace Context | `traceparent`, `tracestate` | Parent-Child |
+| Kafka | Message Headers | Custom headers | Link |
+| SQS/SNS | Message Attributes | `AWSTraceHeader` | Link |
+| RabbitMQ | Message Properties | `trace_id` in headers | Link |
+| Redis Pub/Sub | Message Payload | Embedded JSON | Link |
+| Thread Pool | Context API | In-memory | Parent-Child |
+| Async/Await | Context Vars | Language runtime | Parent-Child |
+
+#### 5. Common Pitfalls
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    CONTEXT PROPAGATION PITFALLS                              │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  1. LOST CONTEXT IN ASYNC                                                   │
+│     Problem: Context not copied to worker threads                           │
+│     Fix: Use instrumented executors or manual propagation                   │
+│                                                                              │
+│  2. CONTEXT LEAKAGE                                                         │
+│     Problem: Global context variable shared between requests                │
+│     Fix: Use ThreadLocal/ContextVar, never global                          │
+│                                                                              │
+│  3. MISSING HEADERS IN RETRIES                                              │
+│     Problem: Retry library doesn't copy trace headers                       │
+│     Fix: Ensure retry wrapper copies headers from original request          │
+│                                                                              │
+│  4. WRONG RELATIONSHIP FOR QUEUES                                           │
+│     Problem: Using parent-child for async messages                          │
+│     Fix: Use Links for message queues, parent-child for sync calls         │
+│                                                                              │
+│  5. SAMPLING DECISIONS INCONSISTENT                                         │
+│     Problem: Parent is sampled but child isn't (or vice versa)             │
+│     Fix: Propagate sampling decision in tracestate                         │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+**Staff Tip:** When designing an observability stack, ensure your **Trace Context** propagates through asynchronous boundaries like message queues (Kafka headers) and background jobs (sidekiq/celery), otherwise your traces will have "gaps" that make debugging impossible.
+
 ### Metrics and Alerting
 
 ```
@@ -438,7 +645,59 @@ Operating distributed systems at scale requires specialized skills beyond just b
 
 ---
 
-## Module 30: Incident Management
+## Module 30: Advanced Resiliency Patterns
+
+At the Staff/Principal level, reliability isn't just about "fixing bugs"—it's about designing architectures that are inherently resistant to failure.
+
+### 1. Static Stability
+
+A system is **Statically Stable** if it continues to operate in its "steady state" without needing to make changes during a dependency failure.
+
+- **The Problem**: Reactive autoscaling. If AZ-1 fails, AZ-2 and AZ-3 try to scale up. But if the control plane (Kubernetes/EC2 API) is also failing, they can't scale, and the whole system crashes.
+- **The Solution**: **Over-provisioning**. Run AZ-1, AZ-2, and AZ-3 at 50% capacity each. If one AZ fails, the remaining two are already at 100% capacity and can handle the full load immediately without calling any external APIs.
+- **Key Principle**: Avoid "Control Plane" dependencies in the "Data Plane" recovery path.
+
+### 2. Cell-Based Architectures
+
+Instead of one giant "monolith" cluster, you split your infrastructure into many independent **Cells**.
+
+- **Definition**: A Cell is a complete, self-contained instance of the service (App + DB + Cache).
+- **Blast Radius**: If Cell A has a "poison pill" request or a hardware failure, only the 5% of users in Cell A are affected. The other 95% of users in other cells are completely isolated.
+- **Scaling**: To double capacity, you don't scale the cells; you just add more cells.
+- **Used By**: AWS (Lambda, DynamoDB), Salesforce, and Facebook.
+
+```text
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         CELL-BASED ARCHITECTURE                             │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│       [ Global DNS / Router ]                                               │
+│                │                                                             │
+│       ┌────────┴────────┬───────────────┬──────────────┐                     │
+│       │                 │               │              │                     │
+│       ▼                 ▼               ▼              ▼                     │
+│  ┌──────────┐      ┌──────────┐    ┌──────────┐   ┌──────────┐               │
+│  │  CELL 1  │      │  CELL 2  │    │  CELL 3  │   │  CELL 4  │               │
+│  │ (Users   │      │ (Users   │    │ (Users   │   │ (Users   │               │
+│  │  1-10k)  │      │ 10-20k)  │    │ 20-30k)  │   │ 30-40k)  │               │
+│  └──────────┘      └──────────┘    └──────────┘   └──────────┘               │
+│                                                                              │
+│  - No cross-cell dependencies.                                               │
+│  - Failures are contained within a single cell.                              │
+│  - Upgrades happen one cell at a time.                                       │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### 3. Dependency Isolation (The Bulkhead Pattern)
+
+Just like a ship is divided into watertight compartments (bulkheads), a distributed system should isolate its dependencies.
+- **Implementation**: Use separate thread pools or connection pools for different downstream services.
+- **Benefit**: If Service A becomes slow, its thread pool fills up, but Service B's thread pool remains free, allowing the rest of the system to function.
+
+---
+
+## Module 31: Incident Management
 
 ### Incident Response Framework
 
@@ -556,7 +815,7 @@ Operating distributed systems at scale requires specialized skills beyond just b
 
 ---
 
-## Module 31: Capacity Planning
+## Module 32: Capacity Planning
 
 ### Load Testing
 
@@ -699,6 +958,51 @@ Operating distributed systems at scale requires specialized skills beyond just b
 │                                                                              │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
+
+---
+
+## Advanced: Cluster Scheduling Internals (Borg & DRF)
+
+In a modern distributed environment, you don't manage individual servers; you manage a **Cluster**. A **Scheduler** (like Google’s Borg or Kubernetes’ kube-scheduler) is responsible for deciding where your code runs.
+
+### The Bin Packing Problem
+At its core, scheduling is a "Multidimensional Bin Packing" problem. You have containers with varying CPU/RAM needs and nodes with varying capacities.
+
+### 1. Dominant Resource Fairness (DRF)
+In a cluster, users need multiple resources (e.g., User A needs high CPU, User B needs high RAM). How do you allocate resources fairly? **DRF** is the standard algorithm.
+- **Definition**: DRF calculates the "dominant share" for each user (the resource they need the most of relative to the cluster's total capacity) and tries to equalize these shares.
+
+### 2. Priority and Preemption
+Not all jobs are equal. Borg introduced two main categories:
+- **Prod (Production)**: Low latency, high availability (e.g., Search, Gmail).
+- **Non-Prod (Batch)**: High throughput, latency-insensitive (e.g., Log processing, ML training).
+
+**Preemption**: If a high-priority "Prod" job needs resources, the scheduler will **kill** (evict) lower-priority "Non-Prod" jobs to make room. This allows Google to run clusters at 90%+ utilization.
+
+```text
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                        SCHEDULER DECISION FLOW                              │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  Task arrives: {CPU: 2, RAM: 4GB, Priority: PROD}                            │
+│                                                                              │
+│  1. FILTERING (Predicates):                                                  │
+│     - Does node have enough free RAM?                                        │
+│     - Does node have required OS/Hardware?                                   │
+│     - Result: Set of "Feasible Nodes"                                        │
+│                                                                              │
+│  2. SCORING (Priorities):                                                    │
+│     - Which node minimizes fragmentation? (Bin packing)                      │
+│     - Which node has the data locally? (Locality)                            │
+│     - Result: "Best Node" picked                                             │
+│                                                                              │
+│  3. PREEMPTION (If no feasible nodes):                                       │
+│     - Can I kill priority 0 jobs to fit priority 10?                         │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+**Staff Tip:** When designing a system, differentiate between **Hard Constraints** (the app *cannot* run without this) and **Soft Constraints/Affinities** (the app *should* run here for better performance). Over-constraining your scheduler leads to "unschedulable" tasks and wasted resources.
 
 ---
 

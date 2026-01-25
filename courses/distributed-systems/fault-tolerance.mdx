@@ -58,7 +58,7 @@ In distributed systems, failures are not exceptional events—they are **expecte
 
 ---
 
-## Timeout Patterns
+## Module 37: Timeout Patterns
 
 ### The Foundation of Fault Tolerance
 
@@ -224,7 +224,7 @@ async def make_downstream_call(service: str, deadline: Deadline):
 
 ---
 
-## Retry Patterns
+## Module 38: Retry Patterns
 
 ### When and How to Retry
 
@@ -404,9 +404,239 @@ async def fetch_user(user_id: str) -> dict:
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
 
+### Advanced: The "Tail at Scale" (Hedged Requests & Backup Tasks)
+
+In large-scale systems (like Google Search), the total system latency is determined by the **slowest node**. As you increase the number of nodes involved in a request, the probability of hitting a "tail" latency (p99 or p99.9) increases dramatically.
+
+#### 1. Hedged Requests
+Instead of waiting for a timeout to retry, a system sends the same request to multiple replicas simultaneously.
+- **Classic Hedge**: Send to two replicas, take the fastest response.
+- **Adaptive Hedge**: Send to one replica. If no response after the $95^{th}$ percentile latency ($p95$), send a second request to another replica.
+- **Result**: Drastically reduces $p99.9$ latency with only $\sim 5\%$ increase in total load.
+
+#### 2. Backup Tasks (MapReduce/Spark)
+In batch processing, a single "straggler" task can delay an entire job.
+- When a task is nearly finished but a few instances are still running, the scheduler spawns **Backup Tasks** (replicas of the slow tasks).
+- The first one to finish wins, and the others are killed.
+
+#### 3. Tie-breaking (The "Power of Two Choices" variant)
+When a client has multiple healthy replicas, it sends a probe to two of them. It then sends the actual request to the one with the shorter queue (or better historical latency).
+
+**Staff Tip:** When designing for low latency, don't just "fix the slow node." Assume some nodes **will** be slow (due to GC, background tasks, or noisy neighbors) and build "Hedged" logic into your client libraries to route around them.
+
 ---
 
-## Circuit Breaker Pattern
+## Advanced: Tail Latency Optimization (p99/p999 Patterns)
+
+At scale, **tail latency** (p99, p99.9) becomes more important than average latency. Here's why and how to fix it.
+
+### The Math of Fan-Out
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    WHY TAIL LATENCY MATTERS                                  │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  Single service p99 = 100ms                                                 │
+│  Seems fine, right? But...                                                  │
+│                                                                              │
+│  SERIAL REQUESTS (chained):                                                 │
+│  If you call 3 services in sequence:                                        │
+│  P99 ≈ p99₁ + p99₂ + p99₃ = 100 + 100 + 100 = 300ms                        │
+│                                                                              │
+│  PARALLEL REQUESTS (fan-out):                                               │
+│  If you call N services in parallel, you wait for slowest:                  │
+│  P(all < 100ms) = 0.99^N                                                    │
+│                                                                              │
+│  N=10:  0.99^10  = 90.4%  → 10% of requests hit p99                        │
+│  N=50:  0.99^50  = 60.5%  → 40% of requests hit p99!                       │
+│  N=100: 0.99^100 = 36.6%  → Majority hit p99                               │
+│                                                                              │
+│  AT GOOGLE SCALE: A single search touches 1000+ servers                     │
+│  Even with p99.9 = 10ms per server, overall p99 is terrible                │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Pattern 1: Hedged Requests
+
+Send duplicate requests to reduce waiting for slow nodes.
+
+```python
+async def hedged_request(
+    operation: Callable,
+    replicas: List[str],
+    initial_timeout_ms: float = 10,  # p95 latency
+    max_outstanding: int = 2
+) -> Response:
+    """
+    Send request to one replica. If no response after p95 latency,
+    send to another replica. Take first response.
+    """
+    pending_tasks = set()
+    
+    # Start first request
+    task1 = asyncio.create_task(operation(replicas[0]))
+    pending_tasks.add(task1)
+    
+    # Wait for p95 timeout
+    try:
+        done, _ = await asyncio.wait(
+            pending_tasks,
+            timeout=initial_timeout_ms / 1000,
+            return_when=asyncio.FIRST_COMPLETED
+        )
+        if done:
+            result = done.pop().result()
+            # Cancel outstanding
+            for task in pending_tasks - done:
+                task.cancel()
+            return result
+    except asyncio.TimeoutError:
+        pass
+    
+    # No response yet - send hedge to second replica
+    if len(replicas) > 1 and len(pending_tasks) < max_outstanding:
+        task2 = asyncio.create_task(operation(replicas[1]))
+        pending_tasks.add(task2)
+    
+    # Wait for either to complete
+    done, pending = await asyncio.wait(
+        pending_tasks,
+        return_when=asyncio.FIRST_COMPLETED
+    )
+    
+    result = done.pop().result()
+    for task in pending:
+        task.cancel()
+    
+    return result
+```
+
+**Impact**: Reduces p99.9 by 50-80% with only 2-5% extra load.
+
+### Pattern 2: Request Coalescing
+
+Combine duplicate requests to reduce backend load.
+
+```python
+class RequestCoalescer:
+    """
+    If multiple callers request the same key simultaneously,
+    only make one backend call and share the result.
+    """
+    def __init__(self):
+        self._inflight: Dict[str, asyncio.Future] = {}
+        self._lock = asyncio.Lock()
+    
+    async def get(self, key: str, fetcher: Callable) -> Any:
+        async with self._lock:
+            if key in self._inflight:
+                # Another request is in flight - wait for it
+                return await self._inflight[key]
+            
+            # We're the first - create future and fetch
+            future = asyncio.get_event_loop().create_future()
+            self._inflight[key] = future
+        
+        try:
+            result = await fetcher(key)
+            future.set_result(result)
+            return result
+        except Exception as e:
+            future.set_exception(e)
+            raise
+        finally:
+            async with self._lock:
+                del self._inflight[key]
+
+# Usage: 1000 concurrent requests for same key = 1 backend call
+coalescer = RequestCoalescer()
+results = await asyncio.gather(*[
+    coalescer.get("popular_item", fetch_from_db)
+    for _ in range(1000)
+])
+```
+
+### Pattern 3: Adaptive Timeout Percentile Tracking
+
+Don't use static timeouts - track latency percentiles and adapt.
+
+```python
+class AdaptiveTimeout:
+    """
+    Track latency distribution and set timeout at p99 + buffer.
+    """
+    def __init__(self, window_size: int = 1000, percentile: float = 0.99):
+        self.latencies = deque(maxlen=window_size)
+        self.percentile = percentile
+        self.min_timeout = 10   # ms
+        self.max_timeout = 5000 # ms
+        self.buffer_factor = 1.5
+    
+    def record(self, latency_ms: float):
+        self.latencies.append(latency_ms)
+    
+    def get_timeout(self) -> float:
+        if len(self.latencies) < 100:
+            return self.max_timeout  # Not enough data
+        
+        sorted_latencies = sorted(self.latencies)
+        idx = int(len(sorted_latencies) * self.percentile)
+        p99 = sorted_latencies[idx]
+        
+        timeout = p99 * self.buffer_factor
+        return max(self.min_timeout, min(self.max_timeout, timeout))
+```
+
+### Pattern 4: Goodput Optimization
+
+Maximize **goodput** (successful work) not throughput (total work).
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    GOODPUT vs THROUGHPUT                                     │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  Throughput = Total requests processed                                       │
+│  Goodput = Requests completed WITHIN SLO                                    │
+│                                                                              │
+│  EXAMPLE:                                                                   │
+│  ─────────                                                                  │
+│  Server processes 1000 req/s                                                │
+│  • 900 complete in 50ms (within SLO)                                        │
+│  • 100 complete in 2000ms (timeout, useless)                                │
+│                                                                              │
+│  Throughput = 1000 req/s                                                    │
+│  Goodput = 900 req/s                                                        │
+│                                                                              │
+│  OPTIMIZATION STRATEGIES:                                                   │
+│  ────────────────────────                                                   │
+│  1. Drop requests if queue is too deep (they'll timeout anyway)            │
+│  2. Track remaining deadline, skip work if deadline exceeded                │
+│  3. Use admission control to reject new work during overload                │
+│  4. Prioritize near-deadline requests over fresh ones (LIFO)               │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### p99 Optimization Checklist
+
+| Technique | p99 Improvement | Cost |
+|-----------|-----------------|------|
+| Hedged requests | 50-80% | +5% load |
+| Request coalescing | Variable | Complexity |
+| LIFO queuing | 30-50% | Unfairness |
+| Adaptive timeouts | 20-40% | Monitoring |
+| Pre-warming connections | 50%+ on cold | Memory |
+| GC tuning | 30-50% | Expertise |
+| Disable Nagle's algorithm | Variable | Bandwidth |
+
+**Staff Tip**: Always measure tail latency at the **client**, not the server. Server-side metrics don't capture queueing delays, network retries, or load balancer issues.
+
+---
+
+## Module 39: Circuit Breaker Pattern
 
 The circuit breaker prevents cascade failures by failing fast when a dependency is unhealthy.
 
@@ -650,7 +880,7 @@ async def process_payment(order_id: str, amount: float) -> dict:
 
 ---
 
-## Bulkhead Pattern
+## Module 40: Bulkhead Isolation
 
 Isolate components so a failure in one doesn't sink the entire ship.
 
@@ -823,6 +1053,113 @@ async def process_payment(payment: dict) -> dict:
     
     return await payment_bulkhead.execute(_process)
 ```
+
+## Distributed Rate Limiting
+
+### Generic Cell Rate Algorithm (GCRA)
+
+For Staff-level infrastructure, basic "Fixed Window" or "Sliding Window" rate limiting is often insufficient due to burstiness. **GCRA**, used in ATM networks and by companies like Stripe and Cloudflare (via `limit-ador`), provides a sophisticated way to handle rate limiting with sub-millisecond precision.
+
+#### How it works: TAT (Theoretical Arrival Time)
+Instead of a counter, GCRA tracks the **Theoretical Arrival Time (TAT)** of the next allowed request.
+
+1.  **Emission Interval ($T$)**: The time between requests (e.g., if limit is 10 req/sec, $T = 100ms$).
+2.  **Burst Tolerance ($\tau$)**: How much earlier than the TAT a request can arrive.
+3.  **Logic**:
+    - When a request arrives at time $t$:
+    - If $t < TAT - \tau$: **Reject** (too early).
+    - Else: **Accept** and update $TAT = \max(t, TAT) + T$.
+
+#### Implementation with Redis
+GCRA is easy to implement atomically in Redis using a single key and `SET ... GET` or a Lua script.
+
+```lua
+-- Redis GCRA Lua Script
+local key = KEYS[1]
+local rate = tonumber(ARGV[1]) -- interval in ms
+local burst = tonumber(ARGV[2]) -- burst tolerance in ms
+local now = tonumber(ARGV[3]) -- current time in ms
+
+local tat = tonumber(redis.call('GET', key) or 0)
+if tat < now then tat = now end
+
+local new_tat = tat + rate
+local allow_at = new_tat - burst
+
+if now < allow_at then
+    return 0 -- Rejected
+else
+    redis.call('SET', key, new_tat)
+    return 1 -- Accepted
+end
+```
+
+**Why choose GCRA?**
+- **Memory Efficient**: Only stores one number (the TAT) per user/key.
+- **Fairness**: Smooths out traffic better than leaky bucket.
+- Precision: Handles high-frequency requests without the "window reset" spikes of fixed-window algorithms.
+
+---
+
+## Control Theory & Adaptive Load Shedding
+
+While rate limiting (GCRA) protects against specific users, **Load Shedding** protects the system from its own congestion. Principal-level systems often move beyond static thresholds to **Control Theory** (PID Controllers) to maintain stability under extreme load.
+
+### The Feedback Loop
+In control theory, we treat the system as a process with an output (e.g., CPU, Latency) that we want to keep at a **Set Point**.
+
+1.  **Process Variable ($PV$)**: The measured value (e.g., Current 99th percentile latency).
+2.  **Set Point ($SP$)**: The desired value (e.g., 200ms).
+3.  **Error ($e$)**: $SP - PV$.
+4.  **Manipulated Variable ($MV$)**: What we change to fix the error (e.g., The percentage of traffic we drop).
+
+### PID Controllers in Load Shedding
+A PID (Proportional-Integral-Derivative) controller calculates the rejection rate based on the error over time.
+
+- **Proportional (P)**: Drops traffic based on the *current* error. If latency is high, drop more now.
+- **Integral (I)**: Drops traffic based on the *history* of error. If latency has been high for a while, increase the rejection rate even if it's currently dropping.
+- **Derivative (D)**: Drops traffic based on the *rate of change*. if latency is spiking rapidly, drop traffic aggressively *before* it hits the limit.
+
+```python
+class PIDLoadShedder:
+    """
+    Adaptive load shedder using a PID controller.
+    Used by systems like Netflix (Congestion Control) and Google (SRE Load Shedding).
+    """
+    def __init__(self, kp, ki, kd, setpoint):
+        self.kp, self.ki, self.kd = kp, ki, kd
+        self.setpoint = setpoint
+        self._integral = 0
+        self._last_error = 0
+        self._rejection_rate = 0.0 # 0.0 to 1.0
+
+    def update(self, current_latency, dt):
+        error = current_latency - self.setpoint
+        
+        # Proportional
+        p = self.kp * error
+        
+        # Integral (with anti-windup)
+        self._integral = max(0, min(100, self._integral + error * dt))
+        i = self.ki * self._integral
+        
+        # Derivative
+        d = self.kd * (error - self._last_error) / dt
+        self._last_error = error
+        
+        # Calculate new rejection rate
+        output = p + i + d
+        self._rejection_rate = max(0.0, min(1.0, output / 1000.0))
+        return self._rejection_rate
+
+    def should_drop(self):
+        import random
+        return random.random() < self._rejection_rate
+```
+
+### Little's Law and Congestion
+Load shedding is mathematically grounded in **Little's Law**: $L = \lambda W$ (Items = Arrival Rate $\times$ Wait Time).
+If $W$ (Latency) increases while $L$ (Concurrent Requests) is capped (Bulkheads), the system **must** reduce $\lambda$ (Arrival Rate) or it will enter a "Congestion Collapse" where it spends more time context switching than doing work.
 
 ---
 
@@ -1441,9 +1778,11 @@ class PriorityLoadShedder:
 
 ---
 
+## Module 41: Graceful Degradation
+
 ## Combining Patterns
 
-Real systems use multiple patterns together:
+Real systems use multiple patterns together to maintain partial functionality during failures:
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
@@ -1489,6 +1828,193 @@ Real systems use multiple patterns together:
 │                                                                              │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
+
+---
+
+## Advanced Design Scenarios
+
+### Scenario 1: Resilient Payment Service
+
+You are responsible for a payment service that calls multiple downstream providers (card processor, fraud service, ledger). Outages or latency at any dependency must not take down checkout globally.
+
+**Requirements**:
+
+- Never charge a customer **twice** for the same request.
+- Degrade gracefully to limited functionality (e.g., only some payment methods) during partial outages.
+- Protect core services from **cascading failures**.
+
+**Architecture**:
+
+- **Timeouts + retries** with idempotency:
+  - Each payment request carries a unique `idempotency_key`.
+  - Gateway retries only idempotent operations with **exponential backoff + jitter**.
+- **Circuit breakers** per downstream:
+  - Separate circuit for `card-processor`, `fraud-service`, `ledger`.
+  - Open circuits fail fast and use **GracefulDegrader** to fall back.
+- **Bulkheads**:
+  - Dedicated connection/thread pools for each dependency.
+  - Failure or slowness in `fraud-service` does not starve `ledger` calls.
+- **Fallback strategies**:
+  - `fraud-service` down → apply conservative rules + lower risk limits.
+  - Secondary payment provider configured for card processing.
+
+```python
+async def process_payment(req: PaymentRequest) -> dict:
+    # Idempotency key from client
+    key = req.idempotency_key
+
+    # Fast path: deduplicate
+    existing = await payments_store.get_by_idempotency_key(key)
+    if existing:
+        return existing.response
+
+    async def _call_primary():
+        return await primary_processor.charge(req)
+
+    async def _call_backup():
+        return await backup_processor.charge(req)
+
+    # Circuit breaker around primary processor
+    degrader = GracefulDegrader("payment", circuit_breaker=payment_circuit)
+    result = await degrader.execute(
+        primary=_call_primary,
+        fallback=_call_backup,
+        fallback_description="backup processor"
+    )
+
+    await payments_store.save_result(key, result.value)
+    return result.value
+```
+
+This combines **idempotency**, **circuit breaking**, **graceful degradation**, and **bulkheads** to keep checkout working under partial failure.
+
+---
+
+### Scenario 2: Multi-Region Read API with Safe Degradation
+
+You operate a global read API (product catalog, user profiles) with a primary write region and multiple read replicas. You must stay up even if a region or inter-region link fails.
+
+**Design**:
+
+- **Local region first**:
+  - For each client, route to **nearest healthy region** using DNS or anycast.
+  - Within a region, use **health checks** and **load shedding** to reject traffic before overload.
+- **Cross-region fallback**:
+  - If local DB or cache is unhealthy (readiness fails), circuit-break that dependency.
+  - Use **GracefulDegrader** to fall back to:
+    - Stale cache snapshot.
+    - A remote region’s read replica (with higher latency but still available).
+
+```python
+async def get_profile(user_id: str) -> Profile:
+    async def local_read():
+        # Prefer local region
+        return await local_profile_store.get(user_id)
+
+    async def remote_read():
+        # Fallback: slower, cross-region
+        return await remote_profile_client.get(user_id)
+
+    degrader = GracefulDegrader("profile-read", circuit_breaker=local_db_circuit)
+    result = await degrader.execute(
+        primary=local_read,
+        fallback=remote_read,
+        fallback_description="remote region"
+    )
+
+    return result.value
+```
+
+**Operational notes**:
+
+- Health checks drive traffic routing: if an entire region is unhealthy, remove it from DNS rotation.
+- Use **bounded staleness** policies: local caches can serve data for up to \(T\) seconds when both DB and remote region are unavailable.
+
+---
+
+### Scenario 3: Protecting Core System with Load Shedding
+
+A search service provides typeahead suggestions and full-text search. Under heavy load, it must prioritize **checkout and order placement** over search.
+
+**Strategy**:
+
+- Use **PriorityLoadShedder** in front of search.
+- Assign higher priorities to requests originating from checkout flows, lower priorities for background/autocomplete.
+
+```python
+shedder = PriorityLoadShedder(max_load=0.8)
+
+async def handle_search(request):
+    # System load from metrics (CPU, QPS, queue depth)
+    shedder.update_load(current_system_load())
+
+    priority = shedder.NORMAL
+    if request.context.get("flow") == "checkout":
+        priority = shedder.CRITICAL
+    elif request.context.get("flow") == "autocomplete":
+        priority = shedder.LOW
+
+    if not shedder.should_accept(priority):
+        # Soft failure: degrade gracefully
+        return {"results": [], "degraded": True}
+
+    # Normal search path
+    results = await search_backend.query(request.query)
+    return {"results": results, "degraded": False}
+```
+
+**Outcome**:
+
+- During overload, low-priority searches are dropped first, preserving capacity for critical flows.
+- Combined with **timeouts, retries, and circuit breakers**, this keeps the system responsive instead of failing uniformly.
+
+---
+
+## Advanced Testing: Deterministic Simulation
+
+While Chaos Engineering (injecting failures in production) is powerful, it has a major flaw: **non-determinism**. If you find a bug in production, it's often impossible to reproduce it exactly. 
+
+**Deterministic Simulation Testing (DST)**, pioneered by **FoundationDB**, is the "Holy Grail" of distributed systems testing.
+
+### The FoundationDB Philosophy
+Every component of the system—the database, the network, the disk, and even time—is virtualized. The entire distributed system runs in a **single-threaded, deterministic simulator**.
+
+```text
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    DETERMINISTIC SIMULATION ARCHITECTURE                    │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  [ Simulator Engine ] ─── Seed: 0xDEADBEEF                                   │
+│            │                                                                 │
+│            ├─► [ Virtual Time ] (Controlled by simulator)                    │
+│            ├─► [ Virtual Network ] (Injects loss, reordering, partitions)     │
+│            ├─► [ Virtual Disk ] (Injects bit rot, latency, full disk)        │
+│            └─► [ Event Loop ] (Executes all nodes sequentially)              │
+│                                                                              │
+│  BENEFIT: If a bug occurs at step 1,234,982, you can reproduce it            │
+│          EXACTLY by using the same seed.                                     │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Requirements for Determinism
+To make a system simulation-ready, you must eliminate all sources of non-determinism:
+
+1.  **No Threads**: Use an actor model or a single-threaded event loop (like Go's goroutines with a deterministic scheduler or C++ actors).
+2.  **No Direct Time**: Never call `time.Now()`. Use a `TimeSource` interface that the simulator can inject.
+3.  **No Direct Randomness**: Never call `rand()`. Use a PRNG seeded by the simulator.
+4.  **No Direct I/O**: Virtualize network and disk calls so the simulator can fail or delay them at specific points.
+
+### DST vs. Chaos Engineering
+
+| Feature | Chaos Engineering (Jepsen/Chaos Monkey) | Deterministic Simulation (DST) |
+| :--- | :--- | :--- |
+| **Environment** | Real network/Real OS | Single-process simulator |
+| **Speed** | Real-time | Faster than real-time (no idle waits) |
+| **Reproducibility** | Low (Heisenbugs) | **100% (Same seed = Same result)** |
+| **Coverage** | Surface-level failures | Deep logic races and corner cases |
+
+**Staff+ Tip:** Implementing DST is incredibly hard because it requires architectural discipline from day one. However, it is the reason FoundationDB is considered the most stable distributed database in the world. If you are designing a new core protocol, consider "Simulation-First" development.
 
 ---
 

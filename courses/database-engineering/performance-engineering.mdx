@@ -5,647 +5,229 @@ description: "Production performance analysis for database engineers at PlanetSc
 icon: "gauge-high"
 ---
 
-# Performance Engineering Deep Dive
+# Performance Engineering: The Bottleneck Analysis Guide
 
-This module covers the tools and techniques used by database engineers at companies like PlanetScale, Supabase, Neon, and CockroachDB to diagnose and fix performance issues at scale.
+Performance engineering is not about "tuning parameters"—it is a systematic process of identifying the **bottleneck** in a complex, layered system and applying the minimum change required to shift that bottleneck to a more scalable resource.
 
 <Info>
-**Target Audience**: Engineers joining distributed database teams  
-**Prerequisites**: Query Engine, Data Structures modules  
-**Tools Covered**: perf, flamegraphs, pg_stat_*, BPF  
-**Interview Relevance**: Staff+ performance interviews
+**Target Audience**: Staff/Principal Database Engineers  
+**Core Methodology**: The USE Method + Wait Event Profiling  
+**Key Goal**: Move from "guessing" to "evidential analysis"  
 </Info>
 
 ---
 
-## Part 1: The Performance Investigation Framework
+## The Performance Engineering Mindset
 
-### 1.1 The Performance Stack
-
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                      PERFORMANCE INVESTIGATION LAYERS                        │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                                                                              │
-│   Layer 6: Application                                                       │
-│   ├── Query patterns, connection management, ORM behavior                   │
-│   │                                                                          │
-│   Layer 5: PostgreSQL Query                                                  │
-│   ├── Query plans, statistics, locks, wait events                           │
-│   │                                                                          │
-│   Layer 4: PostgreSQL Internals                                              │
-│   ├── Buffer pool, WAL, vacuum, checkpointer                                │
-│   │                                                                          │
-│   Layer 3: Operating System                                                  │
-│   ├── I/O scheduler, memory management, CPU scheduling                      │
-│   │                                                                          │
-│   Layer 2: Hardware                                                          │
-│   ├── SSD/NVMe, RAM, CPU cache, network                                     │
-│   │                                                                          │
-│   Layer 1: Cloud Infrastructure                                              │
-│   └── EBS limits, network bandwidth, IOPS credits                           │
-│                                                                              │
-│   Investigation Order:                                                       │
-│   1. Check cloud/hardware limits first (IOPS, bandwidth)                    │
-│   2. OS-level metrics (iostat, vmstat)                                      │
-│   3. PostgreSQL wait events and statistics                                  │
-│   4. Query-level analysis                                                   │
-│   5. Application patterns                                                   │
-│                                                                              │
-└─────────────────────────────────────────────────────────────────────────────┘
-```
-
-### 1.2 The Four Golden Signals
-
-```sql
--- 1. LATENCY: How long do queries take?
-SELECT 
-    query,
-    calls,
-    mean_exec_time::numeric(10,2) as avg_ms,
-    max_exec_time::numeric(10,2) as max_ms,
-    stddev_exec_time::numeric(10,2) as stddev_ms
-FROM pg_stat_statements
-ORDER BY mean_exec_time DESC
-LIMIT 20;
-
--- 2. THROUGHPUT: How many queries per second?
-SELECT 
-    sum(calls) / 
-    EXTRACT(EPOCH FROM (now() - stats_reset)) as qps
-FROM pg_stat_statements, pg_stat_statements_info;
-
--- 3. ERRORS: What's failing?
-SELECT 
-    datname,
-    xact_rollback,
-    conflicts,
-    deadlocks
-FROM pg_stat_database;
-
--- 4. SATURATION: Are resources maxed out?
--- Check wait events to see what's saturated
-SELECT 
-    wait_event_type,
-    wait_event,
-    count(*) as waiting_sessions
-FROM pg_stat_activity
-WHERE state = 'active' AND wait_event IS NOT NULL
-GROUP BY wait_event_type, wait_event
-ORDER BY count(*) DESC;
-```
+A principal engineer view of performance follows three laws:
+1. **The Law of Amdahl**: The speedup of a system is limited by its serial components.
+2. **The Law of Little**: Average number of items in a system = arrival rate × average time spent in system (L = λW).
+3. **The Law of Bottlenecks**: Performance is always limited by the **most saturated resource**. Optimizing anything else is a waste of time.
 
 ---
 
-## Part 2: PostgreSQL Statistics Deep Dive
+## Phase 0: Triage & The Four Golden Signals
 
-### 2.1 pg_stat_statements Mastery
+Before diving into profiles, you must identify the **symptom**. We use the "Four Golden Signals" to determine if the system is healthy.
 
+| Signal | Metric | Principal Question |
+| :--- | :--- | :--- |
+| **Latency** | P99 Response Time | Is the database slow, or is it just a few "outlier" queries? |
+| **Throughput** | Queries Per Second (QPS) | Are we handling the load, or is the engine stalling? |
+| **Errors** | Rollback/Conflict Rate | Are we failing due to deadlocks or serialization issues? |
+| **Saturation** | Resource % (CPU/IO) | How much "headroom" is left before a total collapse? |
+
+### Triage Query: The 30-Second Snapshot
 ```sql
--- Enable pg_stat_statements with all options
--- In postgresql.conf:
--- shared_preload_libraries = 'pg_stat_statements'
--- pg_stat_statements.track = all
--- pg_stat_statements.track_utility = on
--- pg_stat_statements.track_planning = on
-
--- Top queries by total time (production bottlenecks)
+-- Identify the "Current Reality" of the engine
 SELECT 
-    left(query, 80) as query_preview,
-    calls,
-    total_exec_time::numeric(12,2) as total_ms,
-    mean_exec_time::numeric(10,2) as avg_ms,
-    rows,
-    100.0 * shared_blks_hit / nullif(shared_blks_hit + shared_blks_read, 0) 
-        as hit_percent
-FROM pg_stat_statements
-ORDER BY total_exec_time DESC
-LIMIT 20;
-
--- Queries with worst cache hit ratio (I/O bound)
-SELECT 
-    left(query, 80),
-    calls,
-    shared_blks_read,
-    shared_blks_hit,
-    100.0 * shared_blks_hit / nullif(shared_blks_hit + shared_blks_read, 0) 
-        as hit_ratio
-FROM pg_stat_statements
-WHERE shared_blks_hit + shared_blks_read > 1000
-ORDER BY hit_ratio ASC NULLS LAST
-LIMIT 20;
-
--- Queries with high planning time (complex plans)
-SELECT
-    left(query, 80),
-    calls,
-    mean_plan_time::numeric(10,2) as avg_plan_ms,
-    mean_exec_time::numeric(10,2) as avg_exec_ms,
-    mean_plan_time / nullif(mean_exec_time, 0) as plan_exec_ratio
-FROM pg_stat_statements
-WHERE calls > 100
-ORDER BY mean_plan_time DESC
-LIMIT 20;
-
--- Queries with high temp file usage (work_mem issues)
-SELECT
-    left(query, 80),
-    calls,
-    temp_blks_read,
-    temp_blks_written,
-    (temp_blks_read + temp_blks_written) * 8 / 1024 as temp_mb
-FROM pg_stat_statements
-WHERE temp_blks_read + temp_blks_written > 0
-ORDER BY temp_blks_read + temp_blks_written DESC;
-```
-
-### 2.2 Wait Event Analysis
-
-```sql
--- Current wait events
-SELECT 
-    pid,
-    usename,
-    application_name,
     state,
     wait_event_type,
     wait_event,
-    left(query, 60) as query_preview
+    count(*) as count,
+    round(100.0 * count(*) / sum(count(*)) over(), 2) as pct
 FROM pg_stat_activity
-WHERE state = 'active'
-ORDER BY wait_event_type, wait_event;
+WHERE state != 'idle'
+GROUP BY 1, 2, 3
+ORDER BY 4 DESC;
+```
+*If `wait_event_type` is NULL for most sessions, you are **CPU Bound**. If it is 'IO', you are **Disk Bound**. If it is 'LWLock', you are **Contention Bound**.*
 
--- Wait event categories explained:
-/*
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                      WAIT EVENT CATEGORIES                                   │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                                                                              │
-│ Category        Common Events           Meaning                              │
-│ ─────────────────────────────────────────────────────────────────────────── │
-│ LWLock          buffer_content          Buffer pool contention               │
-│                 buffer_mapping          Finding buffer in pool               │
-│                 WALWriteLock            WAL write serialization              │
-│                 lock_manager            Lock table access                    │
-│                                                                              │
-│ Lock            relation                Waiting for table lock               │
-│                 tuple                   Waiting for row lock                 │
-│                 transactionid           Waiting for xact to complete         │
-│                 virtualxid              Waiting for virtual xact             │
-│                                                                              │
-│ BufferPin       BufferPin               Another backend has buffer pinned    │
-│                                                                              │
-│ IO              DataFileRead            Reading from disk                    │
-│                 DataFileWrite           Writing to disk                      │
-│                 WALWrite                Writing WAL                          │
-│                 WALSync                 Fsyncing WAL                         │
-│                                                                              │
-│ Client          ClientRead              Waiting for client to send data      │
-│                 ClientWrite             Waiting to send to client            │
-│                                                                              │
-│ IPC             BgWorkerStartup         Waiting for background worker        │
-│                 ParallelFinish          Waiting for parallel workers         │
-│                 ProcArrayLock           Transaction visibility check         │
-│                                                                              │
-└─────────────────────────────────────────────────────────────────────────────┘
-*/
+---
 
--- Aggregate wait events over time (sample periodically)
-CREATE TABLE wait_event_samples (
-    sample_time timestamptz,
-    wait_event_type text,
-    wait_event text,
-    count int
-);
+## Phase 1: Resource Saturation (The USE Method)
 
--- Sample query (run via cron/pg_cron every second)
-INSERT INTO wait_event_samples
-SELECT 
-    now(),
-    wait_event_type,
-    wait_event,
-    count(*)
-FROM pg_stat_activity
-WHERE state = 'active' AND wait_event IS NOT NULL
-GROUP BY wait_event_type, wait_event;
+Developed by Brendan Gregg, the **USE Method** should be applied to every resource (CPU, Memory, Disk, Network).
+
+### 1.1 CPU: Computation vs. Context Switching
+
+**Utilization**: `top` or `mpstat`. High utilization (>80%) is expected in high-performance DBs.
+**Saturation**: Look at the **Run Queue Length** (load average). If Load > Number of Cores, tasks are waiting for a CPU slot.
+
+**Principal Observation**: High CPU with low throughput often indicates **Spinlock Contention** or **Excessive Context Switching**.
+```bash
+# Check context switches per second
+vmstat 1
+# 'cs' column > 100k/sec usually indicates a problem (e.g., too many connections)
 ```
 
-### 2.3 Index Statistics
+### 1.2 Memory: The Buffer Hit Ratio Myth
 
-```sql
--- Index usage statistics
-SELECT 
-    schemaname,
-    relname as table_name,
-    indexrelname as index_name,
-    idx_scan,
-    idx_tup_read,
-    idx_tup_fetch,
-    pg_size_pretty(pg_relation_size(indexrelid)) as index_size
-FROM pg_stat_user_indexes
-ORDER BY idx_scan DESC;
+**Utilization**: `free -m`.
+**Saturation**: **Scanning/Paging**. Look at `si/so` (swap in/out) in `vmstat`.
 
--- Unused indexes (candidates for removal)
-SELECT 
-    schemaname || '.' || relname as table,
-    indexrelname as index,
-    idx_scan,
-    pg_size_pretty(pg_relation_size(indexrelid)) as size
-FROM pg_stat_user_indexes
-WHERE idx_scan = 0
-  AND indexrelid NOT IN (
-      SELECT conindid FROM pg_constraint  -- Keep constraint indexes
-  )
-ORDER BY pg_relation_size(indexrelid) DESC;
+**Staff Engineer Insight**: A "99% Buffer Cache Hit Ratio" can be a trap. If you have 1,000,000 hits and 10,000 reads, your ratio is 99%. But if those 10,000 reads are random I/Os on a slow disk, your latency will be terrible. **Focus on the absolute number of reads/sec, not the ratio.**
 
--- Index bloat estimation
-SELECT
-    schemaname,
-    tablename,
-    indexname,
-    pg_size_pretty(pg_relation_size(indexrelid::regclass)) as index_size,
-    pg_size_pretty(
-        pg_relation_size(indexrelid::regclass) - 
-        (reltuples * 40)::bigint  -- Rough estimate: 40 bytes per index entry
-    ) as estimated_bloat
-FROM pg_stat_user_indexes
-JOIN pg_class ON pg_class.oid = indexrelid
-WHERE reltuples > 10000
-ORDER BY pg_relation_size(indexrelid::regclass) DESC;
+### 1.3 Disk: IOPS vs. Throughput
 
--- Index efficiency (fetches vs reads)
-SELECT 
-    indexrelname,
-    idx_tup_read,
-    idx_tup_fetch,
-    CASE WHEN idx_tup_read > 0 
-         THEN round(100.0 * idx_tup_fetch / idx_tup_read, 2) 
-         ELSE 0 END as fetch_ratio
-FROM pg_stat_user_indexes
-WHERE idx_tup_read > 1000
-ORDER BY fetch_ratio ASC;
--- Low fetch ratio = index reads many tuples but few are actually needed
--- Consider more selective index or query optimization
-```
+**Utilization**: `%util` in `iostat`.
+**Saturation**: `await` (Average Wait Time).
 
-### 2.4 Table Statistics
-
-```sql
--- Table access patterns
-SELECT 
-    schemaname,
-    relname,
-    seq_scan,
-    seq_tup_read,
-    idx_scan,
-    idx_tup_fetch,
-    n_tup_ins,
-    n_tup_upd,
-    n_tup_del,
-    n_live_tup,
-    n_dead_tup,
-    round(100.0 * n_dead_tup / nullif(n_live_tup + n_dead_tup, 0), 2) 
-        as dead_tup_percent,
-    last_vacuum,
-    last_autovacuum,
-    last_analyze,
-    last_autoanalyze
-FROM pg_stat_user_tables
-ORDER BY seq_tup_read DESC;
-
--- Tables needing vacuum
-SELECT 
-    schemaname || '.' || relname as table,
-    n_live_tup,
-    n_dead_tup,
-    round(100.0 * n_dead_tup / nullif(n_live_tup, 0), 2) as dead_percent,
-    last_autovacuum,
-    pg_size_pretty(pg_total_relation_size(relid)) as total_size
-FROM pg_stat_user_tables
-WHERE n_dead_tup > 10000
-ORDER BY n_dead_tup DESC;
-
--- HOT update ratio (in-place updates, no index update needed)
-SELECT 
-    schemaname,
-    relname,
-    n_tup_upd,
-    n_tup_hot_upd,
-    round(100.0 * n_tup_hot_upd / nullif(n_tup_upd, 0), 2) as hot_update_percent
-FROM pg_stat_user_tables
-WHERE n_tup_upd > 1000
-ORDER BY hot_update_percent ASC;
--- Low HOT ratio = indexes being updated frequently = consider fillfactor
+```bash
+iostat -xy 1
+# If await > 5ms on an NVMe drive, the storage is saturated.
+# If %util is 100% but rkB/s is low, you have a Random I/O bottleneck.
 ```
 
 ---
 
-## Part 3: System-Level Profiling
+## Phase 2: Database Internal Waits
 
-### 3.1 Linux perf Basics
+## Phase 2: Database Internal Waits
 
-```bash
-# Install perf (Ubuntu/Debian)
-apt-get install linux-tools-common linux-tools-$(uname -r)
+If resources are not saturated but latency is high, the database is likely waiting on internal synchronization.
 
-# Basic CPU profiling of PostgreSQL
-# Find postgres backend PID handling your query
-psql -c "SELECT pg_backend_pid();"  # e.g., 12345
+### 2.1 The Hierarchy of Waits
 
-# Profile that backend
-perf record -g -p 12345 -- sleep 30
+| Wait Class | Principal Archetype | Root Cause |
+| :--- | :--- | :--- |
+| **LWLock** | `buffer_content` | **Shared Buffer Contention**. Too many backends trying to access the same page (Hot Block). |
+| **LWLock** | `WALWriteLock` | **WAL Serializer Bottleneck**. Too many small transactions; slow fsync to WAL disk. |
+| **Lock** | `relation` | **Catalog Contention**. An uncommitted DDL (e.g., `ALTER TABLE`) is blocking all DML. |
+| **IO** | `DataFileRead` | **Cache Miss**. Query is pulling cold data from disk into the buffer pool. |
 
-# Generate report
-perf report --stdio
+### 2.2 Advanced: ProcArrayLock Contention
 
-# Example output:
-# 35.00%  postgres  [kernel]  [k] copy_user_enhanced_fast_string
-# 22.00%  postgres  postgres  [.] hash_search_with_hash_value
-# 15.00%  postgres  postgres  [.] ExecScan
-# 10.00%  postgres  postgres  [.] slot_deform_heap_tuple
-#  8.00%  postgres  postgres  [.] ExecQual
+In high-concurrency systems (1000+ TPS), `ProcArrayLock` often becomes the global bottleneck. This lock is used when a transaction needs to compute a "Snapshot" of the system (visibility).
 
-# Profile all postgres processes
-perf record -g -p $(pgrep -d',' postgres) -- sleep 30
-```
+**Staff Engineer Insight**: If you see `ProcArrayLock` as a top wait event, scaling CPU won't help. You must reduce the transaction rate, use a connection pooler (PgBouncer) to reduce backend count, or move to a version of Postgres (14+) with snapshot caching optimizations.
 
-### 3.2 Flame Graphs
+---
+
+## Phase 3: Code-Level Profiling (Flamegraphs)
+
+When you are **CPU Bound** and cannot find a simple query fix, you must look at what the CPU is actually doing inside the Postgres binary.
+
+### 3.1 Capturing the Flamegraph
 
 ```bash
-# Clone flamegraph tools
-git clone https://github.com/brendangregg/FlameGraph.git
-cd FlameGraph
-
-# Capture profile
+# Profile all postgres backends for 60 seconds
 perf record -F 99 -g -p $(pgrep -d',' postgres) -- sleep 60
 
-# Generate flame graph
-perf script | ./stackcollapse-perf.pl | ./flamegraph.pl > pg-flamegraph.svg
-
-# View in browser
-# Open pg-flamegraph.svg
+# Generate the SVG
+perf script | ./stackcollapse-perf.pl | ./flamegraph.pl > db_profile.svg
 ```
 
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                      READING FLAME GRAPHS                                    │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                                                                              │
-│   ┌─────────────────────────────────────────────────────────────────────┐   │
-│   │████████████████████████████ hash_search ████████████████████████████│   │
-│   └─────────────────────────────────────────────────────────────────────┘   │
-│   ┌────────────────────────────┐ ┌──────────────────────────────────────┐   │
-│   │██████ ExecHashJoin █████████│ │███████████ ExecSeqScan ████████████│   │
-│   └────────────────────────────┘ └──────────────────────────────────────┘   │
-│   ┌────────────────────────────────────────────────────────────────────┐    │
-│   │████████████████████████ ExecProcNode ██████████████████████████████│    │
-│   └────────────────────────────────────────────────────────────────────┘    │
-│   ┌────────────────────────────────────────────────────────────────────┐    │
-│   │██████████████████████████ ExecutorRun █████████████████████████████│    │
-│   └────────────────────────────────────────────────────────────────────┘    │
-│                                                                              │
-│   Reading Guide:                                                             │
-│   • Y-axis: Stack depth (bottom = entry point)                              │
-│   • X-axis: Time spent (width = % of samples)                               │
-│   • Color: Random, just for differentiation                                 │
-│   • Plateaus: Functions that consume CPU time                               │
-│   • Towers: Deep call stacks                                                │
-│                                                                              │
-│   What to look for:                                                          │
-│   • Wide plateaus at top = hot functions to optimize                        │
-│   • hash_search = possible hash table sizing issue                          │
-│   • ExecSeqScan = missing index                                             │
-│   • slot_deform_heap_tuple = consider column ordering                       │
-│   • LWLockAcquire = contention issue                                        │
-│                                                                              │
-└─────────────────────────────────────────────────────────────────────────────┘
-```
+### 3.2 Interpreting "Staff-Level" Patterns
 
-### 3.3 Off-CPU Analysis (I/O Waits)
-
-```bash
-# Off-CPU flame graph shows where processes are WAITING, not running
-# Requires BPF/eBPF
-
-# Using bcc-tools
-apt-get install bpfcc-tools
-
-# Trace off-CPU events
-offcputime-bpfcc -p $(pgrep -d',' postgres) -f 30 > offcpu.stacks
-
-# Generate off-CPU flame graph
-./flamegraph.pl --color=io --countname=us < offcpu.stacks > offcpu.svg
-
-# Common off-CPU patterns:
-# • pread/pwrite → Disk I/O
-# • epoll_wait → Waiting for client
-# • futex → Lock contention
-# • nanosleep → Intentional sleep (background workers)
-```
-
-### 3.4 I/O Analysis
-
-```bash
-# Basic I/O stats
-iostat -xz 1
-
-# Key columns:
-# r/s, w/s      - Reads/writes per second
-# rkB/s, wkB/s  - KB read/written per second
-# await         - Average I/O wait time (ms)
-# %util         - Device utilization
-
-# Example concerning output:
-# Device    r/s    w/s   rkB/s   wkB/s  await  %util
-# nvme0n1  5000   2000  400000  160000   12.5   99.8
-#                                         ↑      ↑
-#                                    High wait  Saturated!
-
-# Per-process I/O with iotop
-iotop -oPa
-
-# BPF-based I/O latency histogram
-biolatency-bpfcc -D 10
-
-# Example output shows latency distribution:
-# usecs     : count     distribution
-# 0 -> 1    : 0        |                    |
-# 2 -> 3    : 0        |                    |
-# 4 -> 7    : 12       |*                   |
-# 8 -> 15   : 156      |************        |
-# 16 -> 31  : 298      |***********************|
-# 32 -> 63  : 842      |************************|  ← Most I/O here
-# 64 -> 127 : 234      |******************  |
-# 128 -> 255: 89       |*******             |
-# 256 -> 511: 12       |*                   |  ← Tail latency
-```
+| Pattern | Code Path | Meaning |
+| :--- | :--- | :--- |
+| **Wide Plateau** | `hash_search` | The Hash Table (for Joins or Aggs) is huge and spending time in bucket lookup. Consider `work_mem` tuning. |
+| **Wide Plateau** | `slot_deform_tuple` | **The Defragmentation Tax**. Postgres spends massive CPU "deforming" rows to find a column at the end of a wide table. Move heavily accessed columns to the front. |
+| **Jagged Towers** | `ExecQual` | Massive expression evaluation. Likely a complex `WHERE` clause with non-indexed functions. |
+| **Wide Tower** | `LWLockAcquire` | **Lock Contention**. The engine is spending more time waiting for metadata than doing work. |
 
 ---
 
-## Part 4: Benchmarking
+## Phase 4: Query-Level Optimization (The 80/20 Rule)
 
-### 4.1 pgbench Fundamentals
+You cannot optimize every query. A principal engineer identifies the 20% of queries causing 80% of the load.
 
-```bash
-# Initialize test database
-pgbench -i -s 100 testdb  # Scale factor 100 = 10M rows
-
-# Basic TPC-B style benchmark
-pgbench -c 10 -j 2 -T 60 testdb
-# -c 10: 10 concurrent clients
-# -j 2:  2 worker threads
-# -T 60: Run for 60 seconds
-
-# Output interpretation:
-# tps = 1234.567890 (including connections establishing)
-# tps = 1245.678901 (excluding connections establishing)
-# ↑ This is your throughput
-
-# With detailed timing
-pgbench -c 10 -j 2 -T 60 -r testdb
-# -r: Report per-statement latencies
-
-# Example output:
-# statement latencies in milliseconds:
-#  0.002  \set aid random(1, 100000 * :scale)
-#  0.001  \set bid random(1, 1 * :scale)
-#  0.001  \set tid random(1, 10 * :scale)
-#  0.001  \set delta random(-5000, 5000)
-#  0.156  BEGIN;
-#  0.234  UPDATE pgbench_accounts SET abalance = abalance + :delta WHERE aid = :aid;
-#  0.089  SELECT abalance FROM pgbench_accounts WHERE aid = :aid;
-#  0.067  UPDATE pgbench_tellers SET tbalance = tbalance + :delta WHERE tid = :tid;
-#  0.078  UPDATE pgbench_branches SET bbalance = bbalance + :delta WHERE bid = :bid;
-#  0.045  INSERT INTO pgbench_history (tid, bid, aid, delta, mtime) VALUES (:tid, :bid, :aid, :delta, CURRENT_TIMESTAMP);
-#  0.823  END;
-```
-
-### 4.2 Custom pgbench Scripts
+### 4.1 The pg_stat_statements Strategy
 
 ```sql
--- Create custom benchmark script: mixed_workload.sql
-
--- Point query (80% of workload)
-\set user_id random(1, 10000000)
-SELECT * FROM users WHERE id = :user_id;
-
--- Save as point_read.sql, then run with weight:
--- pgbench -f point_read.sql@80 -f range_scan.sql@15 -f write.sql@5 -T 60 testdb
+-- Identify queries with the highest I/O impact
+SELECT 
+    query,
+    calls,
+    round(total_exec_time::numeric, 2) as total_ms,
+    shared_blks_read + shared_blks_written as io_blocks,
+    round(100.0 * shared_blks_hit / nullif(shared_blks_hit + shared_blks_read, 0), 2) as hit_ratio
+FROM pg_stat_statements
+ORDER BY io_blocks DESC
+LIMIT 10;
 ```
 
+**Staff Engineer Insight**: Look for queries with high `calls` but low `rows`. This indicates **index-thrashing** or **unnecessary repeat work**. A query called 10,000 times a second that takes 1ms is often more dangerous than a 10s query called once an hour.
+
+### 4.2 The "Temp File" Trap
+
+If `work_mem` is too small, Postgres spills sorts and hashes to disk. This is a silent performance killer.
 ```sql
--- Range scan workload: range_scan.sql
-\set start_id random(1, 9900000)
-\set end_id :start_id + 1000
-SELECT * FROM users WHERE id BETWEEN :start_id AND :end_id ORDER BY id;
+SELECT query, temp_blks_read, temp_blks_written
+FROM pg_stat_statements
+WHERE temp_blks_read > 0
+ORDER BY 2 DESC;
 ```
-
-```sql
--- Write workload: write.sql
-\set user_id random(1, 10000000)
-\set new_balance random(0, 100000)
-UPDATE users SET balance = :new_balance WHERE id = :user_id;
-```
-
-### 4.3 Latency Histogram Analysis
-
-```bash
-# Capture latency histogram
-pgbench -c 20 -j 4 -T 300 -L 100 --log --aggregate-interval=1 testdb
-
-# -L 100: Latency limit 100ms (report if exceeded)
-# --log: Write per-transaction logs
-# --aggregate-interval=1: Report stats every second
-
-# Analyze with percentiles
-cat pgbench_log.* | awk '{print $3}' | sort -n | \
-  awk 'BEGIN{c=0} {a[c++]=$1} END{
-    print "P50:", a[int(c*0.50)], "ms";
-    print "P95:", a[int(c*0.95)], "ms";
-    print "P99:", a[int(c*0.99)], "ms";
-    print "P99.9:", a[int(c*0.999)], "ms";
-  }'
-
-# Or use HdrHistogram for accurate percentiles
-# https://github.com/HdrHistogram/HdrHistogram_c
-```
-
-### 4.4 Benchmark Methodology
-
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                      BENCHMARK BEST PRACTICES                                │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                                                                              │
-│   1. Warm Up Phase                                                           │
-│      • Run benchmark for 5-10 minutes before measuring                      │
-│      • Ensures buffer pool is populated                                      │
-│      • JIT compilation has occurred                                          │
-│      • Statistics are accurate                                               │
-│                                                                              │
-│   2. Measurement Phase                                                       │
-│      • Run for at least 5-10 minutes for stable results                     │
-│      • Multiple runs (at least 3) to check variance                         │
-│      • Report median, not mean (avoids outlier skew)                        │
-│                                                                              │
-│   3. Control Variables                                                       │
-│      • Same hardware configuration                                           │
-│      • Same data size and distribution                                       │
-│      • Same PostgreSQL configuration                                         │
-│      • Same OS tuning                                                        │
-│      • Quiesce other workloads                                               │
-│                                                                              │
-│   4. Metrics to Capture                                                      │
-│      • Throughput (TPS or QPS)                                              │
-│      • Latency percentiles (P50, P95, P99, P99.9)                           │
-│      • CPU utilization                                                       │
-│      • I/O utilization                                                       │
-│      • Memory usage                                                          │
-│      • Error rate                                                            │
-│                                                                              │
-│   5. Common Mistakes                                                         │
-│      ✗ Running too short (< 1 minute)                                       │
-│      ✗ Not warming up                                                       │
-│      ✗ Comparing averages instead of percentiles                            │
-│      ✗ Ignoring variance between runs                                       │
-│      ✗ Testing with unrealistic data sizes                                  │
-│      ✗ Not monitoring system resources during test                          │
-│                                                                              │
-└─────────────────────────────────────────────────────────────────────────────┘
-```
+*Solution: Increase `work_mem` for specific users or queries, or optimize the join to reduce result set size.*
 
 ---
 
-## Part 5: Connection and Memory Tuning
+## Phase 5: Concurrency & Lock Contention
 
-### 5.1 Connection Pool Sizing
+### 5.1 The Blocker Tree
 
+Use this recursive query to find the "Root Blocker" causing a pile-up.
+```sql
+WITH RECURSIVE blockers AS (
+  SELECT 
+    pid, 
+    pg_blocking_pids(pid) AS pids 
+  FROM pg_stat_activity 
+  WHERE cardinality(pg_blocking_pids(pid)) > 0
+  UNION ALL
+  SELECT 
+    s.pid, 
+    pg_blocking_pids(s.pid) 
+  FROM pg_stat_activity s 
+  JOIN blockers b ON s.pid = ANY(b.pids)
+)
+SELECT 
+  pid, 
+  state, 
+  wait_event, 
+  query 
+FROM pg_stat_activity 
+WHERE pid IN (SELECT unnest(pids) FROM blockers)
+  AND pid NOT IN (SELECT pid FROM blockers);
 ```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                      CONNECTION POOL FORMULA                                 │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                                                                              │
-│   Optimal pool size (per database node):                                    │
-│                                                                              │
-│   connections = (cores * 2) + effective_spindle_count                       │
-│                                                                              │
-│   For SSD/NVMe (no spindles):                                               │
-│   connections = (cores * 2) + 1                                             │
-│                                                                              │
-│   Example: 8-core server with NVMe:                                         │
-│   connections = (8 * 2) + 1 = 17                                            │
-│                                                                              │
-│   Key insight: More connections != more throughput                          │
-│   After optimal point, contention increases, throughput decreases           │
-│                                                                              │
-│   Symptoms of too many connections:                                         │
-│   • Increased latency                                                        │
-│   • Context switching overhead                                               │
-│   • Lock contention                                                          │
-│   • Memory pressure (each backend uses ~10MB+)                              │
-│                                                                              │
-└─────────────────────────────────────────────────────────────────────────────┘
-```
+
+### 5.2 Common Contention Archetypes
+
+1. **The Hot Row**: Millions of updates to a single row (e.g., a counter). *Solution: Use batching or CRDT-style additive counters.*
+2. **The Foreign Key Lock**: Updating a child table requires a shared lock on the parent. If many children update simultaneously, the parent becomes a bottleneck.
+3. **The Index Build**: Creating an index without `CONCURRENTLY` locks the whole table for writes.
+
+---
+
+## Phase 6: Production Troubleshooting Runbook
+
+| Symptom | Initial Check | Probable Root Cause |
+| :--- | :--- | :--- |
+| **Spiking Latency** | `pg_stat_activity` | Lock pile-up or a "Plan Flip" (CBO chose a bad plan due to stale stats). |
+| **High Load Avg** | `vmstat` / `top` | High context switching or Spinlock contention. |
+| **I/O Saturation** | `iostat` | Checkpoint spike or a huge Sequential Scan. |
+| **Out of Memory** | `dmesg` | `work_mem` is set too high for the connection count. |
+
+---
+
+## Summary: The Principal's Workflow
+
+1. **Start at the OS**: Is there a resource (CPU/IO) at 100%? (USE Method)
+2. **Look at the Waits**: Is the database waiting on itself? (`pg_stat_activity`)
+3. **Find the Culprit**: Which queries are causing the most impact? (`pg_stat_statements`)
+4. **Profile if Needed**: If CPU is high but queries look fine, use `perf` and Flamegraphs.
+5. **Optimize Evidentially**: Change one variable, measure the throughput shift, and repeat.
 
 ### 5.2 PgBouncer Configuration
 
@@ -1061,6 +643,431 @@ SELECT pg_terminate_backend(12345);  -- Last resort
     - Not all queries hit the database
   </Accordion>
 </AccordionGroup>
+
+---
+
+## Production Troubleshooting Scenario 1: High-CPU Query Analysis
+
+### Incident Report
+**Symptoms**: Database server showing 95%+ CPU utilization. Application reporting 5x normal query latency.  
+**Impact**: User-facing API timing out, customer complaints escalating.  
+**Time to Resolve**: Target < 15 minutes
+
+### Investigation Workflow
+
+**Step 1: Identify CPU-Intensive Queries (2 minutes)**
+```sql
+-- Find queries consuming the most CPU time
+SELECT 
+    left(query, 100) as query_preview,
+    calls,
+    total_exec_time::numeric(12,2) as total_exec_ms,
+    mean_exec_time::numeric(10,2) as mean_exec_ms,
+    (total_exec_time / sum(total_exec_time) OVER ()) * 100 as pct_total_time
+FROM pg_stat_statements
+ORDER BY total_exec_time DESC
+LIMIT 10;
+
+-- Check currently running expensive queries
+SELECT 
+    pid,
+    usename,
+    application_name,
+    now() - query_start as duration,
+    state,
+    left(query, 100) as query_preview
+FROM pg_stat_activity
+WHERE state = 'active' 
+  AND query NOT LIKE '%pg_stat_activity%'
+ORDER BY query_start;
+```
+
+**What to Look For**:
+- Queries with high `total_exec_time` but reasonable `mean_exec_time` → high call frequency issue
+- Queries with high `mean_exec_time` → individual query performance issue
+- Long-running queries that started recently → may be holding locks
+
+**Step 2: Analyze the Problematic Query (3 minutes)**
+```sql
+-- Get the full query text if truncated
+SELECT query FROM pg_stat_statements WHERE queryid = <identified_queryid>;
+
+-- Check execution plan
+EXPLAIN (ANALYZE, BUFFERS, VERBOSE) 
+<paste the problematic query here>;
+```
+
+**Common High-CPU Patterns**:
+1. **Full Table Scans on Large Tables**
+   - Look for `Seq Scan` on tables with millions of rows
+   - Missing index or statistics out of date
+   
+2. **Nested Loop Joins with High Row Estimates**
+   - `Nested Loop` on large result sets is CPU-intensive
+   - May need hash join or merge join instead
+   
+3. **Complex Aggregations Without Indexes**
+   - `GROUP BY` on non-indexed columns
+   - Window functions scanning entire tables
+
+4. **Regular Expression or String Operations**
+   - `LIKE '%pattern%'` (can't use indexes)
+   - `regexp_match` on large text fields
+
+**Step 3: Check for Statistics Issues (2 minutes)**
+```sql
+-- Check when tables were last analyzed
+SELECT 
+    schemaname,
+    relname,
+    last_analyze,
+    last_autoanalyze,
+    n_live_tup,
+    n_dead_tup
+FROM pg_stat_user_tables
+WHERE relname IN (
+    -- List tables from the problematic query
+    'users', 'orders', 'products'
+)
+ORDER BY last_analyze NULLS FIRST;
+
+-- If statistics are stale, run ANALYZE
+ANALYZE users;
+ANALYZE orders;
+-- Check if plan improves
+```
+
+**Step 4: Immediate Mitigation (3 minutes)**
+
+**Option A: Kill the Offending Queries**
+```sql
+-- Identify specific PIDs
+SELECT 
+    pid,
+    usename,
+    left(query, 80),
+    now() - query_start as duration
+FROM pg_stat_activity
+WHERE query ILIKE '%<pattern from step 1>%'
+  AND state = 'active';
+
+-- Terminate them
+SELECT pg_terminate_backend(pid) FROM pg_stat_activity 
+WHERE query ILIKE '%<pattern>%' AND state = 'active';
+```
+
+**Option B: Add Missing Index**
+```sql
+-- If Seq Scan is the issue and WHERE clause is clear
+CREATE INDEX CONCURRENTLY idx_users_created_at ON users(created_at);
+-- CONCURRENTLY prevents table locking
+```
+
+**Option C: Query Rewrite (if possible)**
+```sql
+-- Example: Replace full table scan with indexed lookup
+-- Bad:
+SELECT * FROM orders WHERE status IN ('pending', 'processing');
+
+-- Better:
+SELECT * FROM orders WHERE status = 'pending'
+UNION ALL
+SELECT * FROM orders WHERE status = 'processing';
+-- If there's an index on status, this uses it twice instead of seq scan
+```
+
+**Step 5: Monitor and Verify (5 minutes)**
+```sql
+-- Watch CPU and query stats
+SELECT 
+    sum(total_exec_time) as total_time,
+    sum(calls) as total_calls
+FROM pg_stat_statements;
+
+-- Check every 30 seconds, verify total_time growth rate decreased
+-- Monitor system CPU with `top` or monitoring dashboard
+```
+
+### Post-Incident Analysis
+
+**Root Cause Categories**:
+1. **Missing Index**: Application added new query pattern without proper indexing
+2. **Statistics Drift**: Large data changes made planner choose wrong plan
+3. **Query Regression**: Application deployed with inefficient query
+4. **Load Spike**: Sudden traffic increase exposed existing slow query
+
+**Preventive Measures**:
+- Enable `auto_explain` with `log_min_duration` to catch slow queries before they become incidents
+- Set up alerts on CPU >80% sustained for >2 minutes
+- Run `ANALYZE` after bulk data imports
+- Review new queries in development with `EXPLAIN ANALYZE`
+- Implement query review process before production deployment
+
+---
+
+## Production Troubleshooting Scenario 2: I/O-Bound Workload with Low Cache Hit Ratio
+
+### Incident Report
+**Symptoms**: Response times degraded 10x. Disk I/O is saturated at 100%. Cache hit ratio dropped from 99% to 85%.  
+**Impact**: All database-dependent services experiencing timeouts.  
+**Time to Resolve**: Target < 20 minutes
+
+### Investigation Workflow
+
+**Step 1: Confirm I/O Saturation (1 minute)**
+```bash
+# Check disk I/O utilization (Linux)
+iostat -x 1 5
+
+# Look for:
+# - %util near 100% (disk saturated)
+# - await > 10ms (high latency)
+# - r/s and w/s (read/write operations per second)
+
+# PostgreSQL wait events
+```
+```sql
+SELECT 
+    wait_event_type,
+    wait_event,
+    count(*) as waiting_backends
+FROM pg_stat_activity
+WHERE wait_event IS NOT NULL
+GROUP BY wait_event_type, wait_event
+ORDER BY count(*) DESC;
+
+-- Look for: DataFileRead, DataFileWrite, WALWrite
+```
+
+**Step 2: Identify Cache-Unfriendly Queries (3 minutes)**
+```sql
+-- Queries with worst buffer hit ratios
+SELECT 
+    left(query, 100) as query_preview,
+    calls,
+    shared_blks_read as disk_reads,
+    shared_blks_hit as cache_hits,
+    shared_blks_read + shared_blks_hit as total_blks,
+    round(100.0 * shared_blks_hit / nullif(shared_blks_hit + shared_blks_read, 0), 2) as cache_hit_pct
+FROM pg_stat_statements
+WHERE shared_blks_read > 1000  -- Significant disk activity
+ORDER BY shared_blks_read DESC
+LIMIT 20;
+
+-- Identify specific tables being read from disk
+SELECT 
+    schemaname,
+    relname as table_name,
+    heap_blks_read as disk_reads,
+    heap_blks_hit as cache_hits,
+    heap_blks_read + heap_blks_hit as total_accesses,
+    round(100.0 * heap_blks_hit / nullif(heap_blks_hit + heap_blks_read, 0), 2) as hit_ratio
+FROM pg_statio_user_tables
+WHERE heap_blks_read > 0
+ORDER BY heap_blks_read DESC
+LIMIT 20;
+```
+
+**Step 3: Analyze Query Plans for I/O Issues (4 minutes)**
+```sql
+-- Get explain plan with buffer statistics
+EXPLAIN (ANALYZE, BUFFERS, VERBOSE)
+<paste problematic query>;
+
+-- Look for:
+-- • "Buffers: shared read=XXXXX" - high numbers mean disk reads
+-- • Seq Scans on large tables
+-- • Index scans that read too many pages
+-- • Sorts or aggregations spilling to disk
+```
+
+**Common I/O Problem Patterns**:
+1. **Large Sequential Scans**
+   - Reading entire large tables from disk
+   - Solution: Add appropriate indexes or partition data
+
+2. **Index Scans with Poor Selectivity**
+   - Index scan fetching >10% of table (seq scan might be better)
+   - Solution: Consider covering index or change query
+
+3. **Work Memory Exhaustion**
+   - Sorts/hashes spilling to temp files
+   - Look for "external merge disk" in plan
+   - Solution: Increase `work_mem`
+
+4. **Table Bloat**
+   - Dead tuples force reading more pages
+   - Solution: Run VACUUM or VACUUM FULL
+
+**Step 4: Check for Bloat and Fragmentation (3 minutes)**
+```sql
+-- Identify bloated tables
+SELECT 
+    schemaname,
+    tablename,
+    pg_size_pretty(pg_total_relation_size(schemaname||'.'||tablename)) as total_size,
+    n_live_tup,
+    n_dead_tup,
+    round(100.0 * n_dead_tup / nullif(n_live_tup + n_dead_tup, 0), 2) as dead_tup_pct,
+    last_vacuum,
+    last_autovacuum
+FROM pg_stat_user_tables
+WHERE n_dead_tup > 1000
+ORDER BY n_dead_tup DESC;
+
+-- Check if autovacuum is running
+SELECT * FROM pg_stat_progress_vacuum;
+```
+
+**Step 5: Immediate Mitigation (5 minutes)**
+
+**Option A: Reduce Query Load**
+```sql
+-- Kill or throttle the I/O-heavy queries
+SELECT pg_terminate_backend(pid)
+FROM pg_stat_activity
+WHERE query ILIKE '%<identified pattern>%'
+  AND state = 'active'
+  AND backend_type = 'client backend';
+
+-- Or set a statement timeout for that session
+ALTER DATABASE mydb SET statement_timeout = '5s';
+```
+
+**Option B: Emergency VACUUM**
+```sql
+-- If bloat is the issue
+VACUUM (ANALYZE, VERBOSE) problematic_table;
+
+-- Monitor progress
+SELECT * FROM pg_stat_progress_vacuum;
+```
+
+**Option C: Add Targeted Index**
+```sql
+-- If missing index is clear from EXPLAIN
+CREATE INDEX CONCURRENTLY idx_orders_user_created 
+ON orders(user_id, created_at) 
+INCLUDE (status, total);  -- Covering index to avoid heap lookups
+```
+
+**Option D: Temporarily Increase Shared Buffers**
+```sql
+-- If you have available RAM and can restart
+-- postgresql.conf:
+-- shared_buffers = 8GB  (increase from current value)
+-- effective_cache_size = 24GB  (hint for planner)
+
+-- Or for immediate session-level help:
+SET work_mem = '256MB';  -- For current session only
+```
+
+**Step 6: Monitor Recovery (4 minutes)**
+```sql
+-- Watch cache hit ratio improve
+SELECT 
+    sum(heap_blks_hit) as cache_hits,
+    sum(heap_blks_read) as disk_reads,
+    round(100.0 * sum(heap_blks_hit) / 
+          nullif(sum(heap_blks_hit) + sum(heap_blks_read), 0), 2) as hit_ratio
+FROM pg_statio_user_tables;
+
+-- Check every 30 seconds, target >99%
+
+-- Monitor I/O wait events
+SELECT 
+    wait_event_type,
+    count(*) as waiting
+FROM pg_stat_activity
+WHERE wait_event_type = 'IO'
+GROUP BY wait_event_type;
+-- Should decrease significantly
+```
+
+### Post-Incident Analysis
+
+**Root Cause Categories**:
+1. **Working Set Exceeds Cache**: Data accessed frequently doesn't fit in shared_buffers
+2. **Sudden Query Change**: New query pattern reads cold data from disk
+3. **Bloat Accumulation**: VACUUM not keeping up, forcing reads of many dead-tuple pages
+4. **Cache Eviction Storm**: Massive seq scan pushed frequently-used data out of cache
+
+**Preventive Measures**:
+- **Right-size shared_buffers**: Aim for 25-40% of system RAM
+- **Monitor bloat proactively**: Set up alerts when dead_tup_pct >20%
+- **Tune autovacuum aggressively**: Lower `autovacuum_vacuum_scale_factor`
+- **Implement query review**: Catch full table scans in development
+- **Set up I/O alerts**: Alert when disk await >10ms sustained or cache hit ratio under 95%
+- **Consider read replicas**: Offload analytical queries to dedicated instances
+
+---
+
+## Module Mastery Checklist
+
+Complete this checklist to confirm you've mastered Performance Engineering:
+
+### Performance Investigation Framework
+- [ ] Apply the 6-layer performance stack to diagnose issues systematically
+- [ ] Implement the four golden signals for database monitoring
+- [ ] Conduct root cause analysis using appropriate metrics at each layer
+- [ ] Triage production incidents within the first 5 minutes
+- [ ] Communicate performance findings to technical and non-technical stakeholders
+
+### Statistics and Monitoring
+- [ ] Configure and query pg_stat_statements for query performance analysis
+- [ ] Interpret wait event statistics to identify resource bottlenecks
+- [ ] Use pg_stat_activity to monitor active connections and queries
+- [ ] Analyze pg_stat_user_tables for table-level performance metrics
+- [ ] Build custom monitoring queries for production dashboards
+
+### CPU Profiling and System Analysis
+- [ ] Use perf and flamegraphs to profile PostgreSQL processes
+- [ ] Identify hot code paths and CPU-intensive operations
+- [ ] Interpret flamegraph patterns for different workload types
+- [ ] Analyze system-level CPU metrics and context switches
+- [ ] Apply profiling insights to optimize queries
+
+### I/O Performance
+- [ ] Monitor and optimize buffer cache hit ratios
+- [ ] Identify queries causing excessive physical I/O
+- [ ] Diagnose disk saturation using iostat and wait events
+- [ ] Configure shared_buffers and effective_cache_size appropriately
+- [ ] Implement strategies to reduce I/O amplification
+
+### Query Optimization
+- [ ] Read and interpret EXPLAIN and EXPLAIN ANALYZE output
+- [ ] Identify suboptimal scan types and join algorithms
+- [ ] Recognize when statistics are stale and run ANALYZE
+- [ ] Force better query plans when necessary
+- [ ] Optimize queries to use appropriate indexes
+
+### Concurrency and Locking
+- [ ] Diagnose lock contention using pg_locks and wait events
+- [ ] Identify and resolve deadlocks
+- [ ] Understand lock mode compatibility
+- [ ] Optimize transaction scope to minimize lock duration
+- [ ] Debug serialization failures in high-concurrency scenarios
+
+### Production Troubleshooting
+- [ ] Diagnose and resolve high-CPU query workloads
+- [ ] Fix I/O-bound performance degradation
+- [ ] Respond to sudden query slowdowns systematically
+- [ ] Debug connection pool exhaustion
+- [ ] Identify and remediate bloat-related performance issues
+
+### Configuration Tuning
+- [ ] Tune shared_buffers based on workload and available RAM
+- [ ] Configure work_mem to prevent disk spills
+- [ ] Optimize checkpoint settings for write performance
+- [ ] Tune autovacuum for production workloads
+- [ ] Apply connection pooling strategies effectively
+
+### Practical Application
+- [ ] Complete production troubleshooting scenarios
+- [ ] Build a monitoring dashboard for PostgreSQL
+- [ ] Conduct performance reviews of new queries before deployment
+- [ ] Implement proactive alerting for performance metrics
+- [ ] Document performance baselines and SLOs for production systems
 
 ---
 
