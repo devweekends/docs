@@ -1,0 +1,1027 @@
+---
+title: "Cloud Service Patterns"
+description: "AWS Lambda, DynamoDB, S3, and Production Patterns for Cloud-Native Architecture"
+icon: "cloud-arrow-up"
+---
+
+# Cloud Service Patterns -- AWS in Depth
+
+*Knowing that "the cloud" exists is table stakes. Knowing which specific service to reach for, why it behaves the way it does under load, and where the cost traps hide -- that is what separates engineers who build on AWS from engineers who get paged by AWS. This chapter goes deep on the services you will actually use in production: Lambda, S3, DynamoDB, SQS, EventBridge, ECS, and the networking and security primitives that hold it all together. Every section is grounded in real production behavior, not marketing pages.*
+
+<Note>
+**Cross-chapter context.** This chapter builds on the cloud architecture foundations covered in [Cloud, Problem Framing & Trade-Offs](/resources/interview-questions/think-like-an-engineer/cloud-problemframing-tradeoffs) -- especially the 5-Question Framework, the Well-Architected Framework, and the compute decision matrix. Where that chapter teaches you *how to think* about cloud decisions, this chapter teaches you *how the services actually behave* when real traffic hits them.
+</Note>
+
+<Warning>
+**AWS-centric, principles-universal.** This chapter uses AWS service names because AWS has the largest market share and the most granular service catalog. But every pattern here has a direct equivalent on GCP and Azure. If you understand *why* Lambda has cold starts, you understand why Cloud Functions and Azure Functions do too. The principles transfer; the console does not.
+</Warning>
+
+---
+
+## Part I -- Serverless Patterns (Lambda / Cloud Functions)
+
+### 1.1 Cold Starts -- What Actually Happens
+
+When you invoke a Lambda function, AWS must run your code somewhere. If there is already a warm execution environment sitting idle from a recent invocation, your code runs immediately -- this is a "warm start" and adds near-zero overhead. But if no warm environment exists, AWS must provision one from scratch. This is a cold start, and understanding exactly what happens during one is the key to mitigating them.
+
+**The cold start lifecycle:**
+
+1. **Download your code** -- AWS fetches your deployment package (zip or container image) from S3 or ECR. Larger packages take longer.
+2. **Create the execution environment** -- AWS provisions a microVM (Firecracker), allocates memory, sets up networking, and mounts the filesystem.
+3. **Initialize the runtime** -- The language runtime starts (Python interpreter, Node.js V8, JVM, .NET CLR). This is where JVM-based languages pay a massive tax.
+4. **Run your initialization code** -- Any code outside your handler function executes: import statements, database connection setup, SDK client creation, global variable initialization.
+5. **Execute your handler** -- Finally, your actual function logic runs.
+
+Steps 1-4 are the cold start. Step 5 is what happens every time.
+
+**Cold start duration by language:**
+
+| Runtime | Typical Cold Start | Worst Case | Why |
+|---|---|---|---|
+| Python | 100-300 ms | 500 ms+ | Interpreter starts fast; import-heavy packages (pandas, numpy) add time |
+| Node.js | 100-300 ms | 500 ms+ | V8 is quick; large node_modules increase download/init |
+| Go | 50-100 ms | 200 ms | Compiled binary, no runtime initialization |
+| Rust | 50-100 ms | 200 ms | Same as Go -- compiled, minimal runtime |
+| Java | 3-10 seconds | 15+ seconds | JVM startup, class loading, JIT compilation warmup |
+| .NET | 1-3 seconds | 5+ seconds | CLR initialization, assembly loading |
+
+<Warning>
+**Java cold starts are not a myth.** If you are building a latency-sensitive API on Lambda with Java, you *will* have cold start problems. A Spring Boot application with dependency injection, annotation scanning, and connection pool initialization can easily take 8-12 seconds on first invocation. This is not an edge case -- it is the default behavior. Either mitigate aggressively or choose a different runtime.
+</Warning>
+
+**Mitigation strategies:**
+
+- **Provisioned Concurrency** -- Pre-warms a specified number of execution environments. You pay for them whether they are used or not (like reserved instances for Lambda). Use when: your API has strict latency SLAs and cold starts are unacceptable.
+- **SnapStart (Java only)** -- AWS takes a snapshot of the initialized JVM after your init code runs, then restores from snapshot on cold start instead of re-initializing. Reduces Java cold starts from seconds to ~200-500 ms. Released late 2022. Use for any Java Lambda function.
+- **Keep functions small** -- Smaller deployment packages download faster. Trim unused dependencies. Use Lambda layers for shared libraries.
+- **Warm-up pings** -- A CloudWatch Events rule that invokes your function every 5 minutes with a no-op payload. Cheap and effective, but does not guarantee warm instances under concurrent load (one ping keeps one instance warm).
+- **Choose lightweight runtimes** -- Go and Rust have the fastest cold starts. Python and Node.js are a good middle ground. Java and .NET are the slowest without SnapStart or equivalent.
+- **Initialize outside the handler** -- Database connections, SDK clients, and configuration should be created in the global scope (outside the handler function). This code runs once per cold start and is reused across warm invocations.
+
+```python
+# GOOD: Connection created once, reused across invocations
+import boto3
+dynamodb = boto3.resource('dynamodb')
+table = dynamodb.Table('Orders')
+
+def handler(event, context):
+    return table.get_item(Key={'order_id': event['order_id']})
+
+# BAD: Connection created on EVERY invocation
+def handler(event, context):
+    dynamodb = boto3.resource('dynamodb')
+    table = dynamodb.Table('Orders')
+    return table.get_item(Key={'order_id': event['order_id']})
+```
+
+---
+
+### 1.2 Concurrency Model
+
+Lambda concurrency is one of the most misunderstood aspects of the service. Here is how it actually works:
+
+**One invocation = one execution environment.** If your function receives 100 simultaneous requests, AWS creates 100 execution environments. Each environment handles exactly one request at a time (no multi-threading within a single environment). This is fundamentally different from a container or VM that handles many concurrent requests.
+
+**Account-level limits:**
+
+| Limit | Default | Can Increase |
+|---|---|---|
+| Concurrent executions (per region) | 1,000 | Yes, via support ticket (common to get 10K-100K) |
+| Burst concurrency | 500-3,000 (region-dependent) | No |
+| Function-level reserved concurrency | Configurable (0 to account limit) | N/A |
+
+**Reserved vs unreserved concurrency:**
+
+- **Unreserved** -- All functions share the account's concurrency pool. A traffic spike on one function can starve all others.
+- **Reserved** -- You allocate a guaranteed number of concurrent executions to a specific function. That function can never exceed its reservation, and no other function can consume its allocation. This is both a guarantee and a throttle.
+
+<Tip>
+**Always set reserved concurrency on critical functions.** Without it, a runaway function processing a backlog of SQS messages can consume your entire account's concurrency, causing throttling on your user-facing API Lambda. This is one of the most common production incidents in serverless architectures.
+</Tip>
+
+**What happens when you hit the limit:** Lambda returns a `429 TooManyRequestsException`. For synchronous invocations (API Gateway), this surfaces as a 429 to the client. For asynchronous invocations (S3 events, SNS), Lambda retries automatically (twice by default). For SQS event sources, the message returns to the queue and is retried based on visibility timeout.
+
+---
+
+### 1.3 Event Sources -- The Lambda Trigger Taxonomy
+
+Lambda's power comes from its integration with dozens of AWS services. But each event source has different invocation semantics, and misunderstanding them causes subtle bugs.
+
+| Event Source | Invocation Type | Retry Behavior | Concurrency Model |
+|---|---|---|---|
+| **API Gateway** | Synchronous | No retry (client retries) | One Lambda per HTTP request |
+| **SQS** | Polling (Lambda pulls) | Message returns to queue on failure | Batch size controls concurrency |
+| **S3** | Asynchronous | 2 retries, then DLQ | One Lambda per event |
+| **EventBridge** | Asynchronous | Retries for 24 hours | One Lambda per event |
+| **Kinesis** | Polling (Lambda pulls) | Retries until data expires | One Lambda per shard |
+| **DynamoDB Streams** | Polling (Lambda pulls) | Retries until data expires | One Lambda per shard |
+| **SNS** | Asynchronous | 3 retries | One Lambda per message |
+
+<Warning>
+**Kinesis and DynamoDB Streams will block on failure.** If your Lambda function fails processing a record from a Kinesis stream, Lambda retries that same batch *forever* (until the record expires from the stream, typically 24-168 hours). This means a single poison record blocks all processing on that shard. Always configure `bisectBatchOnFunctionError` (to narrow down the failing record) and `maxRetryAttempts` (to eventually skip it), and send failed records to a DLQ or on-failure destination.
+</Warning>
+
+---
+
+### 1.4 Lambda Architecture Patterns
+
+**Pattern 1: API Backend**
+API Gateway -> Lambda -> DynamoDB/RDS. The most common pattern. Each HTTP endpoint maps to a Lambda function (or a single function with routing logic). Works well for moderate traffic APIs. Watch out for: cold starts on infrequently-hit endpoints, connection pooling with RDS (use RDS Proxy), and API Gateway's 29-second timeout limit.
+
+**Pattern 2: Event Processor**
+S3/SQS/SNS/EventBridge -> Lambda -> DynamoDB/S3. Process events asynchronously. Image uploaded to S3 triggers a Lambda that generates thumbnails. Order placed publishes to SNS, triggering Lambdas for email, inventory, and analytics. This is where serverless shines -- zero cost when idle, scales automatically with event volume.
+
+**Pattern 3: Scheduled Task**
+EventBridge Scheduled Rule -> Lambda. Replaces cron jobs. Clean up expired sessions every hour, generate daily reports, sync data between systems. Cheaper and more reliable than running a dedicated EC2 instance for cron.
+
+**Pattern 4: Stream Processor**
+Kinesis/DynamoDB Streams -> Lambda. Process real-time data streams. Clickstream analytics, change data capture, real-time aggregations. Lambda processes records in order within each shard. Use enhanced fan-out for high-throughput consumers.
+
+---
+
+### 1.5 Container Images vs Zip Packages
+
+Lambda supports two deployment formats, and the choice matters more than most teams realize.
+
+**Zip packages (the default):**
+- Max size: 50 MB zipped, 250 MB unzipped
+- Fast deployment (seconds)
+- Works with Lambda layers for shared dependencies
+- Best for: most Lambda functions, small-to-medium dependency footprints
+
+**Container images:**
+- Max size: 10 GB
+- Uses standard Docker tooling (Dockerfile, docker build, ECR)
+- Slower cold starts (larger image to download, though AWS caches aggressively)
+- No Lambda layer support (bake everything into the image)
+- Best for: ML inference (large model files), functions with massive dependencies, teams with existing Docker workflows, functions that need specific system libraries
+
+<Tip>
+**The real reason to use container images:** It is not about Docker familiarity. It is about dependency size. If your function needs TensorFlow, PyTorch, or a large native binary, the 250 MB zip limit is a hard wall. Container images give you 10 GB of headroom. For everything else, zip packages are simpler and deploy faster.
+</Tip>
+
+---
+
+### 1.6 Step Functions -- Orchestration Done Right
+
+When you need to coordinate multiple Lambda functions into a workflow, you have three options: synchronous chaining (Lambda calls Lambda -- terrible idea), event-driven choreography (SQS/EventBridge between steps -- good for simple flows), or orchestration with Step Functions (good for complex flows with branching, retries, and error handling).
+
+**When to use Step Functions:**
+- Workflows with conditional logic (if payment succeeds, do X; if it fails, do Y)
+- Long-running workflows that exceed Lambda's 15-minute timeout
+- Workflows that need human approval steps
+- Complex retry and error handling across multiple steps
+- When you need a visual representation of workflow state for debugging
+
+**When to use SQS/EventBridge instead:**
+- Simple fan-out (one event triggers multiple independent actions)
+- When steps are truly independent and do not need coordination
+- When you want loose coupling between services owned by different teams
+- When the "workflow" is really just a pipeline (A -> B -> C with no branching)
+
+**Step Functions pricing trap:** Standard workflows charge per state transition ($0.025 per 1,000 transitions). A workflow with 10 steps processing 1 million events costs $250 in state transitions alone. For high-volume, simple workflows, Express Workflows (charged per execution and duration, not per transition) are dramatically cheaper.
+
+---
+
+### 1.7 Cost Model -- When Serverless Stops Being Cheap
+
+Lambda pricing has two components: per-invocation ($0.20 per million requests) and per-compute-time ($0.0000166667 per GB-second). The combination means Lambda is extraordinarily cheap at low scale and surprisingly expensive at high scale.
+
+**The break-even calculation:**
+
+| Metric | Lambda (128 MB, 200ms avg) | ECS Fargate (0.25 vCPU, 0.5 GB) |
+|---|---|---|
+| 100K requests/month | ~$0.43 | ~$9.00 |
+| 1M requests/month | ~$4.30 | ~$9.00 |
+| 10M requests/month | ~$43.00 | ~$9.00 |
+| 100M requests/month | ~$430.00 | ~$36.00 (4 tasks) |
+
+The crossover point depends heavily on memory allocation, execution duration, and traffic pattern. But the rule of thumb: **at roughly 1-5 million sustained requests per month, containers start winning on cost.** Below that, Lambda is almost always cheaper. Above that, do the math for your specific workload.
+
+<Note>
+**The hidden cost of "free."** Lambda's free tier (1M requests + 400,000 GB-seconds per month) is generous for development and low-traffic production. But it masks the true cost curve. Teams that prototype on the free tier and then scale to production are often shocked by the bill. Always model costs at your projected 6-month traffic, not your current traffic.
+</Note>
+
+---
+
+### 1.8 Anti-Patterns
+
+**The Lambda-lith:** Deploying your entire Express/Flask application as a single Lambda function behind API Gateway. You lose all the benefits of serverless (granular scaling, independent deployment, per-function monitoring) and keep all the downsides (cold starts, 15-minute timeout, payload limits). If you want to run a monolith, use containers.
+
+**Synchronous Lambda chains:** Lambda A calls Lambda B, which calls Lambda C, all synchronously. Each function waits for the next, consuming concurrency and accumulating latency. If Lambda C times out, Lambda B times out, and Lambda A times out -- a cascade failure. Use Step Functions or async patterns (SQS between steps) instead.
+
+**Cold-start-sensitive critical paths:** Placing Lambda in the hot path of a user-facing request without provisioned concurrency, then wondering why p99 latency is 3 seconds. Either use provisioned concurrency, or move the latency-sensitive operation to an always-on service.
+
+**Recursive Lambda invocations:** A Lambda function that writes to an S3 bucket that triggers the same Lambda function. This creates an infinite loop that racks up a massive bill in minutes. AWS now has recursive loop detection for some event sources, but do not rely on it -- design your event routing to prevent cycles.
+
+---
+
+## Part II -- Storage Patterns (S3 / Blob Storage)
+
+### 2.1 S3 Consistency Model
+
+Before December 2020, S3 had eventual consistency for overwrite PUTs and DELETEs. You could update an object and immediately read the old version. This was one of the most common sources of subtle bugs in S3-based architectures.
+
+**Since December 2020, S3 provides strong read-after-write consistency** for all operations. After a successful PUT, any subsequent GET returns the new version. After a DELETE, any subsequent GET returns a 404. This applies to all S3 API operations, all storage classes, and all regions. You do not need to pay extra for it. There is no performance penalty.
+
+<Tip>
+**Why this matters for interviews:** Many older blog posts, Stack Overflow answers, and even some AWS documentation references still mention eventual consistency in S3. If an interviewer asks about S3 consistency, demonstrate that you know the *current* model (strong consistency since December 2020) while also knowing what the *old* model was and why it caused problems. This shows you stay current, not just that you memorized an old textbook.
+</Tip>
+
+---
+
+### 2.2 Storage Classes and Lifecycle Policies
+
+S3 has six storage classes, each with different cost and access characteristics. Choosing the right one -- and automating transitions between them -- is one of the easiest ways to cut AWS bills.
+
+| Storage Class | Use Case | Retrieval Time | Monthly Cost (per GB) | Retrieval Cost |
+|---|---|---|---|---|
+| **S3 Standard** | Frequently accessed data | Instant | ~$0.023 | None |
+| **S3 Intelligent-Tiering** | Unknown/changing access patterns | Instant | ~$0.023 + monitoring fee | None |
+| **S3 Standard-IA** | Infrequently accessed, needs instant access | Instant | ~$0.0125 | Per-GB retrieval fee |
+| **S3 One Zone-IA** | Infrequent, reproducible data (thumbnails, transcoded media) | Instant | ~$0.01 | Per-GB retrieval fee |
+| **S3 Glacier Flexible** | Archive, retrieval in minutes to hours | 1-12 hours | ~$0.0036 | Per-GB + per-request |
+| **S3 Glacier Deep Archive** | Long-term archive, compliance | 12-48 hours | ~$0.00099 | Per-GB + per-request |
+
+**Lifecycle policies automate transitions:**
+
+```json
+{
+  "Rules": [
+    {
+      "ID": "ArchiveOldLogs",
+      "Status": "Enabled",
+      "Prefix": "logs/",
+      "Transitions": [
+        { "Days": 30, "StorageClass": "STANDARD_IA" },
+        { "Days": 90, "StorageClass": "GLACIER" },
+        { "Days": 365, "StorageClass": "DEEP_ARCHIVE" }
+      ],
+      "Expiration": { "Days": 2555 }
+    }
+  ]
+}
+```
+
+This policy moves logs to Infrequent Access after 30 days, Glacier after 90 days, Deep Archive after a year, and deletes them after 7 years. For a company storing 10 TB of logs per month, this can reduce storage costs by 70-80%.
+
+---
+
+### 2.3 Multipart Uploads
+
+For files larger than 100 MB, S3's multipart upload is essential. Instead of uploading a single large object (which fails if the network drops midway), you split the file into parts (5 MB to 5 GB each), upload each part independently (possibly in parallel), and then tell S3 to assemble them.
+
+**Why this matters:**
+- **Resilience** -- If one part fails, you retry only that part, not the entire file.
+- **Parallelism** -- Upload parts concurrently to saturate your bandwidth.
+- **Required for files > 5 GB** -- S3 has a 5 GB single-PUT limit.
+- **Resumable** -- Parts already uploaded persist for up to 7 days (configurable). You can resume after a failure.
+
+<Warning>
+**Incomplete multipart uploads cost money.** If you start a multipart upload but never complete it (your application crashes, the user cancels), the uploaded parts remain in S3 and you pay for them. They are invisible in the S3 console unless you specifically look for them. Set a lifecycle policy to abort incomplete multipart uploads after a few days: `"AbortIncompleteMultipartUpload": { "DaysAfterInitiation": 7 }`. This is one of the most common hidden S3 cost traps.
+</Warning>
+
+---
+
+### 2.4 Pre-Signed URLs -- Secure Temporary Access
+
+Pre-signed URLs let you grant temporary access to private S3 objects without making them public or sharing credentials. You generate a URL server-side that includes a cryptographic signature and expiration time. Anyone with the URL can download (or upload) the object until the URL expires.
+
+**Common patterns:**
+
+- **Secure file downloads** -- User requests a file, your API generates a pre-signed GET URL valid for 15 minutes, returns it to the client. Client downloads directly from S3, bypassing your server entirely.
+- **Direct-to-S3 uploads** -- Your API generates a pre-signed PUT URL. Client uploads directly to S3. Your server never touches the file data, eliminating a bandwidth and memory bottleneck.
+- **Temporary media access** -- Serve images or videos through pre-signed URLs with short expiration. Works with CloudFront signed URLs for even better performance.
+
+```python
+import boto3
+s3 = boto3.client('s3')
+
+# Generate a download URL valid for 1 hour
+url = s3.generate_presigned_url(
+    'get_object',
+    Params={'Bucket': 'my-bucket', 'Key': 'reports/q4-2025.pdf'},
+    ExpiresIn=3600
+)
+```
+
+---
+
+### 2.5 S3 Event Notifications
+
+S3 can emit events when objects are created, deleted, or restored. These events can trigger Lambda functions, SQS queues, SNS topics, or EventBridge rules. This is the foundation of most event-driven data processing architectures on AWS.
+
+**Common patterns:**
+- Upload image to S3 -> Lambda generates thumbnails -> writes to another S3 bucket
+- CSV uploaded to S3 -> SQS message -> worker processes and loads to database
+- Log file uploaded -> EventBridge rule -> Step Functions workflow for analysis
+
+<Note>
+**S3 to EventBridge is the modern choice.** While S3 can send events directly to Lambda, SQS, or SNS, routing through EventBridge gives you filtering, transformation, multiple targets, archival, and replay. Enable EventBridge notifications on the bucket and let EventBridge handle the routing. This decouples your event routing from your S3 configuration.
+</Note>
+
+---
+
+### 2.6 S3 Select and Athena -- Querying Data in Place
+
+Instead of downloading an entire CSV or JSON file to filter it, **S3 Select** lets you run SQL expressions directly against objects in S3. It pushes the filtering to the storage layer, reducing data transfer and processing time.
+
+```sql
+-- S3 Select: filter a CSV in S3 without downloading it
+SELECT s.name, s.revenue
+FROM S3Object s
+WHERE s.revenue > 1000000
+```
+
+**Athena** takes this further: a serverless query engine that runs standard SQL against data in S3. No infrastructure to manage, no data to load. You point it at a bucket, define a schema, and run queries. Pay per query ($5 per TB scanned).
+
+**When to use which:**
+- **S3 Select** -- Simple filtering on a single object. Quick, cheap, no setup.
+- **Athena** -- Complex queries across many objects. Joins, aggregations, window functions. Best with columnar formats (Parquet, ORC) that reduce data scanned (and therefore cost).
+
+---
+
+### 2.7 S3 Cost Traps
+
+**Trap 1: Request costs.** S3 storage is cheap, but GET and PUT requests are not free. GET: $0.0004 per 1,000 requests. PUT: $0.005 per 1,000 requests. A system that makes 100 million GET requests per month pays $40 in request fees alone -- on top of storage and transfer.
+
+**Trap 2: Data transfer out.** S3 to the internet costs $0.09 per GB (first 10 TB/month). Serving 1 TB of media directly from S3 costs $90/month in transfer alone. Use CloudFront ($0.085/GB but with caching, actual transfer from S3 drops dramatically).
+
+**Trap 3: Storing everything in STANDARD.** Old logs, backups, and infrequently accessed data sitting in S3 Standard is waste. Lifecycle policies are free to configure and can cut storage costs by 50-80%.
+
+**Trap 4: Versioning without lifecycle rules.** S3 versioning keeps every version of every object. Without lifecycle rules to expire old versions, storage grows silently. A 1 GB file overwritten daily generates 365 GB of versions per year.
+
+---
+
+## Part III -- Compute Patterns
+
+### 3.1 The Compute Decision Matrix
+
+This is the question you will face in every architecture review and most system design interviews: which compute platform for this workload?
+
+| Factor | Lambda | ECS Fargate | ECS on EC2 | EKS | EC2 |
+|---|---|---|---|---|---|
+| **Startup time** | 100ms-10s (cold start) | 30-60s | 30-60s | 30-60s | Minutes |
+| **Max execution** | 15 minutes | Unlimited | Unlimited | Unlimited | Unlimited |
+| **Scaling** | Automatic, per-request | Auto, task-based | Auto, instance+task | Auto, pod-based | Auto, instance-based |
+| **Min cost** | $0 (scale to zero) | ~$9/month (1 task) | EC2 instance cost | EC2 + EKS $73/mo | EC2 instance |
+| **Operational overhead** | Minimal | Low | Medium | High | High |
+| **Container support** | Yes (images) | Native | Native | Native | Manual |
+| **Team size** | 1-3 OK | 2-5 OK | 5+ | 5+ | Any |
+| **Best for** | Event-driven, APIs, glue | Web apps, APIs, workers | Cost-optimized steady load | Multi-cloud, complex orchestration | Legacy, GPU, special hardware |
+
+<Tip>
+**The honest decision framework:** Start with Lambda. When you hit its limits (execution time, cold starts, cost at scale), move to Fargate. When you need cost optimization at steady-state high traffic, consider ECS on EC2. Only reach for EKS when you need Kubernetes-specific features (multi-cloud portability, complex scheduling, service mesh) or your team already has deep Kubernetes expertise. EC2 bare metal is for when you need GPU access, specific hardware, or are running software that does not containerize well.
+</Tip>
+
+### 3.2 Fargate Spot -- The Cost Optimization Cheat Code
+
+Fargate Spot tasks run on spare AWS capacity at up to 70% discount. AWS can terminate them with 30 seconds notice. Use for: batch processing, CI/CD builds, development environments, any workload that can handle interruption.
+
+**Do not use for:** Production API servers, database tasks, anything where a 30-second termination notice causes data loss or user-facing errors.
+
+**Strategy:** Run your baseline on regular Fargate tasks and burst onto Spot. Set up capacity providers to automatically split traffic (e.g., 80% regular, 20% Spot).
+
+### 3.3 Auto-Scaling Patterns
+
+**Target tracking (simplest, usually best):** "Keep average CPU at 60%." AWS handles the math -- adds tasks when CPU exceeds 60%, removes when it drops below. Works for most workloads. Also supports custom metrics (queue depth, request count).
+
+**Step scaling (more control):** "When CPU > 70% for 3 minutes, add 2 tasks. When CPU > 90% for 1 minute, add 5 tasks." Gives you fine-grained control over scaling speed. Useful when you know your scaling curve.
+
+**Predictive scaling:** Uses machine learning to forecast traffic based on historical patterns and pre-scales before the load arrives. Ideal for workloads with predictable daily/weekly cycles (e-commerce sites, business applications). Needs at least 24 hours of historical data.
+
+<Note>
+**Scale-in is harder than scale-out.** It is easy to add capacity when load increases. It is tricky to remove capacity without dropping active connections or requests. Always configure scale-in cooldown periods (5-10 minutes minimum), use connection draining, and scale in more slowly than you scale out.
+</Note>
+
+### 3.4 Graviton Processors -- ARM on AWS
+
+AWS Graviton processors are ARM-based chips designed by AWS. They offer up to 40% better price-performance compared to equivalent x86 instances. Available on EC2 (M7g, C7g, R7g families), ECS, EKS, Lambda, and RDS.
+
+**Why switch:**
+- 20-40% cheaper for compute-heavy workloads (no code changes needed for interpreted languages)
+- Better energy efficiency (lower carbon footprint)
+- Same or better single-threaded performance for most workloads
+
+**Watch out for:**
+- Native compiled code (C, C++, Go, Rust) needs ARM cross-compilation
+- Some third-party software does not have ARM builds yet
+- Docker images must be built for ARM (`--platform linux/arm64`) or use multi-arch manifests
+
+---
+
+## Part IV -- Messaging and Event Patterns
+
+### 4.1 The Messaging Decision Tree
+
+This is the question that comes up in every system design interview involving async processing. Here is the honest decision framework:
+
+**Do you need a simple task queue?** -> **SQS Standard.** Messages are delivered at-least-once, ordering is best-effort. Simple, cheap, scales automatically. This handles 80% of async use cases.
+
+**Do you need strict ordering?** -> **SQS FIFO.** Messages are delivered exactly-once (within the deduplication window), in order, grouped by message group ID. Limited to 300 messages/second (3,000 with batching). Use when order matters (financial transactions, sequential processing).
+
+**Do you need fan-out (one event, many consumers)?** -> **SNS** for simple fan-out, **EventBridge** for filtered routing. SNS pushes to all subscribers. EventBridge lets you filter by event content (only route `OrderPlaced` events where `order.total > 1000` to the fraud detection service).
+
+**Do you need high-throughput stream processing with replay?** -> **Kinesis Data Streams.** Consumers can replay the stream from any point. Supports multiple independent consumers. Sharded for parallelism. Use for: clickstream analytics, real-time aggregations, change data capture.
+
+| Feature | SQS | SNS | EventBridge | Kinesis |
+|---|---|---|---|---|
+| **Model** | Queue (point-to-point) | Pub/sub (fan-out) | Event bus (filtered routing) | Stream (ordered log) |
+| **Ordering** | FIFO option | No | No | Per-shard |
+| **Retention** | Up to 14 days | No retention (push only) | Archive + replay | 1-365 days |
+| **Throughput** | Nearly unlimited (Standard) | 30M messages/s | Thousands/s (soft limit) | Per-shard (1 MB/s in, 2 MB/s out) |
+| **Consumer model** | Pull (polling) | Push (HTTP, Lambda, SQS) | Push (100+ targets) | Pull (KCL, Lambda) |
+| **Replay** | No | No | Yes (archive) | Yes (any point in stream) |
+| **Cost model** | Per-request | Per-publish + delivery | Per-event | Per-shard-hour + per-PUT |
+| **Best for** | Task queues, decoupling | Simple fan-out, notifications | Event routing, cross-account events | Real-time analytics, CDC |
+
+<Tip>
+**Cross-chapter connection.** For deeper coverage of messaging semantics -- delivery guarantees, exactly-once processing, idempotency patterns, and dead letter queues -- see [Messaging, Concurrency & State](/resources/interview-questions/think-like-an-engineer/messaging-concurrency-state). This section focuses on the AWS-specific service selection; that chapter covers the distributed systems principles that apply regardless of provider.
+</Tip>
+
+---
+
+### 4.2 SQS Deep Dive
+
+**Visibility timeout:** When a consumer reads a message, SQS hides it from other consumers for the visibility timeout period (default 30 seconds). If the consumer processes it and deletes it within that window, done. If the consumer crashes, the timeout expires and the message becomes visible again for another consumer. Set the timeout to slightly longer than your maximum processing time.
+
+**Dead Letter Queue (DLQ):** After a configurable number of failed processing attempts (`maxReceiveCount`), SQS moves the message to a DLQ. Monitor your DLQ. An empty DLQ means your processing is healthy. A growing DLQ means something is wrong. Set up CloudWatch alarms on DLQ message count.
+
+**Batching:** SQS supports reading up to 10 messages at a time and sending up to 10 messages at a time. Always batch when possible -- it reduces API calls and therefore cost by up to 10x.
+
+**Long polling:** By default, `ReceiveMessage` returns immediately even if no messages are available (short polling). Set `WaitTimeSeconds` to 20 (maximum) for long polling -- the call blocks until a message arrives or the timeout expires. This eliminates empty responses and reduces API call costs.
+
+### 4.3 EventBridge Patterns
+
+EventBridge is the most underused AWS service relative to its power. Think of it as a serverless event router with content-based filtering.
+
+**Event patterns** let you filter events by content:
+
+```json
+{
+  "source": ["my-app.orders"],
+  "detail-type": ["OrderPlaced"],
+  "detail": {
+    "total": [{ "numeric": [">", 1000] }],
+    "country": ["US", "CA"]
+  }
+}
+```
+
+This rule only matches `OrderPlaced` events with total > $1,000 from US or Canada. Events that do not match are silently ignored -- no code needed.
+
+**Schema registry** automatically discovers and stores event schemas as events flow through EventBridge. You can generate type-safe code bindings from these schemas. This solves one of the biggest pain points of event-driven architecture: knowing what events look like.
+
+**Cross-account events** let you route events between AWS accounts -- critical for multi-account organizational architectures where production, staging, and shared services run in separate accounts.
+
+### 4.4 Event-Driven Anti-Patterns
+
+**The event spaghetti:** Every service emits events, every other service consumes them, nobody knows the full event flow. Solve with: an event catalog (EventBridge schema registry), event ownership documentation, and architectural diagrams that show event flows.
+
+**The event that should have been a command:** Events describe what happened ("OrderPlaced"). Commands describe what should happen ("SendConfirmationEmail"). If your event consumers are doing imperative work that the publisher expects to happen, you have a disguised command. Use a queue (SQS) for commands, events (EventBridge/SNS) for notifications.
+
+**Missing dead letter queues:** Events that fail processing silently disappear. Every async integration must have a failure path -- DLQ, on-failure destination, or error logging at minimum.
+
+---
+
+## Part V -- Database Patterns on AWS
+
+### 5.1 RDS vs Aurora
+
+**RDS** is managed PostgreSQL/MySQL/MariaDB/Oracle/SQL Server. AWS handles patching, backups, and replication. You choose the instance size and manage storage scaling.
+
+**Aurora** is AWS's cloud-native database engine compatible with PostgreSQL and MySQL. It uses a fundamentally different storage architecture: a distributed, fault-tolerant storage layer that replicates data six ways across three AZs.
+
+**When Aurora is worth 2x the cost:**
+- **Availability requirements:** Aurora's storage layer survives losing two copies without read impact and three copies without write impact. RDS Multi-AZ failover takes 60-120 seconds; Aurora failover takes under 30 seconds.
+- **Read-heavy workloads:** Aurora supports up to 15 read replicas (RDS supports 5), with replication lag typically under 20ms (RDS lag can be seconds).
+- **Auto-scaling storage:** Aurora storage grows automatically in 10 GB increments up to 128 TB. No need to provision storage upfront.
+- **Large databases:** For databases over 1 TB, Aurora's distributed storage outperforms RDS's EBS-based storage significantly.
+
+**When RDS is fine (save the money):**
+- Small databases (< 100 GB) with moderate traffic
+- Development and staging environments
+- When you need Oracle or SQL Server (Aurora only supports PostgreSQL and MySQL)
+- When your workload is write-heavy and does not benefit from Aurora's read replica architecture
+
+### 5.2 Aurora Serverless v2
+
+Aurora Serverless v2 scales database compute automatically based on demand. You define a minimum and maximum capacity (in ACUs -- Aurora Capacity Units), and Aurora adjusts in near real-time. You pay only for the capacity you use, measured in ACU-seconds.
+
+**When it shines:** Development environments, applications with variable traffic patterns, new products where you do not know the traffic profile yet. You get the Aurora storage engine's reliability without paying for a provisioned instance 24/7.
+
+**When it does not:** Highly predictable, steady-state workloads. Provisioned Aurora instances are cheaper when utilization is consistently high. Also, ACU scaling has a brief pause that can cause latency spikes during rapid scale-up.
+
+### 5.3 ElastiCache -- Redis vs Memcached on AWS
+
+| Factor | ElastiCache Redis | ElastiCache Memcached |
+|---|---|---|
+| **Data structures** | Strings, hashes, lists, sets, sorted sets, streams, geospatial | Strings only |
+| **Persistence** | Yes (snapshots, AOF) | No (pure cache) |
+| **Replication** | Yes (read replicas, Multi-AZ) | No |
+| **Cluster mode** | Yes (horizontal scaling) | Yes (multi-node) |
+| **Pub/sub** | Yes | No |
+| **Use case** | Session store, leaderboards, rate limiting, real-time analytics | Simple caching, session caching |
+
+<Tip>
+**The honest answer in 2025-2026:** Just use Redis. Memcached's only advantage is slightly simpler multi-threaded architecture for pure caching workloads. Redis does everything Memcached does plus vastly more. The operational simplicity of running one caching technology (Redis) instead of choosing between two is worth far more than Memcached's marginal performance edge in narrow scenarios.
+</Tip>
+
+<Note>
+**Cross-chapter connection.** For deeper coverage of caching patterns (cache-aside, write-through, cache stampede, invalidation strategies) and observability, see [Caching & Observability](/resources/interview-questions/think-like-an-engineer/caching-observability). For database internals (indexing, transactions, replication, sharding), see [APIs & Databases](/resources/interview-questions/think-like-an-engineer/apis-databases).
+</Note>
+
+---
+
+## Part VI -- Networking and Security on AWS
+
+### 6.1 VPC Design Patterns
+
+A VPC (Virtual Private Cloud) is your isolated network in AWS. Every resource you launch (EC2 instances, RDS databases, Lambda functions in a VPC, ECS tasks) lives inside a VPC. Getting VPC design right is foundational -- changing it later is painful.
+
+**The standard pattern:**
+
+```
+VPC (10.0.0.0/16)
+├── Public Subnet A (10.0.1.0/24) -- AZ-a
+│   └── ALB, NAT Gateway, Bastion Host
+├── Public Subnet B (10.0.2.0/24) -- AZ-b
+│   └── ALB, NAT Gateway
+├── Private Subnet A (10.0.10.0/24) -- AZ-a
+│   └── Application servers, ECS tasks
+├── Private Subnet B (10.0.11.0/24) -- AZ-b
+│   └── Application servers, ECS tasks
+├── Database Subnet A (10.0.20.0/24) -- AZ-a
+│   └── RDS Primary
+└── Database Subnet B (10.0.21.0/24) -- AZ-b
+    └── RDS Standby
+```
+
+**NAT Gateway vs VPC Endpoints:** Resources in private subnets need a NAT Gateway ($0.045/hour + $0.045/GB processed) to reach the internet. But most "internet" traffic from private subnets is actually going to AWS services (S3, DynamoDB, SQS, ECR). **VPC Endpoints** provide private connectivity to AWS services without going through the NAT Gateway.
+
+- **Gateway Endpoints** (free): S3, DynamoDB. Use these always.
+- **Interface Endpoints** ($0.01/hour + $0.01/GB): Everything else (SQS, ECR, Secrets Manager, CloudWatch). Use when the cost is less than NAT Gateway traffic.
+
+<Warning>
+**NAT Gateway is one of the most expensive items on AWS bills for many teams.** A single NAT Gateway processing 1 TB of data per month costs $45 in processing fees plus $32 in hourly fees -- $77/month for what feels like basic networking. For a team pulling Docker images from ECR multiple times per day across 50 ECS tasks, the NAT Gateway bill can be hundreds of dollars monthly. VPC endpoints for ECR, S3, and CloudWatch Logs often pay for themselves within the first month.
+</Warning>
+
+---
+
+### 6.2 Security Groups vs NACLs
+
+Both control network traffic, but they work differently:
+
+| Feature | Security Groups | Network ACLs |
+|---|---|---|
+| **Level** | Instance/ENI level | Subnet level |
+| **Statefulness** | Stateful (return traffic automatically allowed) | Stateless (must explicitly allow both directions) |
+| **Rules** | Allow rules only | Allow AND deny rules |
+| **Evaluation** | All rules evaluated together | Rules evaluated in order (lowest number first) |
+| **Default** | Deny all inbound, allow all outbound | Allow all inbound and outbound |
+| **Use case** | Primary security control | Additional subnet-level defense |
+
+**In practice:** Security groups do 95% of the work. NACLs are a belt-and-suspenders defense layer that most teams configure once and rarely touch.
+
+---
+
+### 6.3 IAM Least Privilege
+
+IAM (Identity and Access Management) is the most important security service on AWS. Every API call is authenticated and authorized through IAM. Getting IAM right is the difference between a secure architecture and a breach waiting to happen.
+
+**Principles:**
+- **Never use root credentials.** Create IAM users or roles for everything.
+- **Use roles, not long-lived access keys.** EC2 instance profiles, ECS task roles, Lambda execution roles -- all use temporary credentials that rotate automatically.
+- **Scope permissions narrowly.** `"Resource": "*"` is almost never necessary. Specify the exact ARN of the resource.
+- **Use conditions.** Restrict by IP range, VPC, time of day, MFA requirement, or source account.
+
+**Trust policies** define *who* can assume a role. This is separate from the role's permissions (which define *what* the role can do). A Lambda execution role's trust policy says "Lambda service can assume this role." An ECS task role's trust policy says "ECS task service can assume this role."
+
+```json
+{
+  "Effect": "Allow",
+  "Action": "s3:GetObject",
+  "Resource": "arn:aws:s3:::my-bucket/reports/*"
+}
+```
+
+This grants read access to only the `reports/` prefix of one specific bucket -- not all of S3.
+
+### 6.4 Secrets Manager vs Parameter Store
+
+Both store configuration and secrets. The difference is scope and cost.
+
+| Feature | Secrets Manager | Systems Manager Parameter Store |
+|---|---|---|
+| **Cost** | $0.40/secret/month + $0.05/10K API calls | Free (standard), $0.05/10K for advanced |
+| **Auto-rotation** | Built-in for RDS, Redshift, DocumentDB | Manual (you write the Lambda) |
+| **Cross-account** | Native support | Requires additional IAM |
+| **Encryption** | Always encrypted (KMS) | Optional encryption (KMS) |
+| **Best for** | Database passwords, API keys, rotation-required secrets | App configuration, feature flags, non-sensitive parameters |
+
+<Tip>
+**The cost-effective pattern:** Use Parameter Store for application configuration (feature flags, endpoint URLs, non-sensitive settings). Use Secrets Manager only for credentials that need automatic rotation. A team with 50 secrets in Secrets Manager pays $20/month; the same 50 values in Parameter Store's standard tier cost $0.
+</Tip>
+
+### 6.5 WAF and Shield
+
+**AWS WAF (Web Application Firewall):** Filters HTTP/HTTPS requests to CloudFront, ALB, or API Gateway. You define rules to block common attacks: SQL injection, XSS, IP reputation lists, rate limiting, geo-blocking. Managed rule groups from AWS and partners provide pre-built protection against OWASP Top 10 threats.
+
+**AWS Shield Standard:** Free DDoS protection for all AWS resources. Protects against common network-layer (L3/L4) attacks. Automatically enabled.
+
+**AWS Shield Advanced:** $3,000/month. Provides DDoS cost protection (AWS credits you for scaling costs during an attack), 24/7 access to the AWS DDoS Response Team, advanced detection, and real-time attack visibility. Worth it only for organizations where a DDoS attack has significant financial impact.
+
+---
+
+## Part VII -- Cost Engineering
+
+### 7.1 Reserved Instances vs Savings Plans vs Spot
+
+This is the compute pricing decision framework that every team running significant AWS workloads must understand.
+
+| Option | Discount | Commitment | Flexibility | Best For |
+|---|---|---|---|---|
+| **On-Demand** | 0% (baseline) | None | Complete | Unknown workloads, testing, burst capacity |
+| **Savings Plans (Compute)** | Up to 66% | 1 or 3 years, $/hour commitment | Any instance family, region, OS, tenancy | Teams that know they will spend $X/hour on compute but want flexibility |
+| **Savings Plans (EC2)** | Up to 72% | 1 or 3 years, specific instance family | Same family, any size/OS/tenancy | Workloads committed to a specific instance family |
+| **Reserved Instances** | Up to 72% | 1 or 3 years, specific instance type | Limited (convertible RIs have some flex) | Steady-state databases, well-known workloads |
+| **Spot Instances** | Up to 90% | None (but can be terminated) | Any instance type with spare capacity | Batch processing, CI/CD, fault-tolerant workloads |
+
+**The decision framework:**
+
+1. Cover your steady-state baseline (databases, minimum API capacity) with **Savings Plans or RIs**.
+2. Handle predictable burst capacity with **On-Demand** (auto-scaling groups).
+3. Run fault-tolerant batch work on **Spot**.
+4. Use **Compute Savings Plans** when you are not sure which instance types you will use -- they apply across Lambda, Fargate, and EC2.
+
+### 7.2 Cost Allocation Tags
+
+Tags are key-value pairs you attach to AWS resources. They flow through to Cost Explorer and billing reports, letting you answer: "How much does the recommendations team spend on compute?" or "What does our staging environment cost?"
+
+**Why they matter before day 1:** Retroactive tagging is painful and often incomplete. Resources created without tags generate unattributable costs. Once your bill is $50K/month with 500 untagged resources, you have a cost visibility problem that takes weeks to clean up.
+
+**Mandatory tag strategy:**
+
+| Tag Key | Purpose | Example Values |
+|---|---|---|
+| `team` | Cost attribution to team | `platform`, `payments`, `ml` |
+| `environment` | Separate prod from dev costs | `production`, `staging`, `dev` |
+| `service` | Map costs to services | `api-gateway`, `order-processor` |
+| `cost-center` | Finance/budgeting alignment | `eng-100`, `data-200` |
+
+Enable **AWS Cost Allocation Tags** in the Billing console to make your tags appear in Cost Explorer reports. Use **AWS Organizations Tag Policies** to enforce tagging compliance across accounts.
+
+### 7.3 The Serverless Tax
+
+Managed services trade operational cost for financial cost. At some point, the financial cost exceeds what you would pay to self-manage.
+
+**Examples where serverless costs more:**
+
+- **NAT Gateway:** $77/month for 1 TB of traffic. A t3.nano instance running as a NAT costs ~$4/month (with reduced availability and throughput).
+- **API Gateway REST:** $3.50 per million requests. An ALB ($16/month + $0.008/LCU-hour) is cheaper above roughly 5 million requests/month.
+- **Managed Kafka (MSK):** $200+/month minimum. Self-managed Kafka on EC2 can be cheaper at scale (but operational cost is significant).
+- **Lambda at scale:** As shown in section 1.7, Lambda is 10-40x more expensive than containers at sustained high traffic.
+
+**When the serverless tax is worth paying:**
+- Your team is small and engineering time is more expensive than AWS bills
+- Traffic is variable and unpredictable
+- The operational risk of self-managing exceeds the cost savings
+- You are optimizing for speed of delivery, not cost efficiency
+
+---
+
+## Interview Questions -- Cloud Service Patterns
+
+<AccordionGroup>
+
+<Accordion title="Design a file processing pipeline using S3, Lambda, and SQS">
+**What they are testing:** Can you design an event-driven architecture, handle failure gracefully, and reason about scaling behavior?
+
+**Strong answer framework:**
+
+1. **Trigger:** File uploaded to S3 triggers an event notification.
+2. **Buffering:** S3 event goes to SQS (not directly to Lambda). SQS provides buffering if Lambda is at concurrency limits, retry with backoff, and DLQ for failed messages.
+3. **Processing:** Lambda polls SQS, processes each file (parse, validate, transform).
+4. **Output:** Processed results written to a separate S3 bucket or DynamoDB.
+5. **Error handling:** Failed messages go to a DLQ after 3 retries. A separate Lambda monitors the DLQ and alerts or routes to manual review.
+
+**Key details that impress:**
+- "I would not trigger Lambda directly from S3 because SQS gives me buffering, retry control, and a DLQ. Direct S3-to-Lambda has limited retry semantics."
+- "I would set reserved concurrency on the processing Lambda to prevent it from consuming the entire account's concurrency pool."
+- "For large files, I would use S3 Select to process the file in place rather than downloading the entire object."
+- "I would add a visibility timeout on SQS that is 6x the Lambda timeout, per AWS recommendations, to prevent a message from becoming visible again while Lambda is still processing it."
+
+**Architecture diagram (text):**
+
+```
+S3 Upload -> S3 Event Notification -> SQS Queue -> Lambda (processor) -> S3 / DynamoDB
+                                         |
+                                         v (after 3 failures)
+                                      DLQ -> Lambda (alerter) -> SNS -> PagerDuty/Slack
+```
+</Accordion>
+
+<Accordion title="Your Lambda function has a 30% cold start rate. How do you fix it?">
+**What they are testing:** Do you understand cold start mechanics and can you apply the right mitigation for the context?
+
+**Strong answer:**
+
+A 30% cold start rate means roughly 1 in 3 invocations hits a cold start. This indicates the function is not invoked frequently enough to keep warm instances alive (Lambda recycles idle instances after ~5-15 minutes).
+
+**Step 1: Diagnose.** Look at CloudWatch metrics -- `Init Duration` shows cold start time. Check invocation frequency. If the function is invoked once every 10 minutes, cold starts are inevitable without intervention.
+
+**Step 2: Quick wins (free or cheap).**
+- Move initialization code outside the handler (SDK clients, DB connections).
+- Reduce deployment package size (remove unused dependencies, use Lambda layers).
+- If using Java, enable SnapStart.
+- Switch to a lighter runtime if possible (Python/Node.js start 10-50x faster than Java).
+
+**Step 3: Provisioned concurrency (costs money).**
+- Analyze traffic patterns. If traffic is predictable (business hours), use scheduled provisioned concurrency (scale up at 8 AM, down at 6 PM).
+- If traffic is unpredictable, use Application Auto Scaling on provisioned concurrency to scale based on utilization.
+- Start with the minimum needed: if peak concurrency is 50, provisioning 30-40 instances covers 80-90% of cold starts.
+
+**Step 4: Architectural alternatives.**
+- If this is a user-facing API with strict latency requirements and high cold start rate, consider whether Lambda is the right compute model. A small Fargate task that is always warm may be cheaper and faster than Lambda with full provisioned concurrency.
+
+**The nuance that separates senior from mid-level:** "The fix depends on whether this is a cost problem or a latency problem. If cold starts add 200ms and the SLA is 500ms, it is tolerable. If cold starts add 5 seconds on a Java function and the SLA is 1 second, I need to fix it aggressively. The 30% rate alone does not tell me if it is a problem -- the *duration* of the cold start and the *SLA* of the service do."
+</Accordion>
+
+<Accordion title="Compare the cost of processing 10M events/day: Lambda vs ECS Fargate">
+**What they are testing:** Can you do back-of-envelope cost estimation and reason about when serverless is and is not cost-effective?
+
+**Strong answer:**
+
+**Lambda estimate:**
+- 10M events/day = ~300M events/month
+- Assume 128 MB memory, 200ms average duration
+- Compute: 300M * 0.2s * (128/1024) GB = 7.5M GB-seconds
+- Compute cost: 7.5M * $0.0000166667 = ~$125/month
+- Request cost: 300M * $0.20/1M = $60/month
+- **Lambda total: ~$185/month**
+
+**Fargate estimate:**
+- 10M events/day = ~116 events/second average
+- Assume each event takes 200ms to process
+- Need: 116 * 0.2 = ~24 concurrent processing slots
+- Run 3 Fargate tasks (0.5 vCPU, 1 GB each) with 10 concurrent processors each
+- Cost: 3 tasks * $0.04048/vCPU-hour * 0.5 vCPU * 730 hours = ~$44/month (vCPU)
+- Plus: 3 tasks * $0.004445/GB-hour * 1 GB * 730 hours = ~$10/month (memory)
+- **Fargate total: ~$54/month**
+
+**The conclusion:** At 10M events/day with short processing times, Fargate is roughly 3x cheaper than Lambda. But the total difference is $130/month. If your team values Lambda's operational simplicity (no containers to manage, automatic scaling, zero-idle cost on weekends), $130/month is nothing compared to engineering time.
+
+**The senior nuance:** "The raw cost comparison favors Fargate, but the *total cost of ownership* includes engineering time for container management, deployment pipelines, health checks, and scaling configuration. For a team of 3 engineers, I would stay on Lambda until the bill exceeds $500/month. For a team with existing container infrastructure, I would use Fargate from the start."
+</Accordion>
+
+<Accordion title="You notice your AWS bill jumped 40% this month. Walk me through how you investigate.">
+**What they are testing:** Systematic debugging approach, familiarity with AWS cost tools, and the ability to distinguish signal from noise.
+
+**Strong answer:**
+
+**Step 1: Scope the increase.** Open AWS Cost Explorer and compare this month to last month. Group by service -- is the increase concentrated in one service (e.g., EC2 jumped 60%) or spread across many? Group by region -- did someone spin up resources in a new region? Group by tag -- is it one team or one service?
+
+**Step 2: Identify the top contributors.** Cost Explorer's "Daily Costs" view shows when the increase started. If it started on a specific day, correlate with deployments, configuration changes, or traffic spikes. Look at the "Top 5 Cost Changes" widget.
+
+**Step 3: Common culprits.**
+- **Forgotten resources:** Someone launched large EC2 instances for testing and forgot to terminate them. Check for instances with low utilization.
+- **NAT Gateway data processing:** A new service was deployed that routes traffic through NAT Gateway. Check NAT Gateway charges in the VPC cost breakdown.
+- **S3 request costs:** A misconfigured client making millions of unnecessary API calls. Check S3 request metrics.
+- **Data transfer:** Cross-region replication, S3-to-internet transfer, or inter-AZ traffic increase. Check the "Data Transfer" line item.
+- **DynamoDB scaling:** On-demand pricing with a traffic spike, or provisioned capacity that was scaled up and never scaled back down.
+- **Spot interruptions:** If Spot capacity became unavailable, workloads fell back to On-Demand pricing.
+
+**Step 4: Prevent recurrence.** Set up AWS Budgets with alerts at 80% and 100% of expected spend. Enable Cost Anomaly Detection for automatic alerting on unusual spending patterns. Require cost allocation tags on all resources via Organization Tag Policies. Review costs weekly in a 15-minute team meeting.
+
+**The word that impresses:** "I would check our *cost anomaly detection* alerts first -- if those were configured, we should have caught this before the bill arrived."
+</Accordion>
+
+<Accordion title="When would you choose Kinesis over SQS for event processing?">
+**What they are testing:** Understanding of stream vs queue semantics and the ability to pick the right tool for specific requirements.
+
+**Strong answer:**
+
+**Choose Kinesis when:**
+- **You need replay.** Kinesis retains data for 1-365 days. Multiple consumers can read from any point in the stream. SQS deletes messages after they are consumed.
+- **You need ordering.** Kinesis guarantees order within a shard. SQS Standard does not guarantee order; SQS FIFO guarantees it but at lower throughput.
+- **You need multiple independent consumers.** With Kinesis, consumer A reads the sales analytics and consumer B reads the fraud detection stream -- independently, at their own pace, from the same data. SQS delivers each message to one consumer.
+- **You are doing real-time analytics.** Kinesis integrates with Kinesis Data Analytics (Apache Flink), allowing windowed aggregations, pattern detection, and real-time SQL over streams.
+
+**Choose SQS when:**
+- **You need a simple task queue.** One message, one consumer, delete after processing.
+- **You need per-message retry and DLQ.** SQS has built-in retry counting and dead letter queue support. Kinesis requires you to build this yourself.
+- **Traffic is spiky and you need buffering.** SQS scales automatically with no shard management.
+- **You do not need replay or ordering.** SQS Standard is simpler and cheaper for most async processing.
+
+**The sharp distinction:** "SQS is for *work distribution* -- assign tasks to workers. Kinesis is for *event streaming* -- publish a log of what happened and let multiple consumers derive meaning from it."
+</Accordion>
+
+<Accordion title="Design a multi-region active-active architecture for a critical payment service on AWS">
+**What they are testing:** Deep understanding of distributed systems, data consistency, and the practical challenges of multi-region deployments.
+
+**Strong answer framework:**
+
+**Compute layer:** Deploy the payment service as ECS Fargate tasks in two regions (e.g., us-east-1 and eu-west-1). Use Route 53 latency-based routing to direct users to the nearest region. Health checks automatically failover to the surviving region.
+
+**Data layer (the hard part):**
+- **DynamoDB Global Tables** for payment state (transaction records, idempotency keys). Global Tables provide multi-region replication with eventual consistency (typically under 1 second). Use conditional writes and idempotency keys to prevent duplicate payments when both regions are active.
+- **Aurora Global Database** for account data (if relational is required). One primary region handles writes; the secondary has a read replica that can be promoted to writer in under 1 minute.
+
+**Messaging:** SQS queues are regional. Use SNS cross-region subscriptions or EventBridge cross-region event buses to replicate events between regions.
+
+**The consistency challenge:** Active-active with payments is dangerous because two regions could process the same payment simultaneously. Mitigations:
+- Idempotency keys stored in DynamoDB Global Tables (both regions see the same key within ~1 second).
+- Route each customer to a "home" region by default (reduces cross-region conflict).
+- Implement optimistic locking: write with a condition that the item does not already exist.
+
+**Why an experienced engineer raises this concern:** "Active-active sounds great on paper, but for payments, I would actually recommend active-passive unless the business requirement truly demands zero RPO. Active-active introduces split-brain risk where both regions accept a conflicting write. For most payment systems, a 30-second failover (active-passive) is acceptable, and the consistency guarantees are much simpler."
+</Accordion>
+
+<Accordion title="How would you design a cost-effective log aggregation pipeline on AWS?">
+**What they are testing:** Practical architecture with cost awareness, understanding of storage tiers, and data lifecycle management.
+
+**Strong answer:**
+
+**Ingestion:** Applications write logs to CloudWatch Logs (or ship directly to Kinesis Data Firehose via the Fluent Bit agent for higher volume). Firehose batches logs into compressed files and delivers to S3 every 60-300 seconds.
+
+**Hot storage (0-30 days):** Logs land in S3 Standard. Use CloudWatch Logs Insights or OpenSearch for interactive querying during active development and incident investigation.
+
+**Warm storage (30-90 days):** S3 lifecycle policy transitions logs to S3 Standard-IA. Still queryable via Athena on demand, but cheaper storage.
+
+**Cold storage (90+ days):** Transition to Glacier Flexible Retrieval. Available within hours if needed for compliance or historical investigation.
+
+**Archival (1+ years):** Glacier Deep Archive for long-term compliance retention at $1/TB/month.
+
+**The cost-saving details that impress:**
+- "I would use Parquet format for logs in S3 -- Athena charges per TB scanned, and Parquet reduces scan volume by 80-90% compared to raw JSON."
+- "I would avoid keeping logs in CloudWatch Logs long-term. CloudWatch Logs Insights is expensive for large volumes. Export to S3 within 24 hours and query with Athena."
+- "I would set up S3 Intelligent-Tiering for logs with unpredictable access patterns -- it automatically moves objects between access tiers with no retrieval fees."
+</Accordion>
+
+<Accordion title="A developer asks you to give their Lambda function AdministratorAccess. How do you respond?">
+**What they are testing:** Security mindset, ability to push back constructively, IAM understanding.
+
+**Strong answer:**
+
+"I would not grant AdministratorAccess. Here is what I would do instead:
+
+1. **Understand the requirement.** What AWS services does the function actually need to access? S3? DynamoDB? SQS? Get the specific operations -- read, write, list?
+
+2. **Create a scoped policy.** Grant only the permissions the function needs, on only the resources it needs to access.
+
+```json
+{
+  "Effect": "Allow",
+  "Action": [
+    "dynamodb:GetItem",
+    "dynamodb:PutItem",
+    "dynamodb:Query"
+  ],
+  "Resource": "arn:aws:dynamodb:us-east-1:123456789:table/Orders"
+}
+```
+
+3. **Use IAM Access Analyzer.** If the function already exists with broad permissions, enable IAM Access Analyzer to see which permissions it *actually uses* over a 30-day period. Then generate a least-privilege policy based on actual usage.
+
+4. **Explain the risk.** AdministratorAccess on a Lambda function means a vulnerability in the function code (injection, SSRF, dependency vulnerability) becomes a complete account compromise. The attacker can create IAM users, access any database, exfiltrate any S3 bucket, and launch cryptomining instances -- all through the Lambda's execution role.
+
+The principle is: **give the function the minimum permissions it needs, on the specific resources it needs, and nothing more.** If the developer does not know what permissions they need, that is a conversation worth having before writing the code."
+</Accordion>
+
+<Accordion title="Your team is spending $2,000/month on NAT Gateway. How do you reduce it?">
+**What they are testing:** Practical cost engineering, VPC networking knowledge, and ability to identify hidden cloud costs.
+
+**Strong answer:**
+
+**Step 1: Identify the traffic.** Enable VPC Flow Logs and analyze where the NAT Gateway traffic is going. Most of it is probably going to AWS services, not the public internet.
+
+**Step 2: Deploy VPC Endpoints for AWS services.**
+- **S3 Gateway Endpoint** (free) -- Eliminates all S3 traffic through NAT Gateway.
+- **DynamoDB Gateway Endpoint** (free) -- Same for DynamoDB.
+- **ECR, CloudWatch Logs, SQS, Secrets Manager Interface Endpoints** (~$7/month each) -- Eliminates pull-through traffic for container images and logging.
+
+**Step 3: Check for unnecessary cross-AZ traffic.** If services in AZ-a are communicating with services in AZ-b, that traffic goes through the NAT Gateway and costs $0.01/GB on top of NAT processing. Consider AZ-affinity for tightly coupled services.
+
+**Step 4: Evaluate the NAT instance alternative.** For non-critical workloads (dev, staging), a t3.nano or t4g.nano instance acting as a NAT costs ~$4/month. You lose the managed high-availability, but for non-production environments, that is acceptable.
+
+**Expected savings:** Most teams that deploy S3 and ECR VPC endpoints see a 50-70% reduction in NAT Gateway costs within the first billing cycle."
+</Accordion>
+
+</AccordionGroup>
+
+---
+
+## Real-World Architecture Examples
+
+### Example 1: E-Commerce Order Pipeline
+
+**Context:** An e-commerce platform processing 50,000 orders per day.
+
+```
+User places order
+  -> API Gateway -> Lambda (validate order)
+  -> DynamoDB (store order, status: PENDING)
+  -> SQS (order-processing queue)
+  -> Lambda (process payment via Stripe API)
+  -> EventBridge (OrderPaid event)
+    -> Lambda: send confirmation email (SES)
+    -> Lambda: update inventory (DynamoDB)
+    -> Lambda: publish to analytics (Kinesis Firehose -> S3)
+  -> DynamoDB (update order, status: CONFIRMED)
+```
+
+**Why this works:** Each step is independent and can fail/retry without affecting others. The SQS queue buffers orders during traffic spikes. EventBridge fan-out ensures the email, inventory, and analytics services are decoupled -- adding a new consumer (loyalty points, warehouse notification) requires zero changes to existing code.
+
+### Example 2: Media Processing Pipeline
+
+**Context:** A platform where users upload videos up to 5 GB, which need to be transcoded into multiple formats.
+
+```
+Client -> Pre-signed URL (PUT) -> S3 (raw-uploads bucket)
+  -> S3 Event -> SQS -> Lambda (validate file, extract metadata)
+  -> Step Functions workflow:
+    -> Parallel:
+      -> MediaConvert job: 1080p H.264
+      -> MediaConvert job: 720p H.264
+      -> MediaConvert job: 480p H.264
+      -> Lambda: generate thumbnail from first frame
+    -> Lambda: update DynamoDB (status: READY, URLs)
+    -> Lambda: send notification (SNS -> user's webhook)
+```
+
+**Why Step Functions here:** The workflow has parallelism (transcode all formats simultaneously), error handling (retry individual format conversions), and state tracking (know exactly which step a video is in). SQS alone cannot express this.
+
+### Example 3: Real-Time Fraud Detection
+
+**Context:** A fintech processing credit card transactions that need fraud scoring within 100ms.
+
+```
+Transaction API -> Kinesis Data Streams (partitioned by card_id)
+  -> Lambda (enhanced fan-out consumer):
+    -> Call ML inference endpoint (SageMaker) for fraud score
+    -> If score > 0.8: publish to SNS (block transaction)
+    -> If score 0.5-0.8: publish to SQS (human review queue)
+    -> All: write to DynamoDB (transaction log)
+    -> All: Kinesis Firehose -> S3 (for model retraining)
+```
+
+**Why Kinesis, not SQS:** Ordering by card_id ensures all transactions for the same card are processed sequentially (detecting velocity patterns -- 5 transactions in 10 seconds). Multiple consumers (real-time scoring, batch analytics, model retraining) read from the same stream independently. Replay capability allows re-scoring historical transactions when the model is updated.
+
+---
+
+## Curated Resources
+
+<AccordionGroup>
+<Accordion title="AWS Documentation and Architecture Center">
+
+**Essential Docs:**
+- [AWS Well-Architected Framework](https://docs.aws.amazon.com/wellarchitected/latest/framework/welcome.html) -- The foundational framework for evaluating any cloud architecture. Read the "Pillars" section at minimum.
+- [Lambda Operator Guide](https://docs.aws.amazon.com/lambda/latest/operatorguide/intro.html) -- The best single resource for understanding Lambda's behavior in production. Covers cold starts, concurrency, monitoring, and cost optimization.
+- [S3 User Guide: Performance Design Patterns](https://docs.aws.amazon.com/AmazonS3/latest/userguide/optimizing-performance.html) -- Request rate optimization, prefix distribution, and multipart upload best practices.
+
+**Architecture Center:**
+- [Serverless Application Lens](https://docs.aws.amazon.com/wellarchitected/latest/serverless-applications-lens/welcome.html) -- Well-Architected review specifically for serverless architectures.
+- [AWS Architecture Center](https://aws.amazon.com/architecture/) -- Reference architectures, diagrams, and best practices for common workloads.
+
+</Accordion>
+<Accordion title="re:Invent Talks (Best of)">
+
+- **"Optimizing Lambda Cost and Performance" (SVS401)** -- Deep dive into Lambda internals, Firecracker, and optimization techniques from the Lambda team.
+- **"Advanced Serverless Patterns" (SVS340)** -- Step Functions, event-driven patterns, and saga implementations.
+- **"S3 Masterclass" (STG301)** -- Storage classes, lifecycle management, and cost optimization from the S3 team.
+- **"Networking Best Practices for VPC" (NET301)** -- VPC design, Transit Gateway, and PrivateLink patterns.
+- **"Running Kubernetes at Scale" (CON301)** -- For teams that have chosen EKS, this covers production patterns and pitfalls.
+
+Search for these on YouTube -- AWS publishes all re:Invent sessions publicly.
+
+</Accordion>
+<Accordion title="Books, Blogs, and Courses">
+
+**Books:**
+- *Designing Data-Intensive Applications* by Martin Kleppmann -- Not AWS-specific, but the distributed systems principles behind every AWS service.
+- *AWS Certified Solutions Architect Study Guide* -- Even if you are not pursuing the cert, the SAA-C03 study materials are the most structured way to learn AWS service selection.
+
+**Blogs:**
+- [AWS Architecture Blog](https://aws.amazon.com/blogs/architecture/) -- Practical architecture patterns from AWS solutions architects.
+- [Last Week in AWS](https://www.lastweekinaws.com/) by Corey Quinn -- The best newsletter for AWS cost analysis and commentary. Corey is brutally honest about pricing.
+- [theburningmonk.com](https://theburningmonk.com/) by Yan Cui -- The best independent blog on serverless patterns, costs, and pitfalls.
+- [cloudonaut.io](https://cloudonaut.io/) by Michael and Andreas Wittig -- Deep technical blog covering VPC, IAM, cost optimization, and CloudFormation.
+
+</Accordion>
+</AccordionGroup>
+
+---
+
+## Cross-Chapter Connections
+
+<Note>
+**This chapter connects to:**
+
+- [Cloud, Problem Framing & Trade-Offs](/resources/interview-questions/think-like-an-engineer/cloud-problemframing-tradeoffs) -- The decision frameworks and architectural thinking that precede service selection. Read that chapter first for the "why," then this chapter for the "how."
+- [Messaging, Concurrency & State](/resources/interview-questions/think-like-an-engineer/messaging-concurrency-state) -- Deeper coverage of messaging semantics (exactly-once, idempotency, ordering guarantees) that apply to SQS, Kinesis, and EventBridge patterns.
+- [APIs & Databases](/resources/interview-questions/think-like-an-engineer/apis-databases) -- Database internals, indexing, and transaction patterns that inform DynamoDB and Aurora design decisions.
+- [Caching & Observability](/resources/interview-questions/think-like-an-engineer/caching-observability) -- ElastiCache patterns, cache invalidation, and the observability stack (CloudWatch, X-Ray, Datadog) for monitoring cloud-native applications.
+- [Performance & Scalability](/resources/interview-questions/think-like-an-engineer/performance-scalability) -- Auto-scaling patterns, latency optimization, and capacity planning that apply directly to Lambda concurrency, Fargate scaling, and database sizing.
+- [Networking & Deployment](/resources/interview-questions/think-like-an-engineer/networking-deployment) -- VPC networking fundamentals, DNS, load balancing, and deployment strategies (blue-green, canary) applied to AWS services.
+- [Compliance, Cost & Debugging](/resources/interview-questions/think-like-an-engineer/compliance-cost-debugging) -- FinOps practices, GDPR implications for S3 data residency, and incident response for cloud outages.
+</Note>

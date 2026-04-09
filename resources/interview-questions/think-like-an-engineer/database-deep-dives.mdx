@@ -1,0 +1,874 @@
+---
+title: "Database Deep Dives"
+description: "PostgreSQL Internals, MongoDB Patterns, DynamoDB Strategies, and Redis Architecture"
+icon: "hard-drive"
+---
+
+# Database Deep Dives
+
+*Knowing SQL syntax is table stakes. Knowing why your query plan changed after a `VACUUM`, why your DynamoDB table has a hot partition at 3 AM, why MongoDB's `$lookup` is killing your aggregation pipeline, or why Redis just evicted your session keys -- that is what separates engineers who operate databases from engineers who understand them. This chapter goes beneath the surface of four databases you will encounter in production, with the depth that interviews at serious companies demand.*
+
+<Note>
+**Real-World Story: Figma's PostgreSQL Scaling Journey.** Figma, the collaborative design tool valued at $20 billion, ran on a single PostgreSQL instance far longer than most engineers would expect. By 2020, that single instance was handling millions of collaborative editing sessions, billions of rows, and thousands of queries per second. Rather than immediately jumping to a distributed database, Figma's team invested in understanding PostgreSQL internals -- aggressive index tuning, partitioning large tables, optimizing VACUUM settings, and using PgBouncer to manage connection pooling. When they eventually needed to scale further, they horizontally partitioned by workspace using application-level routing, keeping PostgreSQL as the storage engine. Their CTO has publicly stated that deep PostgreSQL knowledge bought them years of runway on a single database -- years they spent building product instead of managing distributed systems complexity. The lesson: understanding your database's internals is often worth more than replacing it.
+</Note>
+
+<Note>
+**Real-World Story: Coinbase and DynamoDB at Financial Scale.** When Coinbase needed a database to handle cryptocurrency transaction ledgers -- millions of writes per second during market volatility, with zero tolerance for data loss -- they chose DynamoDB. But the decision was not "DynamoDB is the best database." It was "DynamoDB's single-digit millisecond latency at any scale, combined with its durability guarantees, matches our specific access pattern: high-velocity writes with simple key-based lookups." Coinbase's engineering team designed their DynamoDB tables around access patterns first (not entities), used single-table design for related data, and built a sophisticated partition key strategy to avoid hot partitions during Bitcoin price spikes (when everyone buys or sells simultaneously). They have publicly discussed how getting the partition key wrong in early iterations caused throttling during peak trading -- a mistake that directly cost money. The takeaway: choosing the right database is necessary but not sufficient. Designing for that database's strengths is where the real engineering happens.
+</Note>
+
+---
+
+# Section 1: PostgreSQL Internals
+
+PostgreSQL is not just "a relational database." It is a sophisticated system with its own approach to concurrency, crash recovery, query optimization, and extensibility. Understanding these internals transforms you from someone who writes SQL into someone who can diagnose why a query that ran in 2 ms yesterday takes 30 seconds today.
+
+## 1.1 MVCC (Multi-Version Concurrency Control)
+
+Most databases face a fundamental tension: readers and writers want to access the same data simultaneously. The brute-force solution is locking -- make readers wait while writers write, and vice versa. PostgreSQL chose a different path: **readers never block writers, and writers never block readers.**
+
+PostgreSQL achieves this through MVCC. Instead of modifying a row in place, every UPDATE creates a *new version* of the row. The old version is not immediately deleted -- it sticks around so that any transaction that started before the update can still see the original value. Each row version has two hidden system columns: `xmin` (the transaction ID that created this version) and `xmax` (the transaction ID that deleted or replaced this version, or 0 if it is still current).
+
+When a transaction runs a query, PostgreSQL checks each row version's `xmin` and `xmax` against the transaction's **snapshot** -- a record of which transactions were committed at the moment this transaction began. If `xmin` is from a committed transaction that started before the snapshot and `xmax` is either 0 or from a transaction not yet visible, the row version is visible. Otherwise, it is skipped.
+
+**What this means in practice:** Ten concurrent transactions can all read the `orders` table while an eleventh transaction is updating 50,000 rows. The readers see a consistent snapshot of the data as it existed when their transaction started. No locks. No waiting. No dirty reads.
+
+<Warning>
+**The cost of MVCC: dead tuples.** Every UPDATE creates a new row version and marks the old one as "dead." A table with 1 million rows that gets updated 10 times has 10 million dead tuples consuming disk space and slowing down sequential scans. This is why VACUUM exists -- and why understanding VACUUM is non-negotiable for PostgreSQL operations.
+</Warning>
+
+<Tip>
+**Cross-chapter connection:** MVCC is the mechanism behind PostgreSQL's isolation levels discussed in [APIs and Databases -- Transactions and Isolation Levels](/resources/interview-questions/think-like-an-engineer/apis-databases). PostgreSQL's REPEATABLE READ is actually snapshot isolation powered by MVCC -- each transaction sees a frozen snapshot of the database, which is why it prevents phantom reads (unlike the SQL standard's definition of REPEATABLE READ).
+</Tip>
+
+## 1.2 WAL (Write-Ahead Log)
+
+The Write-Ahead Log is PostgreSQL's crash recovery mechanism and the foundation of its replication system. The principle is simple: before any change is written to the actual data files on disk, a record of that change is first written to the WAL.
+
+**Why this matters:** Imagine PostgreSQL is halfway through writing an UPDATE to a data page when the server loses power. Without WAL, that page is now corrupted -- half old data, half new data. With WAL, on restart PostgreSQL reads the WAL from the last checkpoint, replays any committed transactions that were not yet flushed to the data files, and rolls back any uncommitted transactions. The data files might be in an inconsistent state, but the WAL has everything needed to reconstruct consistency.
+
+**How it works step by step:**
+
+1. Transaction begins. Client issues `UPDATE accounts SET balance = 500 WHERE id = 42`.
+2. PostgreSQL modifies the row in the **shared buffer pool** (in-memory copy of the data page).
+3. A WAL record describing this change is written to the **WAL buffer** (in memory).
+4. When the transaction commits, the WAL buffer is flushed to disk (`pg_wal/` directory). This is the `fsync` call -- the moment the change is durable.
+5. The actual data page in the buffer pool is *not* immediately written to disk. It will be flushed later by the background writer or checkpointer.
+6. On crash, PostgreSQL replays WAL records from the last checkpoint to bring data files up to date.
+
+**WAL and replication:** Streaming replication works by sending WAL records from the primary to replicas in real-time. The replica applies the same WAL records to its own data files, keeping an exact copy. This is why PostgreSQL replication is so reliable -- replicas are literally replaying the same sequence of changes.
+
+<Note>
+**pg_wal directory.** WAL segments are stored in `pg_wal/` (called `pg_xlog/` before PostgreSQL 10). Each segment is 16 MB by default. If this directory fills up (because archiving is failing or replication slots are retaining too many segments), PostgreSQL will **refuse to accept new writes** until space is freed. Monitor `pg_wal` disk usage in production.
+</Note>
+
+## 1.3 VACUUM -- Dead Tuple Cleanup
+
+VACUUM is the garbage collector for MVCC. It reclaims space occupied by dead tuples (old row versions that are no longer visible to any active transaction), updates the **visibility map** (which pages are fully visible to all transactions -- enabling index-only scans), and updates the **free space map** (which pages have room for new rows).
+
+**What happens without VACUUM:**
+- Table bloat: a 1 GB table grows to 10 GB as dead tuples accumulate.
+- Index bloat: indexes still point to dead tuples, making them larger and slower.
+- Transaction ID wraparound: PostgreSQL uses 32-bit transaction IDs. After ~2 billion transactions, IDs wrap around and old transactions appear to be in the "future." If this happens, PostgreSQL shuts down to prevent data corruption. VACUUM marks old transaction IDs as "frozen" to prevent wraparound.
+
+**Autovacuum** is the background process that runs VACUUM automatically. It monitors each table and triggers when the number of dead tuples exceeds a threshold:
+
+```
+threshold = autovacuum_vacuum_threshold + autovacuum_vacuum_scale_factor * table_size
+```
+
+Default: `50 + 0.2 * row_count`. For a 10-million-row table, that means autovacuum triggers after 2,000,050 dead tuples -- often too late.
+
+**Autovacuum tuning for large tables:**
+
+```sql
+ALTER TABLE large_events SET (
+  autovacuum_vacuum_scale_factor = 0.01,    -- trigger at 1% dead tuples instead of 20%
+  autovacuum_vacuum_threshold = 1000,       -- lower base threshold
+  autovacuum_analyze_scale_factor = 0.005,  -- update statistics more frequently
+  autovacuum_vacuum_cost_delay = 2          -- reduce throttling (default 20ms)
+);
+```
+
+<Warning>
+**VACUUM does not reclaim disk space to the OS.** Regular VACUUM marks dead space as reusable *within* the table but does not shrink the file. Only `VACUUM FULL` (which rewrites the entire table with an exclusive lock) returns space to the OS. For a 500 GB table, `VACUUM FULL` requires 500 GB of temporary disk space and locks the table for the entire duration -- potentially hours. In production, use `pg_repack` instead, which performs an online table rewrite without an exclusive lock.
+</Warning>
+
+## 1.4 The Query Planner
+
+When you run a query, PostgreSQL does not just execute it. It first generates multiple possible **execution plans** and estimates the cost of each, then picks the cheapest one. Understanding the planner means understanding why PostgreSQL sometimes ignores your carefully crafted index.
+
+**Scan types the planner chooses between:**
+
+| Scan Type | When Chosen | Example Scenario |
+|---|---|---|
+| **Sequential Scan** | Reading most of the table, or table is small | `SELECT * FROM users` (no WHERE), or `WHERE status = 'active'` when 90% of rows are active |
+| **Index Scan** | Fetching a small fraction of rows via index | `WHERE id = 42` on a B-tree primary key index |
+| **Bitmap Index Scan** | Fetching a moderate fraction (1-20%) of rows | `WHERE created_at > '2024-01-01'` returning 10% of rows |
+| **Index Only Scan** | All required columns exist in the index (covering index) and visibility map is current | `SELECT id, email FROM users WHERE email = 'x'` with an index on `(email) INCLUDE (id)` |
+
+**Why the planner sometimes "ignores" your index:** The planner uses table statistics (row count, value distribution, correlation) to estimate how many rows each plan will return. If statistics are stale (because `ANALYZE` has not run recently), the planner makes bad estimates. If the planner estimates a query will return 50% of the table, a sequential scan is genuinely faster than an index scan -- random I/O (jumping around the heap via index pointers) is slower than sequential I/O (reading pages in order) when you are reading most of the table anyway.
+
+<Tip>
+**Force a statistics update** if the planner is making bad choices: `ANALYZE tablename;` This updates the statistics that the planner relies on. In autovacuum configurations, `ANALYZE` runs automatically, but after bulk loads or major data distribution changes, a manual `ANALYZE` is often needed immediately.
+</Tip>
+
+## 1.5 EXPLAIN ANALYZE Deep Dive
+
+`EXPLAIN` shows the plan. `EXPLAIN ANALYZE` runs the query and shows actual vs estimated numbers. This is the single most important diagnostic tool for PostgreSQL performance.
+
+```sql
+EXPLAIN (ANALYZE, BUFFERS, FORMAT TEXT)
+SELECT u.name, COUNT(o.id) as order_count
+FROM users u
+JOIN orders o ON o.user_id = u.id
+WHERE u.created_at > '2024-01-01'
+GROUP BY u.name
+ORDER BY order_count DESC
+LIMIT 10;
+```
+
+**Reading the output -- what to look for:**
+
+1. **Actual rows vs estimated rows.** If the planner estimated 100 rows but got 50,000, the plan is based on wrong statistics. Run `ANALYZE` on the table.
+2. **Loops.** A Nested Loop with `loops=10000` means the inner operation ran 10,000 times. Multiply the inner node's time by the loop count for the true cost.
+3. **Buffers: shared hit vs shared read.** `shared hit` = read from buffer cache (fast). `shared read` = read from disk (slow). A high `shared read` count means the working set does not fit in `shared_buffers`.
+4. **Sort Method: external merge disk.** The sort spilled to disk because `work_mem` was too small. Increase `work_mem` for this session or globally.
+5. **Seq Scan with Filter: rows removed by filter.** If a sequential scan filtered out 99% of rows, an index would be far more efficient.
+
+<Note>
+**pg_stat_statements.** The single most valuable extension for production PostgreSQL. It tracks every distinct query, its total/mean/max execution time, the number of calls, rows returned, and buffer usage. Finding your slowest queries is as simple as:
+```sql
+SELECT query, calls, mean_exec_time, total_exec_time
+FROM pg_stat_statements
+ORDER BY total_exec_time DESC
+LIMIT 20;
+```
+This tells you which queries consume the most cumulative time -- the highest-ROI optimization targets.
+</Note>
+
+## 1.6 Connection Management
+
+Each PostgreSQL connection is a full OS process (not a thread). On Linux, each backend process consumes approximately 5-10 MB of RAM. A server with `max_connections = 500` reserves 2.5-5 GB just for connection overhead -- before any query execution.
+
+**The problem:** Modern web applications using serverless functions or microservices can easily open thousands of connections. Each Lambda invocation, each Kubernetes pod, each application instance opens its own connections. Without connection pooling, you exhaust PostgreSQL's connection limit quickly.
+
+**PgBouncer** is the standard solution -- a lightweight connection pooler that sits between your application and PostgreSQL. It maintains a small pool of actual PostgreSQL connections (say, 50) and multiplexes hundreds or thousands of client connections onto them.
+
+**Pooling modes:**
+- **Transaction pooling** (most common): A server connection is assigned to a client for the duration of one transaction, then returned to the pool. Best for web workloads with short transactions.
+- **Session pooling:** A server connection is assigned for the entire client session. Needed for features that require session state (prepared statements, temp tables, `SET` commands).
+- **Statement pooling:** A connection is assigned per statement. Most aggressive but breaks multi-statement transactions.
+
+<Warning>
+**Transaction pooling breaks prepared statements** unless you use server-side prepared statement support in PgBouncer 1.21+. If your ORM uses prepared statements by default (most do), you will get errors like `prepared statement does not exist`. Either switch to session pooling (loses most of the benefit), disable prepared statements in the ORM, or upgrade PgBouncer.
+</Warning>
+
+## 1.7 Partitioning
+
+Partitioning splits a single logical table into multiple physical tables. PostgreSQL supports three strategies:
+
+- **Range partitioning:** Divide by value ranges. Most common for time-series data: one partition per month, per week, or per day.
+- **List partitioning:** Divide by discrete values. Partition by region (`us-east`, `eu-west`) or status (`active`, `archived`).
+- **Hash partitioning:** Distribute evenly across N partitions based on a hash of the partition key. Good for even distribution when there is no natural range or list.
+
+**When to partition:**
+- Tables over 100 million rows where queries consistently filter by the partition key.
+- Time-series data where old partitions can be cheaply dropped (`DROP TABLE` is instant; `DELETE FROM ... WHERE date < X` on a 500M row table takes hours and creates massive dead tuple bloat).
+- When you need different storage strategies for hot vs cold data (recent partitions on SSD, old partitions on cheaper storage).
+
+**When NOT to partition:** When your queries do not filter by the partition key (every query hits all partitions -- *worse* than a single table). When the table has fewer than 10 million rows (partitioning overhead exceeds benefit). When you just need better indexes.
+
+## 1.8 Extensions
+
+PostgreSQL's extension ecosystem is one of its strongest competitive advantages:
+
+- **PostGIS:** Geospatial data types and queries. `ST_DWithin(point, location, 5000)` finds everything within 5 km. Powers location features at companies from Instacart to OpenStreetMap.
+- **pg_trgm:** Trigram-based fuzzy text search. Enables `LIKE '%search%'` queries to use an index (normally impossible with leading wildcards). Create a GIN trigram index and suddenly fuzzy search is fast.
+- **TimescaleDB:** Turns PostgreSQL into a time-series database with automatic partitioning (hypertables), compression (90%+ space reduction on old data), and continuous aggregates. If you are choosing between PostgreSQL + TimescaleDB and InfluxDB, keep it in the PostgreSQL ecosystem unless you have a strong reason not to.
+- **pgvector:** Vector similarity search for AI/ML embeddings. Store embeddings alongside relational data and query both in a single SQL statement. Rapidly becoming the default for RAG (Retrieval-Augmented Generation) applications that do not need billion-vector scale.
+
+<Tip>
+**Cross-chapter connection:** pgvector is increasingly relevant for AI engineering interviews. If you are building RAG applications, being able to discuss how pgvector compares to dedicated vector databases (Pinecone, Weaviate, Qdrant) demonstrates cross-domain depth. See the [AI Engineer Interview Questions](/resources/interview-questions/ai-engineer-interview-qs) chapter for LLM-specific database considerations.
+</Tip>
+
+---
+
+# Section 2: MongoDB Patterns
+
+MongoDB is a document database -- it stores data as JSON-like documents (BSON internally) rather than rows in tables. It excels at rapid iteration with flexible schemas, hierarchical data that maps naturally to nested documents, and read-heavy workloads with denormalized data. It struggles with complex relationships, multi-document transactions at scale, and workloads that would benefit from JOINs.
+
+## 2.1 The Document Model
+
+A MongoDB document is a JSON object. Unlike a relational row, it can contain nested objects, arrays, and mixed types. This flexibility is both its greatest strength and its most common source of production pain.
+
+**When the document model shines:**
+- **Hierarchical data:** A product with variants, each variant with sizes, each size with inventory by warehouse. In PostgreSQL, that is 4 tables and 3 JOINs. In MongoDB, it is one document.
+- **Flexible schema:** An e-commerce platform where shoes have `size` and `color`, electronics have `voltage` and `wattage`, and books have `isbn` and `author`. In relational, you either use sparse columns (wasteful) or an EAV pattern (painful). In MongoDB, each document has exactly the fields it needs.
+- **Read-heavy with denormalization:** When 90% of your operations are "fetch this entire thing and display it," embedding all the data in one document means one read, no JOINs.
+
+**When the document model hurts:**
+- **Many-to-many relationships:** Students and courses. If a student document embeds course references and a course document embeds student references, updating a course name means updating every student document that references it. This is the relational model's strength and the document model's weakness.
+- **Data that is frequently updated in nested arrays:** Updating the 500th element of a 1000-element embedded array is expensive. MongoDB must rewrite the entire document.
+- **Complex analytical queries with JOINs across collections:** MongoDB's `$lookup` (the equivalent of JOIN) is significantly slower than relational JOINs and does not support the same optimization strategies.
+
+## 2.2 Schema Design Patterns
+
+MongoDB schema design is not "throw everything in one document." Production schemas use well-established patterns:
+
+**Extended Reference Pattern:** Instead of embedding the entire related document, embed only the fields you need for display. An order document contains `{ customer_name: "Jane", customer_email: "jane@co.com" }` rather than the entire customer object. Reduces document size and read latency while accepting controlled denormalization.
+
+**Subset Pattern:** When a document has a large array but queries only need the most recent entries, store only the last N items in the main document and archive older items to a separate collection. A product's reviews document has the last 10 reviews embedded; the full review history lives in a `reviews` collection.
+
+**Bucket Pattern:** Instead of one document per event (millions of tiny documents), group events into time-based buckets. A sensor reading every second becomes one document per minute with an array of 60 readings. Reduces document count by 60x, improves query efficiency, and reduces index overhead.
+
+**Computed Pattern:** Pre-compute aggregations and store the results. Instead of calculating `total_revenue` by summing all order documents every time, maintain a running total in a `statistics` document updated on each new order. Trades write complexity for read speed.
+
+**Outlier Pattern:** When 99% of documents have small arrays but 1% have massive arrays (a celebrity with 10 million followers vs a normal user with 200), handle the outliers differently. Normal users embed their follower list. Celebrity users store a flag `has_overflow: true` and put excess followers in a separate collection.
+
+## 2.3 Write Concerns and Read Concerns
+
+Write concern controls how many replicas must acknowledge a write before the driver returns success. Read concern controls the consistency guarantee of read operations.
+
+| Write Concern | Durability | Latency | Use Case |
+|---|---|---|---|
+| `w: 0` | Fire and forget (no acknowledgment) | Lowest | Metrics, logs where occasional loss is acceptable |
+| `w: 1` | Primary acknowledged | Low | Default -- good for most operations |
+| `w: "majority"` | Majority of replica set acknowledged | Higher | Financial data, anything you cannot afford to lose on primary failure |
+
+| Read Concern | Guarantee | Trade-off |
+|---|---|---|
+| `local` | Returns the most recent data on the queried node (may be rolled back) | Fastest, default |
+| `majority` | Returns data acknowledged by majority (durable, will not be rolled back) | Slightly slower |
+| `linearizable` | Returns data that is both majority-committed and reflects all successful writes before the read started | Slowest, strongest |
+
+<Warning>
+**The default `w: 1` can lose data.** If the primary acknowledges a write and then fails before replicating to a secondary, that write is lost when a secondary is promoted to primary. For any data where loss is unacceptable, use `w: "majority"`. The latency cost is typically 2-5 ms extra.
+</Warning>
+
+## 2.4 Aggregation Pipeline
+
+MongoDB's aggregation pipeline is a sequence of stages that transform documents. Think of it as a Unix pipeline for data: each stage takes documents in, processes them, and passes the results to the next stage.
+
+Key stages: `$match` (filter -- always put first to reduce documents early), `$group` (aggregate), `$project` (reshape), `$sort`, `$limit`, `$unwind` (flatten arrays), `$lookup` (left outer join to another collection).
+
+**The `$lookup` limitation:** `$lookup` performs a left outer join, but it is fundamentally different from a relational JOIN. It executes a separate query for each input document (unless the joined collection is small enough to fit in memory). On a pipeline processing 100,000 documents, a `$lookup` can trigger 100,000 separate queries against the joined collection. Always ensure the joined collection has an index on the foreign field. Even then, `$lookup` at scale is where MongoDB's document model starts to feel its limitations.
+
+**Optimization tip:** `$match` and `$sort` stages at the beginning of the pipeline can use indexes. Once a `$group` or `$project` reshapes the documents, subsequent stages cannot use indexes. Structure your pipeline to filter as much as possible before transforming.
+
+## 2.5 Sharding
+
+Sharding distributes data across multiple servers (shards). The **shard key** is the most critical MongoDB decision you will make -- it determines how data is distributed and cannot be easily changed after the fact.
+
+**Shard key selection criteria:**
+1. **High cardinality:** A boolean field (`is_active`) is a terrible shard key -- all data lands on two chunks. A user ID or order ID has millions of distinct values.
+2. **Even distribution:** Monotonically increasing keys (timestamps, ObjectId) cause all new writes to hit the same shard (the one owning the highest range). This creates a "hot shard" bottleneck.
+3. **Query isolation:** The shard key should appear in most queries. If your queries filter by `user_id`, shard on `user_id` so queries hit a single shard. If you shard on `order_id` but query by `user_id`, every query must scatter to all shards and gather results -- a scatter-gather query that does not scale.
+
+**Jumbo chunks:** When a chunk grows beyond the maximum chunk size (default 128 MB) but cannot be split because all documents in the chunk have the same shard key value, it becomes a "jumbo chunk." Jumbo chunks cannot be migrated between shards, causing data imbalance. This happens with low-cardinality shard keys. Prevention: choose high-cardinality shard keys or use compound shard keys.
+
+## 2.6 Change Streams
+
+Change Streams let you subscribe to real-time changes on a collection, database, or entire cluster. Under the hood, they tail MongoDB's oplog (operation log -- similar to PostgreSQL's WAL).
+
+**Use cases:** Real-time event processing (new order -> trigger fulfillment), cache invalidation (document updated -> invalidate Redis cache), sync to search index (change in MongoDB -> update Elasticsearch), audit logging.
+
+**Key limitation:** Change Streams require a replica set (not available on standalone instances). They are "at-least-once" delivery -- your consumer must be idempotent because it may receive the same change event more than once after a resume.
+
+## 2.7 Common Gotchas
+
+- **Unbounded arrays:** Embedding an ever-growing array (all user activity, all comments) into a single document eventually hits MongoDB's 16 MB document size limit. Even before hitting the limit, updates to large arrays are slow because MongoDB rewrites the entire document. Use the Bucket or Outlier pattern instead.
+- **Missing compound indexes:** If you query by `{ user_id, status, created_at }`, an index on just `user_id` forces MongoDB to scan all of that user's documents to filter by `status` and `created_at`. Create a compound index matching your query pattern.
+- **WiredTiger cache sizing:** WiredTiger (MongoDB's storage engine) defaults to using 50% of RAM minus 1 GB for its internal cache. On a 64 GB server, that is ~31 GB. If your working set (frequently accessed data + indexes) exceeds this, performance degrades dramatically as WiredTiger constantly reads from and evicts to disk. Monitor `wiredTiger.cache.bytes currently in the cache` and ensure it does not stay near the maximum.
+
+---
+
+# Section 3: DynamoDB Strategies
+
+DynamoDB is AWS's fully managed NoSQL database. It is not a general-purpose database -- it is purpose-built for applications that need predictable single-digit millisecond performance at any scale. The trade-off: you give up query flexibility (no JOINs, no ad-hoc queries) in exchange for virtually unlimited throughput and rock-solid latency guarantees.
+
+## 3.1 Access Patterns First
+
+The most important DynamoDB design principle: **design your table around your queries, not your entities.** In relational databases, you normalize data into entities (users, orders, products) and rely on JOINs to answer any query. In DynamoDB, there are no JOINs. Every access pattern must be answerable by a single query against a single table (or index).
+
+Before writing a single line of schema, list every access pattern your application needs:
+1. Get user by ID
+2. Get all orders for a user, sorted by date
+3. Get all comments on a post
+4. Get a user's most recent 10 posts
+5. Get all users in an organization
+
+Then design your partition key (PK), sort key (SK), and Global Secondary Indexes (GSIs) so that each access pattern maps to a single `GetItem`, `Query`, or `BatchGetItem` operation.
+
+## 3.2 Single-Table Design
+
+Single-table design stores multiple entity types in one DynamoDB table. This is counterintuitive for engineers from a relational background, but it is the canonical DynamoDB pattern.
+
+**How it works (adjacency list pattern):**
+
+| PK | SK | Data |
+|---|---|---|
+| `USER#123` | `PROFILE` | `{ name: "Jane", email: "jane@co.com" }` |
+| `USER#123` | `ORDER#2024-001` | `{ total: 59.99, status: "shipped" }` |
+| `USER#123` | `ORDER#2024-002` | `{ total: 129.00, status: "pending" }` |
+| `ORDER#2024-001` | `ITEM#A` | `{ product: "Widget", qty: 2 }` |
+| `ORDER#2024-001` | `ITEM#B` | `{ product: "Gadget", qty: 1 }` |
+| `ORG#acme` | `MEMBER#123` | `{ role: "admin", joined: "2024-01-15" }` |
+| `ORG#acme` | `MEMBER#456` | `{ role: "viewer", joined: "2024-03-20" }` |
+
+**Access patterns served:**
+- Get user profile: `GetItem(PK=USER#123, SK=PROFILE)`
+- Get all orders for user: `Query(PK=USER#123, SK begins_with ORDER#)`
+- Get all items in an order: `Query(PK=ORDER#2024-001, SK begins_with ITEM#)`
+- Get all members of an org: `Query(PK=ORG#acme, SK begins_with MEMBER#)`
+
+One table. No JOINs. Every query hits a single partition.
+
+<Tip>
+**When NOT to use single-table design:** When your access patterns are not well-defined or change frequently (early-stage startups exploring product-market fit). When your team is not DynamoDB-experienced (the learning curve is steep and mistakes are costly). When ad-hoc queries are important (use DynamoDB for the transactional workload and export to Athena/Redshift for analytics). Single-table design optimizes for read performance and cost at the expense of developer ergonomics and flexibility.
+</Tip>
+
+## 3.3 Partition Key Design
+
+DynamoDB distributes data across partitions based on a hash of the partition key. If many items share the same partition key, that partition becomes "hot" -- receiving a disproportionate share of read/write traffic and potentially getting throttled.
+
+**Avoiding hot partitions:**
+- **High-cardinality keys:** Use user IDs, order IDs, or UUIDs -- not statuses, dates, or categories.
+- **Write sharding:** If you must use a low-cardinality key (e.g., tracking page views per URL), append a random suffix: `URL#homepage#3` (where 3 is random between 0-9). This distributes writes across 10 partitions. Reads require querying all 10 suffixes and aggregating -- a trade-off that is worth it for high-write scenarios.
+- **Composite keys:** Combine fields to increase cardinality. `TENANT#acme#USER#123` is better than `TENANT#acme` alone.
+
+<Warning>
+**The hot partition problem is real and expensive.** During a flash sale, if all orders have `PK=PRODUCT#popular-item`, that single partition receives all write traffic. DynamoDB's adaptive capacity can help by isolating frequently accessed items, but it is not instantaneous and will not save a fundamentally bad key design. A hot partition manifests as `ProvisionedThroughputExceededException` errors even when your overall table capacity is far from exhausted.
+</Warning>
+
+## 3.4 Global Secondary Indexes (GSI)
+
+A GSI is a projection of your table with a different partition key and sort key. It lets you query data by attributes other than the base table's keys.
+
+**Example:** Your base table has `PK=USER#123, SK=ORDER#2024-001`. You need to query "all orders with status=pending." Create a GSI with `PK=STATUS, SK=created_at`. Now `Query(PK=pending, SK between '2024-01-01' and '2024-12-31')` returns all pending orders sorted by date.
+
+**Key characteristics:**
+- GSIs are **eventually consistent** -- there is no strongly consistent read option for GSIs. If you write an item and immediately query the GSI, you might not see it yet (typically milliseconds, but during high load it can be longer).
+- GSIs have their own provisioned throughput. If the GSI is throttled, writes to the base table are also throttled (backpressure).
+- You can project a subset of attributes to the GSI (reducing cost and improving performance) or project all attributes.
+- Maximum 20 GSIs per table.
+
+## 3.5 Local Secondary Indexes (LSI)
+
+An LSI uses the same partition key as the base table but a different sort key. It must be created at table creation time (cannot be added later). LSIs support strongly consistent reads.
+
+**When to use LSI:** When you need an alternative sort order within the same partition AND you need strongly consistent reads on that sort order. Example: base table sorts orders by `order_id`, but you also need orders sorted by `created_at` within the same user partition.
+
+**Limitations:** LSIs share the partition's 10 GB limit. If a single partition key's items (across the base table and all LSIs) exceed 10 GB, writes fail. This is the main reason many DynamoDB practitioners avoid LSIs entirely and use GSIs instead.
+
+## 3.6 DynamoDB Streams
+
+DynamoDB Streams captures a time-ordered sequence of item-level modifications (inserts, updates, deletes) to a DynamoDB table. Think of it as DynamoDB's version of a change data capture (CDC) log.
+
+**Use cases:**
+- **Event-driven architectures:** New order inserted -> Stream triggers Lambda -> Lambda sends confirmation email.
+- **Cross-region replication:** DynamoDB Global Tables use Streams under the hood.
+- **Materialized views:** Stream changes to build denormalized views in another table or in Elasticsearch for full-text search.
+- **Audit trail:** Stream all changes to S3 for compliance and forensics.
+
+Streams guarantee exactly-once delivery to the stream (each change appears exactly once in the stream), but Lambda consumers process with at-least-once semantics -- your Lambda handler must be idempotent.
+
+## 3.7 DAX (DynamoDB Accelerator)
+
+DAX is a fully managed, in-memory cache for DynamoDB. It sits between your application and DynamoDB, caching frequently read items and query results.
+
+**When DAX makes sense:** Read-heavy workloads where the same items are read repeatedly (product catalog, configuration data). When you need microsecond latency (DAX serves from memory in ~200 microseconds vs DynamoDB's ~5 ms).
+
+**When DAX does NOT make sense:** Write-heavy workloads (DAX caches reads, not writes). When reads are highly varied with little repetition (low cache hit rate). When eventual consistency of the cache is problematic (DAX is eventually consistent by default with a 5-minute TTL).
+
+## 3.8 Capacity Modes
+
+**On-demand:** Pay per request. No capacity planning. Instantly handles traffic spikes. Costs roughly 6.5x more per request than provisioned at steady state. Best for: unpredictable workloads, new applications where traffic patterns are unknown, spiky traffic.
+
+**Provisioned:** You specify read/write capacity units. Cheaper at steady state. Risk of throttling if you underestimate. Use with Auto Scaling to adjust capacity based on utilization. Best for: predictable, steady workloads.
+
+**Burst capacity:** DynamoDB reserves unused capacity for up to 5 minutes to handle short spikes. This is not infinite -- sustained traffic above provisioned capacity will be throttled even with burst capacity available.
+
+## 3.9 Cost Optimization
+
+- **Avoid `Scan` operations.** A Scan reads every item in the table and charges for every read capacity unit consumed. Always use `Query` or `GetItem` with a key condition.
+- **Use sparse indexes.** A GSI only contains items that have the GSI's key attributes. If only 5% of items have a `premium_tier` attribute, a GSI on `premium_tier` is 95% smaller than the base table -- dramatically cheaper to read.
+- **Compress large items.** DynamoDB charges per KB of read/write capacity consumed. Compressing a 10 KB JSON attribute to 2 KB saves 80% on throughput costs for that attribute.
+- **Use `ProjectionExpression`.** Only retrieve the attributes you need, not the entire item. Reduces data transfer and read capacity consumption.
+- **Time-to-Live (TTL).** Automatically delete expired items at no cost (DynamoDB handles deletion in the background without consuming write capacity).
+
+---
+
+# Section 4: Redis Architecture
+
+Redis is an in-memory data structure server. It is often described as "a cache," but that undersells it dramatically. Redis is a Swiss Army knife for problems that need sub-millisecond latency: caching, session storage, rate limiting, leaderboards, pub/sub messaging, distributed locks, and real-time analytics.
+
+## 4.1 Data Structures Beyond Key-Value
+
+Redis's power comes from its rich data structure support. Each data structure has O(1) or O(log N) operations that would be expensive to build on top of a plain key-value store:
+
+- **Strings:** Basic key-value. But also atomic counters (`INCR`), bit operations, and values up to 512 MB.
+- **Hashes:** A hash map within a single key. Perfect for objects: `HSET user:123 name "Jane" email "jane@co.com"`. Get individual fields without deserializing the whole object.
+- **Lists:** Doubly-linked lists. `LPUSH` / `RPOP` gives you a queue. `LRANGE` gives you the last N items. Used for activity feeds, recent items.
+- **Sets:** Unordered unique collections. `SADD`, `SINTER` (intersection), `SUNION`. Used for tags, mutual friends, unique visitors.
+- **Sorted Sets:** Sets with a score for each member. `ZADD leaderboard 1500 "player1"`. `ZRANGE leaderboard 0 9 REV` gives the top 10. O(log N) insert and rank query. The data structure behind leaderboards, priority queues, and rate limiters.
+- **HyperLogLog:** Probabilistic data structure for cardinality estimation. Count unique visitors with 0.81% standard error using only 12 KB of memory, regardless of the actual count. `PFADD visitors "user1" "user2"`. `PFCOUNT visitors` returns the approximate unique count.
+- **Streams:** An append-only log data structure (added in Redis 5.0). Think Kafka-lite. Supports consumer groups, acknowledgment, and message replay. Used for event sourcing, activity streams, and lightweight message queues.
+- **Bitmaps:** Bit arrays. Set and get individual bits. `SETBIT active:2024-04-09 user_id 1`. Count bits with `BITCOUNT`. Used for tracking daily active users (1 bit per user, 1 million users = 125 KB per day).
+
+## 4.2 Persistence
+
+Redis is in-memory, but it can persist data to disk via two mechanisms:
+
+**RDB (Redis Database) snapshots:** Point-in-time snapshots of the entire dataset written to a `.rdb` file. Redis forks the process and the child writes the snapshot while the parent continues serving requests (copy-on-write). Fast recovery (load the entire dataset from one file). Risk: data written between the last snapshot and a crash is lost. Configure with `save 900 1` (snapshot if at least 1 key changed in 900 seconds).
+
+**AOF (Append Only File):** Logs every write operation. Three `fsync` policies:
+- `appendfsync always`: fsync after every write. Most durable, slowest.
+- `appendfsync everysec`: fsync every second. Loses at most 1 second of data on crash. The recommended default.
+- `appendfsync no`: Let the OS decide when to flush. Fastest, least durable.
+
+AOF files grow over time (they contain every write ever). AOF rewriting compacts the file by reading the current dataset and writing the shortest sequence of commands to reconstruct it.
+
+**RDB + AOF (recommended for production):** Enable both. Redis uses AOF for recovery (more durable) and RDB for faster restarts and backups. Since Redis 7.0, the AOF uses a multi-part format with a base RDB snapshot plus incremental AOF, combining the best of both approaches.
+
+## 4.3 Eviction Policies
+
+When Redis reaches `maxmemory`, it must decide what to evict:
+
+| Policy | Behavior | Use Case |
+|---|---|---|
+| `noeviction` | Return errors on writes when memory is full | When data loss is unacceptable (session store, job queue) |
+| `allkeys-lru` | Evict least recently used keys across all keys | General-purpose caching |
+| `volatile-lru` | Evict least recently used keys *among keys with a TTL set* | When some keys must persist (config) and others can be evicted (cache) |
+| `allkeys-lfu` | Evict least frequently used keys | When access frequency matters more than recency (popular items should stay) |
+| `volatile-lfu` | Evict least frequently used keys among those with a TTL | Mixed workload with frequency-based eviction |
+| `allkeys-random` | Evict random keys | When all keys have equal value |
+| `volatile-ttl` | Evict keys with the shortest remaining TTL | When near-expiry keys should go first |
+
+<Tip>
+**For most caching workloads, `allkeys-lfu` is the best modern choice** (available since Redis 4.0). It keeps frequently accessed items in memory even if they have not been accessed in the last few seconds (which LRU would evict). A product catalog page accessed 10,000 times a day but not in the last 5 minutes should not be evicted in favor of a page accessed once 2 minutes ago. LFU handles this correctly; LRU does not.
+</Tip>
+
+## 4.4 Redis Cluster
+
+Redis Cluster provides horizontal scaling by distributing data across multiple nodes. The keyspace is divided into **16,384 hash slots**. Each node is responsible for a subset of slots. The hash slot for a key is `CRC16(key) mod 16384`.
+
+**How resharding works:** To add a node, you migrate hash slots from existing nodes to the new node. Redis handles this online -- keys in migrating slots are redirected with `ASK` and `MOVED` responses that clients follow automatically.
+
+**Multi-key operations:** Operations that span multiple keys (`MGET`, `SUNION`, transactions) work only if all keys map to the same hash slot. Use **hash tags** to force related keys to the same slot: `{user:123}:profile` and `{user:123}:orders` both hash on `user:123` and land on the same slot.
+
+**Client-side vs proxy-based:**
+- **Client-side (smart clients):** The client library (like `redis-py-cluster` or `ioredis`) knows the slot-to-node mapping and routes requests directly to the correct node. Lower latency (no proxy hop), but the client must handle cluster topology changes.
+- **Proxy-based (Twemproxy, Redis Cluster Proxy):** A proxy sits between clients and the cluster, handling routing transparently. Simpler client code, but adds a network hop and a single point of failure.
+
+## 4.5 Redis Sentinel
+
+Redis Sentinel provides high availability for non-clustered Redis (single master with replicas). Sentinel monitors the master, detects failures, and automatically promotes a replica to master.
+
+**How failover works:**
+1. Multiple Sentinel instances (minimum 3 for quorum) monitor the master.
+2. When a Sentinel detects the master is unreachable, it asks other Sentinels to confirm (to avoid false positives from network issues).
+3. If a quorum of Sentinels agree the master is down, one Sentinel is elected to perform the failover.
+4. The elected Sentinel promotes the best replica (most up-to-date data) to master and reconfigures the other replicas to follow the new master.
+5. Clients using Sentinel-aware drivers are notified of the new master address.
+
+**Sentinel vs Cluster:** Use Sentinel when your dataset fits on a single node and you just need automatic failover. Use Cluster when you need to shard data across multiple nodes for capacity beyond what one node can handle.
+
+## 4.6 Pub/Sub vs Streams
+
+**Pub/Sub:** Fire-and-forget messaging. Publishers send messages to channels; subscribers receive messages in real-time. Messages are NOT persisted -- if a subscriber is disconnected, it misses messages. No consumer groups. No acknowledgment. Best for: real-time notifications, chat, live updates where message loss is acceptable.
+
+**Streams:** Persistent, append-only log with consumer groups. Messages are stored and can be replayed. Consumer groups allow multiple consumers to cooperatively process messages with acknowledgment and pending message tracking. Best for: reliable event processing, task queues, audit logs, anything where message loss is not acceptable.
+
+**Decision rule:** If you would be upset that a message was lost, use Streams. If the message is only valuable in real-time and losing it is fine (like a live scoreboard update), Pub/Sub is simpler and faster.
+
+## 4.7 Lua Scripting
+
+Redis executes Lua scripts atomically -- no other command runs between the script's start and finish. This eliminates race conditions in multi-step operations.
+
+**Example: Atomic rate limiter**
+
+```lua
+-- KEYS[1] = rate limit key, ARGV[1] = max requests, ARGV[2] = window in seconds
+local current = redis.call('INCR', KEYS[1])
+if current == 1 then
+  redis.call('EXPIRE', KEYS[1], ARGV[2])
+end
+if current > tonumber(ARGV[1]) then
+  return 0  -- rate limited
+end
+return 1  -- allowed
+```
+
+Without Lua, the `INCR` and `EXPIRE` would be separate commands with a gap between them -- if the process crashes after `INCR` but before `EXPIRE`, the key never expires and the rate limit becomes permanent. Lua makes this atomic.
+
+## 4.8 Common Patterns
+
+**Distributed locks (Redlock):** Acquire locks across multiple independent Redis instances. A lock is considered acquired only if the majority of instances grant it within a time limit. More robust than a single-instance lock but controversial -- Martin Kleppmann published a detailed critique arguing that Redlock does not provide the guarantees it claims in the presence of clock drift and process pauses. Use it for efficiency (avoiding duplicate work) but not for correctness (where a race condition would corrupt data).
+
+**Rate limiting:** Use Sorted Sets with timestamps as scores. `ZADD rate:user:123 <timestamp> <request_id>`. `ZREMRANGEBYSCORE` to remove entries outside the window. `ZCARD` to count entries in the window. This gives a precise sliding window rate limiter.
+
+**Leaderboards:** Sorted Sets are purpose-built for this. `ZADD leaderboard <score> <player>`. `ZREVRANK leaderboard <player>` gives rank in O(log N). `ZREVRANGE leaderboard 0 9 WITHSCORES` gives the top 10. Used by gaming companies, Stack Overflow, and fitness apps.
+
+**Session storage:** Store session data as Redis Hashes with a TTL. `HSET session:<id> user_id 123 role admin`. `EXPIRE session:<id> 3600`. All app instances share the same session store. Stateless application servers.
+
+## 4.9 Memory Optimization
+
+- **Key naming conventions:** Use `user:123:profile` not `the_profile_data_for_user_id_one_hundred_twenty_three`. Short, consistent key names save significant memory at scale. At 100 million keys, saving 20 bytes per key name saves 2 GB.
+- **Ziplist encoding:** Redis automatically uses a compact encoding (ziplist) for small Hashes, Lists, and Sorted Sets. A Hash with fewer than `hash-max-ziplist-entries` (default 128) entries and values smaller than `hash-max-ziplist-value` (default 64 bytes) is stored as a ziplist instead of a hash table -- using 5-10x less memory. Keep small objects small to benefit from this.
+- **TTL strategies:** Set TTLs aggressively. Every key without a TTL is a potential memory leak. Use `SCAN` periodically to find keys without TTLs that should have them.
+- **Compression:** For large values (JSON blobs > 1 KB), compress with gzip or LZ4 at the application level before storing in Redis. Redis does not compress values internally.
+
+---
+
+# Section 5: When to Choose What
+
+## Decision Matrix
+
+| Criteria | PostgreSQL | MongoDB | DynamoDB | Redis |
+|---|---|---|---|---|
+| **Data model** | Relational (tables, rows, JOINs) | Documents (JSON, nested, flexible) | Key-value / wide column | In-memory data structures |
+| **Query flexibility** | Highest (SQL, ad-hoc queries, JOINs) | High (flexible queries, aggregation pipeline) | Lowest (must design for access patterns) | Low (key-based access, Lua for complex ops) |
+| **Scale model** | Vertical (read replicas, partitioning, Citus for horizontal) | Horizontal (native sharding) | Horizontal (fully managed, unlimited) | Vertical (Cluster for horizontal) |
+| **Consistency** | Strong (ACID, serializable isolation) | Tunable (w:majority for strong writes) | Tunable (strong reads on base table) | Eventual (replication), strong (single node) |
+| **Latency** | 1-100 ms (query dependent) | 1-50 ms (query dependent) | <10 ms (predictable at any scale) | <1 ms (in-memory) |
+| **Operational burden** | Medium (VACUUM, connection mgmt, replication) | Medium (sharding, WiredTiger tuning) | Low (fully managed by AWS) | Medium (memory management, persistence) |
+| **Best for** | Complex queries, transactions, data integrity | Flexible schema, hierarchical data, rapid iteration | Predictable latency at scale, serverless backends | Caching, real-time, sessions, leaderboards |
+| **Worst for** | Unlimited horizontal scale without extensions | Complex relationships, heavy JOINs | Ad-hoc queries, complex transactions | Primary data store (data > memory), complex queries |
+
+## Concrete Scenarios
+
+| Scenario | Choose | Why |
+|---|---|---|
+| E-commerce platform with orders, inventory, payments | **PostgreSQL** | Transactions, data integrity, complex queries across entities |
+| Content management system with varied content types | **MongoDB** | Flexible schema (articles, videos, podcasts all have different fields) |
+| Mobile app backend with millions of users, simple reads/writes | **DynamoDB** | Predictable latency, scales with users, serverless-friendly |
+| Real-time leaderboard, session store, rate limiter | **Redis** | Sub-millisecond latency, purpose-built data structures |
+| IoT sensor data (millions of events/second, time-series queries) | **PostgreSQL + TimescaleDB** or **DynamoDB** | TimescaleDB for SQL analytics on time-series; DynamoDB for pure ingestion throughput |
+| Social network (users, posts, comments, likes, follows) | **PostgreSQL** + **Redis** (cache) | Relational model for relationships; Redis for feeds, counts, sessions |
+| AI/ML embeddings search + metadata | **PostgreSQL + pgvector** | Vector search + relational queries in one database |
+
+## Polyglot Persistence
+
+Most production systems use multiple databases, each for what it does best:
+
+- **PostgreSQL** for the core transactional data (users, orders, billing).
+- **Redis** for caching, sessions, rate limiting, and real-time features.
+- **Elasticsearch** (or MongoDB with Atlas Search) for full-text search.
+- **DynamoDB** for high-throughput, low-latency specific access patterns (API keys, feature flags).
+- **S3** for blob storage (images, files, backups).
+
+The cost of polyglot persistence is operational complexity -- each database has its own failure modes, backup procedures, monitoring, and expertise requirements. The benefit is that each workload runs on the engine optimized for it. The rule of thumb: start with one database (PostgreSQL is the safest default), and add specialized databases only when a measured limitation of the primary database cannot be solved by tuning or restructuring.
+
+<Tip>
+**Cross-chapter connection:** Polyglot persistence connects to the CQRS pattern discussed in [Design Patterns and Architecture](/resources/interview-questions/think-like-an-engineer/design-patterns). In a CQRS architecture, the write side might use PostgreSQL for transactional integrity, while the read side uses Elasticsearch for flexible search or DynamoDB for low-latency reads. The event bus between them keeps the read models in sync with the source of truth.
+</Tip>
+
+## Migration Strategies
+
+Migrating between databases is one of the highest-risk operations in production engineering. The general approach:
+
+1. **Dual-write phase:** Write to both old and new databases. Read from old. Verify data consistency between them.
+2. **Shadow read phase:** Read from both databases. Return old database results to users. Compare results in the background and log discrepancies.
+3. **Cutover:** Switch reads to the new database. Keep the old database running as a fallback.
+4. **Cleanup:** After a soak period (weeks, not days), decommission the old database.
+
+<Warning>
+**Never do a "big bang" migration.** The company that turns off MySQL on Friday and turns on MongoDB on Monday is the company that has a very bad Monday. Incremental migration with dual-writes and shadow reads is slower but dramatically safer. Stripe famously took over a year to migrate a core table between databases, with zero downtime and zero data loss.
+</Warning>
+
+---
+
+# Interview Questions
+
+<AccordionGroup>
+<Accordion title="Your PostgreSQL table has 500M rows and VACUUM is taking too long. What do you do?">
+**What they are really testing:** Do you understand PostgreSQL's MVCC internals and have operational experience with large tables?
+
+**Strong answer:**
+
+First, I would diagnose *why* VACUUM is slow. Check `pg_stat_user_tables` for `n_dead_tup` and `last_autovacuum`. If dead tuples are in the hundreds of millions, autovacuum fell behind.
+
+**Immediate actions:**
+1. **Tune autovacuum for this specific table.** Reduce `autovacuum_vacuum_scale_factor` to 0.01 (trigger at 1% dead tuples instead of 20%) and increase `autovacuum_vacuum_cost_limit` to let autovacuum work faster.
+2. **Increase `maintenance_work_mem`** for the VACUUM session (e.g., `SET maintenance_work_mem = '2GB'`). VACUUM uses this to store dead tuple IDs -- if it cannot fit them all, it makes multiple passes over the table.
+3. **Check for long-running transactions.** Any open transaction prevents VACUUM from cleaning up tuples created after that transaction started. A forgotten idle transaction from 3 days ago can block all vacuuming. Check `pg_stat_activity` for old transactions and terminate them.
+4. **Run VACUUM manually with `VERBOSE`** to see progress and identify where it is spending time.
+
+**Long-term fix:** Partition the table. If this is time-series data, partition by month or week. VACUUM runs per-partition, so a 500M-row table becomes 12 partitions of ~42M rows each. Dropping old partitions is instant (`DROP TABLE`) instead of DELETEing and VACUUMing millions of rows. Also consider `pg_repack` if the table is heavily bloated -- it performs an online table rewrite without the exclusive lock that `VACUUM FULL` requires.
+
+**Words that impress:** dead tuples, xmin/xmax visibility, autovacuum scale factor, cost-based vacuum delay, maintenance_work_mem, transaction ID wraparound, pg_repack.
+</Accordion>
+
+<Accordion title="Design a DynamoDB table for a social media app with users, posts, and comments.">
+**What they are really testing:** Can you think in access patterns rather than entities? Do you understand single-table design?
+
+**Strong answer:**
+
+Start by listing access patterns:
+1. Get user profile by user ID
+2. Get all posts by a user (most recent first)
+3. Get a specific post
+4. Get all comments on a post (most recent first)
+5. Get a user's feed (posts from users they follow)
+6. Get all followers of a user
+
+**Single-table design:**
+
+| PK | SK | GSI1-PK | GSI1-SK | Type |
+|---|---|---|---|---|
+| `USER#jane` | `PROFILE` | -- | -- | User profile |
+| `USER#jane` | `POST#2024-04-09T10:00:00#uuid` | `POST#uuid` | `POST` | Post by Jane |
+| `POST#uuid` | `COMMENT#2024-04-09T10:05:00#uuid2` | `USER#bob` | `COMMENT` | Comment by Bob on post |
+| `USER#jane` | `FOLLOWS#bob` | `USER#bob` | `FOLLOWER#jane` | Jane follows Bob |
+
+**Access patterns mapped:**
+- User profile: `GetItem(PK=USER#jane, SK=PROFILE)`
+- User's posts: `Query(PK=USER#jane, SK begins_with POST#)` -- sorted by timestamp in SK
+- Post comments: `Query(PK=POST#uuid, SK begins_with COMMENT#)` -- sorted by time
+- Bob's followers: `Query(GSI1-PK=USER#bob, GSI1-SK begins_with FOLLOWER#)`
+
+**The feed problem:** The feed (posts from followed users) is the hardest access pattern. Two approaches: (1) Fan-out on write -- when Jane posts, write the post ID to each follower's feed (a separate item type). Fast reads, expensive writes for popular users. (2) Fan-out on read -- at read time, query each followed user's recent posts and merge. Simpler writes, potentially slow reads. A hybrid approach (fan-out on write for users with <10K followers, fan-out on read for celebrities) is what Twitter and Instagram use.
+
+**Key design decisions I would explain:** Sort keys include timestamps for natural ordering. UUIDs are appended to timestamps to guarantee uniqueness. GSI1 enables the inverse query (given a post, find the user; given a user, find followers). The feed strategy depends on the ratio of followers to follow frequency.
+</Accordion>
+
+<Accordion title="Redis is running out of memory. Walk me through your investigation.">
+**What they are really testing:** Systematic debugging methodology, understanding of Redis memory internals.
+
+**Strong answer:**
+
+**Step 1: Understand the current state.**
+- `INFO memory` -- check `used_memory`, `used_memory_rss` (actual OS allocation, which includes fragmentation), `mem_fragmentation_ratio`. If fragmentation ratio is > 1.5, Redis is wasting significant memory on fragmentation. If `used_memory` is close to `maxmemory`, eviction is being triggered.
+- `INFO keyspace` -- how many keys in each database? Is the key count growing unexpectedly?
+
+**Step 2: Find what is consuming memory.**
+- `MEMORY USAGE <key>` on suspected large keys.
+- `redis-cli --bigkeys` -- scans the keyspace and reports the largest keys of each type. This often reveals a single Sorted Set or Hash that has grown to several GB.
+- For a deeper analysis: `redis-cli --memkeys` or use Redis's `MEMORY DOCTOR` command.
+
+**Step 3: Common culprits and fixes.**
+- **Missing TTLs:** Keys that should expire but never do. Use `OBJECT IDLETIME <key>` to find keys that have not been accessed in weeks but have no TTL. Set TTLs aggressively.
+- **Unbounded data structures:** A List or Sorted Set that grows without limit (e.g., appending every event without trimming). Fix with `LTRIM` (keep last N elements) or `ZREMRANGEBYSCORE` (remove entries older than X).
+- **Serialization bloat:** Large JSON strings stored as Redis Strings. Compress at the application level or switch to Redis Hashes for structured data (hashes use ziplist encoding for small objects, which is much more memory-efficient).
+- **Key fragmentation:** Many small keys with verbose names. Shorten key names or group related data into Hashes.
+
+**Step 4: If the data legitimately needs more memory.**
+- Scale vertically (larger instance).
+- Implement Redis Cluster to shard across multiple nodes.
+- Move cold or less latency-sensitive data to disk-based storage and keep only hot data in Redis.
+
+**The meta-point:** I would approach this the same way I approach any resource exhaustion issue -- measure first, identify the largest consumers, then decide whether to reduce consumption or increase capacity.
+</Accordion>
+
+<Accordion title="When would you choose MongoDB over PostgreSQL?">
+**What they are really testing:** Nuanced understanding of database trade-offs, not tribal loyalty.
+
+**Strong answer:**
+
+I would choose MongoDB over PostgreSQL in specific scenarios:
+
+1. **Highly variable schema with rapid iteration.** If I am building a product where the data model changes weekly -- different content types with different fields, A/B testing different data structures -- MongoDB's flexible schema means I can iterate without migration scripts. PostgreSQL's JSONB can handle this too, but MongoDB's query language is designed for it.
+
+2. **Hierarchical document data.** If my primary entity is a deeply nested document (a product catalog with variants, each variant with options, each option with regional pricing), MongoDB stores and retrieves this as a single document read. PostgreSQL would require multiple JOINs or JSONB with less ergonomic querying.
+
+3. **Horizontal scaling as a primary requirement.** If I know from day one that I need to shard across many nodes (multi-region, multi-tenant at massive scale), MongoDB's native sharding is more mature than PostgreSQL's horizontal scaling options (which require Citus or application-level sharding).
+
+4. **When the team has deep MongoDB expertise** and the use case does not require multi-document transactions, complex JOINs, or strong schema enforcement.
+
+**When I would NOT choose MongoDB:**
+- When I need complex transactions across multiple entities (financial systems).
+- When ad-hoc analytical queries with JOINs are a core requirement.
+- When data integrity constraints (foreign keys, check constraints, unique constraints across related entities) are critical.
+- When the team does not have MongoDB experience -- PostgreSQL is a safer default because it handles a wider range of use cases well.
+
+**The honest take:** PostgreSQL is my default choice for most applications. MongoDB is a specialist tool that excels in its niche. The worst outcome is choosing MongoDB because "NoSQL scales better" (it does not, inherently) and then fighting against the document model for every relational query you need.
+</Accordion>
+
+<Accordion title="Explain the difference between a hot partition and a hot key in DynamoDB. How do you diagnose and fix each?">
+**What they are really testing:** Depth of DynamoDB operational experience.
+
+**Strong answer:**
+
+A **hot partition** occurs when a disproportionate amount of traffic targets items that share the same partition key prefix and therefore land on the same physical partition. Example: sharding by date (`PK=2024-04-09`) means today's partition receives all writes while yesterday's is idle.
+
+A **hot key** is a single item that receives an extreme volume of reads or writes. Example: a configuration item (`PK=CONFIG, SK=FEATURE_FLAGS`) that every Lambda invocation reads on startup.
+
+**Diagnosis:**
+- CloudWatch `ConsumedReadCapacityUnits` and `ConsumedWriteCapacityUnits` metrics -- look for uneven distribution across partitions.
+- Enable DynamoDB Contributor Insights -- it shows the most accessed partition keys and sort keys.
+- `ThrottlingEvents` metric increasing while the table's overall consumed capacity is well below provisioned capacity is the classic hot partition signal.
+
+**Fixes for hot partitions:** Redesign the partition key for higher cardinality. Use write sharding (append random suffixes). Use composite keys that distribute more evenly.
+
+**Fixes for hot keys:** Use DAX (caching layer) for read-hot keys. For write-hot keys, implement application-level write sharding (scatter writes across multiple items, aggregate on read). DynamoDB's adaptive capacity can automatically isolate hot items onto dedicated partitions, but this is reactive and has limits.
+</Accordion>
+
+<Accordion title="You run EXPLAIN ANALYZE on a PostgreSQL query and see a Nested Loop with loops=50000 and each iteration doing an Index Scan. The query takes 30 seconds. What is happening and how do you fix it?">
+**What they are really testing:** Can you read a query plan and reason about join strategies?
+
+**Strong answer:**
+
+The Nested Loop join is executing the inner Index Scan 50,000 times -- once for each row in the outer relation. Each Index Scan might take 0.5 ms (reasonable for a single lookup), but 50,000 * 0.5 ms = 25 seconds. This is the classic "N+1 at the database level."
+
+**Why the planner chose this:** The planner estimated the outer relation would return a small number of rows (perhaps 100), making a Nested Loop with 100 index lookups efficient. But the actual row count is 50,000 -- a bad estimate, likely due to stale statistics or a correlation the planner does not model well.
+
+**Fixes in order of preference:**
+1. **Run `ANALYZE`** on both tables to update statistics. Rerun the query -- the planner might switch to a Hash Join or Merge Join with accurate estimates.
+2. **Check for a missing index** on the join column of the inner table. If the inner Index Scan is on a poorly selective index, adding a better one helps.
+3. **Increase `work_mem`** for this query (`SET work_mem = '256MB'`). Hash Joins need memory to build the hash table -- if `work_mem` is too small, the planner avoids them. With more memory, the planner might choose a Hash Join (build a hash table from the smaller table, probe it once for each row of the larger table -- O(N+M) instead of O(N*M)).
+4. **Force a different join strategy** as a last resort: `SET enable_nestloop = off` and rerun to see if a Hash Join or Merge Join is faster. This is a diagnostic tool, not a production fix -- the real fix is making the planner's estimates accurate.
+
+**The key insight in an interview:** Always multiply the inner node's time by the loop count. An inner operation that looks fast (0.5 ms) becomes devastating when multiplied by 50,000.
+</Accordion>
+
+<Accordion title="Your MongoDB aggregation pipeline is slow. How do you optimize it?">
+**What they are really testing:** Understanding of MongoDB's aggregation framework internals and optimization strategies.
+
+**Strong answer:**
+
+**Step 1: Use `.explain('executionStats')`** to see the query plan and understand which stages are slow.
+
+**Step 2: Apply optimizations:**
+1. **Move `$match` to the beginning.** `$match` (and `$sort` on indexed fields) at the start of the pipeline can use indexes. After a `$group` or `$project`, no indexes are available.
+2. **Add `$limit` early** if you only need a subset of results. `$match -> $sort -> $limit -> $group` processes far fewer documents than `$match -> $group -> $sort -> $limit`.
+3. **Check `$lookup` performance.** If you are doing a `$lookup` on a large collection, ensure the joined collection has an index on the `foreignField`. Without it, every lookup does a collection scan.
+4. **Avoid `$unwind` on large arrays** before `$group` if you can use array operators (`$sum`, `$avg` on array fields) instead. `$unwind` explodes document count.
+5. **Use `allowDiskUse: true`** if the pipeline exceeds 100 MB of RAM (the default limit for in-memory aggregation). But also investigate why it needs that much memory -- it may indicate the pipeline is processing too many documents.
+6. **Consider a materialized view** for aggregations that run frequently on the same data. Pre-compute the result and store it, refreshing periodically.
+
+**Step 3: If `$lookup` is the bottleneck**, consider whether the data model should be restructured. A slow `$lookup` in a hot path often means the data should be denormalized (embedded in the parent document) rather than joined at query time.
+</Accordion>
+
+<Accordion title="How does Redis Cluster handle a situation where you need to run a transaction across keys that are on different nodes?">
+**What they are really testing:** Understanding of distributed systems constraints in Redis Cluster.
+
+**Strong answer:**
+
+Redis Cluster does NOT support cross-slot transactions. If keys are on different hash slots (and therefore potentially on different nodes), `MULTI/EXEC` and Lua scripts will fail because Redis cannot guarantee atomicity across nodes.
+
+**Solutions:**
+
+1. **Hash tags (preferred).** Force related keys to the same slot using `{tag}` in the key name. `{order:123}:items` and `{order:123}:total` both hash on `order:123` and land on the same slot. Design your key naming convention so that keys that need transactional access share a hash tag.
+
+2. **Application-level coordination.** If the keys genuinely belong on different nodes, handle the "transaction" in application code with idempotent operations and compensating actions (saga pattern). This is complex and should be avoided if possible.
+
+3. **Reconsider the architecture.** If you frequently need transactions across unrelated keys, Redis Cluster might not be the right tool. Consider whether the operation can be redesigned as independent operations, or whether a database with distributed transactions (PostgreSQL, CockroachDB) should handle this part of the workload.
+
+**The senior insight:** The constraint is not a Redis bug -- it is a fundamental distributed systems trade-off. Distributed transactions across nodes require coordination (2PC or similar), which kills the sub-millisecond latency that makes Redis valuable. Redis Cluster chose performance over distributed transactions. Understanding *why* the limitation exists matters more than knowing a workaround.
+</Accordion>
+
+<Accordion title="You notice that your DynamoDB table's consumed write capacity is only 20% of provisioned, but you are still seeing throttling. What is happening?">
+**What they are really testing:** Understanding of DynamoDB's partition-level throughput allocation.
+
+**Strong answer:**
+
+This is the classic hot partition problem. DynamoDB distributes provisioned throughput evenly across partitions. If you have 10,000 WCU provisioned and the table has 10 partitions, each partition gets approximately 1,000 WCU. If one partition receives 2,000 WCU of traffic (because the partition key is uneven), that partition throttles -- even though the table overall is at 20% utilization.
+
+**Diagnosis:** Enable DynamoDB Contributor Insights to see which partition keys are getting the most traffic. Check the `ThrottledRequests` CloudWatch metric grouped by operation type.
+
+**Fixes:**
+1. **Short-term:** Switch to on-demand capacity mode, which handles this better (DynamoDB automatically allocates capacity per-partition based on actual traffic).
+2. **Medium-term:** DynamoDB's adaptive capacity feature (enabled by default) can redistribute unused capacity from cold partitions to hot ones, but it has limits and is not instantaneous.
+3. **Long-term:** Redesign the partition key. This is the real fix. If you are writing to `PK=STATUS#pending` and most orders are pending, that partition is always hot. Change to `PK=USER#<userId>` so writes distribute across users.
+
+**Words that signal depth:** partition-level throughput, adaptive capacity, burst capacity (5-minute rolling window of unused capacity), Contributor Insights, hot partition isolation.
+</Accordion>
+
+<Accordion title="Compare PostgreSQL's JSONB with MongoDB for storing semi-structured data. When would you use each?">
+**What they are really testing:** Whether you understand both tools deeply enough to make a nuanced comparison, rather than defaulting to tribal preferences.
+
+**Strong answer:**
+
+**PostgreSQL JSONB advantages:**
+- ACID transactions that span both relational and JSONB columns. You can JOIN a JSONB column with a relational table in a single transactional query.
+- GIN indexes on JSONB paths for fast queries (`CREATE INDEX ON products USING GIN (attributes jsonb_path_ops)`).
+- No separate database to operate. If your primary data is already in PostgreSQL, adding JSONB columns avoids the operational cost of a second database.
+
+**MongoDB advantages:**
+- First-class document query language. Querying nested documents and arrays in MongoDB is more ergonomic than PostgreSQL's `->`, `->>`, and `@>` operators.
+- Native horizontal sharding. If you need to scale semi-structured data across many nodes, MongoDB's sharding is more mature.
+- Better developer experience for document-centric workloads. The MongoDB shell, Compass, and aggregation pipeline are purpose-built for working with documents.
+
+**Decision rule:** If you already run PostgreSQL and the semi-structured data is a feature of a larger relational model (like product attributes in an e-commerce system with relational orders and users), use JSONB. If the *entire application* is document-centric and you need horizontal sharding, MongoDB is purpose-built for that. The worst choice is adding MongoDB alongside PostgreSQL just for JSONB-like functionality -- that is two databases to operate for a marginal developer experience improvement.
+</Accordion>
+
+<Accordion title="Your team is building a rate limiter. Compare implementing it in Redis vs DynamoDB. Which would you choose and why?">
+**What they are really testing:** Practical understanding of both tools' strengths and the ability to reason about trade-offs.
+
+**Strong answer:**
+
+**Redis implementation:**
+- Use a Sorted Set with timestamp scores. `ZADD rate:user:123 <timestamp> <request_id>`, `ZREMRANGEBYSCORE` to remove old entries, `ZCARD` to count.
+- Or use Lua scripting for an atomic sliding window counter (INCR + EXPIRE in a single atomic operation).
+- Latency: <1 ms. Perfect for inline rate limiting in the request path.
+- Risk: if Redis goes down, rate limiting stops. Need Sentinel or Cluster for HA.
+
+**DynamoDB implementation:**
+- Use a table with `PK=user_id, SK=timestamp`. TTL automatically removes old entries. Count items with a `Query` to check the rate.
+- Latency: 5-10 ms. Still fast, but 10x slower than Redis.
+- Advantage: fully managed, no operational burden, survives without additional HA setup.
+
+**My recommendation:** Redis, almost always. Rate limiting is latency-sensitive (it runs in the hot path of every request). The 1 ms vs 5-10 ms difference matters when you are adding it to every API call. Redis's atomic operations (INCR, Lua scripts) make the implementation simpler and race-condition-free. DynamoDB is a reasonable fallback if you already have it in your stack and do not want to operate Redis, or if your rate limits are generous enough (per-minute, not per-second) that the extra latency does not matter.
+
+**The nuance a senior would add:** For a distributed rate limiter across multiple regions, DynamoDB Global Tables give you a globally consistent view with less effort than setting up Redis Cluster across regions. It depends on whether the rate limit needs to be enforced globally or per-region.
+</Accordion>
+
+<Accordion title="Explain what happens internally when you run an UPDATE on a row in PostgreSQL. Trace the full lifecycle from client to disk.">
+**What they are really testing:** Deep understanding of PostgreSQL's write path, MVCC, and WAL.
+
+**Strong answer:**
+
+1. **Client sends `UPDATE users SET name = 'Jane' WHERE id = 42`** to the PostgreSQL backend process over the connection.
+2. **Parser** converts the SQL text into a parse tree. **Rewriter** applies any rules (updatable views, etc.). **Planner** generates an execution plan (likely an Index Scan on the primary key to find row 42).
+3. **Executor** locates the target row. PostgreSQL does NOT update the row in place. Instead, it:
+   - Marks the old row version as "dead" by setting its `xmax` to the current transaction ID.
+   - Inserts a **new row version** at a new location on the heap with the updated values. The new version's `xmin` is set to the current transaction ID.
+4. **Index entries** that point to the old row must also be updated. If the new row version is on the same page and it is a HOT (Heap-Only Tuple) update, the index does not need updating (a pointer chain in the heap connects old to new). If it is on a different page, new index entries are created.
+5. **WAL record** describing both the old row's xmax change and the new row's insertion is written to the WAL buffer.
+6. **On COMMIT:** The WAL buffer is flushed to disk (`fsync` to `pg_wal/`). This is the durability guarantee. The actual heap pages are NOT flushed yet -- they remain "dirty" in the shared buffer pool.
+7. **Background writer and checkpointer** eventually flush dirty pages from the buffer pool to the data files on disk.
+8. **VACUUM** (later) will reclaim the space occupied by the dead row version, once no active transaction can see it.
+
+This is why PostgreSQL UPDATEs are actually "INSERT new version + mark old version dead" -- a direct consequence of MVCC. It is also why update-heavy workloads create table bloat without aggressive vacuuming.
+</Accordion>
+</AccordionGroup>
+
+---
+
+# Curated Resources
+
+<Note>
+**PostgreSQL:**
+- [PostgreSQL Official Documentation — Internals Chapter](https://www.postgresql.org/docs/current/internals.html) — the authoritative source for understanding MVCC, WAL, query planning, and the executor. Dense but unmatched in accuracy.
+- [The Internals of PostgreSQL by Hironobu Suzuki](https://www.interdb.jp/pg/) — a free, deeply visual guide to PostgreSQL internals covering buffer management, WAL, VACUUM, query processing, and replication. The best free resource for learning PostgreSQL internals.
+- [pganalyze Blog](https://pganalyze.com/blog) — production-focused articles on EXPLAIN ANALYZE, index tuning, connection management, and pg_stat_statements. Practical, not academic.
+- [Crunchy Data Blog](https://www.crunchydata.com/blog) — excellent PostgreSQL operational guides covering partitioning, extensions, and real-world tuning scenarios.
+
+**MongoDB:**
+- [MongoDB University](https://university.mongodb.com/) — free courses covering schema design, aggregation, sharding, and operations. The M320 Data Modeling course is particularly valuable.
+- [MongoDB Schema Design Patterns](https://www.mongodb.com/blog/post/building-with-patterns-a-summary) — the official summary of the Bucket, Computed, Extended Reference, Outlier, Subset, and other patterns. Bookmark this.
+- [MongoDB Developer Center](https://www.mongodb.com/developer/) — practical guides, code examples, and architecture patterns from MongoDB's developer advocacy team.
+
+**DynamoDB:**
+- [The DynamoDB Book by Alex DeBrie](https://www.dynamodbbook.com/) — the definitive guide to DynamoDB data modeling. If you are serious about DynamoDB, this is required reading. It covers single-table design, GSI patterns, and real-world modeling examples in depth.
+- [AWS DynamoDB Developer Guide](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/) — official documentation covering every feature, capacity mode, and best practice. Start with the "Best Practices" section.
+- [Rick Houlihan's DynamoDB Deep Dive (AWS re:Invent)](https://www.youtube.com/watch?v=6yqfmXiZTlM) — the legendary re:Invent talk that popularized single-table design. Dense, opinionated, and essential viewing.
+
+**Redis:**
+- [Redis University](https://university.redis.com/) — free courses covering data structures, persistence, clustering, and Lua scripting.
+- [Redis Documentation](https://redis.io/docs/) — comprehensive coverage of every command, data structure, and configuration option. The "Data types" section is the best starting point.
+- [Martin Kleppmann's Analysis of Redlock](https://martin.kleppmann.com/2016/02/08/how-to-do-distributed-locking.html) — the critical analysis of Redis's distributed lock algorithm. Essential reading for anyone implementing distributed locks with Redis, regardless of whether you agree with Kleppmann's conclusions.
+- [Antirez's Response to Kleppmann](http://antirez.com/news/101) — Salvatore Sanfilippo's (Redis creator) rebuttal. Read both sides to form your own opinion.
+
+**Cross-Database:**
+- [Designing Data-Intensive Applications by Martin Kleppmann](https://dataintensive.net/) — the single best book on databases, distributed systems, and data infrastructure. Covers replication, partitioning, consistency, encoding, batch/stream processing with depth that no other single resource matches. If you read one book on this list, make it this one.
+</Note>
+
+<Tip>
+**Cross-chapter connections:**
+- For caching patterns with Redis, see [Caching and Observability](/resources/interview-questions/think-like-an-engineer/caching-observability).
+- For database replication, backup strategies, and isolation levels, see [APIs and Databases — Part IX](/resources/interview-questions/think-like-an-engineer/apis-databases).
+- For scaling strategies, sharding, and performance optimization, see [Performance and Scalability](/resources/interview-questions/think-like-an-engineer/performance-scalability).
+- For event-driven architectures using DynamoDB Streams, Change Streams, or Redis Streams, see [Messaging, Concurrency, and State](/resources/interview-questions/think-like-an-engineer/messaging-concurrency-state).
+- For CQRS and event sourcing patterns with polyglot persistence, see [Design Patterns and Architecture](/resources/interview-questions/think-like-an-engineer/design-patterns).
+</Tip>
