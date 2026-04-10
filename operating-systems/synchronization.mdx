@@ -278,4 +278,95 @@ assert(data == 42); // Safe after the barrier
 -   **Memory Barriers** are what actually make synchronization work across multiple CPU cores. If you write lock-free code without understanding barriers, it will work on x86 and break on ARM.
 -   **Know the hierarchy**: mutex (simple, correct) -> rwlock (read parallelism) -> RCU (zero-cost reads) -> lock-free CAS (maximum control, maximum risk). Move down this list only when profiling proves you need to.
 
+---
+
+## Interview Deep-Dive
+
+<AccordionGroup>
+  <Accordion title="Explain RCU to me as if I am a senior engineer who has never worked with the Linux kernel. When would I reach for RCU instead of a reader-writer lock, and what is the catch?">
+    **Strong Answer:**
+
+    RCU (Read-Copy-Update) is the kernel's answer to the read-mostly data structure problem. Think of it this way: you have a routing table read by every packet (millions of times per second) and updated maybe once every few minutes. A reader-writer lock requires every reader to perform an atomic increment on a shared counter. On a 64-core machine, those atomic increments cause cache-line bouncing that adds 100+ nanoseconds per read.
+
+    RCU eliminates reader overhead entirely:
+    - **Readers**: Enter a critical section with `rcu_read_lock()`, which simply disables preemption (a thread-local operation, zero shared state). Read the data. Exit with `rcu_read_unlock()`. No atomic instructions, no cache-line bouncing. Cost: effectively zero.
+    - **Writers**: Do not modify in place. Instead: (1) copy the data structure, (2) modify the copy, (3) atomically swap the pointer from old to new via `rcu_assign_pointer()`, (4) wait for a "grace period" before freeing the old copy.
+    - **Grace period**: The writer calls `synchronize_rcu()`, which blocks until every CPU that might have been in an RCU read-side critical section has exited. The kernel detects this by watching for context switches and idle periods on each CPU ("quiescent states").
+
+    When to use RCU over rwlock: read-to-write ratio of 100:1 or higher, zero reader overhead required, updates infrequent and can tolerate grace period delay.
+
+    The catch: writer latency (grace period can be milliseconds), memory overhead (old and new versions coexist during grace period), and complexity (must use `rcu_dereference()` for reads and `rcu_assign_pointer()` for publishes to get correct memory barriers, especially on weakly-ordered architectures like ARM).
+
+    **Follow-up: How does RCU handle readers that get preempted in the middle of an RCU critical section?**
+
+    In non-preemptible kernels, `rcu_read_lock()` disables preemption, so this cannot happen. In preemptible kernels (PREEMPT_RT), "preemptible RCU" tracks preempted readers explicitly on per-CPU blocked-tasks lists. The grace period does not end until all such tasks exit their critical sections. This adds complexity but allows RCU to work correctly in fully preemptible kernels.
+  </Accordion>
+
+  <Accordion title="What is the ABA problem in lock-free programming? Give a concrete example and explain how epoch-based reclamation solves it.">
+    **Strong Answer:**
+
+    The ABA problem is the Achilles' heel of CAS-based lock-free algorithms. CAS checks "is the value still what I expect?" but cannot detect if the value was changed to something else and changed back.
+
+    Concrete example with a lock-free stack:
+    1. Thread T1 reads `top = A` (stack: `A -> B -> C`). It prepares to pop A by doing `CAS(top, A, B)`.
+    2. T1 is preempted before the CAS.
+    3. Thread T2 pops A, pops B, pushes A back. Stack: `A -> C`. B has been freed.
+    4. T1 resumes. `CAS(top, A, B)` succeeds because top is still A. But B is freed memory. The stack now points to freed memory -- use-after-free.
+
+    Epoch-based reclamation solves this by deferring memory reclamation:
+    - The system maintains a global epoch counter (0, 1, 2, cycling).
+    - Each thread records which epoch it entered when starting an operation.
+    - When a thread removes a node, it places it on a "retired" list tagged with the current epoch instead of freeing immediately.
+    - The system periodically checks: are all active threads in the current epoch or later? If so, the previous epoch's retired nodes can be safely freed.
+    - Key guarantee: while T1 holds its epoch registration, A cannot be freed. T2 retires A to the list, but freeing is deferred until T1 advances its epoch.
+
+    This is essentially user-space RCU. The Crossbeam library in Rust implements this pattern.
+
+    **Follow-up: What are hazard pointers and when would you prefer them over epoch-based reclamation?**
+
+    Hazard pointers bound unreclaimed memory to O(threads * pointers_per_thread) by having each thread publish addresses it is currently accessing. Before freeing, the reclaimer scans all hazard pointer lists. If the address appears, freeing is deferred. The advantage: bounded memory overhead even if one thread stalls. The disadvantage: scanning all hazard pointers on every free is expensive. Use hazard pointers for memory-constrained environments; use epoch-based for simpler code when temporary memory bloat is acceptable.
+  </Accordion>
+
+  <Accordion title="You have 64 cores incrementing a shared counter. The mutex-based approach is a bottleneck. Walk through progressively better solutions.">
+    **Strong Answer:**
+
+    Each solution trades accuracy or complexity for throughput:
+
+    **Level 1: Mutex (current approach)**
+    Every increment acquires a lock, increments, releases. On 64 cores, this serializes all operations. Throughput: ~10-20M increments/sec (limited by lock acquisition at ~50-100ns due to cache-line bouncing).
+
+    **Level 2: Atomic increment**
+    Replace the mutex with `__atomic_fetch_add(&counter, 1, __ATOMIC_RELAXED)`. Uses hardware `LOCK XADD`. No lock, but the cache line still bounces across 64 L1 caches via the MESI protocol. Throughput: ~50-100M increments/sec. Better, but still limited by coherence traffic.
+
+    **Level 3: Per-CPU counters**
+    Each CPU has its own counter on its own cache line (padded to 64 bytes to avoid false sharing). Threads increment their local counter -- no contention. Reading the global total requires summing all per-CPU counters. Throughput for increments: billions per second (thread-local store, no inter-core communication). Trade-off: global read is expensive and slightly stale.
+
+    ```c
+    struct padded_counter {
+        long value;
+        char padding[56];
+    } __attribute__((aligned(64)));
+    struct padded_counter per_cpu[MAX_CPUS];
+
+    void increment() { per_cpu[sched_getcpu()].value++; }
+    long read_total() {
+        long sum = 0;
+        for (int i = 0; i < num_cpus; i++) sum += per_cpu[i].value;
+        return sum;
+    }
+    ```
+
+    **Level 4: Approximate counting**
+    If exact counts are not needed (rate limiting, statistics), increment a thread-local counter and only propagate to a shared counter every N increments. Reduces shared-state updates by factor N.
+
+    The meta-lesson: scalability on multi-core requires eliminating shared mutable state. Every shared cache line is a serialization point.
+
+    **Follow-up: What is false sharing and how do you detect it?**
+
+    False sharing: two unrelated variables share the same 64-byte cache line. One core writes variable A, another writes variable B -- the hardware invalidates the entire cache line on both cores, causing ping-pong despite no logical contention. Detection: `perf c2c` on Linux reports cache lines with high contention and identifies source addresses. Fix: pad structures to 64-byte alignment.
+  </Accordion>
+</AccordionGroup>
+
+---
+
 Next: [File Systems & VFS](/operating-systems/file-systems) →

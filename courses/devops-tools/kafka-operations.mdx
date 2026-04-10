@@ -439,6 +439,52 @@ max.partition.fetch.bytes=1048576  # 1MB per partition per fetch. Increase for
 
 ---
 
+## Interview Deep-Dive
+
+<AccordionGroup>
+  <Accordion title="Your Kafka cluster's disk usage is growing faster than expected. You have 7 days of retention configured but disk is filling up in 3 days. Walk me through how you diagnose and resolve this." icon="circle-question">
+    **Strong Answer:**
+    - First, I identify which topics are consuming the most disk. I check per-topic sizes with `kafka-log-dirs.sh --describe --bootstrap-server localhost:9092`. This shows the size of each topic-partition across brokers. Often, one or two topics dominate disk usage (e.g., a high-volume logging topic or a topic with large message payloads).
+    - Second, I check if retention is working correctly. I verify the topic-level configuration: `kafka-configs.sh --describe --topic big-topic --bootstrap-server localhost:9092`. If `retention.ms` and `retention.bytes` are set at the topic level, they override broker defaults. I also check `cleanup.policy` -- if it is set to `compact` instead of `delete`, old segments are not deleted by time, they are compacted by key.
+    - Third, I check segment configuration. The active segment is never deleted by retention policy. If `segment.bytes` is set to 1GB (default) and a partition receives only 100MB/day, a segment takes 10 days to fill and roll. Until it rolls, it is immune to retention cleanup. The fix is to reduce `segment.ms` (e.g., to 1 hour) so segments roll by time even if they have not reached the size limit.
+    - Fourth, I check for partition imbalance. If some brokers have more partitions than others, disk usage is uneven. Kafka does not auto-rebalance partitions when new brokers are added. I use `kafka-reassign-partitions.sh` or Cruise Control to rebalance.
+    - Immediate fixes: reduce retention for the largest topics (if the business allows it), enable compression at the producer level (`compression.type=lz4` or `zstd` can reduce disk usage 50-80%), and add disk capacity if needed.
+
+    **Follow-up: The team wants to keep 30 days of retention for compliance, but disk costs are too high. What options do you have?**
+
+    Three options. First, tiered storage (Kafka 3.6+): automatically moves older segments to cheap object storage (S3, GCS) while keeping recent data on local disk. Consumers transparently read from either tier. This is the modern answer for long retention periods. Second, compression: if producers are not already compressing, switching to `zstd` can reduce storage by 60-80% for JSON/text payloads. Third, move cold data to a separate Kafka cluster with cheaper storage (larger, slower disks) using MirrorMaker 2, and set a shorter retention on the primary cluster. The compliance team reads from the archive cluster for audits.
+  </Accordion>
+
+  <Accordion title="You need to perform a zero-downtime upgrade of your Kafka cluster from version 3.3 to 3.6. Describe the exact steps and the risks at each stage." icon="circle-question">
+    **Strong Answer:**
+    - Kafka supports rolling upgrades: you upgrade brokers one at a time while the cluster continues serving traffic. The key constraint is the inter-broker protocol version -- brokers must be able to communicate with each other during the transition.
+    - Step 1: Before touching any broker, set `inter.broker.protocol.version` and `log.message.format.version` to the current version (3.3) in the configuration files. This ensures that even after the binary is upgraded, the broker speaks the old protocol to communicate with not-yet-upgraded brokers.
+    - Step 2: Upgrade brokers one at a time. For each broker: stop it cleanly (`kill -TERM`, not `kill -9`), replace the binary with 3.6, start it with the updated binary but the same old protocol version. Wait for the broker to rejoin the cluster and all its replicas to be in-sync (check under-replicated partitions = 0) before moving to the next broker.
+    - Step 3: Once all brokers are running the 3.6 binary, update `inter.broker.protocol.version` to 3.6 and do another rolling restart. This enables the new protocol features.
+    - Step 4: Upgrade clients. Consumers first (they are more tolerant of broker version changes), then producers. Kafka maintains backward compatibility, so old clients work with new brokers, but new client features require new broker protocol.
+    - Risks: the biggest risk is upgrading too fast -- if you start the next broker before the previous one has fully rejoined and caught up, you temporarily reduce the number of in-sync replicas, which can cause write failures if `min.insync.replicas` is not met. Never skip versions (do not go from 3.0 to 3.6 directly; go 3.0 to 3.3 to 3.6) because protocol changes accumulate.
+
+    **Follow-up: During the rolling upgrade, one broker fails to start on the new version. How do you handle the situation?**
+
+    I check the broker logs for the startup failure (common causes: incompatible configuration, Java version mismatch, corrupt log segments). If the fix is quick (configuration issue), I fix it and restart. If the fix requires investigation, I roll back that single broker to the old version. Since the old protocol version is still configured, the rolled-back broker communicates fine with the already-upgraded brokers. The cluster operates with a mix of versions, which is the supported state during an upgrade. I fix the issue on a test environment, then retry the upgrade for that broker. The key rule: never leave a broker down during an upgrade if you can restart it on the old version. A running broker on the old version is better than a dead broker on the new version.
+  </Accordion>
+
+  <Accordion title="Your team has a 50-broker Kafka cluster with 10,000 partitions. Partition leadership is unevenly distributed -- some brokers lead 500 partitions while others lead 50. How do you rebalance, and what are the risks?" icon="circle-question">
+    **Strong Answer:**
+    - Uneven partition leadership is common and happens organically: when brokers restart, preferred replica election may not run, and new topics may be created when some brokers are temporarily down. This causes hot spots where some brokers are overloaded with leader responsibilities (handling all reads and writes for those partitions) while others are idle.
+    - First, I check if running a preferred leader election fixes the issue: `kafka-leader-election.sh --election-type preferred --all-topic-partitions --bootstrap-server localhost:9092`. Kafka assigns a "preferred replica" for each partition (typically the first broker in the replica list). If a failover occurred and the preferred replica is healthy again, this command restores leadership to it. This is lightweight and usually resolves 80% of imbalance.
+    - If the replica assignment itself is skewed (not just the leadership), I use Cruise Control or `kafka-reassign-partitions.sh` to physically move partition replicas between brokers. Cruise Control is preferred for large clusters because it optimizes for disk, CPU, and network balance simultaneously, and it throttles data movement to avoid impacting production traffic.
+    - Risks of partition reassignment: the broker physically copies data from the current replicas to the new replicas. For a partition with 50GB of data, this is 50GB of network and disk I/O. Moving many partitions simultaneously can saturate the broker's network and disk, causing increased latency for production traffic. I always set a replication throttle (`kafka-reassign-partitions.sh --throttle 50000000` for 50MB/s) and run reassignments during low-traffic periods.
+    - Monitoring during rebalance: watch `UnderReplicatedPartitions` (should be non-zero during data movement but trend toward zero), broker CPU and disk I/O, and consumer lag (should not spike significantly).
+
+    **Follow-up: How does Cruise Control determine the "ideal" partition distribution?**
+
+    Cruise Control builds a model of the cluster based on real-time metrics (CPU usage, disk usage, network throughput, leadership count per broker). It defines "goals" in priority order (e.g., rack awareness first, then disk capacity balance, then CPU balance, then network balance). The optimizer generates a partition reassignment plan that satisfies as many goals as possible, starting from the highest priority. You can customize goals and their priorities. For example, in a multi-AZ deployment, rack awareness (ensuring replicas span AZs) is non-negotiable, while CPU balance is best-effort. Cruise Control can also self-heal: when a broker fails, it can automatically move partitions to restore balance without human intervention.
+  </Accordion>
+</AccordionGroup>
+
+---
+
 **Congratulations!** You have completed the Kafka Crash Course.
 
 Next: [Kubernetes Crash Course →](/courses/devops-tools/kubernetes-overview)

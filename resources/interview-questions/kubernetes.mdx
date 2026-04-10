@@ -70,37 +70,131 @@ graph TD
 
 
 <Accordion title="2. Role of Etcd">
+**What interviewers are really testing:** Do you understand why etcd is the single most critical component in Kubernetes, how Raft consensus works at a high level, and what operational practices keep it alive in production?
+
 **Answer**:
-Distributed KV Store.
-Stores Cluster State (Config, Secrets, Metadata).
-Consistent (Raft Consensus).
-**Critical**: If etcd is lost, cluster is lost. Needs High Availability (3-5 nodes).
+etcd is a distributed, strongly-consistent key-value store that serves as the **single source of truth** for the entire Kubernetes cluster.
+
+*   **What it stores**: Every Kubernetes object -- Pods, Services, Secrets, ConfigMaps, RBAC rules, lease objects for leader election -- is serialized as protobuf and stored in etcd under a key like `/registry/pods/default/my-pod`.
+*   **Consistency model**: Uses the **Raft consensus algorithm**. One node is elected leader; all writes go through the leader and are replicated to a majority (quorum) before being acknowledged. This guarantees linearizable reads (if configured with `--serializable=false`).
+*   **Cluster sizing**: Always run an **odd number** of nodes -- 3 (tolerates 1 failure) or 5 (tolerates 2 failures). Running 4 nodes gives no advantage over 3 because quorum for 4 is still 3.
+*   **Performance characteristics**: etcd is sensitive to disk latency. Production recommendation is SSD-backed storage with &lt;10ms fsync latency. On GKE/EKS, the managed control plane handles this, but on self-managed clusters (kubeadm), slow disks are the number-one etcd killer.
+*   **Backup strategy**: `etcdctl snapshot save /backup/etcd-$(date +%Y%m%d).db` run as a CronJob every 1-4 hours. Without this, losing etcd quorum means rebuilding the cluster from scratch.
+
+**Production war story**: A team ran etcd on nodes with spinning disks in a 200-node cluster. During peak load, etcd fsync latency spiked to 200ms, leader elections started flipping every few seconds, and the entire cluster became unresponsive -- kubectl commands timed out, new deployments froze. The fix was migrating etcd to dedicated nodes with NVMe SSDs and setting `--heartbeat-interval=250` and `--election-timeout=2500`.
+
+**Red flag answer:** "etcd is just a database for Kubernetes." This misses the consensus model, the quorum requirement, the operational criticality, and the performance sensitivity that make etcd unique.
+
+**Follow-up:**
+1. **"What happens if 2 out of 3 etcd nodes go down simultaneously?"** -- The cluster loses quorum. etcd becomes read-only (no writes can be committed). The API Server can still serve cached/stale reads but cannot accept any create/update/delete operations. You must restore from snapshot or bring at least one node back to regain quorum.
+2. **"How would you migrate etcd from 3 nodes to 5 nodes without downtime?"** -- Add one node at a time using `etcdctl member add`. Each new node joins as a learner, syncs data, then promotes to full voter. Never add 2 nodes simultaneously because it changes the quorum size mid-operation and can cause split-brain.
+3. **"Why not just use PostgreSQL or MySQL instead of etcd?"** -- Kubernetes needs a distributed consensus store with watch semantics (clients subscribe to changes on keys). etcd provides this natively via gRPC watch streams. Traditional RDBMS would need polling, which does not scale to thousands of controllers watching thousands of resources in real-time.
 </Accordion>
 
 <Accordion title="3. Kube-proxy modes">
+**What interviewers are really testing:** Do you understand how Service networking actually works at the kernel level, and can you reason about when default settings break at scale?
+
 **Answer**:
-*   **IPTables**: Default. Fast. Linux Kernel routing.
-*   **IPVS**: For massive scale (thousands of services). Hash table based.
-*   **Userspace**: Old, slow.
+Kube-proxy runs on every node and programs the kernel to route traffic from a Service's virtual IP (ClusterIP) to the actual Pod endpoints. It operates in one of three modes:
+
+*   **iptables mode** (default since K8s 1.2): Creates iptables rules in the KUBE-SERVICES and KUBE-SVC-* chains. For each Service, there is a chain of rules that DNAT (destination NAT) traffic to one of the backend Pod IPs using probabilistic matching. For example, a Service with 3 Pods gets rules with 33%/50%/100% probability splits. **Pros**: Fast (kernel-space, no userspace hop), simple. **Cons**: O(n) rule evaluation -- with 5,000 Services, iptables has ~25,000+ rules, and rule updates cause full-table rewrites that can take seconds, causing packet drops during updates.
+*   **IPVS mode** (stable since K8s 1.11): Uses Linux IPVS (IP Virtual Server) kernel module. Hash-table based lookups give **O(1) performance** regardless of Service count. Supports multiple load-balancing algorithms: round-robin, least-connections, source-hash, shortest-expected-delay. **When to switch**: When you have &gt;1,000 Services or notice kube-proxy taking &gt;5 seconds to sync iptables rules. Enable with `--proxy-mode=ipvs` on kube-proxy.
+*   **Userspace mode** (legacy, pre-1.2): Traffic goes to kube-proxy process in userspace, then back to kernel. Round-trip through userspace adds 1-3ms latency per packet. No one runs this in production anymore.
+
+**Real-world metric**: At a cluster with 3,000 Services, switching from iptables to IPVS reduced kube-proxy sync time from 12 seconds to under 200ms and eliminated the intermittent connection timeouts users were seeing during Service endpoint updates.
+
+**Red flag answer:** "Kube-proxy is a proxy that forwards traffic." This misses that kube-proxy does not actually proxy traffic in iptables/IPVS mode -- it programs kernel rules and gets out of the data path entirely.
+
+**Follow-up:**
+1. **"If kube-proxy crashes on a node, do existing connections break?"** -- No. The iptables/IPVS rules are already programmed in the kernel. Existing connections continue to work. However, no new rule updates will happen, so new Services or endpoint changes will not be reflected on that node until kube-proxy restarts.
+2. **"How does kube-proxy know which Pods back a Service?"** -- It watches EndpointSlice objects (or legacy Endpoints) from the API Server. When a Pod becomes Ready (passes readiness probe), the Endpoints controller adds it to the EndpointSlice, and kube-proxy picks up the change via its watch stream.
+3. **"What is nftables mode and why does it matter?"** -- Starting in K8s 1.29 (alpha) and graduating in 1.31, nftables mode is the successor to iptables mode. It uses the newer Linux nftables subsystem which has atomic rule updates (no full-table rewrite), better performance than iptables at scale, and a cleaner rule structure. It is expected to eventually replace iptables mode as the default.
 </Accordion>
 
 <Accordion title="4. API Server Role">
+**What interviewers are really testing:** Can you walk through the full request pipeline inside the API Server? Do you understand the difference between authentication, authorization, and admission control -- and why the ordering matters?
+
 **Answer**:
-Authentication -> Authorization -> Admission Control -> Write to Etcd.
-Stateless. Can be scaled horizontally.
+The API Server (kube-apiserver) is the **only** component that reads from and writes to etcd. Every interaction in the cluster -- kubectl, kubelet, controllers, external CI/CD -- goes through it. Here is the full request pipeline:
+
+1.  **Authentication** (Who are you?): Supports multiple methods simultaneously -- x509 client certificates, bearer tokens, OIDC (Google/Azure AD), webhook token review. If all authenticators reject, you get a 401. In production, most teams use OIDC for human users and ServiceAccount tokens for Pods.
+2.  **Authorization** (Are you allowed?): Default is RBAC (Role-Based Access Control). The API Server checks if the authenticated identity has a RoleBinding/ClusterRoleBinding granting the requested verb (`get`, `list`, `create`, `delete`) on the requested resource. Also supports ABAC (legacy), Webhook, and Node authorization.
+3.  **Admission Control** (Should we allow/modify this?): Two phases run sequentially:
+    *   **Mutating admission** (runs first): Can modify the request. Examples: Istio sidecar injector adds an Envoy container, `LimitRanger` sets default resource requests, `ServiceAccount` admission controller mounts SA tokens.
+    *   **Validating admission** (runs second): Can only accept or reject. Examples: OPA Gatekeeper blocks images from untrusted registries, `PodSecurity` admission enforces Pod Security Standards.
+4.  **Persistence**: Object is serialized (protobuf) and written to etcd.
+5.  **Response**: API Server returns the created/updated object to the client, and all watchers (controllers, kubelet) are notified via their watch streams.
+
+**Scaling**: The API Server is **stateless** -- all state is in etcd. You can run 3-5 replicas behind a load balancer (GKE does this by default). The bottleneck is usually etcd, not the API Server itself.
+
+**Key detail most people miss**: The API Server also serves as the **aggregation layer** for extension API servers (like metrics-server, custom CRDs with aggregated API servers). When you run `kubectl top pods`, the request goes to the API Server, which proxies it to the metrics-server.
+
+**Red flag answer:** "The API Server stores data and serves it to kubectl." This misses the entire authentication/authorization/admission pipeline, which is the core of Kubernetes security.
+
+**Follow-up:**
+1. **"If a mutating webhook is down, what happens to all Pod create requests?"** -- By default, if a webhook has `failurePolicy: Fail` (the default), all requests matching its rules will be rejected with a 500 error. This is why webhook availability is critical -- a broken sidecar injector can bring all deployments to a halt. Use `failurePolicy: Ignore` for non-critical webhooks and set `timeoutSeconds` to something low like 5s.
+2. **"Why do mutating webhooks run before validating webhooks?"** -- Because validating webhooks need to see the final form of the object. If validation ran first, it might approve an object that a mutating webhook then changes into something invalid.
+3. **"How would you debug slow API Server responses?"** -- Check API Server audit logs for slow requests, look at etcd latency metrics (`etcd_request_duration_seconds`), check if admission webhooks are slow (webhook latency is additive), and verify watch cache is healthy with `apiserver_cache_list_total` metrics. The `--audit-policy-file` flag lets you log every request for forensic analysis.
 </Accordion>
 
 <Accordion title="5. Scheduler Logic">
+**What interviewers are really testing:** Do you understand the two-phase scheduling algorithm, can you name specific filter/score plugins, and do you know how to influence scheduling decisions for real workloads?
+
 **Answer**:
-1.  **Filtering**: Which nodes meet requirements? (RAM, CPU, Taints).
-2.  **Scoring**: Rank valid nodes (Least load, Image affinity).
-3.  **Binding**: Notify API Server.
+The scheduler watches for Pods with an empty `spec.nodeName` and assigns them to nodes using a plugin-based, two-phase algorithm:
+
+1.  **Filtering (Predicates)** -- Eliminates nodes that cannot run the Pod:
+    *   `NodeResourcesFit`: Does the node have enough allocatable CPU/memory for the Pod's requests?
+    *   `NodeAffinity`: Does the node match `requiredDuringSchedulingIgnoredDuringExecution` rules?
+    *   `TaintToleration`: Does the Pod tolerate the node's taints?
+    *   `PodTopologySpread`: Would placing this Pod violate `maxSkew` constraints?
+    *   `VolumeBinding`: Can the required PersistentVolumes be bound on this node/zone?
+    If zero nodes pass filtering, the Pod stays `Pending`.
+2.  **Scoring (Priorities)** -- Ranks the remaining nodes 0-100:
+    *   `LeastAllocated`: Prefer nodes with more free resources (spreads load).
+    *   `MostAllocated`: Prefer fuller nodes (bin-packing for cost savings -- useful in autoscaled clusters).
+    *   `ImageLocality`: Prefer nodes that already have the container image cached (saves pull time).
+    *   `InterPodAffinity`: Score based on `preferredDuringScheduling` affinity/anti-affinity rules.
+    *   `NodeResourcesBalancedAllocation`: Prefer nodes where CPU and memory utilization are balanced.
+3.  **Binding** -- The highest-scoring node wins. Scheduler writes `spec.nodeName` to the Pod object via the API Server, and the Kubelet on that node picks it up.
+
+**Scheduler Profiles** (since v1.18): You can run multiple scheduling profiles in a single scheduler, each with different plugin configurations. For example, one profile for general workloads (LeastAllocated) and another for batch jobs (MostAllocated/bin-packing).
+
+**Performance**: The scheduler processes ~100 Pods/second by default. For large clusters, it uses `percentageOfNodesToScore` (default 50% for clusters &gt;100 nodes) to avoid scoring every single node -- it stops scoring once it has found enough feasible nodes.
+
+**Red flag answer:** "The scheduler just picks the node with the most resources." This misses the entire plugin framework, the filter/score distinction, and the many factors beyond raw resources.
+
+**Follow-up:**
+1. **"A Pod is Pending and events show 'insufficient CPU'. But `kubectl top nodes` shows plenty of CPU free. What is going on?"** -- `kubectl top` shows **actual usage**, but the scheduler looks at **requests** (allocated capacity), not usage. The node might have 8 CPU cores, only 2 cores actually in use, but 7.5 cores worth of resource requests already allocated. The remaining 0.5 cores of allocatable CPU is not enough for the new Pod's request. This is the #1 scheduling confusion in production.
+2. **"How would you force a critical Pod to schedule even when the cluster is full?"** -- Use PriorityClasses with preemption. Create a `PriorityClass` with a high value and `preemptionPolicy: PreemptLowerPriority`. The scheduler will evict lower-priority Pods to make room. But be careful -- preemption can cascade and kill important workloads if priority values are not well-planned.
+3. **"Can you bypass the scheduler entirely?"** -- Yes, set `spec.nodeName` directly in the Pod manifest. The Pod goes straight to the Kubelet without scheduler involvement. This is how static Pods work and can be used for emergency debugging, but it bypasses all filter checks, so you might overcommit a node.
 </Accordion>
 
 <Accordion title="6. Controller Pattern">
+**What interviewers are really testing:** Do you understand the declarative reconciliation model that underpins all of Kubernetes? Can you explain level-triggered vs edge-triggered, and why idempotency matters?
+
 **Answer**:
-Infinite Loop: Watch Current State -> Compare with Desired State -> Make changes.
-Example: ReplicaSet sees 2 pods, wants 3. Creates 1.
+The controller pattern is the **core design principle** of Kubernetes. Every controller runs an infinite reconciliation loop:
+
+1.  **Watch**: Subscribe to API Server events for specific resource types (via informers/watch streams).
+2.  **Compare**: Read the current state of the world and compare it to the desired state declared in the resource spec.
+3.  **Reconcile**: Take the minimum action needed to make current state match desired state.
+
+**Key design properties**:
+*   **Level-triggered, not edge-triggered**: Controllers do not react to "what happened" (edge) -- they react to "what is the current delta between desired and actual" (level). If a controller crashes and misses 10 events, when it restarts it simply compares current vs desired and fixes any drift. This is what makes Kubernetes self-healing.
+*   **Idempotent**: Running a reconciliation twice with no state change in between should produce no side effects. Controllers use `create-if-not-exists` and `update-if-changed` patterns.
+*   **Optimistic concurrency**: etcd uses resource versions. If two controllers try to update the same object, one gets a conflict error and retries with the latest version.
+
+**Built-in controllers** (inside kube-controller-manager): ReplicaSet, Deployment (manages rollouts via ReplicaSets), StatefulSet, DaemonSet, Job, CronJob, Node (marks unhealthy nodes), EndpointSlice, Namespace (cleanup on deletion), ServiceAccount (creates default SA per namespace), and ~20 more.
+
+**Example walkthrough**: ReplicaSet controller sees `spec.replicas: 3` but only 2 matching Pods exist. It creates 1 new Pod object (with `nodeName` empty). It does not care **why** there are only 2 -- maybe one crashed, maybe someone deleted one manually, maybe the cluster just scaled up. The controller only cares about the delta.
+
+**Red flag answer:** "Controllers are like cron jobs that check things periodically." Controllers use watch streams (real-time push notifications), not polling. The informer framework maintains a local cache and delivers events with minimal latency.
+
+**Follow-up:**
+1. **"What is the difference between a controller and an operator?"** -- An operator IS a controller, but specifically one that encodes domain-specific operational knowledge for a complex stateful application. All operators are controllers; not all controllers are operators. For example, the ReplicaSet controller is a generic controller. The Prometheus Operator is a controller that knows how to deploy, configure, and upgrade Prometheus instances, handle shard rebalancing, etc.
+2. **"What happens if the controller manager crashes for 10 minutes and 5 Pods die during that time?"** -- When the controller manager restarts, it re-lists all resources from the API Server, rebuilds its local cache, and reconciles. It sees 5 fewer Pods than desired and creates 5 new ones. No events were "lost" because the system is level-triggered -- it does not need to replay the history of what happened.
+3. **"How do you avoid thundering herd problems when many controllers reconcile simultaneously after a restart?"** -- Controllers use work queues with rate limiting, exponential backoff, and jitter. The `client-go` `workqueue` package provides `RateLimitingQueue` that prevents a controller from hammering the API Server with thousands of reconcile calls at once.
 </Accordion>
 
 <Accordion title="7. CRI, CNI, CSI">

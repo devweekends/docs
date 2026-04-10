@@ -55,3 +55,50 @@ We will build a simplified Amazon clone.
 - **Security:** Add Keycloak (OAuth2) to the Gateway.
 - **Config:** Move all `application.yml` to a Config Server.
 - **Resilience:** Add Rate Limiting to the Order API.
+
+---
+
+## Interview Deep-Dive
+
+<AccordionGroup>
+  <Accordion title="Walk me through how you would design the Order placement flow in this e-commerce system. How do you handle the case where the Inventory check passes but the database write fails?">
+    **Strong Answer:**
+
+    - The happy path: User sends `POST /api/orders` to the Gateway. Gateway routes to Order Service. Order Service synchronously calls Inventory Service via WebClient with a circuit breaker to check stock. If stock is available, Order Service saves the order to its database with status `PLACED`, publishes `OrderPlacedEvent` to Kafka, and returns 201 Created.
+    - The problem: the inventory check and the database write are two separate operations. If the inventory check succeeds (stock is reserved) but the database write fails (connection pool exhausted, constraint violation), the inventory is decremented but no order exists. The user sees an error, but the product's stock is reduced.
+    - Solution 1 -- Saga with compensating transactions: Inventory Service does not decrement stock on the check. It "reserves" stock (separate column: `available` vs. `reserved`). Order Service saves the order, publishes `OrderPlacedEvent`. Inventory Service consumes the event and converts the reservation to a decrement. If Order Service fails to save, no event is published, and a scheduled job in Inventory Service releases stale reservations after 5 minutes.
+    - Solution 2 -- Simpler approach using the Transactional Outbox: Order Service saves the order AND an outbox event in one database transaction. A poller/Debezium publishes the event to Kafka. Inventory Service consumes the event and decrements stock. If Inventory is out of stock, it publishes `InsufficientStockEvent`, and Order Service updates the order to `CANCELLED`. The user is notified asynchronously.
+    - The trade-off between these approaches: Solution 1 provides a faster user experience (synchronous check gives immediate feedback) but is more complex to implement correctly. Solution 2 is simpler and more reliable but means the user gets a `PENDING` response and learns the outcome later.
+
+    **Follow-up: How do you handle the case where the user places the same order twice (double-click, network retry)?**
+
+    Idempotency at the API level. The client sends an `Idempotency-Key` header (a UUID generated client-side). The Order Service stores this key in the database. On a duplicate request, it checks the key -- if it exists, it returns the existing order instead of creating a new one. This is implemented as a unique constraint on the idempotency key column. The check and insert happen within the same `@Transactional` method. At the Kafka consumer level, the event also carries this key, so Inventory Service can deduplicate if the same event is delivered twice.
+  </Accordion>
+
+  <Accordion title="In this architecture, the Order Service makes a synchronous call to the Inventory Service. The Inventory Service goes down. Without a circuit breaker, what happens? With one, what is the user experience?">
+    **Strong Answer:**
+
+    - Without a circuit breaker: Order Service sends an HTTP request to Inventory Service. The request times out (default: 30 seconds or infinity, depending on client config). The Tomcat thread handling this request is blocked for the entire duration. If 200 users try to place orders simultaneously, 200 Tomcat threads are blocked waiting for Inventory Service. Tomcat's thread pool is exhausted. New requests to Order Service -- even those that do not need Inventory (like `GET /orders/history`) -- are queued. Order Service becomes unresponsive. The Gateway times out calling Order Service. The user sees a generic "Service Unavailable." Meanwhile, health checks fail, the orchestrator restarts Order Service pods, but they immediately fill their thread pools again because Inventory is still down. This is a cascading failure.
+    - With a circuit breaker (Resilience4j): after the configured failure threshold (e.g., 5 out of 10 calls fail), the circuit opens. Subsequent calls to Inventory Service fail IMMEDIATELY (no waiting) and invoke the fallback method. The fallback returns a degraded response: "We are unable to verify stock at this moment. Your order has been placed with status PENDING and will be confirmed shortly." Order Service saves the order as `PENDING`, the Tomcat thread is freed in milliseconds, and the user gets a response. When Inventory Service recovers, the circuit transitions to HALF_OPEN, tests with a few requests, and if they succeed, closes the circuit. A background job processes PENDING orders against the now-healthy Inventory Service.
+    - The business decision: does the business prefer to reject orders during Inventory outages (return 503) or accept them optimistically (place as PENDING)? This is not an engineering decision -- it depends on the cost of overselling vs. the cost of lost sales. An e-commerce platform selling physical goods might accept PENDING orders because overselling 0.1% of orders is cheaper than losing 100% of sales during an outage.
+
+    **Follow-up: How do you monitor the circuit breaker health in production? What dashboards and alerts would you set up?**
+
+    Resilience4j integrates with Micrometer out of the box (`registerHealthIndicator: true`). Metrics exposed: `resilience4j_circuitbreaker_state` (0=CLOSED, 1=OPEN, 2=HALF_OPEN), `resilience4j_circuitbreaker_failure_rate`, `resilience4j_circuitbreaker_calls_seconds` (call duration histogram). In Grafana: create a dashboard showing circuit state as a state timeline (green=CLOSED, red=OPEN, yellow=HALF_OPEN), failure rate as a gauge, and call latency as a heatmap. Alert: circuit breaker state transitions to OPEN triggers a PagerDuty alert. A circuit staying OPEN for more than 5 minutes escalates to the Inventory Service team. Also monitor the fallback invocation rate -- if fallbacks are firing 1000 times/minute, the degraded experience is widespread and needs attention.
+  </Accordion>
+
+  <Accordion title="How would you add OAuth2 security with Keycloak to this architecture? Where does authentication happen, and how does the user identity flow across services?">
+    **Strong Answer:**
+
+    - Keycloak acts as the OAuth2 Authorization Server (Identity Provider). It manages user accounts, handles login flows, and issues JWTs. The Spring Cloud Gateway is configured as an OAuth2 Resource Server that validates incoming JWTs.
+    - Authentication flow: (1) Client (React/mobile app) redirects the user to Keycloak's login page. (2) User authenticates (username/password, social login, 2FA). (3) Keycloak issues an access token (JWT) and optionally a refresh token. (4) Client sends subsequent API requests with `Authorization: Bearer {jwt}` header.
+    - At the Gateway: configure `spring.security.oauth2.resourceserver.jwt.issuer-uri=http://keycloak:8080/realms/ecommerce`. The Gateway fetches Keycloak's public keys (JWKS endpoint), validates the JWT signature, checks expiration, and extracts claims (user ID, roles). Coarse-grained authorization happens here: `/admin/**` requires `realm_role: admin`.
+    - Propagation to downstream services: the Gateway forwards the validated JWT (or extracted claims as headers) to Order Service, Inventory Service, etc. Each downstream service can optionally re-validate the JWT (defense in depth) or trust the Gateway's validation and read user identity from a header like `X-User-Id`.
+    - Fine-grained authorization at the service level: Order Service uses `@PreAuthorize("hasRole('CUSTOMER')")` on `POST /orders` and `@PreAuthorize("#userId == authentication.principal.claims['sub']")` on `GET /orders/{userId}` to ensure users can only see their own orders.
+    - For service-to-service communication (Order Service calling Inventory Service), use a "client credentials" grant. Order Service has its own Keycloak client with a service account. It obtains a machine-to-machine token and includes it when calling Inventory Service. This ensures that even internal calls are authenticated and authorized.
+
+    **Follow-up: How do you handle token expiration during a long-running saga that spans multiple services?**
+
+    JWTs should have a short lifetime (5-15 minutes) for security. For a saga that takes seconds, this is not an issue -- the token is valid throughout. For truly long-running sagas (order processing over hours), the token expires before the saga completes. Solution: the initial service (Order Service) extracts the user ID from the JWT at the start and stores it with the saga state in the database. Downstream steps use the service-to-service client credentials token for authentication and include the original user ID as a correlation field (not for auth, but for audit and data association). The user identity is carried as data, not as a security token. If a downstream service needs to act "on behalf of" the user (e.g., charge their payment method), it uses a token exchange flow (RFC 8693) where the service trades its client credentials token for a delegated user token from Keycloak.
+  </Accordion>
+</AccordionGroup>
