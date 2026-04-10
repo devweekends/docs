@@ -1702,3 +1702,698 @@ The rule of thumb: `SELECT *` is for humans in terminals. Production code should
 </Accordion>
 
 </AccordionGroup>
+
+---
+
+## Advanced Interview Scenarios
+
+*These questions go beyond foundational knowledge into the territory where real production experience separates candidates. Each scenario is designed so that the "textbook" answer is incomplete or wrong. The questions reward engineers who have been on-call, debugged 3 AM incidents, and shipped migrations on tables with billions of rows. If you can answer these with specific tool names, real metrics, and trade-offs you have personally lived through -- you will stand out.*
+
+<AccordionGroup>
+
+<Accordion title="Q13: Your team's API adds an optional field to a response. No fields were removed, no types changed. A partner's integration breaks in production. How is this possible, and whose fault is it?">
+
+### The trap: "Additive changes are always safe" is the textbook answer. It is also wrong in practice.
+
+**What weak candidates say:**
+"Additive changes are non-breaking by definition. The partner must have a bug in their code. We should tell them to fix their deserialization."
+
+**What strong candidates say:**
+
+This is one of the most common real-world API incidents, and it catches teams who believe the "only removals are breaking changes" rule without understanding how client code actually works.
+
+**How an additive change breaks clients -- five real mechanisms:**
+
+1. **Strict deserialization.** Many clients use statically typed languages with strict JSON parsers. Java's Jackson with `FAIL_ON_UNKNOWN_PROPERTIES = true` (the default in some frameworks) throws an exception when it encounters a field not defined in the model class. .NET's `System.Text.Json` behaves similarly by default. The partner integrated six months ago, generated their DTOs, and never updated them. Your new field is "unknown" to their parser, and their code throws. I have personally seen this break a $2M/year partner integration at a fintech company -- a single new `metadata` field on an invoice response crashed their nightly reconciliation pipeline for 14 hours.
+
+2. **Response size increase triggering limits.** If the new field is a nested object or array, the response payload grows. Partners with a 64KB response body limit in their HTTP client configuration, or a Lambda function with a 6MB response payload limit, suddenly start failing. At one company, adding a `line_items` array to an order response pushed the payload for large orders from 45KB to 180KB, exceeding a partner's nginx `proxy_buffer_size` of 128KB. The response was silently truncated, producing invalid JSON.
+
+3. **Database/cache key changes.** If the partner hashes the response body for caching or deduplication, a new field changes the hash. Their cache hit rate drops to zero overnight. Their "is this a duplicate webhook?" check starts treating every callback as new because the signature of the payload changed.
+
+4. **Snapshot testing and CI pipelines.** The partner's integration test suite does exact-match comparison against a stored response fixture. The new field causes every test to fail, blocking their deployments. They cannot ship any code until they update all fixtures -- which for a large integration could be hundreds of test files.
+
+5. **Field name collisions.** The new field name collides with a field the partner's application uses internally. If they flatten the API response into a flat namespace (common in ETL pipelines), `status` from your API collides with their internal `status` field.
+
+**Whose fault is it?** Both sides share responsibility. The API provider should document that additive changes are part of the contract and are not considered breaking. Every API's terms should state: "Clients MUST ignore unknown fields." Stripe's API reference explicitly states this. But the provider should also announce additive changes in a changelog (even if they are not "breaking"), give partners a way to preview upcoming changes, and never add a field that changes the semantic meaning of existing fields.
+
+**The defensive architecture:** This is why Stripe pins each integration to an API version. Even "additive" changes are only visible in the version they were introduced. A partner on `2025-01-15` never sees a field added in `2025-06-01` until they explicitly upgrade their version. This is the gold standard -- but it requires the version transformation layer described in Q11.
+
+**War Story:** At a payments platform processing 40M API calls/day, we added an `enhanced_risk_score` field to the transaction response. The field was optional, nullable, well-documented in the changelog. Within 4 hours, three partners reported failures. Partner A had strict deserialization in their Java service. Partner B's webhook signature verification failed because they computed HMAC over the raw response body (new field changed the hash). Partner C's Snowflake ingestion pipeline broke because their COPY command expected a fixed number of JSON keys per row. We ended up rolling back the field, adding it only to v3 of the API, and sending a "breaking change notice" even though, by our own documentation, it was not breaking. The lesson: the theoretical contract ("ignore unknown fields") and the practical contract (what client code actually does) are different things.
+
+#### Follow-up: How do you prevent this class of incident going forward?
+
+Build a consumer compatibility testing pipeline. Before deploying any API change -- even additive ones -- replay the last 24 hours of each partner's actual request/response pairs through the new code. If the response shape changes in a way that would break strict deserialization (new fields appear), flag it for review. Stripe, Twilio, and Plaid all have internal "compatibility gates" that catch this. For smaller teams: maintain a set of "canonical partner response fixtures" in your test suite that are validated on every deploy. Any fixture diff requires explicit approval.
+
+#### Follow-up: A partner demands you never add fields to existing endpoints. How do you respond?
+
+This is an unreasonable demand that would freeze your API's evolution. But the underlying concern is valid -- they want stability. Offer them two things: (1) pin them to a versioned API where response shapes are frozen per version, and (2) provide a schema registry (OpenAPI spec published per version) so their code generation tools can stay in sync. If they refuse both and insist on a frozen response format forever, that is a contract negotiation, not an engineering problem. Involve product and legal.
+</Accordion>
+
+<Accordion title="Q14: Production alert fires at 2 AM: your PostgreSQL database has 15 deadlocks per minute. Walk me through exactly how you diagnose and resolve this without restarting anything.">
+
+### This is a debugging war story question. Candidates who have never been on-call will flounder.
+
+**What weak candidates say:**
+"I would increase the lock timeout or add retry logic." -- This treats the symptom, not the cause. You will still have 15 deadlocks per minute, just with more retries consuming more resources.
+
+**What strong candidates say:**
+
+Deadlocks at 15/min means two or more transactions are consistently acquiring locks in conflicting orders on the same rows. This is not random -- it is a deterministic code pattern. Here is exactly how I would diagnose it, step by step, using real PostgreSQL tooling.
+
+**Step 1: Confirm the deadlocks and capture the details (2 minutes).**
+
+PostgreSQL logs deadlock details automatically when `log_lock_waits = on` and `deadlock_timeout` is set (default 1 second). Check the PostgreSQL log:
+
+```
+ERROR: deadlock detected
+DETAIL: Process 12345 waits for ShareLock on transaction 67890; blocked by process 12346.
+         Process 12346 waits for ShareLock on transaction 67891; blocked by process 12345.
+HINT: See server log for query details.
+STATEMENT: UPDATE orders SET status = 'shipped' WHERE id = 4567
+```
+
+This tells you exactly which queries are deadlocking and which processes are involved. In RDS, these logs are in CloudWatch Logs under the PostgreSQL log group. In self-hosted, check `log_directory`.
+
+Also query `pg_stat_activity` for currently blocked sessions:
+
+```sql
+SELECT blocked.pid AS blocked_pid,
+       blocked.query AS blocked_query,
+       blocking.pid AS blocking_pid,
+       blocking.query AS blocking_query,
+       blocked.wait_event_type,
+       blocked.state
+FROM pg_stat_activity blocked
+JOIN pg_locks bl ON bl.pid = blocked.pid
+JOIN pg_locks bk ON bk.locktype = bl.locktype
+  AND bk.database IS NOT DISTINCT FROM bl.database
+  AND bk.relation IS NOT DISTINCT FROM bl.relation
+  AND bk.page IS NOT DISTINCT FROM bl.page
+  AND bk.tuple IS NOT DISTINCT FROM bl.tuple
+  AND bk.pid != bl.pid
+JOIN pg_stat_activity blocking ON blocking.pid = bk.pid
+WHERE NOT bl.granted;
+```
+
+**Step 2: Identify the pattern (5 minutes).**
+
+Deadlocks in production almost always come from one of three patterns:
+
+*Pattern A: Inconsistent lock ordering.* Transaction 1 updates Order A then Order B. Transaction 2 updates Order B then Order A. If they interleave, deadlock. This is the classic case and accounts for ~70% of production deadlocks I have seen. The fix: sort the rows by ID before updating. If you are updating orders 4567 and 4568, always update 4567 first, regardless of business logic order.
+
+*Pattern B: Foreign key lock escalation.* When you insert into a child table, PostgreSQL acquires a shared lock on the parent row (to verify the FK exists). If another transaction holds an exclusive lock on that parent row (updating it), and is also trying to insert a child row that references the row the first transaction locked -- deadlock. This is insidious because the developer writing `INSERT INTO order_items` has no idea they are locking a row in the `orders` table.
+
+*Pattern C: Index contention on HOT updates.* Less common, but on tables with many indexes, an UPDATE that changes indexed columns can acquire locks on multiple index entries. Two concurrent updates on adjacent rows can deadlock on the same index page.
+
+**Step 3: Fix it (15-30 minutes for a hotfix).**
+
+For Pattern A (most likely): identify the application code path doing multi-row updates in inconsistent order. Add explicit ordering:
+
+```python
+# WRONG: order depends on business logic, inconsistent across requests
+for order_id in batch_of_orders:
+    update_order(order_id, status='shipped')
+
+# RIGHT: sort by ID to guarantee consistent lock ordering
+for order_id in sorted(batch_of_orders):
+    update_order(order_id, status='shipped')
+```
+
+For Pattern B: restructure the transaction to update the parent row first, then insert children. Or batch the inserts so all children for one parent are inserted in a single statement, minimizing the lock window. In extreme cases, defer the FK check with `SET CONSTRAINTS ... DEFERRED` within the transaction.
+
+**Step 4: Prevent recurrence.**
+
+Add a monitoring alert on `pg_stat_database.deadlocks` (a cumulative counter). If deadlocks/minute exceeds 1, alert. Zero deadlocks is the goal -- any deadlock in production indicates a code pattern that should be fixed, not tolerated.
+
+Add `SET lock_timeout = '5s'` to application transactions as a safety net. This causes a transaction to fail fast rather than wait indefinitely for a lock, reducing the deadlock detection window.
+
+**War Story:** At an e-commerce company processing 3,000 orders/minute during Black Friday, we hit 200+ deadlocks/minute at peak. The root cause: a batch fulfillment service was updating order statuses in the order they appeared in the warehouse pick list (sorted by bin location), while a customer-facing service was updating the same orders in the order customers placed them (sorted by timestamp). Same orders, different lock ordering. The fix was a one-line change -- `ORDER BY order_id` in both code paths. Deadlocks dropped to zero within 60 seconds of deployment. Total time from alert to fix: 23 minutes. Total revenue at risk during those 23 minutes: approximately $150K based on our average order value and error rate.
+
+#### Follow-up: How do deadlocks differ between PostgreSQL and MySQL InnoDB?
+
+PostgreSQL detects deadlocks by running a deadlock detector every `deadlock_timeout` seconds (default 1s). When detected, it kills the youngest transaction (least work done) and lets the other proceed. The detection is a waits-for graph cycle check.
+
+MySQL InnoDB checks for deadlocks on every lock wait (not periodically). It uses a waits-for graph and immediately rolls back the transaction with the fewest rows modified. However, MySQL's gap locks in REPEATABLE READ mode create deadlocks that would not happen in PostgreSQL. A range query like `SELECT * FROM orders WHERE amount BETWEEN 100 AND 200 FOR UPDATE` locks the index gap, which can block inserts that PostgreSQL would allow. This is why MySQL deadlocks are more frequent and more surprising than PostgreSQL deadlocks in equivalent workloads.
+
+#### Follow-up: When are deadlocks actually acceptable?
+
+When the retry cost is low and the alternative (global lock ordering) is impractical. In a system where thousands of transactions operate on overlapping sets of rows and the sets are not known in advance (think: a graph database updating connected nodes), enforcing a global lock order is architecturally infeasible. In this case, design for deadlock tolerance: wrap every transaction in a retry loop (3 retries with jitter), monitor the deadlock rate, and alert if it exceeds a threshold (e.g., 0.1% of transactions). PostgreSQL's deadlock detection is fast enough that the overhead of occasional deadlock retries is negligible compared to the cost of global lock ordering in complex workloads.
+</Accordion>
+
+<Accordion title="Q15: You inherit a service where every API endpoint does a direct database query. There are no caches. The database is at 90% CPU. A senior engineer says 'just add Redis in front of everything.' What is wrong with that advice, and what do you actually do?">
+
+### The "obvious answer is wrong" question. Caching everything is a common anti-pattern.
+
+**What weak candidates say:**
+"Sounds right. We should add Redis caching to every endpoint with a 5-minute TTL. That will reduce database load by 80%."
+
+**What strong candidates say:**
+
+"Just add Redis in front of everything" is the database equivalent of "just throw more hardware at it." It might reduce load, but it creates an entirely new class of problems and may not even fix the root cause. Here is why I would push back and what I would do instead.
+
+**First, diagnose why the database is at 90% CPU.**
+
+90% CPU does not tell you the story. Is it 90% from thousands of efficient queries at high volume? Or 90% from three terrible queries doing sequential scans on 500M-row tables? The fix is radically different.
+
+```sql
+-- Find the most expensive queries by total time
+SELECT query, calls, total_exec_time, mean_exec_time,
+       rows, shared_blks_hit, shared_blks_read
+FROM pg_stat_statements
+ORDER BY total_exec_time DESC
+LIMIT 20;
+```
+
+In my experience, the Pareto principle applies aggressively to database load: 3-5 queries account for 80%+ of total execution time. If three queries are doing sequential scans because they lack indexes, adding Redis does not fix anything -- it just means you are caching slow queries and still paying the CPU cost when the cache misses.
+
+**What is wrong with "cache everything":**
+
+1. **Cache invalidation becomes your new primary problem.** Every write now needs to invalidate the right cache keys. Miss one, and users see stale data. With 50 endpoints, you need 50 invalidation paths. The joke "there are only two hard things in computer science: cache invalidation and naming things" exists because cache invalidation in a complex system is genuinely harder than the database queries it replaces.
+
+2. **Thundering herd on cache expiry.** If a hot cache key expires and 1,000 requests simultaneously hit the database, you get a load spike worse than having no cache. With TTL-based caching on every endpoint, you get mini thundering herds constantly as different keys expire. Solutions exist (cache stampede locks, stale-while-revalidate), but they add complexity to every endpoint.
+
+3. **Memory cost is non-trivial.** A Redis instance with 50GB of cached API responses is expensive and operationally complex (Redis cluster, failover, persistence, monitoring). If most of those responses are accessed once per TTL window, you are paying for memory to store data nobody will read before it expires.
+
+4. **You now have two data stores to keep consistent.** Every bug investigation now requires checking both the database and the cache. "Is the user seeing stale data because of a cache issue or a replication lag issue?" Debugging complexity increases quadratically with the number of data stores.
+
+**What I would actually do, in order:**
+
+**Step 1: Fix the queries (hours, biggest impact).** Use `pg_stat_statements` to find the worst queries. Add missing indexes. Rewrite N+1 patterns. This alone typically reduces CPU by 40-60%. Cost: zero infrastructure, just SQL.
+
+**Step 2: Add connection pooling if missing.** If each request opens a new connection, the overhead is enormous. PgBouncer in transaction mode with a pool of 20 connections serving 200 application instances eliminates connection management overhead and can reduce CPU by 10-20%.
+
+**Step 3: Add targeted caching for specific hot paths.** Not "cache everything" -- cache the 5 endpoints that account for 80% of traffic AND whose data tolerates staleness. A product catalog page that updates once per hour? Cache it for 5 minutes. A user's account balance? Never cache it -- stale financial data is a support ticket.
+
+**Step 4: Read replicas for read-heavy paths.** If 85% of queries are reads, route them to a read replica. This halves the primary's CPU immediately. Combine with caching: cache in Redis for the hottest data, read replica for the long tail.
+
+**Step 5: THEN consider broader caching.** Only after steps 1-4 are exhausted. And use cache-aside (lazy loading) with explicit TTLs per endpoint, not a blanket "cache everything for 5 minutes."
+
+**War Story:** At a B2B SaaS company, the database hit 95% CPU. The team's instinct was to add Redis. I spent 30 minutes with `pg_stat_statements` and found three things: (1) A dashboard endpoint was running `SELECT COUNT(*) FROM events WHERE tenant_id = ?` on a 200M-row table with no index on `tenant_id` -- 45 seconds per call, called every time the dashboard loaded. Adding a composite index reduced it to 3ms. (2) An ORM was generating N+1 queries for a list endpoint -- 1 query for the list, then 1 query per item for a related entity. 50 items = 51 queries. Adding `.include(:related_entity)` collapsed it to 2 queries. (3) A background job was running `ANALYZE` on the entire database every 5 minutes (someone copy-pasted a Stack Overflow answer). Changing it to rely on autovacuum freed 15% CPU. After these three fixes, CPU dropped from 95% to 35%. We never added Redis. Total cost: zero dollars. Time: one afternoon.
+
+#### Follow-up: When IS "add Redis everywhere" the right answer?
+
+When the query layer is already optimized, and the bottleneck is genuinely read volume at a scale that a single database (even with replicas) cannot handle. If you have 500,000 reads/second of a product catalog that changes once per hour, caching it in Redis with a 60-second TTL is correct. The pattern: high read volume + low write frequency + tolerance for staleness = cache aggressively. But that describes maybe 10-20% of endpoints in a typical application, not "everything."
+
+#### Follow-up: How do you handle cache invalidation for data that changes unpredictably?
+
+Use cache-aside with short TTLs for unpredictable data (30-60 seconds). The cache absorbs burst reads, and the TTL guarantees eventual freshness. For data that MUST be fresh on write (user updates their name, should see it immediately), use write-through caching: on every write, update the database AND the cache in the same operation. If the cache update fails, delete the cache key (so the next read fetches from the database). Never let a stale cache key persist after a successful write -- this is the most common caching bug in production.
+</Accordion>
+
+<Accordion title="Q16: You need to shard a PostgreSQL database that has grown to 2TB with 3 billion rows. The CEO wants it done in two weeks. Walk me through your response.">
+
+### This question tests whether you recognize when NOT to do something, and how you manage up when a technical decision is being driven by unrealistic timelines.
+
+**What weak candidates say:**
+"We can use hash-based sharding on the primary key. Set up two PostgreSQL instances, split the data by hash, and update the application to route queries." -- This is technically not wrong, but the timeline confidence and the lack of risk awareness is the red flag.
+
+**What strong candidates say:**
+
+The first thing I would do is have an honest conversation with the CEO about what "done in two weeks" actually means and what the risks are. Sharding a production 2TB PostgreSQL database is a 3-6 month project for an experienced team. Rushing it is how you get a week-long outage that costs more than the original performance problem. Let me explain why, and then what I would actually do in two weeks.
+
+**Why sharding is a 3-6 month project, not 2 weeks:**
+
+1. **Shard key selection is an irreversible architectural decision.** Choose the wrong shard key and you get hot shards, cross-shard queries for common operations, and eventual data migration that is harder than the original sharding. You need to analyze every query pattern, every JOIN, every foreign key relationship. For a 3B-row database that has accumulated years of access patterns, this analysis alone takes weeks.
+
+2. **Cross-shard queries.** Any query that does not include the shard key becomes a scatter-gather across all shards. If you shard orders by `customer_id`, the query `SELECT * FROM orders WHERE created_at > '2025-01-01'` must hit every shard. If 40% of your queries are date-range queries, sharding by customer_id makes 40% of your queries slower, not faster. You need to audit every query path before choosing the shard key.
+
+3. **Application changes are pervasive.** Every database query in the application needs to be shard-aware -- either the application routes to the correct shard, or a proxy (like Vitess or Citus) handles routing. If you use application-level sharding, every ORM query, every raw SQL call, every migration script, every background job needs to know about shards. This is months of engineering.
+
+4. **Data migration without downtime.** Moving 2TB of data from one database to multiple shards while the application continues to serve traffic requires dual-writing, backfilling, verification, and cutover. At 3B rows and typical migration speeds (50K-100K rows/second with backfill), the migration itself takes 8-16 hours. During that window, any write to the old database must be replicated to the new shards.
+
+5. **Operational complexity permanently increases.** Instead of one database to monitor, back up, upgrade, and troubleshoot, you now have N databases. Schema migrations run across all shards (Vitess handles this; DIY sharding does not). Backup and restore procedures multiply. On-call complexity increases.
+
+**What I would actually do in two weeks (to buy time):**
+
+**Week 1 -- Immediate relief without sharding:**
+- Run `pg_stat_statements` analysis. Find and fix the top 10 worst queries (missing indexes, sequential scans, N+1 patterns). On a 3B-row database, a single missing index can account for 30-40% of CPU.
+- Add read replicas. Route all reporting, analytics, and read-heavy API endpoints to replicas. This can cut primary load by 60-70%.
+- Implement connection pooling with PgBouncer if not already in place.
+- Partition the largest tables by date range (declarative partitioning). If the 3B rows are time-series-ish (orders, events, logs), partitioning by month means queries for "last 30 days" scan 1 partition instead of 36 months of data. This is a massive win with far less risk than sharding.
+
+**Week 2 -- Caching and architectural planning:**
+- Add Redis caching for the top 5 read-heavy endpoints.
+- Begin the shard key analysis: catalog all query patterns, JOIN paths, and access patterns. This is the prerequisite for sharding, and starting it now means the eventual sharding project starts from a position of knowledge rather than guessing.
+- Present a realistic sharding timeline (3-6 months) with the query analysis as evidence for why it cannot be rushed.
+
+**If sharding is truly needed, the approach:**
+
+Use Citus (PostgreSQL extension for distributed tables) or Vitess (MySQL sharding proxy) rather than DIY sharding. Citus lets you `SELECT create_distributed_table('orders', 'customer_id')` and it handles shard routing, cross-shard joins, and distributed transactions transparently. The application changes are minimal compared to DIY sharding. Migration is still a multi-week project, but the operational overhead is dramatically lower.
+
+**War Story:** A fintech company I worked with had a 1.5TB PostgreSQL database doing 8K QPS. Leadership wanted to shard within a month. Instead, we spent two weeks on: (1) adding a composite index to the transactions table that eliminated a sequential scan on 800M rows -- this alone dropped P99 query latency from 12 seconds to 40ms. (2) Partitioning the transactions table by quarter -- queries for recent data stopped scanning historical partitions. (3) Adding two read replicas and routing 70% of traffic to them. CPU on the primary dropped from 92% to 28%. The database ran fine for another 18 months before sharding became genuinely necessary -- and by then, the team had done a proper shard key analysis and used Citus for a controlled 3-month migration with zero downtime. The two-week "emergency sharding" would have been a disaster.
+
+#### Follow-up: How do you choose a shard key? What is the worst shard key you have seen?
+
+The shard key should satisfy three criteria: (1) **high cardinality** -- enough distinct values to distribute evenly across shards. (2) **Included in most queries** -- so the router can send each query to a single shard rather than all shards. (3) **Even distribution** -- no single value should have disproportionate data.
+
+The worst shard key I have encountered: `country_code`. A SaaS product sharded by country, thinking it was "natural isolation." The US shard had 70% of all data. The Japan shard had 15%. The remaining 40 shards shared 15%. The US shard was larger than the original unsharded database within a year. They had to re-shard by `tenant_id` -- a 4-month project.
+
+Second worst: `created_date`. All current traffic hits the latest shard. Historical shards are idle. You have not distributed load; you have concentrated it on one shard with extra infrastructure complexity.
+
+#### Follow-up: What is the difference between sharding and partitioning?
+
+Partitioning splits a table into multiple physical segments within the same database instance. PostgreSQL declarative partitioning keeps all partitions on the same server, managed by the same PostgreSQL process. The query planner does partition pruning (only scans relevant partitions). There is zero application change -- queries work identically. It solves query performance (smaller indexes, fewer rows scanned) but not write throughput or storage limits -- you are still on one server.
+
+Sharding splits data across multiple database instances on different servers. Each shard is an independent database. It solves write throughput (each shard handles its own writes), storage (each shard stores a fraction of the data), and read throughput (queries route to one shard). But it introduces cross-shard query complexity, distributed transaction challenges, and operational overhead.
+
+Rule of thumb: partition first, shard only when a single server cannot handle the write throughput or storage requirements. Most teams shard too early. PostgreSQL with partitioning, proper indexing, and read replicas can handle multi-TB databases and tens of thousands of QPS on a single server.
+</Accordion>
+
+<Accordion title="Q17: You are reviewing a pull request that adds a new API endpoint: POST /users/:id/send-notification. What is wrong with this design, and how would you coach the developer?">
+
+### This tests API design instinct -- the ability to spot violations of REST conventions and think through the consequences.
+
+**What weak candidates say:**
+"Looks fine. It sends a notification to a user." -- Missing the core design problem entirely.
+
+**What strong candidates say:**
+
+There are multiple design issues here, ranging from convention violations to real operational risks. Let me walk through them in order of severity.
+
+**Issue 1: Verb in the URL.** REST resources are nouns, not verbs. `send-notification` is a command, not a resource. This matters because it makes the API unpredictable. If `send-notification` is a verb, what about `update-profile`, `reset-password`, `calculate-invoice`? You end up with an API that is a collection of RPC-style commands disguised as REST endpoints, with no consistency in naming, no standard HTTP method semantics, and no way for a developer to guess the URL structure.
+
+**The fix:** Model the notification as a resource.
+
+```
+POST /users/:id/notifications
+Body: { "type": "welcome", "channel": "email" }
+Response 202: { "notification_id": "ntf_abc123", "status": "queued" }
+```
+
+Now notifications are a first-class resource. You can `GET /users/:id/notifications` to list them. `GET /users/:id/notifications/ntf_abc123` to check status. `DELETE /users/:id/notifications/ntf_abc123` to cancel a queued one. The entire CRUD lifecycle emerges naturally from treating notifications as resources.
+
+**Issue 2: POST implies creation, but should this be synchronous?** Sending a notification is inherently async -- it involves email delivery, push notification services, SMS gateways, any of which can take seconds or fail. A synchronous POST that blocks until the notification is delivered will timeout on slow channels. The 202 Accepted pattern is correct: accept the request, return immediately with a resource ID, process asynchronously. The client polls the status or receives a webhook callback.
+
+**Issue 3: No idempotency.** What if the client retries? Without an idempotency key, retrying the POST sends the notification twice. A user getting two identical "Your password was reset" emails is confusing. A user getting two identical "Your payment of $5,000 was processed" SMS messages causes panic and support tickets.
+
+**Issue 4: Missing rate limiting considerations.** This endpoint triggers an external side effect (sending a notification). If a bug or a malicious actor calls it in a loop, you spam the user with thousands of notifications. Add a per-user rate limit (e.g., max 10 notifications per user per hour) separate from the API-level rate limit. Also add a global rate limit per notification type to protect downstream delivery services.
+
+**Issue 5: The `:id` in the URL should be validated.** Can user A send a notification to user B? If this is an admin endpoint, that might be fine. If it is a user-facing endpoint, the `:id` must match the authenticated user. This is an authorization check that is easy to miss in review but is a critical security vulnerability (IDOR -- Insecure Direct Object Reference).
+
+**How I would coach the developer:**
+
+I would not just request changes on the PR. I would schedule a 15-minute pairing session and walk through the design together, using Stripe's API or GitHub's API as references. The goal is to build the developer's API design intuition, not just fix this one endpoint. I would frame it as: "Every endpoint you add becomes a contract. Once a client depends on `POST /users/:id/send-notification`, renaming it is a breaking change. Let us design it as a resource from the start so the API grows naturally."
+
+**War Story:** At a startup, we shipped an endpoint called `POST /orders/:id/refund`. Six months later, we needed partial refunds, refund reasons, refund-to-store-credit, and refund status tracking. The verb-based endpoint could not accommodate any of this without becoming `POST /orders/:id/refund?amount=50&reason=damaged&type=credit`. It was an unreadable mess. We redesigned it as `POST /orders/:id/refunds` (resource), which naturally supported `GET /orders/:id/refunds` (list), `GET /orders/:id/refunds/:refund_id` (detail), and a clean body with all the parameters. The migration from the old endpoint to the new one took 3 months because 80 partners had integrated with the verb-based URL.
+
+#### Follow-up: When IS it acceptable to use verbs in REST URLs?
+
+Two scenarios. First, genuinely non-resource operations that do not create, read, update, or delete anything: `POST /translate` (stateless transformation), `POST /validate` (check without side effects), `POST /search` (complex query that does not fit in a GET query string). Even here, you can often model them as resources (`POST /translations`, `POST /validations`), but the verb form is pragmatically acceptable for stateless operations.
+
+Second, when your API is not actually REST and you have decided that is fine. An internal RPC-style API between two services you own, where neither discoverability nor resource modeling matters, can use verb-based endpoints. Just be honest about it -- do not call it REST.
+
+#### Follow-up: How would you design the notification endpoint to support multiple channels (email, SMS, push)?
+
+Add a `channels` array to the request body:
+
+```json
+POST /users/:id/notifications
+{
+  "template": "order_shipped",
+  "channels": ["email", "push"],
+  "data": { "order_id": "ord_123", "tracking_url": "..." }
+}
+```
+
+The server fans out to each channel asynchronously. The response includes per-channel status:
+
+```json
+{
+  "notification_id": "ntf_abc123",
+  "status": "queued",
+  "channels": [
+    { "channel": "email", "status": "queued" },
+    { "channel": "push", "status": "queued" }
+  ]
+}
+```
+
+Each channel can succeed or fail independently. The client checks `GET /users/:id/notifications/ntf_abc123` for updated per-channel statuses. This is cleaner than separate endpoints per channel (`/send-email`, `/send-sms`) because the business logic (which channels to use, deduplication, user preferences) stays on the server.
+</Accordion>
+
+<Accordion title="Q18: A Kafka consumer processes order events and writes to a database. You discover that some orders were processed twice, resulting in duplicate charges. The team says 'Kafka guarantees exactly-once delivery.' What is actually happening, and how do you fix it?">
+
+### This is a "common misconception with real money on the line" question. The obvious answer -- "Kafka has exactly-once" -- is dangerously incomplete.
+
+**What weak candidates say:**
+"Enable Kafka's exactly-once semantics with `enable.idempotence=true` and transactional producers. Problem solved."
+
+**What strong candidates say:**
+
+The team's understanding is incomplete in a way that cost real money. Let me untangle what "exactly-once" actually means in Kafka and why it did not prevent duplicate charges.
+
+**What Kafka's exactly-once actually guarantees:**
+
+Kafka's exactly-once semantics (EOS), introduced in 0.11, guarantees that a producer-to-Kafka-to-consumer pipeline processes each message exactly once *within Kafka*. Specifically:
+
+- **Idempotent producer** (`enable.idempotence=true`): the producer can retry sends without creating duplicate messages in the topic. Kafka deduplicates by producer ID and sequence number.
+- **Transactional producer/consumer**: a consume-transform-produce pipeline can atomically read from topic A, process, and write to topic B, with consumer offsets committed in the same transaction. If the process crashes mid-transaction, Kafka rolls back both the output message and the offset commit. No message is double-processed *within Kafka*.
+
+**What it does NOT guarantee:**
+
+Exactly-once stops at the Kafka boundary. The moment your consumer writes to an external system (a database, a payment API, an HTTP endpoint), you are outside Kafka's transaction scope. Here is the failure mode:
+
+1. Consumer reads order event from Kafka.
+2. Consumer calls the payment API -- payment succeeds, customer is charged $50.
+3. Consumer attempts to commit the Kafka offset.
+4. Consumer crashes (or the network blips) before the offset commit succeeds.
+5. Kafka redelivers the message (offset was not committed).
+6. Consumer processes it again -- calls payment API again -- customer is charged another $50.
+
+Kafka's exactly-once cannot prevent this because the payment API is not part of Kafka's transaction. The charge at step 2 happened outside Kafka's scope. No message broker can provide exactly-once delivery to an external system -- this is a fundamental distributed systems limitation, not a Kafka bug.
+
+**How to actually fix it -- three approaches:**
+
+**Approach 1: Consumer-side idempotency (most common).**
+
+Before processing each message, check if you have already processed it. Use the Kafka message's `(topic, partition, offset)` as a unique identifier, or better, use a business-level idempotency key (order ID + event type).
+
+```python
+def process_order(event):
+    idempotency_key = f"{event.order_id}:{event.event_type}"
+
+    # Atomic check-and-insert in the same DB transaction as the business logic
+    with db.transaction():
+        if db.exists("processed_events", key=idempotency_key):
+            log.info(f"Skipping duplicate: {idempotency_key}")
+            return  # Already processed
+
+        # Process the order
+        charge_payment(event.order_id, event.amount)
+
+        # Record that we processed it
+        db.insert("processed_events", key=idempotency_key, processed_at=now())
+```
+
+The critical detail: the idempotency check and the business logic MUST be in the same database transaction. If you check in Redis and process in PostgreSQL, a crash between them leaves you inconsistent (same problem as Q2).
+
+**Approach 2: Outbox pattern with transactional writes.**
+
+Instead of calling the payment API directly from the consumer, write the "intent to charge" to a local database table (the outbox) in the same transaction as the offset tracking. A separate process reads the outbox and calls the payment API with its own idempotency key. If the charge fails, the outbox entry is retried. If the charge succeeds but the outbox update fails, the retry calls the payment API again with the same idempotency key -- the payment API deduplicates it.
+
+**Approach 3: Exactly-once with Kafka Streams.**
+
+If your consumer writes its output to another Kafka topic (not an external database), Kafka Streams' exactly-once processing handles everything. But the moment you have a side effect (database write, API call, email), you are back to needing consumer-side idempotency.
+
+**War Story:** At a food delivery platform processing 50K orders/hour, we discovered duplicate charges during a routine financial reconciliation. 0.03% of orders had been charged twice -- 15 orders per hour, $450/hour in overcharges. The consumer was using Kafka's `enable.idempotence=true` and the team believed they were protected. The root cause: the consumer committed offsets asynchronously (`enable.auto.commit=true` with a 5-second interval). During a rolling deployment, containers were killed before the auto-commit fired. On restart, messages since the last commit were redelivered and reprocessed. The fix was threefold: (1) switch to manual offset commits, (2) add an idempotency table keyed on `order_id + event_type` with the processing wrapped in a database transaction, (3) add a daily reconciliation job that detects and flags duplicate charges for automatic refund. The idempotency table added 0.3ms of overhead per event (one indexed lookup). The duplicate rate dropped from 0.03% to zero. The reconciliation job remained as a safety net.
+
+#### Follow-up: Why not just use manual offset commits after processing?
+
+Manual commits reduce but do not eliminate duplicates. The failure window is between "processing completes" and "offset commit completes." If the consumer crashes in that window (or the broker rejects the commit due to a rebalance), the message is redelivered. The window is small (milliseconds), but at 50K messages/hour, even a 0.001% failure rate produces 18 duplicates per day. For payments, zero is the only acceptable number.
+
+#### Follow-up: How does the idempotency table perform at high throughput?
+
+At 50K events/hour (~14 events/second), the overhead is negligible. At 1M events/hour (~278 events/second), you need to think about table management. The idempotency table grows continuously. Partition it by day, drop partitions older than 7 days (your Kafka retention period). Index on the idempotency key for O(log n) lookups. At 278 inserts/second with 7-day retention, the table holds ~170M rows -- PostgreSQL handles this comfortably with a proper index. If throughput exceeds 10K events/second, consider using Redis as a fast-path check with the database as a fallback (check Redis first, if miss then check DB, write to both).
+</Accordion>
+
+<Accordion title="Q19: Your DynamoDB table is experiencing throttling on a single partition despite having plenty of provisioned capacity. The table has 10,000 WCU provisioned but only one partition is hot. Explain the problem and fix it.">
+
+### This tests distributed database internals knowledge. Candidates who only know SQL will struggle. Candidates who have operated DynamoDB in production will nail it.
+
+**What weak candidates say:**
+"Increase the provisioned capacity. If 10,000 WCU is not enough, set it to 50,000." -- This fundamentally misunderstands how DynamoDB distributes capacity.
+
+**What strong candidates say:**
+
+This is the classic DynamoDB hot partition problem, and it is one of the most misunderstood aspects of DynamoDB's architecture. Increasing provisioned capacity will not help because the problem is not total capacity -- it is how capacity is distributed across partitions.
+
+**How DynamoDB partitioning works:**
+
+DynamoDB divides your table into partitions based on the partition key hash. Each partition handles a maximum of 3,000 RCU and 1,000 WCU (these are hard limits per partition, not configurable). When you provision 10,000 WCU, DynamoDB creates at least 10 partitions (10,000 / 1,000 = 10) and distributes the capacity evenly: 1,000 WCU per partition.
+
+If your access pattern sends 80% of writes to a single partition key value (e.g., `tenant_id = "big_enterprise_customer"`), that one partition receives 8,000 WCU of demand but can only handle 1,000 WCU. The other 9 partitions sit idle with 9,000 WCU unused. You are throttled at 1,000 WCU effective capacity despite provisioning 10,000.
+
+**DynamoDB adaptive capacity** (introduced 2018) partially mitigates this -- it can boost a hot partition's throughput by borrowing from underutilized partitions. But adaptive capacity has limits: it takes minutes to kick in, cannot exceed the table-level throughput, and does not help if the hot partition is at the physical node's I/O limit.
+
+**Root cause analysis for hot partitions:**
+
+Run a query against CloudWatch `ConsumedWriteCapacityUnits` with the `TableName` and partition key dimension. Or use DynamoDB Contributor Insights (must be enabled per table) -- it shows the top 20 most-accessed partition keys over the last 24 hours. If one key dominates, you have found your hot partition.
+
+Common causes:
+1. **Bad partition key design.** Using `date` as the partition key means all of today's writes hit one partition. Using `status` (with 3 possible values) means 3 partitions max, with the most common status being hot.
+2. **One big tenant in a multi-tenant table.** If `tenant_id` is the partition key and one tenant has 100x the traffic of others, their partition is permanently hot.
+3. **Time-based access patterns.** An IoT system where `device_id` is the partition key, but all devices report at the top of every minute. The write pattern is bursty, concentrating on a few partitions simultaneously.
+
+**Fixes, ordered by effort:**
+
+1. **Write sharding (adding randomness).** Append a random suffix to the partition key: instead of `tenant_id = "big_customer"`, use `tenant_id = "big_customer#3"` where the suffix is a random number from 0-9. This spreads the big customer's writes across 10 partitions. Reads require a scatter-gather across all 10 suffixed keys, but writes are distributed. This is DynamoDB's official recommended pattern for hot partitions.
+
+```python
+import random
+# Write: spread across 10 logical partitions
+suffix = random.randint(0, 9)
+table.put_item(Item={
+    'pk': f'TENANT#{tenant_id}#{suffix}',
+    'sk': f'ORDER#{order_id}',
+    ...
+})
+
+# Read all orders for a tenant: query all 10 partitions
+for suffix in range(10):
+    results = table.query(
+        KeyConditionExpression=Key('pk').eq(f'TENANT#{tenant_id}#{suffix}')
+    )
+```
+
+2. **Switch to on-demand capacity mode.** On-demand mode provisions capacity automatically based on traffic and does not have per-partition limits as strict as provisioned mode (it still has limits, but they are higher and auto-adjust). For bursty workloads, on-demand eliminates the capacity planning problem entirely. The trade-off: on-demand is 5-7x more expensive per request than provisioned at steady-state traffic. But if you are throttling, the lost requests cost more than the price premium.
+
+3. **Redesign the partition key.** If the hot partition is caused by a fundamental design flaw (using `date` or `status` as the partition key), no amount of capacity will fix it. Redesign with a high-cardinality key. For time-series data, use `device_id` (high cardinality) as the partition key and `timestamp` as the sort key -- not the reverse.
+
+4. **Use a GSI with a different partition key.** If the hot path is a specific query pattern, create a Global Secondary Index with a partition key that distributes more evenly. The GSI has its own partitions and throughput.
+
+**War Story:** At an IoT platform ingesting telemetry from 100K devices, we used `device_type` as the partition key (thinking it was a logical grouping). There were 12 device types. 60% of devices were type "sensor_v2." That one partition handled 60% of all writes -- 180K WCU of demand on a partition that could handle 3K WCU. Contributor Insights showed the hot key immediately. We redesigned the table to use `device_id` as the partition key (100K distinct values = excellent distribution). The migration required dual-writing to old and new tables for 48 hours, then cutting over reads. Throttling dropped to zero. The table went from needing 300K provisioned WCU (to brute-force the hot partition) to 50K WCU (actual demand, evenly distributed). Cost savings: $18K/month.
+
+#### Follow-up: How does DynamoDB's on-demand mode handle sudden traffic spikes?
+
+On-demand mode maintains a "previous peak" high-water mark. It can instantly serve up to double the previous peak traffic. If traffic exceeds double the previous peak, DynamoDB throttles while it provisions additional capacity (which takes minutes). For truly unpredictable spikes (0 to 50K WCU in seconds), on-demand may still throttle briefly. The mitigation: "pre-warm" by running a load test that establishes the high-water mark before the expected spike. Or use provisioned mode with auto-scaling and set the max capacity high enough.
+
+#### Follow-up: When would you use DynamoDB over PostgreSQL?
+
+When access patterns are known and key-based (get by ID, query by partition key + sort key range), write throughput needs to be massive (>100K writes/second), you want zero-operational-overhead scaling, and you do not need ad-hoc queries or multi-table joins. DynamoDB excels at: session stores, user profiles, shopping carts, IoT telemetry, gaming leaderboards. PostgreSQL excels at: anything requiring JOINs, complex queries, transactions across multiple tables, or access patterns that evolve unpredictably. The wrong choice: using DynamoDB when you need to run `SELECT orders.*, customers.name FROM orders JOIN customers ON ...` -- you will end up doing the JOIN in application code, which is slower and more error-prone.
+</Accordion>
+
+<Accordion title="Q20: Your API has a 99.9% success rate, which sounds great until you do the math. A product manager asks why customers are still complaining. Explain the math and propose a solution.">
+
+### This is a "numbers that sound good but are not" question. It tests whether candidates think in absolute numbers, not just percentages.
+
+**What weak candidates say:**
+"99.9% is three nines of reliability. That is industry standard. Customers should not be complaining." -- This shows the candidate has never operated a high-traffic API.
+
+**What strong candidates say:**
+
+99.9% sounds great as a percentage. But percentages without volume are meaningless. Let me do the math.
+
+**The math that changes the narrative:**
+
+If the API serves 10 million requests per day:
+- 99.9% success = 0.1% failure = **10,000 failed requests per day**
+- That is **416 failures per hour**, or **7 per minute**
+
+If each failed request represents a user-visible error (a payment that did not go through, a page that did not load, a notification that was not sent), 10,000 users per day are having a bad experience. If even 1% of those users contact support, that is 100 support tickets per day. If 10% of those users churn, you lose 1,000 users per day. At an average customer LTV of $500, that is $500K/day in lost future revenue.
+
+Now compare to 99.99% (four nines):
+- 0.01% failure = **1,000 failed requests per day**
+- 42 per hour, less than 1 per minute
+
+And 99.99% at 100M requests/day:
+- **10,000 failures per day** -- you are right back where you started
+
+**This is why SLOs must be defined in absolute terms, not just percentages.** "99.9% success rate" is not an SLO. "Fewer than 1,000 user-visible errors per day" is an SLO.
+
+**How to improve from 99.9% to 99.99%:**
+
+Going from three nines to four nines is a 10x reduction in failures. This is where the diminishing returns kick in -- each additional nine is an order of magnitude harder and more expensive.
+
+1. **Categorize the failures.** Not all 10,000 daily failures have the same cause. Pull the error logs and categorize:
+   - **Timeouts to downstream services** (often 40-50% of failures): add circuit breakers, increase timeout budgets for critical paths, add fallback responses for non-critical dependencies.
+   - **Database connection exhaustion** (often 15-25%): add PgBouncer, tune pool sizes, add connection timeout with retry.
+   - **Rate limiting / load shedding** (often 10-20%): if you are rate-limiting legitimate traffic, your limits are too low or your capacity is too small.
+   - **Application bugs** (often 10-15%): null pointer exceptions, unhandled edge cases in business logic. Each one is a unique fix.
+   - **Infrastructure failures** (often 5-10%): node crashes, deployment rollouts, cloud provider transient errors.
+
+2. **Implement retries with backoff for transient failures.** Many of the timeouts and connection errors are transient -- the downstream service was busy for 200ms but would succeed on retry. A single retry with 100ms backoff converts a transient failure into a success, reducing the failure count by 30-50%. But retries must be idempotent (see Q2) and must have a retry budget (max 1 retry per request, max 10% of traffic as retries) to avoid amplification.
+
+3. **Add graceful degradation.** If the recommendation engine is down, show popular products instead of a 500 error. If the analytics service is slow, skip analytics tracking and serve the page. Not every dependency failure needs to be a user-visible error. This alone can improve the user-perceived success rate from 99.9% to 99.95%.
+
+4. **Reduce blast radius.** A single bad deployment that crashes 1 of 10 servers causes a 10% error spike for the duration of the rollout. Canary deployments (route 5% of traffic to the new version, monitor for 10 minutes, then proceed) limit the blast radius. A bad deploy now affects 5% of traffic for 10 minutes instead of 100% for 5 minutes.
+
+**War Story:** At a payment processing company doing 50M API calls/day, our SLO was 99.95% (four nines target). We were at 99.91% -- 45,000 failures/day. The CEO thought we were "basically there." I showed the team that 45,000 vs our target of 25,000 meant 20,000 excess failures per day. We categorized them: 18,000 were timeouts to a single downstream fraud detection service that had a P99 latency of 8 seconds. Our timeout was 5 seconds. The fraud service team tuned their slowest query path (a GIN index lookup on a 2B-row table that had bloated), dropping P99 to 800ms. Our timeout failures dropped from 18,000 to 1,200. Overall success rate went to 99.97%. A single index optimization on a downstream service was responsible for 0.06% of our error rate. That is why you categorize failures before optimizing.
+
+#### Follow-up: How do you define and measure SLOs for an API?
+
+Define SLOs using the SLI/SLO/error budget framework (Google SRE book):
+
+- **SLI (Service Level Indicator):** The metric you measure. For an API: `(successful responses / total responses) * 100` where "successful" means HTTP 2xx/3xx within the latency threshold (e.g., <500ms). Exclude 4xx client errors (those are the client's fault, not yours) unless they indicate a server-side issue (429s that should not happen).
+- **SLO (Service Level Objective):** The target for the SLI. "99.95% of requests succeed within 500ms over a 30-day rolling window."
+- **Error budget:** `100% - SLO = error budget`. At 99.95% SLO with 50M requests/day, your error budget is 25,000 failures/day. If you burn through the budget, freeze deployments and focus on reliability.
+
+Measure with: Datadog APM, Grafana + Prometheus, or AWS CloudWatch. The key is measuring at the edge (load balancer or API gateway), not at the application, because infrastructure-level failures (connection resets, TLS errors, load balancer 502s) are invisible to application-level metrics.
+
+#### Follow-up: What is the difference between SLO and SLA?
+
+SLO is an internal engineering target. Missing it triggers an engineering response (freeze deploys, fix reliability). SLA is an external contractual commitment, usually with financial penalties (service credits) for violations. Your SLO should always be stricter than your SLA. If your SLA is 99.9%, your SLO should be 99.95% -- the gap is your safety margin. You should never be in a situation where engineering only finds out about a reliability problem because a customer claims an SLA credit.
+</Accordion>
+
+<Accordion title="Q21: A developer proposes using a single PostgreSQL database as both the application database AND the job queue (using SKIP LOCKED for dequeuing). A staff engineer says 'use a proper queue like SQS.' Who is right?">
+
+### This is a "both sides have merit and the context determines the answer" question. It tests architectural judgment, not religious preference.
+
+**What weak candidates say:**
+Either extreme -- "Never use PostgreSQL as a queue, always use SQS" or "PostgreSQL does everything, why add another service?" Both are dogmatic rather than analytical.
+
+**What strong candidates say:**
+
+Both are right in different contexts, and the decision depends on scale, operational complexity budget, and the team's existing infrastructure. Let me argue both sides, then give my recommendation.
+
+**The case for PostgreSQL as a job queue:**
+
+It genuinely works well at moderate scale, and the operational simplicity is significant.
+
+1. **Transactional enqueue.** When an API request creates an order AND enqueues a notification job, both happen in the same database transaction. If the transaction fails, neither persists. With SQS, you have the dual-write problem: the order is committed to the database, but the SQS send fails (or vice versa). You need the outbox pattern to make this reliable, which adds complexity.
+
+2. **No additional infrastructure.** No SQS configuration, no IAM policies, no dead-letter queue configuration, no CloudWatch alarms for queue depth. The job table is just another table in the database you already monitor, back up, and maintain.
+
+3. **SKIP LOCKED is remarkably efficient.** PostgreSQL's `SELECT ... FOR UPDATE SKIP LOCKED` is purpose-built for this pattern. Multiple workers dequeue concurrently without blocking each other. At 100-500 jobs/second, a well-indexed job table with regular cleanup of completed jobs handles this without breaking a sweat. Libraries like `pgboss` (Node.js), `Oban` (Elixir), `GoodJob` (Ruby), and `Procrastinate` (Python) are production-tested implementations.
+
+4. **Rich querying.** You can `SELECT COUNT(*) FROM jobs WHERE status = 'failed' AND created_at > now() - interval '1 hour'` -- try that with SQS. You can add indexes, run analytics on job performance, and JOIN job data with business data. SQS is an opaque pipe.
+
+**The case for a dedicated queue (SQS, Kafka, RabbitMQ):**
+
+1. **Scale.** PostgreSQL as a queue works at 100-500 jobs/second. At 10,000+ jobs/second, the job table becomes a write hotspot. Every enqueue is an INSERT, every dequeue is a SELECT + UPDATE, every completion is an UPDATE or DELETE. That is 3 write operations per job on a single table. At 10K jobs/second, that is 30K write operations/second on the jobs table alone -- enough to saturate a mid-tier PostgreSQL instance. SQS handles 3,000 messages/second per queue by default and scales transparently to nearly unlimited throughput.
+
+2. **Isolation.** A surge in job processing should not affect API response times. If job dequeuing competes with API queries for database connections, CPU, and I/O, a job backlog can degrade API performance. SQS is completely isolated -- a million queued messages does not affect your database.
+
+3. **Retention and replay.** SQS retains messages for up to 14 days. Kafka retains indefinitely. A PostgreSQL job table fills up and needs cleanup. If you need to replay failed jobs from last week, SQS/Kafka has them. PostgreSQL requires you to not delete completed/failed jobs (which bloats the table).
+
+4. **Dead-letter queues and visibility timeouts.** SQS has built-in DLQ, visibility timeout (message becomes invisible to other consumers for N seconds while being processed), and automatic re-delivery after timeout. Implementing all of this in PostgreSQL is possible but is 500+ lines of code that you have to maintain and test.
+
+**My recommendation framework:**
+
+| Factor | Use PostgreSQL Queue | Use SQS/Dedicated Queue |
+|---|---|---|
+| Job throughput | <500/second | >1,000/second |
+| Team already operates SQS/Kafka | No | Yes |
+| Need transactional enqueue (job + business data atomically) | Yes (this is the killer feature) | Only with outbox pattern |
+| Job processing affects API latency | Acceptable | Unacceptable |
+| Number of services | Monolith or <5 services | Microservices (>5 services) |
+| Need exactly-once processing | Easier (DB transaction) | Harder (need idempotency) |
+
+**For a startup or small team with <500 jobs/second: use PostgreSQL.** The operational simplicity and transactional guarantees outweigh the scaling limitations you do not yet have. Use `Oban`, `pgboss`, or `GoodJob` -- do not build your own.
+
+**For a team at scale with >1,000 jobs/second or microservices architecture: use SQS.** The isolation and scaling benefits outweigh the operational complexity.
+
+**War Story:** A team I advised started with SQS for job processing on day one because "that is what you are supposed to do." Six months in, they had: 3 separate SQS queues, a DLQ for each, CloudWatch alarms for queue depth, a Lambda consumer for each queue, and the outbox pattern with a Debezium CDC pipeline to reliably publish database events to SQS. Total infrastructure: 15 AWS resources for what was 200 jobs/hour. They were spending more engineering time maintaining the queuing infrastructure than the actual application. I helped them rip it all out and replace it with `pgboss` -- one PostgreSQL table, one worker process, zero additional infrastructure. Deployment complexity dropped dramatically. The system ran without incident for two years before they genuinely needed SQS at 5,000 jobs/second. The lesson: match the tool to the actual scale, not the imagined future scale.
+
+#### Follow-up: What about using Redis (Bull/BullMQ) as the queue instead of PostgreSQL or SQS?
+
+Redis with BullMQ is the middle ground. Faster than PostgreSQL for high-throughput dequeuing (Redis operations are sub-millisecond), simpler than SQS (no IAM, no DLQ configuration), and has a beautiful dashboard (Bull Board) for monitoring. The trade-off: Redis is not durable by default. If Redis crashes and AOF persistence is not configured (or has a gap), queued jobs are lost. For jobs where loss is acceptable (send analytics event, update search index), Redis is excellent. For jobs where loss is unacceptable (process payment, send invoice), use PostgreSQL or SQS with their durability guarantees.
+
+#### Follow-up: How does the outbox pattern solve the dual-write problem with SQS?
+
+Instead of writing to the database AND sending to SQS (two separate operations that can partially fail), you write the business data AND the message to the database in the same transaction:
+
+```sql
+BEGIN;
+INSERT INTO orders (id, customer_id, amount) VALUES (...);
+INSERT INTO outbox (id, topic, payload) VALUES (..., 'order_created', '{"order_id": ...}');
+COMMIT;
+```
+
+A separate process (the "relay") polls the outbox table, sends each message to SQS, and deletes it from the outbox after SQS confirms receipt. If the relay crashes, it restarts and re-sends un-relayed messages (SQS consumers must be idempotent). An alternative to polling is CDC (Change Data Capture) with Debezium, which streams the outbox inserts to Kafka/SQS in near-real-time via the database's WAL/binlog. This is more complex but eliminates polling latency.
+</Accordion>
+
+<Accordion title="Q22: You run EXPLAIN ANALYZE on a slow query and see that PostgreSQL chose a sequential scan on a 200M-row table despite a perfectly matching B-tree index existing. Why would the optimizer ignore your index, and what do you do?">
+
+### This tests deep query planner knowledge. The "obvious" answer -- "the index is missing" -- is wrong. The index exists. The planner chose to ignore it.
+
+**What weak candidates say:**
+"The index must be corrupt. Rebuild it." or "Force an index scan with `SET enable_seqscan = off`." -- The first is extremely unlikely. The second is a brute-force hack that masks the real problem and can make other queries worse.
+
+**What strong candidates say:**
+
+The PostgreSQL query planner is cost-based. It estimates the cost of every possible execution plan (sequential scan, index scan, bitmap index scan, etc.) and picks the cheapest one. If it chose a sequential scan over an index scan on a 200M-row table, it is telling you something. Either the planner's cost estimate is wrong, or the planner is actually right and the sequential scan really is cheaper for this specific query. Let me walk through the common reasons.
+
+**Reason 1: The query returns too many rows (low selectivity).**
+
+If the query matches 30%+ of the table, a sequential scan is genuinely faster than an index scan. Why? An index scan requires: (1) traverse the B-tree to find matching keys, (2) for each key, follow a pointer to the heap (table) to fetch the full row. At 30% selectivity on 200M rows, that is 60M random I/O operations to the heap. A sequential scan reads the entire table in one linear pass -- sequential I/O is 10-100x faster than random I/O on both HDDs and SSDs.
+
+The threshold where the planner switches from index scan to sequential scan is typically around 5-15% of the table, depending on `random_page_cost` and `seq_page_cost` settings.
+
+**Diagnosis:** Check `EXPLAIN ANALYZE` for the estimated row count. If the planner estimates returning 50M+ rows from a 200M-row table, the sequential scan is correct. The fix is not to force an index -- it is to add more selective filters to the query or rethink the access pattern.
+
+**Reason 2: Stale statistics.**
+
+PostgreSQL's planner uses table statistics (row counts, value distribution, most common values, histogram of column values) to estimate selectivity. If the statistics are stale -- the table had 10M rows when `ANALYZE` last ran but now has 200M rows -- the planner's estimates are wrong.
+
+**Diagnosis:** Compare `EXPLAIN` (estimated) with `EXPLAIN ANALYZE` (actual). If estimated rows = 50,000 but actual rows = 500, the statistics are wrong. The planner overestimated the result set and chose a sequential scan based on the wrong estimate.
+
+**Fix:**
+```sql
+ANALYZE your_table;
+-- For high-cardinality columns, increase statistics granularity:
+ALTER TABLE your_table ALTER COLUMN important_column SET STATISTICS 1000;
+ANALYZE your_table;
+```
+
+The default statistics target is 100 (PostgreSQL samples 100 * 300 = 30,000 rows to build histograms). For a 200M-row table with skewed data distribution, increasing to 1000 gives much better estimates for columns with many distinct values.
+
+**Reason 3: Correlated columns confusing the planner.**
+
+If your WHERE clause filters on two columns (`WHERE status = 'active' AND region = 'us-east'`) and the planner assumes independence (5% of rows are active, 20% are us-east, so 1% match both), but in reality 90% of active rows are in us-east (correlation), the planner dramatically underestimates the result set. With the wrong estimate, it might choose an index scan expecting 2M rows but actually get 36M rows, or it might choose a sequential scan expecting 20M rows when only 2M match.
+
+**Fix:** PostgreSQL 10+ supports multivariate statistics:
+```sql
+CREATE STATISTICS stat_status_region (dependencies, ndistinct, mcv)
+ON status, region FROM your_table;
+ANALYZE your_table;
+```
+
+This tells the planner about the correlation between `status` and `region`, leading to more accurate row estimates.
+
+**Reason 4: Cost parameters are misconfigured.**
+
+PostgreSQL's default `random_page_cost = 4.0` and `seq_page_cost = 1.0` assumes that random I/O is 4x more expensive than sequential I/O. This was accurate for spinning disks. On SSDs (which most production databases use), random I/O is only 1.1-1.5x more expensive than sequential I/O. With the default settings, the planner overestimates the cost of index scans (which involve random I/O) and favors sequential scans.
+
+**Fix:**
+```sql
+-- For SSD-backed storage:
+SET random_page_cost = 1.1;
+-- For data mostly in cache:
+SET effective_cache_size = '48GB';  -- ~75% of total RAM
+```
+
+Setting `random_page_cost` closer to `seq_page_cost` makes the planner more willing to use index scans, which is correct for SSD-backed databases.
+
+**Reason 5: The index is on the wrong column order.**
+
+A composite index on `(status, created_at)` helps `WHERE status = 'active' AND created_at > '2025-01-01'` but the planner cannot use it for `WHERE created_at > '2025-01-01'` alone (leftmost prefix rule). The index exists, it matches the columns, but the column order does not match the query pattern.
+
+**What I would NEVER do:**
+
+`SET enable_seqscan = off` -- this forces the planner to avoid sequential scans globally. It might "fix" your one query but degrades every other query where a sequential scan was genuinely optimal. It is a debugging tool, not a production setting. Use it only to verify "would an index scan be faster?" then fix the root cause.
+
+**War Story:** At a healthcare SaaS company, a report query on a 150M-row patient records table was doing a sequential scan despite a perfect composite index on `(provider_id, visit_date)`. EXPLAIN showed estimated rows = 12M, actual rows = 3,200. The statistics were wildly off because autovacuum had not analyzed the table in 3 weeks -- the table had grown from 80M to 150M rows in that period due to a data migration, and autovacuum's threshold (`autovacuum_analyze_threshold + autovacuum_analyze_scale_factor * n_live_tup`) had not triggered because the scale factor was set to 10% (the default). At 80M rows, 10% means autovacuum waits for 8M new rows before re-analyzing. We ran `ANALYZE` manually -- query time dropped from 4 minutes (sequential scan) to 80ms (index scan). Then we tuned autovacuum for that table: `ALTER TABLE patient_records SET (autovacuum_analyze_scale_factor = 0.01)` -- now autovacuum re-analyzes after every 1.5M new rows instead of every 8M.
+
+#### Follow-up: How do you investigate whether the planner's estimate is wrong without running the full query?
+
+Use `EXPLAIN` (without `ANALYZE`) to see the planner's estimates without executing the query. Compare the estimated rows to a quick approximation:
+
+```sql
+-- Quick row count estimate from statistics (instant, no table scan):
+SELECT reltuples::bigint FROM pg_class WHERE relname = 'your_table';
+
+-- Estimated selectivity for a specific condition:
+SELECT * FROM pg_stats
+WHERE tablename = 'your_table' AND attname = 'status';
+-- Look at most_common_vals and most_common_freqs
+```
+
+If `pg_stats` shows `status = 'active'` has frequency 0.05 (5%) and the EXPLAIN estimates 10M rows for a 200M-row table, the estimate is correct. If it estimates 100M rows, the statistics are stale.
+
+#### Follow-up: What is a bitmap index scan and when does PostgreSQL use it instead of a regular index scan?
+
+A bitmap index scan is the middle ground between a sequential scan and an index scan. PostgreSQL first scans the index and builds a bitmap of all matching heap pages (not individual rows). Then it scans the heap pages in physical order (sequential I/O, not random). This combines the selectivity of an index with the I/O efficiency of sequential access.
+
+The planner uses a bitmap scan when selectivity is moderate (1-15% of the table). Too selective -> regular index scan (few random reads). Not selective enough -> sequential scan (read everything). In the middle -> bitmap scan. It is also used when combining multiple indexes: `WHERE status = 'active' AND region = 'us-east'` with separate indexes on `status` and `region` -> bitmap AND of the two indexes, then heap scan. This is why PostgreSQL can sometimes use two single-column indexes instead of a composite index, though the composite index is typically faster.
+</Accordion>
+
+</AccordionGroup>

@@ -1559,3 +1559,372 @@ This is why I always look at RSS specifically, not just total container memory, 
 </Accordion>
 
 </AccordionGroup>
+
+---
+
+## Advanced Interview Scenarios
+
+*These questions are designed to expose the gap between "I read about this" and "I lived through this." Each one contains a trap -- a place where the obvious answer is wrong, where conventional wisdom breaks down, or where the real problem is organizational rather than technical. These are the questions that staff-level interviewers use to separate builders from reciters.*
+
+<AccordionGroup>
+
+<Accordion title="Scenario: You add Redis caching to your slowest endpoint. Response times improve by 10x for 24 hours, then the endpoint becomes SLOWER than it was without caching. What happened?">
+
+### The Trap
+
+The obvious answer is "the cache expired" or "cache hit ratio dropped." But the real scenario is more insidious: the cache made things worse because the system adapted to the cache's presence, and when the cache failed to absorb load as expected, the uncovered database was in a worse position than before caching existed.
+
+**What weak candidates say:**
+"The cache TTL expired and requests hit the database." This is surface-level. It does not explain why things are *worse* than before -- before caching, the database handled this load fine.
+
+**What strong candidates say:**
+
+The way I think about this is through the lens of hidden capacity coupling. When you add a cache, two things happen that most people do not anticipate.
+
+- **The database lost its warm buffer pool for that query pattern.** Before caching, the database served this query thousands of times per hour. PostgreSQL's `shared_buffers` and the OS page cache kept the relevant data pages hot in RAM. The B-tree index nodes for this query were always in the buffer pool. After 24 hours of caching absorbing 99% of reads, the database has evicted those pages to make room for other workloads. Now when cache misses start hitting the database, every query is a cold read -- hitting disk instead of RAM. A query that took 5ms before caching now takes 50-200ms because the buffer pool is cold for this access pattern.
+
+- **Traffic grew because the endpoint got faster.** This is the Jevons paradox of performance. The product team saw the faster endpoint and enabled a feature that calls it 3x more frequently. Or users started using the feature more because it was responsive. The pre-cache traffic was 1,000 req/s. Post-cache traffic grew to 3,000 req/s. The cache was absorbing 2,970 req/s, the database handled the remaining 30 req/s easily. When the cache degrades (Redis failover, memory pressure eviction, key pattern change from a deploy), those 3,000 req/s hit a database that was never sized for that load -- it was sized for the original 1,000 req/s, and even that working set is now cold.
+
+- **Cache stampede.** If a popular cache key expires and 500 concurrent requests all see the cache miss simultaneously, they all query the database in parallel for the same data. The database is hit with 500 identical expensive queries instead of 1. This is a thundering herd at the cache layer. At scale, with thousands of keys expiring near the same time (common with fixed TTLs set at the same moment), this becomes a periodic stampede that is worse than no caching.
+
+**The real fix is layered:**
+1. **Stale-while-revalidate.** Serve the stale cached value immediately while refreshing in the background. The user gets a fast (slightly stale) response, and only one request triggers the refresh. Cloudflare, Fastly, and most CDNs support this natively with `Cache-Control: stale-while-revalidate=60`.
+2. **Cache warming on startup.** When Redis restarts or a new cache node joins, pre-populate it with the top 1,000 keys by query frequency before routing traffic to it.
+3. **Probabilistic early expiration (PER).** Each request checks if the key is "close to expiring" (say within 20% of TTL) and refreshes it with a probability proportional to how close it is to expiration. This spreads refresh load over time instead of concentrating it at expiry. The XFetch algorithm formalizes this.
+4. **Circuit breaker on the database.** If cache miss rate exceeds a threshold (say 10%), trip a circuit breaker that returns degraded responses (stale data, partial results, or HTTP 503) rather than letting the database be overwhelmed.
+
+**War Story:** At a fintech company processing 40K req/s, we added Memcached in front of an account balance lookup. Worked brilliantly for three months. Then a Memcached node failed during a routine cluster resize. The surviving nodes absorbed most keys via consistent hashing, but the reshuffled 15% of keys all missed simultaneously. The PostgreSQL instance behind it was a db.r5.2xlarge that had been coasting at 8% CPU. Within 90 seconds of the Memcached node drop, database CPU hit 97%, connection pool was exhausted, and the checkout flow went down for 4 minutes. We were worse off than if we had never added caching because the database's buffer pool had zero warm pages for these queries. The post-mortem added three things: stale-while-revalidate on all cache reads, a cache warming job that runs on any topology change, and a connection-pool-aware circuit breaker that sheds cache-miss traffic when pool utilization exceeds 75%.
+
+#### Follow-up: How would you design a caching layer that survives a complete Redis failure without overwhelming the database?
+
+#### Follow-up: Explain the difference between cache-aside, write-through, and write-behind. When does write-behind lose data?
+
+#### Follow-up: Your cache hit ratio is 99.5% but your P99 latency is still bad. How is that possible?
+</Accordion>
+
+<Accordion title="Scenario: You deploy a new version of Service A. Within 10 minutes, Service D -- three hops away in the call chain -- starts returning 500s. Service A's metrics look fine. Walk me through the investigation.">
+
+### The Cascading Failure
+
+This is a cascade that crosses team boundaries. The trap is focusing only on Service D or only on Service A. The real problem is in the interaction between services B and C, triggered by a subtle behavioral change in A.
+
+**What weak candidates say:**
+"I'd check Service D's logs for errors." This starts at the wrong end of the causal chain. Or: "I'd roll back Service A since it's the most recent change." This might work but teaches you nothing about why it happened or how to prevent it.
+
+**What strong candidates say:**
+
+- **Step 1: Establish the timeline.** I pull up a service dependency map (Datadog Service Map, Grafana Tempo's service graph, or Kiali if we are on Istio). The call chain is A -> B -> C -> D. I overlay deploy events on the latency/error graphs for all four services. Service A deployed at 14:32. Service B's latency started climbing at 14:35. Service C's error rate spiked at 14:38. Service D's 500s began at 14:40. The cascade propagated downstream over 8 minutes -- this delay rules out a direct code dependency and suggests a resource exhaustion cascade.
+
+- **Step 2: Examine what changed in Service A's behavior, not just its health.** Service A's dashboard shows green -- low error rate, normal latency. But I check its *outbound* call pattern. The new deploy changed a retry policy from 2 retries with 500ms backoff to 5 retries with 100ms backoff. Individually, each request from A to B looks fine. But at 10,000 req/s, the old policy generated ~200 retries/s (1% error rate times 2 retries). The new policy generates ~500 retries/s (same 1% error rate, but 5 retries with aggressive backoff means each failure generates 5x the downstream load). Service B now receives 10,500 req/s instead of 10,200 -- a 3% increase that pushes it past its capacity threshold.
+
+- **Step 3: Trace the resource exhaustion.** Service B at 10,500 req/s starts queuing. Its P99 latency rises from 30ms to 200ms. Service B's responses to Service C now take longer, and some timeout. Service C has a connection pool of 50 connections to Service B, each now held for 200ms instead of 30ms. By Little's Law, C needs 50 connections for the old latency but now needs ~330. The pool is exhausted. Service C's requests to B start timing out at the pool wait layer. Service C's error rate to D spikes because C cannot complete its own processing. Service D receives either malformed requests or no requests at all from C, and returns 500s.
+
+- **Step 4: The fix is not where the symptom is.** Rolling back Service A's retry policy immediately resolves the cascade. But the deeper fix involves three things: (1) Retry budgets -- instead of configuring retries per-client, set a cluster-wide retry budget: "total retries must not exceed 10% of baseline traffic." Google's SRE book recommends this. (2) Circuit breakers on B, C, and D so that each service fails fast instead of cascading timeout pressure downstream. (3) Load shedding in Service B -- when queue depth exceeds a threshold, reject new requests with HTTP 503 and `Retry-After` header rather than accepting them into an increasingly deep queue.
+
+**War Story:** This exact pattern happened at a logistics company I worked at. A team changed their HTTP client from `axios` with default retries to a custom wrapper with exponential backoff but no jitter. Under normal conditions, it was fine. During a brief network hiccup that caused 5% packet loss for 30 seconds, every instance retried at the same exponential intervals. The retries synchronized -- 200 instances all retried at T+1s, T+2s, T+4s, T+8s. This created periodic request spikes at exactly 2x normal load every power-of-two seconds. The downstream payment service could not absorb the synchronized bursts, its connection pool drained, and we had a 12-minute outage on checkout. The fix was adding jitter (`delay * (0.5 + random() * 0.5)`) to all retry intervals and implementing a global retry budget of 15% above baseline.
+
+#### Follow-up: What is the difference between retries with jitter and a retry budget? When do you need both?
+
+#### Follow-up: How would you implement a circuit breaker that accounts for slow responses (not just errors)? A service returning 200 OK in 10 seconds is worse than a clean 503.
+
+#### Follow-up: In a service mesh (Istio/Linkerd), how does the mesh change your approach to retry and circuit breaker configuration?
+</Accordion>
+
+<Accordion title="Scenario: Your team runs a load test at 2x production traffic. Everything passes. Two weeks later, production hits 1.5x normal traffic and the system falls over. How is this possible?">
+
+### When Load Tests Lie
+
+The trap is assuming that a load test that passes at 2x traffic proves the system can handle 2x traffic. Load tests can pass for reasons that do not apply to production, and fail to test conditions that only exist in production.
+
+**What weak candidates say:**
+"Maybe the production traffic was different from the test traffic." This is vaguely correct but lacks specificity. Or: "The load test environment was more powerful than production." Possible but unlikely if you are testing properly.
+
+**What strong candidates say:**
+
+There are at least six ways a load test at 2x can pass while production at 1.5x fails, and I have personally encountered three of them:
+
+- **The load test used synthetic data that was uniformly distributed. Production data is skewed.** A load test that generates random user IDs distributes queries evenly across database shards and index pages. In production, 5% of users generate 40% of the traffic. Those hot users trigger hot partitions, cache contention on the same keys, and lock contention on the same rows. The database handles 100K uniformly distributed queries easily but buckles under 75K queries when 30K of them hit the same partition. At one company, our load test used a pool of 10,000 test user IDs. Production had 2 million users, but 200 of them were enterprise accounts with 50,000+ records each. Every query for those accounts bypassed the index's fast path and hit a sequential scan. The load test never exercised that code path.
+
+- **The load test ran for 30 minutes. The production failure happened after 6 hours.** Short load tests miss slow-burn issues: memory leaks that accumulate over hours, connection pool leaks where connections are borrowed but not returned under specific error conditions, GC heap growth that only triggers a full GC after hours of gradual accumulation, and log files filling a disk. Our Celery workers had a memory leak that grew at 2MB per hour per worker. In a 30-minute load test, that is 1MB -- invisible. Over a 12-hour production day, that is 24MB per worker times 50 workers = 1.2GB of leaked memory, enough to trigger OOM kills.
+
+- **The load test hammered a single endpoint. Production traffic is a mix.** Load tests often focus on the "main" endpoint at the expected ratio. But production has long-tail endpoints that share the same connection pool and thread pool. A rarely-used admin endpoint that does a full table scan was not in the load test. During the 1.5x spike, the admin endpoint's traffic also increased, and its expensive queries competed with the main endpoint for database connections.
+
+- **The load test started with a warm cache. Production had a cache cold-start event.** If you run the load test against a system that has been serving traffic for hours (warm cache, warm DB buffer pool, warm JIT compiler), the test benefits from conditions that do not exist after a deploy, a cache flush, or a Redis failover.
+
+- **The staging database was a recent snapshot but lacked production's data volume.** Staging had 10M rows; production had 500M. The query plan was different at production scale because PostgreSQL's planner uses table statistics to choose between index scan and sequential scan. At 10M rows, the planner chose an index scan. At 500M rows with slightly stale statistics, it chose a sequential scan.
+
+- **Network conditions differed.** The load test ran from the same AWS region as the service. Production clients come from everywhere, with higher latency and more packet loss. Higher client-to-server latency means connections are held open longer, which means more concurrent connections, which means more connection pool pressure for the same throughput.
+
+**War Story:** At a healthtech SaaS, we load-tested our appointment scheduling API at 3x production traffic using k6 from the same VPC. All metrics stayed green. Two weeks later, during open enrollment season, we hit 1.8x traffic and the system cratered. Post-mortem revealed three compounding factors: (1) our load test used 500 synthetic patient IDs, cycling through them uniformly -- production had 50 "whale" clinic accounts that each had 100K+ patient records, and their queries were 20x more expensive than average; (2) the load test ran for 45 minutes against a warm system, but the production failure happened 3 hours after a deploy that cleared the JVM's JIT compilation cache, so the first 90 minutes of production traffic was running interpreted bytecode at 5x the normal CPU cost; (3) our load test did not include the background job that runs hourly to sync insurance eligibility -- during production, that job fired during the traffic peak and competed for the same database connection pool. We rebuilt our load test suite with production traffic replay (using GoReplay to capture and replay actual production request patterns), extended the test duration to 4 hours minimum, included all background jobs in the test scenario, and added a specific "whale account" test phase.
+
+#### Follow-up: How would you build a load test that actually catches these problems? What does a production-representative load test look like?
+
+#### Follow-up: What is the role of chaos engineering here? How would you combine load testing with fault injection?
+
+#### Follow-up: Your load test uses production traffic replay. What are the risks of replaying real traffic in a staging environment?
+</Accordion>
+
+<Accordion title="Scenario: You need to migrate a PostgreSQL table with 2 billion rows from one schema to another with zero downtime. The table serves 5,000 reads/second and 500 writes/second. How?">
+
+### The Zero-Downtime Migration
+
+This is a question where every shortcut has a consequence. The trap is proposing `ALTER TABLE` or a simple migration script that locks the table.
+
+**What weak candidates say:**
+"I'd run an ALTER TABLE during a maintenance window." A maintenance window for a table serving 5,500 operations/second means downtime. At 500 writes/second, even a 2-minute window loses 60,000 writes. Or: "I'd create the new table and swap them." This glosses over the hardest part -- what happens to the writes during the swap.
+
+**What strong candidates say:**
+
+This is a multi-phase online migration. I have done this pattern three times and the key insight is: never make the cutover a single atomic moment. Instead, make it a gradual process where both schemas coexist and you can roll back at every step.
+
+- **Phase 1: Dual-write setup (1-2 days of engineering).** Deploy application code that writes to BOTH the old table and the new table simultaneously. Every INSERT, UPDATE, DELETE goes to both. The old table remains the source of truth for reads. This is the "expand" phase. Use a feature flag to enable dual-write so you can turn it off instantly if something goes wrong. Critical detail: the dual-write must be in the same database transaction to maintain consistency. If the new table write fails, the transaction rolls back and the old table is also not written -- you do not end up with divergent data.
+
+- **Phase 2: Backfill historical data (hours to days).** While dual-write is running, backfill the 2 billion existing rows from the old table to the new table. Use a batch migration script that processes rows in chunks of 10,000-50,000, with a configurable delay between batches to avoid overwhelming the database. At 50K rows per batch with a 500ms sleep between batches, processing 2 billion rows takes roughly 5.5 hours. Run this during off-peak hours. Use `WHERE id > last_processed_id ORDER BY id LIMIT 50000` to resume from where you left off if the script crashes. Track progress in a separate `migration_status` table.
+
+- **Phase 3: Verification (1-2 days).** After backfill completes, run a consistency check: compare row counts, checksum a sample of rows between old and new tables. Fix any discrepancies (rows written between the backfill read and the dual-write activation). Let dual-write run for 24-48 hours and verify that both tables stay consistent. Monitor write latency -- the dual-write adds one extra INSERT per transaction, roughly 1-5ms of overhead.
+
+- **Phase 4: Shadow reads (1-2 days).** Start reading from BOTH tables and comparing results, but return only the old table's result to the user. Log discrepancies. GitHub's Scientist library (Ruby) or a custom comparator does this. This catches bugs in the new schema that would only manifest at production scale -- incorrect JOIN behavior, missing indexes, collation differences.
+
+- **Phase 5: Cut over reads (gradual).** Switch reads to the new table using a feature flag. Start with 1% of traffic, monitor latency and correctness, ramp to 10%, 50%, 100%. At each stage, you can instantly revert to reading from the old table. The old table is still receiving writes via dual-write, so it is always up to date.
+
+- **Phase 6: Remove old table writes (the "contract" phase).** Once 100% of reads use the new table and you are confident in correctness, remove the dual-write. The old table stops receiving updates. Keep it around for a week as a safety net, then drop it.
+
+Total timeline: 1-3 weeks of engineering, zero seconds of downtime, rollback possible at every phase.
+
+**War Story:** At an e-commerce company, we migrated the `orders` table (1.8B rows, ~600GB) from a denormalized schema to a normalized one with a separate `order_items` table. The dual-write phase revealed a bug we never would have caught in staging: our ORM batched `order_items` INSERTs in groups of 100, and at production write volume, the batch INSERT occasionally exceeded PostgreSQL's `max_stack_depth` because the query string for 100 items with 15 columns each was 47KB. In staging with 5 items per order, the query was 2KB -- well within limits. We discovered this only because the dual-write to the new table started throwing errors in production while the old table (single denormalized row per order) was fine. We fixed the batch size to 25 items and completed the migration without any user-visible impact. Total migration took 11 days from dual-write activation to old table drop.
+
+#### Follow-up: What happens if a row is updated in the old table during the backfill but before the backfill reaches that row? How do you handle this race condition?
+
+#### Follow-up: The dual-write adds 3ms of latency to every write. The product team says that is unacceptable for the checkout flow. How do you handle this?
+
+#### Follow-up: How would this approach change if you were migrating across databases (PostgreSQL to DynamoDB) rather than across schemas within the same database?
+</Accordion>
+
+<Accordion title="Scenario: Your GC pause times on a JVM service are 200-400ms, causing P99 latency spikes. A junior engineer proposes increasing the heap from 4GB to 16GB. Why might this make things WORSE?">
+
+### When More Memory Hurts
+
+This is the canonical "obvious answer is wrong" question. More heap sounds like it should help -- fewer GCs because more room. The trap is that GC pause duration is proportional to the live object set that must be traversed, and a larger heap means the GC runs less frequently but each pause is much longer.
+
+**What weak candidates say:**
+"More heap means fewer GC pauses, so latency should improve." This is correct for frequency but ignores duration. Or: "Just switch to a different GC." This is a reasonable suggestion but does not demonstrate understanding of why the current approach fails.
+
+**What strong candidates say:**
+
+- **The heap size and GC pause trade-off is non-linear and depends on the collector.** With the default G1GC on a 4GB heap, the GC runs mixed collections frequently (every few seconds) with pauses of 200-400ms -- bad, but bounded. If you increase to 16GB without changing anything else, the GC delays collection because there is plenty of free space. Objects accumulate for minutes instead of seconds. When the GC finally runs, it has 4x the live objects to scan, mark, and compact. The pause goes from 200-400ms to 800ms-2 seconds. You traded frequent short pauses for infrequent catastrophic pauses. The P99 latency actually gets worse because the P99.9 is now a 2-second stop-the-world event.
+
+- **The right fix depends on the GC algorithm, not just the heap size.** With G1GC on 16GB, you should set `-XX:MaxGCPauseMillis=50` to tell G1 to target 50ms pauses. G1 will collect more frequently in smaller increments to stay within the target. But G1's ability to meet this target degrades above ~8-12GB heaps because the marking phase still scales with live object count.
+
+- **The better answer is to switch to a low-pause collector.** ZGC (production-ready since JDK 15) or Shenandoah (Red Hat JDK) are designed for large heaps. ZGC pauses are typically under 1ms regardless of heap size -- I have seen ZGC hold sub-millisecond pauses on 32GB heaps with 20GB live data. The trade-off is ~5-15% throughput reduction (the GC does more concurrent work alongside your application threads, stealing CPU cycles) and higher memory overhead (~20% more RSS because ZGC uses colored pointers that consume extra memory).
+
+- **But before changing any GC configuration, I would profile to understand what is generating garbage.** A high GC frequency with 200-400ms pauses on a 4GB heap suggests the application is allocating aggressively. Common JVM allocation hot spots: (1) Excessive object creation in hot loops -- autoboxing `int` to `Integer` in collections, creating new `String` objects via concatenation instead of `StringBuilder`. (2) Large temporary objects for JSON serialization -- Jackson's ObjectMapper creates intermediate tree structures proportional to payload size. (3) Framework overhead -- Spring's request-scoped beans, Hibernate's dirty checking creating proxy objects. Use `async-profiler -e alloc` to capture an allocation flame graph and find the top allocators. Reducing allocation rate by 50% (which is often achievable by fixing 2-3 hot paths) halves GC frequency without touching heap size or collector.
+
+**War Story:** At a trading platform processing 80K events/second on JVM, a senior engineer bumped the heap from 8GB to 32GB to "give the GC more room." G1GC mixed collection pauses went from 150ms (frequent) to 1.2 seconds (rare but devastating). During those 1.2-second pauses, the service missed 96,000 events. Market data was stale by over a second -- unacceptable for a trading system. We reverted the heap change, switched from G1GC to ZGC (`-XX:+UseZGC`), set the heap to 12GB, and profiled allocations. The allocation flame graph showed that 40% of garbage was from protobuf deserialization creating temporary byte arrays. We switched to a zero-copy deserialization path using Protobuf's `ByteString` with aliasing, cutting allocation rate by 35%. Final result: ZGC pauses under 0.8ms at P99, and throughput actually increased 8% because the CPU was no longer spending 12% of its time on G1's marking phase. The junior engineer learned that GC tuning is not "make the number bigger" -- it is understanding the relationship between allocation rate, live set size, collector algorithm, and pause time targets.
+
+#### Follow-up: Explain the difference between G1GC, ZGC, and Shenandoah. When would you choose each?
+
+#### Follow-up: How would you diagnose GC issues in a Go service? Go does not have heap size configuration the same way JVM does.
+
+#### Follow-up: Your service runs in a container with a 4GB memory limit. The JVM heap is set to 3GB. Why might you still get OOM-killed?
+</Accordion>
+
+<Accordion title="Scenario: You implement rate limiting at 1,000 req/s per API key. A legitimate customer with a batch workflow is constantly being throttled, while an abusive bot with 50 API keys sails through. How do you fix this?">
+
+### Rate Limiting That Actually Works
+
+The trap is that simple per-key rate limiting is trivially bypassed by distributing requests across keys, and overly restrictive for legitimate high-volume users. Rate limiting sounds simple but the design space is surprisingly deep.
+
+**What weak candidates say:**
+"Increase the rate limit for that customer." This helps the legitimate customer but does nothing about the bot. Or: "Block the bot's IP." Bots rotate IPs. This is whack-a-mole.
+
+**What strong candidates say:**
+
+This scenario exposes the fundamental problem with single-dimensional rate limiting. Rate limiting on one axis (API key) is always gameable on that axis. The fix is multi-dimensional rate limiting plus behavioral analysis.
+
+- **Layer 1: Tiered rate limits per API key.** Not all API keys are equal. Free tier: 100 req/s. Paid tier: 1,000 req/s. Enterprise tier: 10,000 req/s with a burst allowance of 15,000 for 30 seconds. The legitimate batch customer gets an enterprise key with appropriate limits. This is table stakes -- every serious API does this.
+
+- **Layer 2: Aggregate rate limiting.** In addition to per-key limits, apply limits per source IP, per IP subnet (/24 block), and per user-agent. The bot with 50 API keys but one IP subnet hits a subnet-level limit of 5,000 req/s even though each individual key is under its limit. Cloudflare, AWS WAF, and Kong all support multi-dimension rate limiting. The key insight: attackers can cheaply generate API keys. They cannot cheaply generate diverse network infrastructure.
+
+- **Layer 3: Adaptive rate limiting based on behavior.** Static limits are a blunt instrument. Implement a scoring system: requests that look like automated traffic (identical user-agents, no `Accept-Language` header, perfectly uniform inter-request timing with zero jitter, sequential API key usage) accumulate a "suspicion score." As the score rises, the effective rate limit tightens. A legitimate user with organic request patterns gets full throughput. A bot with machine-perfect timing gets progressively throttled. Stripe and Shopify use variants of this approach.
+
+- **Layer 4: Cost-based rate limiting (the senior answer).** Not all requests are equal in cost. A `GET /users/{id}` costs almost nothing (cache hit). A `POST /reports/generate` triggers a 30-second database aggregation. Flat per-request rate limiting lets the bot hammer the expensive endpoint. Instead, assign each endpoint a "cost" in tokens. The token bucket drains faster for expensive operations. At Stripe, their API rate limiter assigns different token costs to read vs write vs list operations. The customer's batch workflow (many cheap reads) stays within budget. The bot targeting expensive endpoints exhausts its budget quickly.
+
+- **Implementation: Sliding window counters in Redis.** I would implement this with a Redis sorted set per rate limit dimension. Each request adds a member with the current timestamp as the score. To check the limit, `ZRANGEBYSCORE` counts members within the last N seconds and `ZREMRANGEBYSCORE` removes expired entries. This gives a true sliding window (not a fixed-window approximation that allows 2x burst at window boundaries). For multi-node setups, Redis is already centralized, so the rate limit is global. The latency overhead is ~0.5-1ms per request for the Redis round-trip.
+
+**War Story:** At an API-first company, we had rate limiting at 500 req/s per API key using a token bucket in Redis. A crypto trading bot operator created 200 free-tier API keys and distributed requests across them, consuming 100K req/s -- 200x any single key's limit. Our per-key metrics showed every key under its limit. The bot was consuming 40% of our database capacity. We added three things: (1) IP-subnet rate limiting at 2,000 req/s per /24 block, which immediately cut the bot's effective throughput by 98% because all 200 keys came from the same /24; (2) a "concurrent API keys per IP" limit of 5, so an IP using more than 5 distinct keys in a 5-minute window got flagged and temporarily banned; (3) cost-based token deduction where the market data endpoint (their target) cost 10 tokens per request instead of 1. The bot operator eventually moved on. The legitimate enterprise customer who triggered the original complaint got a dedicated tier with 10,000 req/s and a dedicated support channel.
+
+#### Follow-up: How do you implement rate limiting in a distributed system with 20 application instances? Where does the counter live?
+
+#### Follow-up: What is the difference between a fixed window, sliding window, and sliding window log rate limiter? What is the edge case that makes fixed windows unreliable?
+
+#### Follow-up: Your rate limiter uses Redis. Redis goes down. Do you fail open (allow all requests) or fail closed (reject all requests)? What are the consequences of each?
+</Accordion>
+
+<Accordion title="Scenario: Your microservices team adopts eventual consistency for the order-inventory system. Three months in, customers are buying products that are out of stock, and the business is losing $50K/month on cancelled orders. Was eventual consistency the wrong choice?">
+
+### When Eventual Consistency Bites
+
+The trap is answering "yes, switch to strong consistency." The real answer is nuanced: eventual consistency was likely the right architectural choice, but the consistency window was too wide, and the team failed to account for the business impact of the inconsistency gap.
+
+**What weak candidates say:**
+"Eventual consistency was a mistake for inventory. Use strong consistency." This ignores why eventual consistency was chosen (performance, availability, service decoupling) and does not address the actual problem. Or: "Just make the consistency window shorter." How short? At what cost?
+
+**What strong candidates say:**
+
+- **First, I would quantify the problem.** $50K/month in cancelled orders -- what percentage of total orders is that? If it is 0.1% of orders, that is a business cost that might be cheaper than the engineering cost of strong consistency. If it is 5%, it is a crisis. The right architecture depends on the math. At Amazon, they accept a certain rate of overselling on non-critical items because the cost of occasional cancellation is lower than the cost of pessimistic locking on every purchase across a global inventory system.
+
+- **The root cause is likely not the consistency model itself but the consistency window.** "Eventual" could mean 50ms or 50 seconds. If inventory updates propagate via Kafka with consumer lag, the window could be 2-10 seconds during normal operation and 30-60 seconds during a consumer backlog. During a flash sale, a product could sell out in 5 seconds, but the inventory service does not know for 30 seconds. That 30-second window is where oversells happen.
+
+- **Solution 1: Reduce the consistency window to below the business-critical threshold.** If a product sells out in 5 seconds, the inventory update must propagate in under 1 second. Switch from batch-processed Kafka events to a Redis-based real-time inventory counter. The order service atomically decrements Redis (`DECR`) at purchase time, and the inventory service syncs to the database asynchronously. The Redis counter is the real-time source of truth for availability, and the database is the durable source of truth for accounting. Consistency window: ~0ms for the hot path.
+
+- **Solution 2: Reservation pattern.** Instead of decrementing inventory on order creation, reserve inventory first. The order service calls the inventory service synchronously to reserve N units. If the reservation succeeds (inventory > 0), the order proceeds. If it fails, the user gets "out of stock" immediately. The reservation has a TTL (say 10 minutes). If the order is not completed within the TTL, the reservation expires and inventory is released. This is synchronous for the critical check (is it in stock?) but still eventually consistent for the fulfillment side.
+
+- **Solution 3: Accept overselling with graceful recovery.** For non-critical items (not limited edition, not flash sale), allow overselling up to a configurable threshold (say 5% of stock). When an oversell is detected during fulfillment, automatically offer the customer a choice: backorder, substitute, or refund with a discount code. This is what most large retailers actually do. The $50K/month might drop to $10K/month in refund costs, which is an acceptable business cost for the architectural simplicity.
+
+- **The meta-insight: consistency is not a binary choice between "strong" and "eventual."** It is a spectrum, and different parts of the same system need different consistency guarantees. Inventory availability for display ("12 left!") can tolerate 30 seconds of staleness. Inventory decrement for purchase must be strongly consistent (or near-real-time). Order-to-shipment status can be eventually consistent with a 5-minute window. The mistake was applying one consistency model uniformly instead of matching the consistency guarantee to the business requirement at each boundary.
+
+**War Story:** At a marketplace platform, the inventory team moved from synchronous PostgreSQL `SELECT FOR UPDATE` to an event-driven Kafka pipeline because the lock contention was causing 500ms+ checkout latencies. Oversells jumped from 0.02% to 3.8% of orders. The business team was furious. The engineering team blamed "eventual consistency." The real problem: the Kafka consumer for inventory updates had 8 partitions but was running only 2 consumer instances due to a deployment misconfiguration. Lag was 45 seconds during peak hours. We fixed the consumer scaling (8 consumers for 8 partitions), added a Redis-based real-time inventory counter as the hot-path check (order service does `DECR` on Redis, Kafka events update the database asynchronously for accounting), and added a "soft reserve" with 15-minute TTL. Oversells dropped to 0.05% -- below the pre-Kafka baseline -- while checkout latency stayed at the improved 80ms. The consistency model was not wrong. The operational implementation of the consistency model was.
+
+#### Follow-up: How do you monitor the "consistency window" in production? What metrics would you track?
+
+#### Follow-up: Explain the CAP theorem in the context of this inventory scenario. What are you actually giving up?
+
+#### Follow-up: A product manager asks "can't we just make everything strongly consistent?" How do you explain the trade-off in business terms, not engineering terms?
+</Accordion>
+
+<Accordion title="Scenario: You need to deploy a new version that changes the database schema AND the API response format. Both changes are breaking. Your service handles 20K req/s. How do you deploy with zero downtime and zero errors?">
+
+### The Coordinated Breaking Change
+
+The trap is thinking about this as a single deploy. Any approach that attempts to make both breaking changes atomically will fail because you cannot update the database schema and all application instances simultaneously. There will always be a window where old code runs against a new schema or new code runs against the old schema.
+
+**What weak candidates say:**
+"Deploy during off-hours when traffic is low." At 20K req/s, "low traffic" is still 5K req/s. Errors during deploy are still thousands of affected users. Or: "Use blue-green deployment and switch all at once." Blue-green switches the application but not the database. New code hitting the old schema still breaks.
+
+**What strong candidates say:**
+
+This requires the **expand-contract pattern** (also called parallel change), executed in three distinct deploys spread over days or weeks. The fundamental principle: never make a change that is incompatible with the currently running code. Every intermediate state must be valid.
+
+- **Deploy 1: Expand the database (backward-compatible).** Add the new columns, tables, or schema changes WITHOUT removing or renaming old ones. For example, if you are renaming `user_name` to `display_name`, add `display_name` as a new nullable column. Write a database trigger or application-level dual-write that copies values from `user_name` to `display_name` on every write. The old application code continues to read and write `user_name` without any issues. The new column silently populates alongside it. Backfill existing rows (`UPDATE users SET display_name = user_name WHERE display_name IS NULL`, in batches of 10K to avoid long-running transactions).
+
+- **Deploy 2: Migrate application code (backward-compatible API).** Deploy new application code that reads from `display_name` (with a fallback to `user_name` if `display_name` is null -- belt and suspenders), writes to BOTH columns, and returns the new API response format. But here is the critical part for the API: use API versioning. The new response format is served under `/v2/users`. The old `/v1/users` endpoint continues to return the old format by reading `display_name` and mapping it back to the old field name. Clients migrate from v1 to v2 on their own timeline. During the rolling deploy, some instances serve v1 code and some serve v2 code -- both are valid because the database has both columns and the application handles both.
+
+- **Deploy 3: Contract (remove the old).** After all clients have migrated to v2 (monitor v1 traffic -- when it hits zero or a negligible threshold), deploy code that removes the `user_name` fallback and drops the v1 endpoint. Run a migration to drop the `user_name` column (`ALTER TABLE users DROP COLUMN user_name`). Use `DROP COLUMN` carefully in PostgreSQL -- it acquires an `AccessExclusiveLock` but is instant because it only marks the column as dropped in the catalog without rewriting the table (since PG 11). In MySQL, `DROP COLUMN` rewrites the table -- use `pt-online-schema-change` or `gh-ost` to avoid downtime.
+
+- **Key details that separate a real answer from a textbook one:**
+  - Never rename a column directly. Add new, dual-write, backfill, switch reads, drop old. A direct `ALTER TABLE RENAME COLUMN` breaks every running instance that references the old name.
+  - Feature flags control which code path is active. If Deploy 2 causes issues, flip the flag to fall back to the old code path without a redeploy.
+  - Database migrations must be separate deploys from application code. Deploy the migration first, let it propagate, THEN deploy the code that uses the new schema. Never put both in the same release -- if the app deploy rolls back, the migration does not roll back with it.
+
+**War Story:** At a payments company, we needed to change the `transactions` table from storing amounts as integers (cents) to using `NUMERIC(19,4)` for sub-cent precision required by a new currency pair. The table had 3.2 billion rows and served 12K reads/s. Direct `ALTER TABLE ALTER COLUMN` was estimated at 4+ hours of table lock. We used the expand-contract pattern: added a `amount_precise NUMERIC(19,4)` column, wrote a trigger that populated it on every INSERT/UPDATE (`NEW.amount_precise = NEW.amount_cents / 100.0`), backfilled 3.2B rows in batches of 50K over 18 hours during off-peak, deployed new code that read from `amount_precise` with fallback to `amount_cents / 100.0`, monitored for a week, then scheduled the old column drop. Zero downtime, zero errors. The entire process took 3 weeks from first deploy to final cleanup. The trigger added ~0.3ms per write -- undetectable in our metrics.
+
+#### Follow-up: What if the schema change is not additive? For example, you need to split one table into two tables with a different primary key structure.
+
+#### Follow-up: How do you handle the backfill of 2 billion rows without impacting production query latency?
+
+#### Follow-up: A deploy of the new code goes out but has a bug. You need to roll back. The database already has the new schema. How do you ensure the rollback is safe?
+</Accordion>
+
+<Accordion title="Scenario: Your team argues about whether to use a single multi-tenant database or one database per tenant for a B2B SaaS product. There are currently 200 tenants, expected to grow to 5,000 in 2 years. One tenant is 100x the size of the median tenant. What do you recommend?">
+
+### The Multi-Tenancy Architecture Decision
+
+This is a staff-level question with no clean answer. Both approaches have serious trade-offs, and the right answer depends on dimensions that most candidates do not ask about: regulatory requirements, tenant isolation expectations, operational team size, and the distribution of tenant sizes.
+
+**What weak candidates say:**
+"One database per tenant for isolation." This does not scale to 5,000 databases -- that is 5,000 connection pools, 5,000 sets of migrations, 5,000 backup schedules. Or: "Shared database for simplicity." This ignores the 100x whale tenant that will dominate the shared resources.
+
+**What strong candidates say:**
+
+I would not pick either extreme. I would use a **hybrid model** -- shared multi-tenant database for the majority, with dedicated databases for whale tenants. Here is the reasoning:
+
+- **Shared database for the "long tail" (195+ smaller tenants).** Use a `tenant_id` column on every table. Every query includes `WHERE tenant_id = ?`. This is operationally simple: one schema to migrate, one connection pool, one backup, one monitoring dashboard. Row-level security in PostgreSQL (`CREATE POLICY`) can enforce tenant isolation at the database level so even a bug in the application cannot leak data across tenants. At 200 small tenants, the shared database handles the aggregate load easily.
+
+- **Dedicated database for whale tenants (top 3-5 by size).** The 100x tenant gets its own PostgreSQL instance. Its queries do not compete with smaller tenants for buffer pool, connection pool, or I/O bandwidth. Its large table scans do not evict smaller tenants' hot data from shared_buffers. Its backup does not cause I/O contention for others. This also provides a stronger isolation story for enterprise clients who contractually require dedicated infrastructure (common in healthcare, finance, government).
+
+- **Routing layer.** The application looks up `tenant_id -> database connection` in a routing table (cached in Redis for <1ms latency). Small tenants route to the shared database. Whale tenants route to their dedicated instance. Adding a new dedicated instance for a growing tenant is a data migration (dual-write, backfill, cut over), not an architecture change.
+
+- **Why not database-per-tenant for everyone?** At 5,000 tenants, that is 5,000 PostgreSQL instances. Even using RDS, that is: $50-200/month per instance times 5,000 = $250K-$1M/month in database costs alone. Plus 5,000 schema migrations to coordinate (one bad migration takes down one tenant, not all -- which is actually an advantage -- but running 5,000 migrations is operationally expensive). Plus 5,000 connection pools from your application layer consuming ~5,000 persistent connections minimum. A shared database serving 4,950 small tenants costs one instance at ~$500-2,000/month.
+
+- **Why not a fully shared database?** The 100x whale tenant's queries will dominate `shared_buffers`. A full table scan on the whale's data evicts the hot pages for 199 other tenants. The whale's write volume drives autovacuum frequency, which competes with read workloads. Worst case: the whale's operations trigger lock contention that affects everyone. Also, some enterprise clients will contractually refuse to share a database with other tenants.
+
+- **The path to 5,000 tenants.** At 5,000 tenants, the shared database may need to be sharded. Shard by `tenant_id` hash. Each shard handles ~1,000 tenants. This is where the routing layer pays off -- you already have tenant-to-database routing, so adding shards is a configuration change in the routing table, not an application rewrite. The whale tenants remain on dedicated instances.
+
+**War Story:** At a B2B analytics SaaS, we started with database-per-tenant at 30 tenants. By 150 tenants, the operations team was drowning: migrations took 3 hours to roll out across all databases (sequentially, because running 150 parallel migrations overwhelmed the RDS API rate limit), monitoring required 150 separate dashboards, and our monthly RDS bill was $78K for mostly-idle instances. We migrated to a shared database with dedicated instances for the top 5 tenants. The shared database ran on a single db.r6g.4xlarge at $2,800/month. Five dedicated instances for whales: $14K/month. Total: $17K/month vs $78K -- a 78% cost reduction. Migrations went from 3 hours to 2 minutes. The routing layer was 200 lines of code and a Redis lookup table. The hardest part was convincing the whale tenants that the migration to dedicated infrastructure was an *upgrade*, not a disruption. We framed it as "dedicated resources for your workload" and they loved it.
+
+#### Follow-up: How do you handle cross-tenant analytics queries (e.g., a global admin dashboard showing metrics across all tenants) in this hybrid model?
+
+#### Follow-up: Tenant B is growing fast and is about to become a whale. How do you migrate them from the shared database to a dedicated instance with zero downtime?
+
+#### Follow-up: How do you prevent a query bug from accidentally leaking data between tenants in the shared database? What is your defense-in-depth strategy?
+</Accordion>
+
+<Accordion title="Scenario: Your team migrates from a monolith to microservices. Six months in, end-to-end latency has increased by 3x and debugging takes 5x longer. The CTO is questioning the migration. What went wrong and how do you fix it?">
+
+### The Microservices Tax
+
+The trap is defending the microservices decision or blaming the team's execution. The real answer acknowledges that microservices have a concrete performance and complexity tax that must be paid with specific infrastructure -- and most teams start paying this tax before they have built the infrastructure to offset it.
+
+**What weak candidates say:**
+"The team should have planned better." Vague and unhelpful. Or: "Microservices are always slower because of network hops." This is partially true but does not explain what to do about it.
+
+**What strong candidates say:**
+
+The 3x latency increase and 5x debugging slowdown are the two most predictable consequences of a microservices migration, and both have concrete causes and fixes.
+
+- **Why latency increased 3x.** In the monolith, a function call between modules took ~10 nanoseconds. In microservices, the same logical call is now an HTTP/gRPC request: DNS resolution (~1ms cached, ~50ms uncached), TCP connection setup (~0.5ms within a datacenter), TLS handshake (~5ms), serialization/deserialization (~0.1-1ms for JSON, less for Protobuf), and network transit (~0.5ms within a datacenter). The floor is ~2-7ms per hop. If the checkout flow previously called 5 internal functions (total: ~50ns), it now makes 5 network calls (total: ~10-35ms). That is a 200,000x increase per call chain. Worse, calls that were parallel in the monolith (goroutines, threads accessing shared memory) may have become sequential because the team did not implement concurrent service calls in the API gateway.
+
+  **Fixes:** (1) Identify sequential chains and parallelize them. If Service A calls B, then C, then D, but B and C are independent, call them concurrently. This alone often cuts latency by 30-50%. (2) Use connection pooling and keep-alive on all inter-service HTTP clients. A fresh connection per request adds 5-10ms. A pooled connection adds ~0.1ms. (3) Switch high-throughput internal calls from REST/JSON to gRPC/Protobuf for 3-10x smaller payloads and faster serialization. (4) Merge services that are always called together. If Service A calls Service B on 100% of requests, they should probably be one service. Microservices are not "make everything its own service" -- they are "split at boundaries where independent scaling and deployment matter."
+
+- **Why debugging takes 5x longer.** In the monolith, a stack trace showed the entire call chain. Logs were in one place. A debugger could step through the full flow. In microservices, a single user request generates logs across 5 services, each with its own log format, timestamp, and deployment version. Without distributed tracing, correlating these logs is manual detective work. Without structured logging with a shared request ID, it is nearly impossible.
+
+  **Fixes:** (1) Implement distributed tracing immediately -- OpenTelemetry with Jaeger, Datadog APM, or Grafana Tempo. Every request gets a trace ID that propagates across all service calls. A single trace shows the entire call chain, timing, and errors. This is not optional -- it is a prerequisite for operating microservices. (2) Centralized structured logging. All services log to the same system (ELK stack, Datadog Logs, Grafana Loki) with a shared schema: `{timestamp, service, trace_id, level, message}`. (3) Service dependency map. Visualize which services call which and at what volume. Datadog, Kiali (for Istio), and Grafana's service graph do this automatically from trace data.
+
+- **The organizational question nobody asks.** The CTO's real question is "was this migration worth it?" The answer depends on what the monolith's pain points were. If the monolith's problem was deployment coupling (a bug in the payments module blocks the entire release), microservices solve that. If the problem was independent scaling (the image processing needs 10x the compute of the API), microservices solve that. If the problem was "the codebase is too big and confusing," microservices do not solve that -- they replace in-process complexity with distributed systems complexity, which is harder to reason about. The honest answer to the CTO might be: "We migrated for the right reasons, but we underinvested in the observability and infrastructure tax. Here is the 90-day plan to close that gap."
+
+**War Story:** At a mid-stage startup (~80 engineers), the platform team led a monolith-to-microservices migration over 9 months. They extracted 14 services. P95 latency went from 120ms to 380ms. Debugging MTTR (mean time to resolution) went from 25 minutes to 2 hours. The root causes: (1) No distributed tracing. Engineers were manually grepping across 14 separate CloudWatch log groups. We deployed Datadog APM in a week, and debugging time dropped 60% immediately. (2) Every inter-service call was REST over a new TCP connection (no pooling). Switching to gRPC with connection reuse for the 4 highest-volume internal paths cut 90ms off the P95. (3) The checkout flow made 7 sequential service calls when only 3 had dependencies between them. Parallelizing the independent calls cut another 60ms. (4) Two services that were always called together (cart and pricing) were merged back into one service. Final result after 60 days of fixes: P95 at 155ms (vs 120ms monolith, vs 380ms broken microservices). An acceptable 29% increase that bought independent deployability, independent scaling, and team autonomy. The CTO was satisfied. The lesson: the microservices tax is real, but it is payable -- you just have to budget for it upfront instead of discovering it in production.
+
+#### Follow-up: How do you decide which services to extract from a monolith first? What criteria do you use?
+
+#### Follow-up: The team wants to add a service mesh (Istio) to handle retries, circuit breaking, and mTLS. What is the performance cost, and when is it worth paying?
+
+#### Follow-up: Two services have a circular dependency -- A calls B and B calls A. How do you break this cycle?
+</Accordion>
+
+<Accordion title="Scenario: You are designing a system to ingest 1 million events per second from IoT devices. Each event is 500 bytes. The data must be queryable within 5 seconds of ingestion. What architecture do you propose?">
+
+### The High-Throughput Ingestion Design
+
+This is a system design question that tests whether you can work backward from hard numbers. The trap is jumping to a technology choice without doing the math first.
+
+**What weak candidates say:**
+"I'd use Kafka and write to a database." This is directionally correct but completely lacks specificity. What kind of database? How many Kafka partitions? What is the write throughput math? Or: "I'd use AWS Kinesis." Fine, but how many shards, and can Kinesis handle the throughput at what cost?
+
+**What strong candidates say:**
+
+- **Start with the math.** 1M events/s at 500 bytes = 500 MB/s raw data. That is 43 TB/day. With replication (factor 3 for durability), that is 1.5 GB/s of write throughput and ~130 TB/day of storage. These numbers immediately eliminate most databases. PostgreSQL maxes out at ~50-100 MB/s sustained write throughput on a large instance. Even DynamoDB at 1M writes/s would cost ~$650/hour in on-demand mode. The architecture must use purpose-built ingestion infrastructure.
+
+- **Ingestion layer: Apache Kafka.** A single Kafka broker sustains ~200-500 MB/s write throughput depending on message size and replication factor. With replication factor 3, I need at least 3-5 brokers for the write throughput alone. I would use 64-128 partitions to parallelize consumption. Message key: device_id (ensures ordering per device). Retention: 7 days for reprocessing capability. With log compaction disabled (events are immutable), storage is linear with retention. 7 days times 43 TB/day = ~300 TB of Kafka storage. Use tiered storage (Kafka's tiered storage feature, or Confluent's) to offload older segments to S3 and keep the broker's local SSD for the hot tail. Alternative: AWS MSK (managed Kafka) with tiered storage, or Redpanda (Kafka-compatible, written in C++, better single-node throughput).
+
+- **The 5-second queryable requirement is the hard constraint.** "Queryable within 5 seconds" means the data must be indexed and searchable, not just stored. Kafka alone does not satisfy this -- you can consume from Kafka, but Kafka is not a query engine. Options for the query layer:
+
+  - **ClickHouse.** Columnar database designed for real-time analytics on append-heavy data. ClickHouse can ingest 1M+ rows/s on a modest cluster (3-5 nodes) and make them queryable within 1-2 seconds via the `MergeTree` engine family. This is the option I would default to for time-series IoT data. ClickHouse's `ReplicatedMergeTree` provides durability, and the `MaterializedView` feature can pre-aggregate data at ingest time for common query patterns (e.g., average temperature per device per minute).
+
+  - **Apache Druid.** Real-time OLAP database with sub-second query latency on high-cardinality data. Druid ingests from Kafka directly (built-in Kafka indexing service), making the pipeline simpler. Trade-off: Druid's operational complexity is higher than ClickHouse, and it uses more memory.
+
+  - **TimescaleDB.** PostgreSQL extension for time-series. Easier to operate if the team already knows PostgreSQL. But at 1M events/s, a single TimescaleDB instance maxes out. You would need a multi-node deployment or Timescale Cloud with aggressive partitioning.
+
+- **Stream processing layer (optional but valuable).** Between Kafka and the query layer, Apache Flink or Kafka Streams can perform real-time transformations: deduplication (IoT devices often send duplicate events), enrichment (attach device metadata from a lookup table), windowed aggregations (compute 1-minute averages and store only the aggregates for long-term retention). This reduces the volume hitting the query layer. If 80% of queries are on pre-aggregated data, the query layer needs to handle only 200K raw events/s plus the aggregated stream.
+
+- **Cold storage for historical data.** After 30 days, move raw events from ClickHouse to S3 in Parquet format. Use DuckDB, Athena, or Trino for ad-hoc queries on historical data. This keeps the ClickHouse cluster small and fast for recent data while maintaining full history at S3 storage costs (~$23/TB/month).
+
+**War Story:** At an industrial IoT company, we ingested telemetry from 500K sensors at 800K events/s. Our initial architecture was Kafka -> Spark Streaming -> PostgreSQL. The Spark jobs had 10-15 second micro-batch latency, and PostgreSQL could not sustain the write throughput beyond 200K events/s even with aggressive batching and 5 table partitions. We replaced Spark with Kafka Streams (which reduced processing latency from 10s to 200ms) and swapped PostgreSQL for ClickHouse (3 nodes, ReplicatedMergeTree, partitioned by day). ClickHouse ingested 800K events/s at 35% CPU utilization and served analytical queries with P95 under 200ms on the most recent day's data (roughly 69B rows per day). The total infra cost for ingestion + storage + query was $18K/month on AWS -- less than half the PostgreSQL-based architecture which was failing at lower throughput. The key design decision: we stored raw events in ClickHouse for 14 days and pre-aggregated 1-minute rollups into a separate ClickHouse table with a 2-year retention. 95% of dashboard queries hit the rollup table, which was 60x smaller. This kept query latency under 100ms for the product team's dashboards while still allowing drill-down to raw events when engineers needed to debug a specific sensor.
+
+#### Follow-up: How do you handle late-arriving events -- a sensor that was offline for an hour and then sends a burst of historical data?
+
+#### Follow-up: What happens when a Kafka consumer falls behind? At 500 MB/s, even a 10-minute lag means 300 GB of backlog. How do you recover?
+
+#### Follow-up: How do you handle schema evolution? A new firmware version adds three new fields to the event payload. What happens to the downstream pipeline?
+</Accordion>
+
+</AccordionGroup>

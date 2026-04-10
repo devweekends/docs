@@ -1783,3 +1783,475 @@ These questions go beyond textbook recall. They simulate a real senior/staff-lev
 - **`net.core.rmem_max` and `net.core.rmem_default`:** Increase to 16MB or higher to buffer incoming network traffic during processing spikes. A 2 million lines/sec ingest rate means the network buffers fill quickly during any processing stall.
 - **`fs.file-max` and `ulimit -n`:** Ensure high enough for all connections and file handles. For 50,000 concurrent log sources, set to at least 100,000.
 - **CPU governor:** Set to `performance` mode (`cpupower frequency-set -g performance`) to avoid latency from CPU frequency scaling. At 2M lines/sec, even the 10-50us delay from scaling up CPU frequency during a burst can cause buffer buildup.
+
+---
+
+## Advanced Interview Scenarios
+
+<Note>
+These questions are designed to expose gaps in understanding that survive textbook study. Several have "obvious" answers that are wrong. They test whether you have debugged real systems, made real trade-offs, and learned from real failures -- not whether you can recite definitions. Interviewers use questions like these to separate candidates who have operated systems at scale from those who have only read about them.
+</Note>
+
+<AccordionGroup>
+
+<Accordion title="Scenario: Your team disables swap on all production servers because 'swap is always bad in production.' Six months later, a cascade of OOM kills takes down your entire fleet during a traffic spike. What went wrong, and was disabling swap actually the right call?">
+
+### The Trap
+
+The obvious answer -- "swap is slow, disable it, case closed" -- is the answer that got this team into trouble. This question tests whether you understand the nuanced role swap plays in the kernel's memory reclamation strategy, and whether you can reason about second-order effects of OS configuration changes.
+
+**What weak candidates say:**
+
+- "Swap is always bad. It makes things slow. You should always disable it." This is the cargo-cult answer that ignores why swap exists in the first place.
+- "Just add more RAM." This is a non-answer that does not address the architectural flaw.
+
+**What strong candidates say:**
+
+- The kernel's memory reclamation has a hierarchy. When memory pressure rises, the kernel first reclaims clean page cache pages (free, instant). Then it writes back dirty page cache pages (costs a disk write). Then, if swap exists, it swaps out infrequently-used anonymous pages (application heap memory that has not been touched in a while). Finally, if nothing else works, the OOM Killer fires.
+- **With swap disabled, you removed a buffer zone.** The kernel goes directly from "reclaim page cache" to "OOM kill" with no intermediate step. During a traffic spike, RSS grew across all services simultaneously. The page cache was reclaimed first, which actually made things worse -- suddenly database queries that were hitting page cache started hitting disk, increasing latency, causing request queues to grow, consuming more memory. The positive feedback loop escalated until the OOM Killer started firing.
+- **With swap enabled, the kernel would have swapped out cold, infrequently-used memory pages** -- daemon initialization data, long-idle connection buffers, memory-mapped sections of loaded-but-unused shared libraries. This would have bought 30-60 seconds of breathing room, enough for autoscaling to kick in or for an alert to fire.
+- **The nuance:** Swap is bad *when your working set exceeds RAM* -- that causes thrashing. But a small amount of swap (2-4GB) as a "shock absorber" prevents cliff-edge OOM kills during transient spikes. The right configuration is `vm.swappiness=1` (not 0) with a small swap partition. `swappiness=1` tells the kernel to strongly prefer reclaiming page cache over swapping, but to use swap as an absolute last resort before the OOM Killer.
+- **Kubernetes context:** Kubernetes historically required swap to be disabled (`kubelet --fail-swap-on=true`). Since Kubernetes 1.28 (alpha in 1.22), swap-aware scheduling is available via the `NodeSwap` feature gate, with `LimitedSwap` mode allowing Burstable QoS pods to use swap up to their memory limit. The ecosystem is catching up to the reality that some swap is useful.
+
+**War Story:** A fintech company running 200+ microservices on bare metal Kubernetes disabled swap fleet-wide. During Black Friday, traffic spiked 3x. Memory pressure hit simultaneously across nodes. Without swap, the OOM Killer fired on 40+ pods in under 90 seconds. The pod restarts caused a thundering herd on the database, which also got OOM-killed on its node. Total cascading outage: 23 minutes. Post-mortem analysis showed that with 4GB of swap and `swappiness=1`, the kernel would have swapped ~800MB of cold pages per node, preventing OOM kills entirely during the 4-minute window it took for the cluster autoscaler to add capacity.
+
+#### Follow-up: How does vm.swappiness actually work, and why is setting it to 0 not the same as disabling swap?
+
+- `vm.swappiness` is a kernel tunable (0-200, default 60) that biases the kernel's decision between reclaiming page cache (file-backed pages) vs. swapping anonymous pages (heap, stack). Higher values make the kernel more willing to swap; lower values make it prefer dropping page cache.
+- **`swappiness=0` does NOT disable swap.** It tells the kernel to avoid swapping until absolutely necessary -- specifically, until the ratio of free+file pages to the high watermark drops below a threshold. The kernel will still swap if memory pressure is extreme enough.
+- **`swappiness=1`** is the practical minimum -- it results in the kernel strongly preferring page cache reclamation but leaving the door open for swap as a last resort. This is the sweet spot for production servers with swap enabled as a safety net.
+- Since Linux kernel 3.5+, `swappiness=0` changed behavior to mean "never swap unless under extreme memory pressure," which is subtly different from older kernel versions. This kernel-version-dependent behavior has caused production incidents when teams migrated between kernel versions without retesting memory behavior.
+
+#### Follow-up: How would you design the fleet-wide memory strategy differently?
+
+- **Layer 1:** Small swap (2-4GB) on every node with `swappiness=1`. This is the shock absorber.
+- **Layer 2:** Every container has a `memory.limit` (cgroup memory.max). OOM kills happen at the cgroup level, killing only the offending container.
+- **Layer 3:** Set `memory.high` (cgroup v2) to 80% of `memory.max`. When a container crosses `memory.high`, the kernel throttles its memory allocations (slowing it down) rather than killing it. This is graceful degradation at the cgroup level.
+- **Layer 4:** Prometheus alerts on `container_memory_working_set_bytes / container_spec_memory_limit_bytes > 0.8` to catch leaks and growth before any kernel intervention.
+
+</Accordion>
+
+<Accordion title="Scenario: A containerized Python service reads /proc/meminfo to decide how large its in-memory cache should be. It is allocated 2GB in Kubernetes but keeps sizing its cache to 64GB and getting OOM-killed. What is going wrong?">
+
+### The Trap
+
+This question tests whether you understand one of the most common and subtle container pitfalls: `/proc` inside a container still shows the **host's** resources, not the container's cgroup limits.
+
+**What weak candidates say:**
+
+- "Python is using too much memory." This does not explain *why* -- it is describing the symptom as the diagnosis.
+- "Just set a flag to limit the cache." This is a band-aid that misses the underlying problem.
+
+**What strong candidates say:**
+
+- Inside a container, `/proc/meminfo` shows the **host's** memory, not the container's cgroup limit. If the host has 64GB of RAM, `/proc/meminfo` reports `MemTotal: 65536 MB` even though the container's cgroup limits it to 2GB. The Python service reads `MemTotal`, calculates "I have 64GB, I will use 48GB for caching," and promptly exceeds its 2GB cgroup limit, triggering an OOM kill.
+- This is not a Python-specific bug. It affects **every** language and runtime that reads `/proc/meminfo`, `/proc/cpuinfo`, or `sysconf(_SC_NPROCESSORS_ONLN)` to auto-tune. Java (before JDK 8u191) famously calculated default heap size from the host's total memory, leading to the exact same OOM-kill pattern. Go's `runtime.NumCPU()` reads `/proc/cpuinfo` and returns the host's CPU count, not the container's CPU quota -- causing goroutine over-parallelism.
+- **The fix has multiple layers:**
+  1. **Application-level:** Read from the cgroup filesystem instead: `/sys/fs/cgroup/memory/memory.limit_in_bytes` (cgroup v1) or `/sys/fs/cgroup/memory.max` (cgroup v2). In Python: `resource.getrlimit()` does NOT help here -- it reports ulimits, not cgroup limits.
+  2. **LXCFS:** A FUSE filesystem that intercepts reads to `/proc/meminfo`, `/proc/cpuinfo`, `/proc/stat`, and returns cgroup-aware values. Mount LXCFS into containers and `/proc/meminfo` magically reports the correct 2GB. Used in production at Alibaba Cloud and other large-scale container platforms.
+  3. **Language runtime awareness:** Modern JVM (8u191+) uses `-XX:+UseContainerSupport` (default on) to read cgroup limits. Go 1.19+ has `GOMEMLIMIT` to set a soft memory limit that the runtime respects. Python does not have native cgroup awareness -- you must handle this in application code or use LXCFS.
+
+**War Story:** A team at a logistics company ran 300 Python workers in Kubernetes, each limited to 1GB. The workers used a popular caching library that auto-sized based on `os.sysconf('SC_PAGE_SIZE') * os.sysconf('SC_PHYS_PAGES')`, which returned the host's 128GB. Each worker allocated a 96GB cache target. The cgroup OOM Killer fired thousands of times per hour, but the workers restarted so fast (CrashLoopBackOff with exponential backoff) that monitoring showed only intermittent latency spikes, not total failure. The actual problem was discovered only when someone noticed that `kubectl get events` showed 47,000 OOMKilled events in a single day. The fix: a four-line wrapper that read `/sys/fs/cgroup/memory/memory.limit_in_bytes` and passed it to the cache constructor.
+
+#### Follow-up: How does this same problem manifest for CPU, and why does Go's GOMAXPROCS matter here?
+
+- `/proc/cpuinfo` inside a container shows all host CPUs. A 96-core host running a container with `resources.limits.cpu: "2"` still shows 96 cores in `/proc/cpuinfo`. Runtimes that auto-set parallelism based on CPU count create far too many threads or goroutines.
+- **Go specifically:** `runtime.GOMAXPROCS(0)` defaults to `runtime.NumCPU()`, which reads `/proc/cpuinfo`. On that 96-core host, Go starts 96 OS threads for goroutine execution, but the container can only use 2 cores. 94 of those threads compete for CPU time within the 200ms-per-100ms CFS quota. The scheduler overhead of managing 96 threads when only 2 can run simultaneously causes increased context switching and CPU throttling.
+- **Fix:** Use `go.uber.org/automaxprocs`, a library that reads the CFS quota and automatically sets `GOMAXPROCS` to the container's effective CPU count. For JVM: `-XX:ActiveProcessorCount=2` or rely on the container-aware default. For Python: `multiprocessing.cpu_count()` also reads host CPUs -- use `len(os.sched_getaffinity(0))` instead, which respects CPU affinity (cgroup v2 or taskset).
+
+#### Follow-up: What other /proc and /sys files lie inside containers?
+
+- `/proc/sys/fs/file-max` -- reports the host's system-wide file descriptor limit, not the container's.
+- `/proc/loadavg` -- reports the host's load average. A container under heavy load on an idle host shows low load average; a lightly-loaded container on a saturated host shows high load average. Both are misleading.
+- `/sys/devices/system/cpu/` -- shows all host CPUs, not the container's allocated set.
+- `/proc/diskstats` -- shows all host block devices, including disks not mounted into the container.
+- **The general principle:** Anything in `/proc` or `/sys` that predates cgroups (which is most of it) reports host-level information. Only the cgroup filesystem (`/sys/fs/cgroup/`) reports container-specific limits. This is a fundamental limitation of the container model: containers are processes with namespaces, not VMs with their own kernel, so `/proc` serves host kernel state.
+
+</Accordion>
+
+<Accordion title="Scenario: After upgrading from a 4-core to a 32-core server, your single-process application actually gets slower. More CPUs made things worse. Explain three plausible root causes.">
+
+### The Trap
+
+The "obvious" answer -- more CPUs equals more performance -- is wrong for a surprising number of real-world workloads. This question tests whether you understand that CPU scaling is not free, and whether you can identify the specific mechanisms that turn more cores into worse performance.
+
+**What weak candidates say:**
+
+- "The application is single-threaded so it cannot use the extra cores." This is partially correct but does not explain why performance *decreased* -- it should be the same, not worse.
+- "Maybe the new server is slower per core." This is possible but unlikely and is a guess, not a diagnosis.
+
+**What strong candidates say:**
+
+There are at least three concrete mechanisms where more cores degrade performance:
+
+1. **NUMA topology change.** The 4-core server was single-socket. The 32-core server is dual-socket (2x 16 cores) with NUMA. Your single-process application's memory was entirely local on the 4-core machine. On the 32-core machine, the Linux scheduler migrates the process between NUMA nodes for "load balancing," causing 50-100% memory access latency penalties on every migration. Even without migration, if memory was initially allocated on the "wrong" node (the node that was free at startup but is not where the scheduler runs the process), every memory access is remote. **Diagnosis:** `numastat -p <pid>` shows high `other_node` allocations. `perf stat -e node-load-misses` shows cross-node memory traffic. **Fix:** `numactl --cpunodebind=0 --membind=0 ./my_app`.
+
+2. **Lock contention amplified by cache coherence traffic.** Your application may have background threads (GC threads, JIT compilation threads, logging threads, metrics emission threads) even if the main workload is single-threaded. On 4 cores, these threads share L3 cache and contend on locks minimally. On 32 cores across two sockets, the cache coherence protocol (MESI/MOESI) generates cross-socket invalidation traffic every time a lock is acquired or a shared variable is written. If your application has a global lock (GIL in Python, a global mutex in the application, an allocator lock in glibc), the cost of acquiring that lock goes from ~25ns (L3 cache hit on the same socket) to ~100-200ns (cross-socket coherence traffic). At millions of lock operations per second, this is catastrophic. **Diagnosis:** `perf stat -e LLC-load-misses,LLC-store-misses` shows elevated last-level cache misses. `perf lock report` shows lock contention. **Fix:** Pin threads to the same socket, or redesign to eliminate shared mutable state.
+
+3. **Interrupt and timer overhead.** The kernel runs periodic timers (`CONFIG_HZ`, typically 250 or 1000 Hz) on each CPU core. With 32 cores, the system generates 8x more timer interrupts than with 4 cores. For a latency-sensitive workload, these interrupts preempt your application at unpredictable moments. Additionally, the kernel's scheduler accounting, RCU (Read-Copy-Update) callbacks, and workqueue processing scale with core count. On the 4-core machine, this overhead was negligible. On 32 cores, it is measurable. **Diagnosis:** `perf stat -e context-switches,cpu-migrations` shows elevated switches. `mpstat -P ALL 1` shows time spent in `%sys` and `%si` (soft interrupt). **Fix:** Use `isolcpus` kernel parameter to dedicate cores to your application and prevent the scheduler from running other tasks on them. Use `nohz_full` (tickless mode) to eliminate timer interrupts on isolated cores.
+
+**War Story:** A quant trading firm upgraded their matching engine server from a 4-core i7 to a 64-core AMD EPYC for "more headroom." Median order processing latency increased from 2.3us to 8.7us. The root cause was a combination of all three factors: the EPYC had 8 NUMA nodes (8 CCDs), the engine's lock-free queue used atomic operations that now had to traverse the Infinity Fabric interconnect, and timer interrupts on 64 cores were preempting the hot path. The fix was `isolcpus=2-5`, `numactl --cpunodebind=0 --membind=0`, and `nohz_full=2-5`, which reduced latency to 1.8us -- actually faster than the old server because the EPYC's per-core IPC was higher once NUMA and interrupt noise were eliminated.
+
+#### Follow-up: What is the isolcpus kernel parameter and when is it appropriate?
+
+- `isolcpus=2-5` removes CPU cores 2-5 from the kernel's general-purpose scheduler. No process is scheduled on those cores unless explicitly pinned to them with `taskset` or `sched_setaffinity()`. This eliminates context switches, timer interrupts (with `nohz_full`), and scheduler overhead on those cores.
+- **Appropriate for:** Latency-sensitive workloads (trading engines, real-time audio/video processing, packet processing with DPDK), where even a 10us preemption is unacceptable. Not appropriate for general-purpose servers where you want the scheduler to utilize all cores.
+- **The trade-off:** Isolated cores sit idle if your application does not use them. You are trading overall throughput for latency consistency.
+
+#### Follow-up: How does Python's GIL interact with a many-core machine?
+
+- The Global Interpreter Lock (GIL) in CPython allows only one thread to execute Python bytecode at a time. On a 4-core machine, a multi-threaded Python program effectively runs on 1 core for CPU work. On a 32-core machine, it still runs on 1 core for CPU work -- but the GIL acquisition cost increases because the lock bounces between cores more frequently as threads on different cores contend for it.
+- Python 3.12 introduced a per-interpreter GIL, and Python 3.13 introduced an experimental free-threaded mode (`--disable-gil`). But in production as of 2025, most Python deployments use multiprocessing (separate processes) rather than multithreading for CPU parallelism, sidestepping the GIL entirely at the cost of higher memory usage per worker.
+
+</Accordion>
+
+<Accordion title="Scenario: You deploy a new version of your Go service. Memory usage is stable for 48 hours, then RSS starts climbing 200MB/day. The Go heap profile (pprof) shows nothing growing. Where is the memory going?">
+
+### The Trap
+
+If the heap profiler shows nothing, most candidates are stuck. This question tests whether you understand that process memory is more than just the language runtime's managed heap -- and whether you know where to look when the usual tools come up empty.
+
+**What weak candidates say:**
+
+- "The profiler must be wrong. Run it again." Refusing to consider that the problem exists outside the heap.
+- "It is a Go runtime bug." Blaming the runtime without evidence.
+
+**What strong candidates say:**
+
+When pprof heap shows nothing growing but RSS is climbing, the leak is in memory that pprof does not track. Go's pprof heap profile only tracks allocations made through Go's memory allocator (`runtime.mallocgc`). Several categories of memory are invisible to it:
+
+1. **CGo allocations.** If the service uses any C library via CGo (common: SQLite, image processing libraries, gRPC with C core, DNS resolution via system resolver), memory allocated by `malloc()` in C code is invisible to pprof. The C allocator and Go's allocator maintain completely separate heaps. **Diagnosis:** Check if the service links any C libraries with `go tool nm <binary> | grep cgo`. Profile C-side allocations with Valgrind or ASan on a test instance. Check `/proc/<pid>/maps` for growing anonymous mappings that do not correlate with Go heap growth.
+
+2. **Goroutine stack accumulation.** Each goroutine has a stack (starts at 2KB, grows dynamically). Pprof's heap profile does not include goroutine stacks. If goroutines are leaking (blocked forever on a channel nobody sends to, stuck in a `select` with no timeout, waiting on a mutex held by a deadlocked goroutine), their stacks accumulate. 100,000 leaked goroutines at 8KB average stack = 800MB. **Diagnosis:** `runtime.NumGoroutine()` -- if this grows monotonically, you have a goroutine leak. `go tool pprof http://host:port/debug/pprof/goroutine` shows stack traces of all goroutines -- look for thousands of goroutines with identical stack traces blocked on the same line.
+
+3. **Memory-mapped files.** If the service mmaps files (explicitly or through a library like bbolt/etcd, BoltDB, or a search index library), those mappings contribute to RSS but are not Go heap. The pages are demand-loaded as accessed and may never be freed if the file is kept open. **Diagnosis:** `pmap -x <pid>` shows per-mapping RSS. Look for large `mapped` regions associated with file paths. `/proc/<pid>/smaps` gives per-mapping detailed RSS breakdown.
+
+4. **Go runtime's scavenging behavior.** Go's garbage collector does not always return freed memory to the OS immediately. Since Go 1.12, the runtime returns unused memory to the OS via `madvise(MADV_FREE)` (or `MADV_DONTNEED`), but the OS may not actually reclaim those pages until memory pressure occurs. RSS can appear to grow even though the memory is logically free. **Diagnosis:** Compare `runtime.MemStats.HeapInuse` (what Go is actually using) vs. `runtime.MemStats.HeapSys` (what Go has obtained from the OS) vs. RSS from `/proc/<pid>/status`. If HeapInuse is flat but HeapSys or RSS grows, the runtime is holding pages it is not using. **Fix:** `debug.FreeOSMemory()` forces immediate return (for testing only). Go 1.19's `GOMEMLIMIT` soft memory limit causes more aggressive GC and memory return.
+
+5. **Kernel memory charged to the cgroup.** In a container, the cgroup memory accounting includes kernel memory allocated on behalf of the process: socket buffers, pipe buffers, dentry cache, inode cache. If the service handles many connections, kernel socket buffers can accumulate (each TCP connection: 128-256KB of send+receive buffers). 10,000 persistent connections = 1.3-2.6GB of kernel memory charged to the container's cgroup, invisible to any userspace profiler.
+
+**War Story:** A team at an observability company debugged a Go service (a log collector) that leaked 200MB/day. Pprof heap was flat. Goroutine count was stable at ~500. The culprit was a vendored C DNS resolver library used for service discovery. Each DNS query allocated a small buffer in C that was freed only when the next query reused the resolver context -- but query errors caused new contexts to be created without cleaning up old ones. The C-side leak was invisible to every Go tool. They found it only after running the binary under Valgrind in a staging environment, which showed a steady stream of 1KB `malloc` calls from `libldns` with no corresponding `free`.
+
+#### Follow-up: How do you distinguish between a real leak and Go's scavenging behavior?
+
+- Export `runtime.MemStats` via a `/debug/vars` endpoint or Prometheus metrics. The key fields:
+  - `HeapInuse` -- memory actively used by live Go objects
+  - `HeapIdle` -- heap spans that contain no live objects (available for reuse or return to OS)
+  - `HeapReleased` -- memory returned to the OS via `madvise`
+  - `HeapSys` -- total heap memory obtained from OS
+- If `HeapInuse` is flat but `HeapSys` grows, Go has obtained memory it is not using but has not returned. Call `debug.FreeOSMemory()` manually and check if RSS drops. If it drops, there is no leak -- Go is just being lazy about returning memory (normal behavior, improved with `GOMEMLIMIT`).
+- If `HeapInuse` is flat and `HeapSys` is flat but RSS grows, the leak is outside the Go heap entirely (CGo, mmap, kernel buffers).
+
+#### Follow-up: What does GOMEMLIMIT do differently from GOGC, and when should you set it?
+
+- `GOGC` (default 100) controls GC frequency based on heap growth ratio: GC triggers when the heap has grown 100% since the last GC. It does not limit total memory -- it controls how frequently GC runs relative to allocation rate.
+- `GOMEMLIMIT` (Go 1.19+) sets a soft memory target for the entire Go runtime (heap + stacks + GC metadata). When approaching this limit, the GC runs more aggressively to stay under it. If the limit is exceeded, the GC still runs but does not trigger OOM -- the limit is soft.
+- **When to set it:** In containers, set `GOMEMLIMIT` to 80-90% of the cgroup memory limit. This tells the Go runtime to use available memory efficiently (large cache-friendly heap, less frequent GC) while backing off before the cgroup OOM Killer fires. Without `GOMEMLIMIT`, Go's GC may run too conservatively (leaving memory unused that the page cache could benefit from) or too aggressively (wasting CPU on unnecessary GC cycles).
+
+</Accordion>
+
+<Accordion title="Scenario: Your service handles graceful shutdown correctly — it catches SIGTERM, drains connections, and exits. But in Kubernetes, pods are still being force-killed after the termination grace period. The application logs show the SIGTERM handler never fires. What is happening?">
+
+### The Trap
+
+This is a notorious production issue that bites teams who test shutdown behavior on bare metal but not inside containers. The question tests whether you understand PID 1 signal handling, container init processes, and the Kubernetes pod termination lifecycle.
+
+**What weak candidates say:**
+
+- "Increase the `terminationGracePeriodSeconds`." This treats the symptom, not the cause.
+- "The code must have a bug in the signal handler." The question states the handler works outside containers.
+
+**What strong candidates say:**
+
+- The problem is almost certainly that your application is running as **PID 1 inside the container**, and PID 1 has special signal handling behavior in the Linux kernel.
+- **How PID 1 is different:** In Linux, PID 1 (the init process) has a unique property: it only receives signals for which it has explicitly installed a handler. If PID 1 has not registered a handler for SIGTERM, the kernel **silently discards** SIGTERM. This is by design -- the init process should not be accidentally killed, as it would take down the entire system (or container).
+- **The typical Dockerfile mistake:** `CMD node server.js` uses shell form, which runs as `/bin/sh -c "node server.js"`. Shell (`/bin/sh`) is PID 1, and `node` runs as a child process. When Kubernetes sends SIGTERM to PID 1, the shell receives it but most shells do **not** forward signals to child processes. The shell exits (or ignores SIGTERM), the node process never receives it, and after `terminationGracePeriodSeconds` (default 30 seconds), Kubernetes sends SIGKILL.
+- Alternatively, `CMD ["node", "server.js"]` (exec form) makes `node` PID 1 directly. Node.js does handle SIGTERM if you register a handler with `process.on('SIGTERM', ...)`, but if the handler is not registered, the default PID 1 behavior applies -- SIGTERM is silently dropped.
+- **The fix:**
+  1. **Use a proper init process:** `CMD ["tini", "--", "node", "server.js"]` or Docker's `--init` flag. `tini` runs as PID 1, properly forwards signals to child processes, and reaps zombie children. Your application runs as PID 2+ and receives SIGTERM normally.
+  2. **Use exec form and register the handler:** `CMD ["node", "server.js"]` with `process.on('SIGTERM', gracefulShutdown)` in the code. This works but you lose zombie reaping.
+  3. **In Kubernetes:** Use a `preStop` hook as a belt-and-suspenders approach: `lifecycle.preStop.exec.command: ["/bin/sh", "-c", "kill -TERM 1 && sleep 5"]`. The preStop hook runs before SIGTERM is sent, giving you an alternate shutdown signal path.
+
+**War Story:** A payments company ran 800 pods of a Java service. Every deployment, they observed 3-5% of pods being force-killed (exit code 137 = SIGKILL). The deployment process was: new pods start, old pods receive SIGTERM, old pods should drain and exit within 30 seconds. But the Dockerfile used `ENTRYPOINT ["bash", "-c", "java $JAVA_OPTS -jar app.jar"]` -- bash was PID 1 and did not forward SIGTERM to the Java process. Java never ran its shutdown hooks. The fix was switching to `ENTRYPOINT ["tini", "--", "java", "-jar", "app.jar"]`. Force-kills during deployment dropped to zero.
+
+#### Follow-up: What is the complete Kubernetes pod termination sequence, including preStop hooks and SIGTERM timing?
+
+1. Pod is marked for deletion (user runs `kubectl delete pod` or a rolling update begins).
+2. The pod is removed from Service endpoints **immediately** -- new traffic stops being routed to it. But existing TCP connections remain open.
+3. If a `preStop` hook is defined, it executes. The `terminationGracePeriodSeconds` countdown starts **simultaneously** with the preStop hook, not after it. If your preStop hook sleeps for 25 seconds and the grace period is 30 seconds, you only have 5 seconds after the hook for actual shutdown.
+4. SIGTERM is sent to PID 1 in each container (after preStop hook completes).
+5. The application should catch SIGTERM, stop accepting new connections, drain in-flight requests, close database connections, and exit 0.
+6. If the process has not exited by `terminationGracePeriodSeconds`, Kubernetes sends SIGKILL. The container is forcefully terminated.
+- **The subtle race condition:** Step 2 (endpoint removal) and step 4 (SIGTERM) happen concurrently, not sequentially. The kube-proxy or ingress controller may still route traffic to the pod for a few seconds after SIGTERM is sent, because endpoint propagation is eventually consistent. This is why many teams add a `preStop: sleep 5` -- to allow time for endpoint removal to propagate before the application starts draining.
+
+#### Follow-up: How do you test graceful shutdown behavior in CI, not just in production?
+
+- **Integration test pattern:** Start the container, send it traffic, send SIGTERM, and verify: (1) in-flight requests complete successfully, (2) the process exits with code 0, (3) no connections are reset (check the test client for connection errors), (4) shutdown completes within the grace period.
+- **Use `docker stop` with a timeout:** `docker stop --time=10 <container>` sends SIGTERM and waits 10 seconds before SIGKILL. Assert the container exits before the timeout.
+- **Chaos engineering:** In staging, use a tool like `chaoskube` or LitmusChaos to randomly terminate pods and measure the error rate on the client side. If graceful shutdown works correctly, clients should see zero errors during pod termination (assuming connection draining is implemented).
+
+</Accordion>
+
+<Accordion title="Scenario: Your database server shows 95% idle CPU, 1GB/s of free disk bandwidth, 50GB of free RAM — yet query latency is 50x higher than normal. All the usual metrics say the system is healthy. What is the bottleneck?">
+
+### The Trap
+
+This is the "everything looks fine but nothing works" scenario. It tests whether you can go beyond the USE Method's obvious metrics and identify bottlenecks in the places most engineers never look.
+
+**What weak candidates say:**
+
+- "I do not know, all the metrics look fine." Giving up when the standard playbook does not work.
+- "Network problem." A guess without diagnostic reasoning.
+
+**What strong candidates say:**
+
+When CPU, disk, and memory metrics all look healthy but latency is through the roof, the bottleneck is hiding in one of the "invisible" resources that standard monitoring misses:
+
+1. **Lock contention.** The database process may be spending its time waiting on internal mutexes rather than doing useful work. CPU shows as idle because threads are sleeping on locks, not spinning. Disk is idle because no queries can progress past the lock to issue I/O. **Diagnosis:** For PostgreSQL, check `pg_stat_activity` for queries in `waiting` state with `wait_event_type = 'Lock'` or `wait_event_type = 'LWLock'`. The `pg_locks` view shows held and waiting locks. `perf record -g -p <pid>` and look for time spent in `LWLockAcquire`, `ProcSleep`, or `futex_wait`. For MySQL, `SHOW ENGINE INNODB STATUS\G` shows lock waits and deadlock information.
+
+2. **Network latency or packet loss.** The database server's NIC is barely utilized, but each packet has high latency. This happens with misconfigured TCP settings, a saturated switch, or a misconfigured firewall/security group. A single TCP retransmission adds 200ms+ of latency (the default `tcp_syn_retries` timer). **Diagnosis:** `ss -ti` shows per-socket retransmission counts and RTT estimates. If `retrans` is non-zero or `rtt` is unexpectedly high (e.g., 50ms for a same-datacenter connection), you have a network problem. `tcpdump -i eth0 port 5432 -nn` and look for retransmissions (shown as `[TCP Retransmission]` in Wireshark) or duplicate ACKs.
+
+3. **Disk latency (not throughput).** `iostat` might show low `%util` because few I/O operations are in flight, but each operation takes a long time. An SSD with firmware issues, a cloud volume being throttled on IOPS (not bandwidth), or a RAID controller with a dying battery that disabled write cache. `iostat`'s `%util` can be misleading for SSDs that handle concurrent operations -- low utilization does not mean low latency. **Diagnosis:** Check `iostat -xz 1` for `await` (average I/O latency). If `await` is 50ms on an SSD that should be <1ms, the storage layer is the problem. On AWS, check if your EBS volume hit its provisioned IOPS limit using CloudWatch `VolumeQueueLength` and `VolumeReadOps`/`VolumeWriteOps`.
+
+4. **DNS resolution stalls.** If the database connects to replicas, authentication servers, or logging endpoints by hostname, slow DNS resolution stalls every new connection. A DNS server returning responses in 500ms (instead of the expected 1ms) makes every connection setup take an extra 500ms. **Diagnosis:** `strace -e trace=network -p <pid>` shows DNS queries (UDP to port 53). `dig @<resolver> <hostname>` measures DNS latency directly. Check `/etc/resolv.conf` timeout settings.
+
+5. **TIME_WAIT socket accumulation.** If the application opens and closes many short-lived connections to the database, the client-side sockets enter TIME_WAIT state for 60 seconds (`net.ipv4.tcp_fin_timeout`). This is not a CPU or memory problem -- it is ephemeral port exhaustion. New connections fail or stall while the kernel searches for a free port. **Diagnosis:** `ss -s` shows the count of sockets in TIME_WAIT state. If it is > 20,000, you are likely near ephemeral port exhaustion. `netstat -an | grep TIME_WAIT | wc -l` gives the count.
+
+**War Story:** A SaaS company saw PostgreSQL query latency spike from 2ms to 200ms while CPU was 12% and disk was 30% utilized. The root cause: a cloud provider silently introduced a 50ms round-trip latency on their internal DNS resolver. Every PostgreSQL client connection required DNS resolution for the PgBouncer hostname. Each new connection took 50ms extra. During a traffic spike, PgBouncer's pool ran dry, new connections were created (each paying the 50ms DNS tax), and the cascading effect raised p99 to 200ms. The fix: a local dnsmasq cache on each application server, reducing DNS latency from 50ms to <1ms. Total fix time: 45 minutes. Time spent investigating before finding it: 6 hours.
+
+#### Follow-up: How do you diagnose lock contention in a database when standard OS metrics show idle resources?
+
+- **PostgreSQL:** `SELECT wait_event_type, wait_event, count(*) FROM pg_stat_activity WHERE state = 'active' GROUP BY 1, 2 ORDER BY 3 DESC;` shows what active queries are waiting on. Common culprits: `Lock` / `relation` (table-level lock -- likely an `ALTER TABLE` or explicit `LOCK TABLE`), `LWLock` / `BufferContent` (buffer pool contention), `IO` / `DataFileRead` (waiting for disk I/O).
+- **MySQL/InnoDB:** `SELECT * FROM information_schema.INNODB_TRX WHERE trx_state = 'LOCK WAIT';` shows transactions waiting for locks. `SHOW ENGINE INNODB STATUS\G` has a `LATEST DETECTED DEADLOCK` section and a `TRANSACTIONS` section showing lock waits.
+- **OS level:** `perf lock record -p <pid> -- sleep 10 && perf lock report` shows which locks have the highest contention and wait time. This works for any application, not just databases.
+
+#### Follow-up: What is the difference between EBS IOPS throttling and bandwidth throttling, and how do you tell which one you are hitting?
+
+- EBS volumes have two independent limits: **IOPS** (number of I/O operations per second) and **throughput** (MB/s). A `gp3` volume defaults to 3,000 IOPS and 125 MB/s. You can hit one limit without hitting the other.
+- **IOPS-limited:** Many small random reads/writes (database index lookups). `iostat` shows low `rkB/s` and `wkB/s` but high `r/s` and `w/s`. CloudWatch `VolumeQueueLength > 1` consistently.
+- **Throughput-limited:** Large sequential reads/writes (backups, data loading). `iostat` shows high `rkB/s`/`wkB/s` near the throughput limit but moderate `r/s`/`w/s`.
+- **The sneaky one:** EBS burst credits (for `gp2` and burstable `gp3`). A volume that runs fine for hours can suddenly hit a wall when burst credits are exhausted. CloudWatch `BurstBalance` dropping to 0% is the telltale sign.
+
+</Accordion>
+
+<Accordion title="Scenario: You are debugging a production outage. strace shows the process making millions of futex() system calls per second. The application appears hung. What is happening and how do you fix it?">
+
+### The Trap
+
+Most candidates know `futex` is related to locking, but few can explain what millions of futex calls per second actually means mechanistically, or distinguish between the different futex failure modes.
+
+**What weak candidates say:**
+
+- "There is a deadlock." A deadlock would show a process stuck on a *single* futex call indefinitely, not millions per second.
+- "The process is doing a lot of locking." This is tautological -- the question is *why* and *what kind*.
+
+**What strong candidates say:**
+
+- Millions of `futex()` calls per second indicates **severe lock contention**, not deadlock. The difference is critical: a deadlock means two or more threads are waiting on each other forever (CPU is idle, futex calls are zero because the threads are sleeping). What we see here -- millions of futex calls per second -- means threads are rapidly acquiring and releasing locks in a tight loop, or are in a futex-based spin-wait pattern.
+- **Scenario A: Thundering herd on a shared resource.** Many threads wake up to process work from a shared queue, but only one can acquire the lock. The rest immediately call `futex(FUTEX_WAIT)` to sleep, then are woken again by the next signal -- millions of wake-sleep-wake cycles per second with very little actual work done. **Diagnosis:** `perf record -g` shows most time in `__lll_lock_wait` or `futex_wait_queue_me`. The stack trace above the futex call tells you which application lock is the bottleneck.
+- **Scenario B: Spin-wait degradation.** Some lock implementations (including `pthread_mutex` with `PTHREAD_MUTEX_ADAPTIVE_NP` or user-space spinlock libraries) spin in user-space for a short time before falling back to a `futex(FUTEX_WAIT)` kernel call. If the lock holder runs on a core that is itself contended, the hold time exceeds the spin count, and every waiter falls through to the kernel futex path. Millions of spin-then-futex cycles per second burn CPU in both user-space spinning and kernel futex operations.
+- **Scenario C: Memory allocator contention.** glibc's `malloc`/`free` uses internal locks (arenas). Under extreme multi-threaded allocation pressure, threads contend on arena locks. Each `malloc()` that finds its arena locked calls `futex(FUTEX_WAIT)`. At high concurrency (hundreds of threads), this manifests as millions of futex calls from inside `__libc_malloc`. **Diagnosis:** strace shows futex calls with addresses inside `libc.so` data segments. `perf record` shows `_int_malloc` and `arena_get2` in the stack. **Fix:** Switch to `jemalloc` or `tcmalloc` which have per-thread caches and dramatically lower contention.
+
+**Debugging approach:**
+1. `strace -e futex -c -p <pid>` -- confirm the rate and breakdown of futex operations (`FUTEX_WAIT` vs `FUTEX_WAKE` vs `FUTEX_CMP_REQUEUE`).
+2. `perf record -g -p <pid> -- sleep 5 && perf report` -- the call graph above the futex call tells you *which lock*. Is it an application mutex? The allocator? A library's internal lock?
+3. `perf lock report` -- shows per-lock contention statistics: lock name, number of contentions, average wait time.
+4. If it is the allocator: `LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libjemalloc.so.2 ./myapp` to swap in jemalloc without recompiling. Measure the difference.
+
+**War Story:** A real-time bidding platform saw their Go service (using CGo for a C-based ML inference library) process 100x fewer requests than expected. `strace` showed ~8 million `futex()` calls per second. The C library used `malloc` heavily during inference, and glibc's arena lock became the bottleneck at 200 concurrent goroutines all calling CGo simultaneously. Switching from glibc malloc to jemalloc (`LD_PRELOAD`) increased throughput from 2,000 to 180,000 inferences per second. The futex rate dropped to ~4,000 per second.
+
+#### Follow-up: How do you differentiate a deadlock from severe contention using OS tools?
+
+- **Deadlock:** Zero CPU usage. The threads are sleeping. `strace` shows them blocked on a single `futex(FUTEX_WAIT, ...)` call that never returns. `jstack` (Java) or `SIGQUIT` handler (Go) shows the exact locks each thread holds and is waiting on. The cycle is visible in the lock graph.
+- **Severe contention:** High CPU usage (either in user-space spinning or kernel futex operations). `strace` shows millions of `futex()` calls per second (rapid acquire-release cycles). Threads make progress but slowly. No deadlock cycle exists -- every lock is eventually released; it is just released and immediately re-acquired by one of many waiting threads.
+- **A quick test:** If you reduce the thread count to 1, does the problem go away? If yes, it is contention (no contention with one thread). If no, it is a different kind of hang.
+
+#### Follow-up: What is the difference between futex(FUTEX_WAIT) and futex(FUTEX_WAIT_BITSET) and why does it matter?
+
+- `FUTEX_WAIT` puts the thread to sleep and wakes it on any `FUTEX_WAKE` targeting that futex address. `FUTEX_WAIT_BITSET` adds a bitmask -- the thread only wakes if the wake operation's bitmask overlaps with the wait bitmask.
+- **Why it matters:** `FUTEX_WAIT_BITSET` enables selective waking. Instead of waking all waiters on a lock (thundering herd), you can wake only specific waiters. `pthread_cond_signal()` uses bitset-based futex to wake a single thread instead of all of them.
+- In kernel versions before `FUTEX_WAIT_BITSET`, `pthread_cond_broadcast()` woke all waiters even when only one could make progress. This was a major source of unnecessary context switches. Modern glibc uses `FUTEX_WAIT_BITSET` extensively, which is why you see it in strace output on modern systems.
+
+</Accordion>
+
+<Accordion title="Scenario: Two engineering teams disagree. Team A wants to run their Redis and PostgreSQL on the same 64-core, 256GB bare metal server 'to save money.' Team B says they should be on separate servers. Frame this as an OS-level resource contention debate.">
+
+### The Trap
+
+This is not a "right or wrong" question -- it is a judgment question. The interviewer wants to see whether you can reason about resource contention at the OS level, articulate specific failure modes, and make a recommendation with clear conditions under which it would change.
+
+**What weak candidates say:**
+
+- "Always separate them." Or "Co-locate to save money." Either absolute answer without reasoning is a red flag.
+- Generic statements about "resource competition" without specifying *which* resources and *how* they compete.
+
+**What strong candidates say:**
+
+The answer depends on the specific workload profiles, but co-location creates several concrete OS-level contention risks that separate servers eliminate:
+
+**Where they compete:**
+
+1. **Page cache contention.** Redis relies on `fork()` + CoW for persistence, which doubles its RSS during `BGSAVE`. PostgreSQL relies on the OS page cache for buffered I/O (especially if `shared_buffers` is set conservatively). During a Redis BGSAVE, the CoW memory spike can evict PostgreSQL's page cache, causing previously-cached database pages to be re-read from disk. This manifests as a PostgreSQL latency spike exactly correlating with Redis background save timing. **Quantification:** If Redis has a 40GB dataset, BGSAVE under high write load can consume an extra 10-20GB of RAM for CoW pages, evicting that much from the page cache.
+
+2. **Memory bandwidth saturation.** Both Redis and PostgreSQL perform large memory scans (Redis KEYS/SCAN, PostgreSQL sequential scans). On a single socket, memory bandwidth is typically 30-50 GB/s. Two services simultaneously scanning memory can saturate the memory bus, increasing memory access latency for both. On a NUMA system, if they are on different sockets, they can use separate memory channels -- but if the scheduler migrates them, they share bandwidth.
+
+3. **CPU cache pollution.** Redis serves requests from a single main thread scanning a large in-memory dataset. PostgreSQL serves queries from multiple worker processes, each with different working sets. They compete for L3 cache (typically 32-64MB shared per socket). Redis's large working set evicts PostgreSQL's query execution hot data, and vice versa. The cache miss rate for both increases, raising per-operation latency.
+
+4. **The OOM Killer makes the wrong choice.** If memory pressure occurs, the OOM Killer picks a victim. Without careful `oom_score_adj` tuning, it might kill PostgreSQL (higher RSS = higher oom_score) when the problem is a Redis memory spike. Losing the database because the cache was greedy is a catastrophic failure mode.
+
+5. **Noisy-neighbor I/O.** PostgreSQL checkpoints flush dirty pages to disk aggressively (`checkpoint_completion_target` controls the spread). A checkpoint can saturate disk I/O for seconds. If Redis's AOF persistence shares the same disk, AOF fsync latency spikes during PostgreSQL checkpoints, causing Redis clients to see increased latency.
+
+**When co-location CAN work:**
+
+- Redis dataset is small (< 10GB on a 256GB server) and write rate is low (minimal CoW during BGSAVE).
+- PostgreSQL `shared_buffers` is sized large enough (32-64GB) that it does not depend heavily on the page cache.
+- They are pinned to separate NUMA nodes: `numactl --cpunodebind=0 --membind=0 redis-server` and `numactl --cpunodebind=1 --membind=1 postgres`.
+- Separate disks: Redis AOF on NVMe A, PostgreSQL data on NVMe B. This eliminates I/O contention entirely.
+- Proper `oom_score_adj` tuning: PostgreSQL at -900, Redis at -500, everything else at default.
+- Cgroup-level memory limits on both services to prevent either from monopolizing RAM.
+
+**My recommendation:** Co-locate only if you implement all of the above mitigations and have monitoring to detect contention. If either service is latency-critical (sub-millisecond p99 requirement), separate servers. The cost of a bare metal server is a rounding error compared to the cost of debugging intermittent latency spikes caused by shared-resource contention at 3 AM.
+
+**War Story:** An e-commerce company co-located Redis (20GB dataset) and PostgreSQL (800GB database, 64GB shared_buffers) on a 2-socket, 256GB server to save $2,400/month on hosting. For 6 months, it worked. Then they launched a flash sale feature that increased Redis write rate 10x during peak hours. Every BGSAVE (every 5 minutes) triggered 8-15GB of CoW allocations, evicting PostgreSQL's page cache. PostgreSQL query p99 jumped from 5ms to 200ms for 30-60 seconds every 5 minutes. The team spent 3 weeks diagnosing "random PostgreSQL slowness" before correlating the timing with Redis BGSAVE. They moved Redis to a separate server, and the $2,400/month savings cost them roughly $40,000 in engineering time to diagnose.
+
+#### Follow-up: How would you monitor for resource contention between co-located services?
+
+- **Page cache eviction:** Monitor `sar -B 1` for `pgsteal/s` (pages stolen/reclaimed) and `majflt/s`. Correlate spikes with Redis BGSAVE timestamps.
+- **Memory bandwidth:** `perf stat -e LLC-load-misses,LLC-store-misses` for each process. Intel's `pcm` (Processor Counter Monitor) tool can show per-socket memory bandwidth utilization.
+- **Cache miss rate:** `perf stat -e cache-misses,cache-references -p <pid>` for both services. If the miss rate increases when the other service is active, they are polluting each other's cache.
+- **OOM events:** `dmesg | grep -i oom` and Prometheus alerts on `container_memory_usage_bytes / container_spec_memory_limit_bytes`.
+- **Cross-service latency correlation:** Plot Redis BGSAVE times and PostgreSQL p99 latency on the same Grafana dashboard. If they spike together, you have contention.
+
+#### Follow-up: What NUMA-aware deployment strategy would you use for co-location?
+
+- Bind Redis (single-threaded, latency-critical) to one NUMA node: `numactl --cpunodebind=0 --membind=0 redis-server`. All memory accesses are local, no cross-socket latency.
+- Bind PostgreSQL (multi-process, throughput-oriented) to the other NUMA node: `numactl --cpunodebind=1 --membind=1 pg_ctl start`. Workers stay on socket 1, shared_buffers allocated from socket 1's memory.
+- Monitor with `numastat -p <pid>` for both to verify zero `other_node` allocations.
+- If PostgreSQL needs more than one socket's cores, use `--cpunodebind=0,1 --interleave=all` for the shared_buffers (which are accessed by workers on both sockets), but this sacrifices some NUMA locality for throughput.
+
+</Accordion>
+
+<Accordion title="Scenario: You run eBPF-based tracing in production to diagnose a latency spike. The tracing itself causes a latency spike. How is this possible, and what should you have done differently?">
+
+### The Trap
+
+eBPF is marketed as "near-zero overhead observability." Most candidates accept this at face value. This question tests whether you understand the actual cost model of eBPF tracing and when "near-zero" becomes "very much not zero."
+
+**What weak candidates say:**
+
+- "eBPF should not cause overhead -- it runs in the kernel." Accepting the marketing without understanding the mechanism.
+- "You must have made an error in the eBPF program." Possible but not the primary issue.
+
+**What strong candidates say:**
+
+eBPF's "near-zero overhead" claim is true for *well-scoped* tracing. It becomes false when tracing is too broad:
+
+1. **Probe frequency matters exponentially.** Attaching a kprobe to a function called 10 times per second adds negligible overhead. Attaching it to `tcp_sendmsg()` on a server handling 500,000 packets per second means your eBPF program runs 500,000 times per second. Even if each invocation takes 1 microsecond, that is 0.5 seconds of CPU time per second -- 50% of a core consumed by tracing. At scale, tracing functions on the hot path (memory allocation, network stack, scheduler) can consume entire cores.
+
+2. **Map operations and perf buffer output.** eBPF programs that write to BPF maps (hash maps, ring buffers) on every invocation incur per-invocation overhead. Writing to a perf event buffer for every traced event generates a copy from kernel to user-space per event. At 500K events/sec, the perf buffer processing in user-space (your BCC/bpftrace consumer) becomes a bottleneck, and buffer overflow causes event loss.
+
+3. **Lock contention in BPF maps.** BPF hash maps use per-bucket spinlocks. If multiple CPUs trace concurrently and write to the same map keys, you get spinlock contention inside the kernel -- the exact same scalability problem as any shared-memory concurrent data structure. Per-CPU maps (`BPF_MAP_TYPE_PERCPU_HASH`) eliminate this but use more memory.
+
+4. **Stack unwinding cost.** If your eBPF program captures stack traces (`bpf_get_stackid()` or `bpf_get_stack()`), each invocation walks the kernel and/or user-space stack. Frame pointer-based unwinding is fast (~200ns). DWARF-based unwinding (needed when frame pointers are omitted, which is the default in many compilers) is much slower (~1-10us). On a function called 100K times per second, this adds 0.1-1.0 seconds of CPU time per second.
+
+**What you should have done differently:**
+- **Scope narrowly.** Trace specific PIDs (`-p <pid>`), not system-wide. Trace specific functions, not wildcards like `sys_*`.
+- **Use sampling, not tracing.** Instead of tracing every `tcp_sendmsg` call, use `perf record -F 99` to sample at 99 Hz. You get statistical insight with fixed overhead regardless of call frequency.
+- **Use per-CPU maps** and ring buffers instead of shared hash maps to avoid lock contention.
+- **Test in staging first.** Run the exact tracing command against a staging instance under production-like load and measure the overhead before deploying to production.
+- **Set filters in-kernel.** eBPF's power is that you can filter in kernel space -- only emit events that match specific criteria (latency > 10ms, specific error codes, specific source IPs). This reduces output volume by orders of magnitude compared to tracing everything and filtering in user-space.
+
+**War Story:** A platform team at a streaming company deployed a bpftrace one-liner to trace all `vfs_read()` calls system-wide to investigate slow reads. On their media servers handling 400K read operations per second, the bpftrace program consumed 2.4 CPU cores just running the eBPF bytecode in the kernel. The perf buffer overflowed and the bpftrace consumer in user-space consumed another 1.5 cores parsing events. Total overhead: ~4 cores on a 16-core server. Tail latency for video streams increased from 8ms to 45ms. They replaced the system-wide trace with `bpftrace -e 'kprobe:vfs_read /comm == "nginx"/ { @[kstack] = count(); }'` -- filtering to only the nginx process and aggregating in-kernel using a map instead of emitting per-event data. Overhead dropped to <0.1% of a core.
+
+#### Follow-up: How does eBPF's verifier prevent you from crashing the kernel, and what are its limitations?
+
+- Before an eBPF program is loaded, the kernel's BPF verifier statically analyzes it to ensure: (1) no unbounded loops (all loops must have a provable upper bound), (2) no out-of-bounds memory access (all map lookups are checked for NULL returns), (3) no invalid pointer arithmetic, (4) the program terminates (guaranteed by the loop bound check and a maximum instruction count, currently 1 million instructions).
+- **Limitations:** The verifier can be overly conservative -- it rejects programs that are provably safe but whose safety the verifier cannot prove (complex conditional bounds, pointer aliasing). This is a regular pain point for eBPF developers. Programs must be restructured to make safety obvious to the verifier, sometimes at the cost of readability or performance.
+- The verifier does NOT guarantee performance. It prevents crashes and memory corruption, but an eBPF program that passes verification can still consume excessive CPU or cause lock contention. Safety and performance are orthogonal guarantees.
+
+#### Follow-up: When should you use eBPF vs. traditional tools like strace or perf?
+
+- **strace:** Use when you need per-syscall argument inspection (what file paths are being opened, what socket options are set). Accept the 10-100x overhead. Never run on latency-critical production services for more than a few seconds.
+- **perf:** Use for CPU profiling (sampling where CPU time goes) and hardware performance counter analysis (cache misses, branch mispredictions, TLB misses). Near-zero overhead for sampling. The go-to tool for "why is this process using so much CPU."
+- **eBPF:** Use when you need custom tracing logic -- correlating events across layers (e.g., "trace all disk reads issued by PostgreSQL that take longer than 5ms and capture the query that triggered them"), or when you need production-safe continuous observability. eBPF's advantage is programmability: you define the question in code, and the kernel answers it efficiently. Its disadvantage is complexity (writing BPF programs, dealing with the verifier) and the overhead-at-scale risk described above.
+
+</Accordion>
+
+<Accordion title="Scenario: A team reports that their service running in a Kubernetes pod can only handle 1/4 of the expected requests per second. The pod has resources.limits.cpu: '4' and the service is written in Go. They set GOMAXPROCS=4 manually. But perf shows most time is spent in futex() and schedule(). What is the diagnosis?">
+
+### The Trap
+
+The setup sounds correct -- 4 CPU limit, GOMAXPROCS=4. But there is a subtle interaction between CFS bandwidth throttling, Go's runtime scheduler, and how the kernel accounts CPU time that turns a seemingly well-configured deployment into a performance disaster.
+
+**What weak candidates say:**
+
+- "Maybe Go is inefficient." Vague and unhelpful.
+- "Set GOMAXPROCS higher." This actually makes the problem worse, as the strong answer explains.
+
+**What strong candidates say:**
+
+- The problem is the interaction between GOMAXPROCS=4, CFS bandwidth control, and how Go's runtime scheduler uses OS threads.
+- **CFS quota for `cpu.limit: 4` is `cpu.cfs_quota_us=400000` per `cpu.cfs_period_us=100000`.** This means the container can use 400ms of CPU time per 100ms period. With 4 OS threads running in parallel, they burn through 400ms of quota in ~100ms wall-clock time -- which seems fine. You would expect the container to use 4 full cores continuously.
+- **But Go does not use exactly 4 OS threads.** GOMAXPROCS=4 means 4 **P's** (processor contexts) that can actively execute goroutines. But the Go runtime creates additional OS threads (M's) for: (a) goroutines blocked in CGo calls, (b) goroutines blocked in system calls (file I/O, DNS resolution, etc.), (c) the GC's background mark workers, (d) the `sysmon` monitoring goroutine. A Go service handling HTTP requests (which involves system calls for socket I/O, DNS, TLS), running GC, and possibly using CGo can easily have 8-12 active OS threads even with GOMAXPROCS=4.
+- **The throttling amplification:** 12 OS threads are all runnable. CFS sees 12 threads belonging to this cgroup. In a 100ms period, if all 12 threads run for ~33ms each, they consume 12 * 33ms = 400ms of quota. But each individual thread only got 33ms of execution time, not the 100ms they would have gotten on 4 dedicated cores. From Go's perspective, each P got 33ms of the 100ms period -- effectively 1.3 CPUs of throughput instead of 4. The remaining 67ms of each thread's wall-clock time was spent throttled, which appears as `futex()` and `schedule()` in the perf profile (the kernel puts throttled threads to sleep via the CFS throttling mechanism, which involves futex).
+- **The counterintuitive fix:** Set `GOMAXPROCS` **lower than** the CPU limit when the service creates many OS threads. For a service with significant CGo or syscall-blocking goroutines, `GOMAXPROCS=2` on a `cpu.limit: 4` can actually increase throughput -- fewer M's competing for quota means each P gets more contiguous execution time.
+- **The proper fix:** (1) Use `go.uber.org/automaxprocs` which reads the CFS quota and sets GOMAXPROCS accordingly. (2) Remove CPU limits entirely and rely on CPU requests for scheduling (the recommendation for latency-sensitive services). (3) Profile OS thread count with `runtime.NumGoroutine()` and `/proc/<pid>/status` Threads field to understand the actual parallelism.
+
+**War Story:** A cloud infrastructure company ran their Go API gateway with `cpu.limit: 8` and `GOMAXPROCS=8`. The gateway handled gRPC requests with TLS termination (CGo via BoringSSL) and upstream HTTP calls with DNS resolution. Under load, the process had ~30 OS threads active. CFS throttled aggressively -- `container_cpu_cfs_throttled_periods_total` showed 40% of periods were throttled. Effective throughput was 2.5x lower than expected. Reducing `GOMAXPROCS` to 4 and keeping the limit at 8 (giving Go's extra M's room to run without starving the P's) increased throughput by 3.2x. Removing CPU limits entirely (keeping requests at 8) increased throughput by another 1.4x.
+
+#### Follow-up: How does the Go runtime scheduler interact with CFS bandwidth throttling specifically?
+
+- Go's runtime scheduler is a **cooperative** scheduler layered on top of the kernel's **preemptive** scheduler. Go assumes that when a P's M thread is runnable, it will get CPU time promptly. CFS throttling breaks this assumption -- a runnable M is forced to sleep by the kernel when the quota is exhausted, but Go's scheduler does not know this happened.
+- **The GC amplification:** Go's GC has a pacer that estimates how much CPU time it needs for concurrent marking based on `GOGC` and allocation rate. The pacer assumes full CPU availability. When CFS throttles the GC mark workers, the pacer's estimates are wrong -- it under-allocates GC CPU time, causing the GC to fall behind, which triggers more aggressive GC, which consumes more quota, which causes more throttling. This positive feedback loop can cause GC pause time (STW phases) to increase 5-10x under throttling.
+- **Monitoring:** Export `runtime.MemStats.PauseTotalNs` and `GCCPUFraction` as Prometheus metrics. If `GCCPUFraction` spikes above 25% or pause times increase during load, correlate with `container_cpu_cfs_throttled_seconds_total` to confirm the throttling-GC interaction.
+
+#### Follow-up: If you remove CPU limits, what prevents a runaway pod from starving other pods?
+
+- Without limits, a pod can use all available CPU on the node. The protection comes from **CPU requests** which map to `cpu.shares` (cgroup v1) or `cpu.weight` (cgroup v2). Shares provide proportional fair scheduling: if Pod A has `requests.cpu: 2` and Pod B has `requests.cpu: 1`, and both are CPU-hungry, Pod A gets 2/3 of available CPU and Pod B gets 1/3. Neither is throttled -- they share proportionally.
+- **When the node is not fully utilized,** both pods can burst to use all idle CPU. This is the ideal behavior for latency-sensitive services.
+- **The risk:** If a pod has a CPU-spinning bug (infinite loop), it will consume all available CPU, degrading other pods. The mitigation is monitoring + alerting on per-pod CPU usage and having runbooks for killing runaway pods. Teams that are comfortable with this trade-off (most are) get better latency characteristics than teams that set hard limits.
+
+</Accordion>
+
+<Accordion title="Scenario: You join a team that stores application logs by appending to a single file from 20 concurrent threads. Occasionally, log lines appear interleaved — the beginning of one message mixed with another. They ask you to 'just add a mutex.' Is that the right fix?">
+
+### The Trap
+
+The "obvious" answer is yes, add a mutex. But the question is testing whether you know that POSIX already provides a guarantee here, whether a mutex is the best solution, and whether you understand the `O_APPEND` flag and the write atomicity guarantees of the kernel.
+
+**What weak candidates say:**
+
+- "Yes, add a mutex around every write call." This works but is the brute-force solution that shows no knowledge of POSIX I/O semantics.
+- "Use a logging library." Correct advice in practice but does not demonstrate OS understanding.
+
+**What strong candidates say:**
+
+- **First, the diagnosis:** POSIX guarantees that `write()` to a file opened with `O_APPEND` is atomic with respect to the file offset update -- the seek-to-end and write happen as a single atomic operation. So concurrent `O_APPEND` writes from multiple threads should not interleave. If they ARE interleaving, there are a few possible reasons:
+  1. **The application is not using `O_APPEND`.** It is seeking to the end and then writing in two separate calls (`lseek(SEEK_END)` + `write()`). Between the seek and the write, another thread can seek and write, causing interleaving. **Fix:** Open the file with `O_APPEND`. No mutex needed.
+  2. **Writes exceed `PIPE_BUF` (4096 bytes on Linux).** POSIX guarantees atomicity of writes to pipes up to `PIPE_BUF` bytes. For regular files, `O_APPEND` atomicity applies to the offset update, but the actual data write of a very large buffer might not be written in a single contiguous disk operation. In practice, on local filesystems (ext4, XFS), writes up to the page size (4KB) are effectively atomic, and larger writes are generally atomic too on modern kernels. But on **NFS** or **distributed filesystems**, write atomicity guarantees are much weaker. If the file is on NFS, this is likely the problem.
+  3. **Buffered I/O in the application.** If the application uses `fprintf()` or buffered I/O (stdout is line-buffered, files are fully buffered), the C library may split a single logical write into multiple `write()` system calls (flushing the buffer when it is full, then writing the remainder). Each `write()` is atomic, but the two writes together are not. **Fix:** Use `write()` directly (unbuffered), or use `setvbuf()` to set line buffering, or flush the buffer explicitly for each log line.
+
+- **Is a mutex the right fix?** It depends:
+  - **If the problem is `O_APPEND` not being used:** No mutex needed. Just open with `O_APPEND`.
+  - **If the problem is NFS:** A mutex within a single process does not help if multiple processes on different machines are writing to the same NFS file. You need a distributed lock or a different architecture (log to local files, then ship to a central system).
+  - **If a mutex is used:** It works but serializes all log writes. With 20 threads at high logging rates, the mutex becomes a contention point. Each thread spends time waiting for the lock instead of doing real work. This is the "correct but slow" solution.
+
+- **The senior answer:** Use a **lock-free concurrent queue** pattern. Each thread writes log entries to a concurrent queue (MPSC -- multiple producer, single consumer). A dedicated writer thread drains the queue and writes to the file in batches. This eliminates both the interleaving problem and the contention of 20 threads competing for a mutex. This is how every high-performance logging library works (Log4j2's async appenders, spdlog, Zap in Go).
+
+**War Story:** A team at an ad-tech company debugging "corrupted logs" discovered the corruption only happened on their centralized NFS log volume. Local files on ext4 were fine. The NFS server coalesced small writes from different clients into a single block write, interleaving bytes from different sources. They added a mutex per process -- but there were 8 processes on 4 different servers writing to the same NFS path. The per-process mutex did nothing for inter-server interleaving. The actual fix was switching to structured logging (JSON per line), writing to local files, and using Fluentd to ship logs to Elasticsearch. Total time spent on the NFS approach before giving up: 4 weeks.
+
+#### Follow-up: What is the PIPE_BUF guarantee and when does write atomicity actually break?
+
+- POSIX mandates that writes to a pipe (or FIFO) of `PIPE_BUF` bytes or fewer are atomic: if two processes write to the same pipe simultaneously, each write's data appears contiguously in the output, never interleaved byte-by-byte. On Linux, `PIPE_BUF` is 4096 bytes.
+- For writes larger than `PIPE_BUF` to a pipe, atomicity is NOT guaranteed. A 16KB write can be interleaved with another writer's data.
+- For regular files (not pipes), POSIX is less explicit. The `O_APPEND` guarantee is about the **file offset** being updated atomically, not about the data write being atomic. In practice, on Linux ext4/XFS, regular file writes from a single `write()` call are atomic in terms of data content because the kernel holds the inode mutex during the write. But this is an implementation detail, not a POSIX requirement.
+
+#### Follow-up: How do high-performance logging libraries avoid the contention problem entirely?
+
+- **Async logging with ring buffers:** Log4j2's `AsyncLogger` uses the LMAX Disruptor (a lock-free ring buffer) as the queue between application threads and the I/O thread. Application threads write log events to the ring buffer without any lock (CAS-based claim of a slot). A single background thread drains the ring buffer and writes to disk. This achieves ~18 million log events per second on modern hardware.
+- **Per-thread buffering:** spdlog in C++ maintains per-thread buffers that are periodically flushed to the output. Threads never contend with each other -- each writes to its own buffer. The flush thread collects and writes all buffers. Thread-local storage eliminates all synchronization for the fast path.
+- **The trade-off:** Async logging means log entries are written to disk slightly after they happen. If the process crashes between the event and the flush, the last few log entries are lost. For most applications, this is acceptable. For audit logging where every entry must be durable, synchronous `O_APPEND` writes with `fsync()` are necessary, accepting the performance cost.
+
+</Accordion>
+
+</AccordionGroup>

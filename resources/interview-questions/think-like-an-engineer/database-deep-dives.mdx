@@ -1819,6 +1819,515 @@ The choice depends on how accurate the count needs to be and how much complexity
 
 ---
 
+## Advanced Interview Scenarios
+
+These questions are designed to break candidates out of textbook thinking. Several have answers where the obvious approach is wrong. They test the kind of judgment that only comes from operating databases in production -- where the clean theory meets the messy reality of traffic spikes, human error, cost constraints, and 3 AM pages.
+
+### Your application's p99 latency spikes every day at 2 AM. Nothing in the application code runs at that time. The database is PostgreSQL. What is happening?
+
+**Difficulty:** Senior
+
+**What the interviewer is really testing:** Whether the candidate understands that databases have background maintenance processes with real performance impact, and whether they can trace a symptom back to a non-obvious root cause.
+
+**What weak candidates say:**
+
+"Maybe there is a cron job running. I would check the cron tab." They stay at the application layer and do not consider the database's own internal processes. Some suggest "maybe it is backups" without explaining how a backup causes latency spikes or how to verify.
+
+**What strong candidates say:**
+
+The way I think about this is: what happens at 2 AM that does not involve application code? Three PostgreSQL-internal culprits:
+
+- **Autovacuum anti-wraparound.** PostgreSQL has a hard-coded escalation: when a table's `relfrozenxid` age exceeds `autovacuum_freeze_max_age` (default 200 million), autovacuum ignores its normal cost-based throttling and runs at full speed to prevent transaction ID wraparound. This "emergency autovacuum" consumes massive I/O. On a busy table, this can saturate the disk for 30-60 minutes. Check `pg_stat_user_tables` for `last_autovacuum` timestamps clustering around 2 AM, and look at `pg_stat_progress_vacuum` during the spike.
+
+- **Checkpoint storms.** PostgreSQL's checkpointer writes all dirty pages from shared buffers to disk periodically (controlled by `checkpoint_timeout`, default 5 minutes, and `max_wal_size`). If a large batch of dirty pages accumulated during daytime activity and the checkpoint fires during a low-traffic window, the sudden burst of disk writes spikes latency for concurrent queries. Check `pg_stat_bgwriter` for `checkpoints_req` (forced checkpoints, which are the disruptive kind) vs `checkpoints_timed`. Tune `checkpoint_completion_target` to 0.9 to spread checkpoint writes over a longer window.
+
+- **RDS or cloud-provider maintenance windows.** On AWS RDS, minor engine patches, OS patching, and multi-AZ failover tests often run in the default maintenance window (which many teams never change from the 2-4 AM default). A multi-AZ failover causes a 15-30 second connection drop. Check the AWS RDS Events console.
+
+**War Story:** At a fintech company running PostgreSQL 13 on RDS, we saw p99 spikes every night at 2:17 AM. The team spent two weeks blaming a Lambda function that ran at 2 AM. It turned out to be autovacuum anti-wraparound on the `transactions` table -- 800 million rows, `autovacuum_freeze_max_age` at the default 200 million. The emergency vacuum was ignoring cost delays and saturating the EBS volume at 3,000 IOPS for 45 minutes. We fixed it by reducing `autovacuum_vacuum_scale_factor` to 0.01 on that table so regular autovacuum ran more frequently, preventing the age from ever reaching the emergency threshold. The p99 spikes disappeared completely. The monitoring tool that caught it was `pg_stat_progress_vacuum` combined with CloudWatch `VolumeWriteOps` -- the correlation was unmistakable.
+
+#### Follow-up: How would you distinguish between a checkpoint storm and an autovacuum storm using only pg_stat views?
+
+**Answer:**
+
+Check `pg_stat_bgwriter`. The `checkpoints_req` counter increments when a forced checkpoint occurs (triggered by `max_wal_size` being reached). If that counter is climbing during the spike, it is a checkpoint. For autovacuum, check `pg_stat_progress_vacuum` -- it shows which table is being vacuumed, the phase (scanning heap, vacuuming indexes, etc.), and progress. Also look at `pg_stat_activity` for backend processes with `backend_type = 'autovacuum worker'` and `wait_event_type = 'IO'`. If autovacuum workers are in I/O wait states, they are the ones hammering the disk. You can also correlate with `pg_stat_user_tables.autovacuum_count` and `last_autovacuum` to see which tables were vacuumed during the window.
+
+#### Follow-up: The team wants to "just disable autovacuum on that table to stop the spikes." Why is this dangerous?
+
+**Answer:**
+
+Disabling autovacuum on a high-write table is like disabling the fire alarm because the beeping annoys you. Without autovacuum: dead tuples accumulate indefinitely, bloating the table (a 50 GB table can grow to 500 GB). Index bloat makes every query slower. Most critically, the `relfrozenxid` age keeps climbing toward the 2-billion hard limit. When it gets within 10 million of the limit, PostgreSQL enters emergency mode and starts logging warnings. When it hits the limit, PostgreSQL **shuts down all writes to the entire database cluster** -- not just that table, every table -- and refuses to process any transaction until someone manually runs `VACUUM FREEZE`. I have seen this take a production database offline for 6 hours on a 1 TB table. The correct fix is never to disable autovacuum -- it is to tune it so it runs frequently in small increments instead of rarely in one massive burst.
+
+---
+
+### You inherit a MongoDB cluster that is sharded on { created_at: 1 }. The team says queries are slow. What is your diagnosis before you look at a single query?
+
+**Difficulty:** Senior
+
+**What the interviewer is really testing:** Whether the candidate recognizes a fundamentally flawed shard key on sight, and can explain the cascading consequences without needing to investigate further.
+
+**What weak candidates say:**
+
+"I would look at the slow query log and see which queries are slow, then add indexes." They treat it as a query optimization problem and miss that the architecture itself is broken.
+
+**What strong candidates say:**
+
+I already know the primary problem before looking at a single query: **the shard key is monotonically increasing**. Every new document has a `created_at` value greater than all previous documents. That means every insert goes to the same shard -- the one that owns the highest chunk range. You have N shards, but only one of them is receiving writes. The other N-1 shards are idle for writes and only serve reads for historical data.
+
+This causes three cascading problems:
+
+1. **Write hot shard.** One shard absorbs 100% of write traffic. It becomes the bottleneck. Adding more shards does not help -- the writes still go to the newest chunk range. The `moveChunk` balancer constantly tries to migrate chunks from the hot shard to cold shards, but it cannot keep up with the ingest rate. You see `balancerStatus` showing continuous chunk migrations and `moveChunk` operations consuming I/O on the hot shard.
+
+2. **Scatter-gather reads.** Any query that filters by something other than `created_at` (which is almost every query -- "find me user X's documents," "find documents with status Y") must scatter to all shards because the shard key tells MongoDB nothing about where user X's data lives. These scatter-gather queries get linearly slower as you add shards. The team adds shards for capacity but queries get slower -- the opposite of what they expected.
+
+3. **Jumbo chunks.** If many documents are created within the same second (high-throughput systems), they share the same `created_at` value and land in the same chunk. That chunk cannot be split because all its documents have the same shard key value. It becomes a jumbo chunk that cannot be migrated, further imbalancing the cluster.
+
+**War Story:** An IoT platform I consulted for had sharded their sensor readings collection on `{ timestamp: 1 }`. 200 million inserts per day, all hitting one shard. They had 12 shards but write throughput was identical to a single node. The balancer was consuming 40% of the hot shard's I/O budget just migrating chunks. The fix was a reshard to `{ device_id: 1, timestamp: 1 }` -- a compound shard key where `device_id` provides cardinality and distribution, while `timestamp` in the sort key gives chronological ordering within each device's data. Queries like "get device X's readings for the last hour" went from scatter-gather across 12 shards to a single targeted query. Write throughput increased 9x because writes distributed across all shards. The migration took 3 weeks of dual-writing to a new collection, but the team said they wished they had done it six months earlier.
+
+#### Follow-up: How do you actually migrate to a new shard key on a live MongoDB cluster without downtime?
+
+**Answer:**
+
+Since MongoDB 5.0, there is `reshardCollection` which performs an online reshard. Under the hood, it creates a new sharded collection, clones existing data using a background process, catches up with ongoing writes via change streams, and then atomically swaps the collection namespace. During the cutover (typically sub-second), writes are briefly paused. In practice, I have seen the background cloning phase take days for multi-terabyte collections, and it doubles your storage temporarily. You need to monitor disk usage carefully.
+
+For MongoDB versions before 5.0, or when you need to restructure the schema during migration, the pattern is: create a new collection with the correct shard key, set up a change stream on the old collection to capture live writes, backfill historical data from old to new using a batch job, then switch the application to the new collection once the change stream consumer has caught up. The challenge is the cutover -- you need to drain the change stream buffer to zero lag, switch the application atomically (typically a feature flag), and have a rollback plan.
+
+#### Follow-up: The team pushes back -- "we chose created_at because all our queries filter by time range." Is their reasoning valid?
+
+**Answer:**
+
+Their reasoning is partially valid but still wrong. Yes, filtering by time range is important. But a shard key serves two purposes: **query routing** and **write distribution**. A good shard key optimizes both. `{ created_at: 1 }` optimizes routing for time-range queries but catastrophically fails at write distribution.
+
+The correct approach is a compound shard key where the first element provides distribution and the second provides range-query efficiency. For example, `{ tenant_id: 1, created_at: 1 }` distributes writes across tenants (good cardinality) while still allowing time-range queries within a tenant to hit a single shard. If there are no natural high-cardinality prefixes, use a hashed compound key: `{ hashed_created_at: "hashed", created_at: 1 }` -- but this loses time-range routing, so you are back to scatter-gather for range queries. There is no perfect shard key; there are only trade-offs that match your access patterns. The "all queries filter by time" argument ignores the write side of the equation, which is the classic mistake.
+
+---
+
+### A Redis Lua script that implements a distributed lock is intermittently failing to release the lock, causing downstream services to hang for 30 seconds (the lock TTL). How do you debug this?
+
+**Difficulty:** Staff-Level
+
+**What the interviewer is really testing:** Practical debugging of distributed locking, understanding of Redis atomicity guarantees, and awareness of the subtle failure modes that make distributed locks treacherous.
+
+**What weak candidates say:**
+
+"I would check if the Redis server is overloaded. Maybe increase the TTL." They do not understand the actual failure modes of distributed locks and suggest making the problem worse (longer TTL means longer hangs on failure).
+
+**What strong candidates say:**
+
+This is a classic distributed lock lifecycle bug. Let me walk through the failure modes in order of likelihood:
+
+**1. Lock ownership mismatch on release.** The most common bug. Service A acquires lock with token "abc123" and TTL 30s. Service A takes 35 seconds to complete the work (GC pause, slow downstream call, CPU contention). The lock expires at 30s. Service B acquires the same lock with token "xyz789". Service A finishes at 35s and releases... Service B's lock. Now there is no lock and a third service enters the critical section. The "intermittent failure to release" is actually Service A trying to release a lock it no longer owns and the `DEL` either deletes B's lock (if no ownership check) or fails silently (if the Lua script checks ownership but the token does not match).
+
+The fix: the release Lua script must compare the lock value (a unique token per acquisition) before deleting:
+
+```lua
+if redis.call("GET", KEYS[1]) == ARGV[1] then
+  return redis.call("DEL", KEYS[1])
+else
+  return 0
+end
+```
+
+And the TTL must be longer than the maximum realistic operation time, including tail latency. If p99 of the protected operation is 20s, the lock TTL should be at least 60s, not 30s. Better yet, implement a lock renewal (watchdog) thread that extends the TTL while the operation is in progress -- this is what Redisson does with its watchdog pattern.
+
+**2. Clock drift in Redlock.** If using the Redlock algorithm across multiple Redis instances, clock drift between the client and Redis servers can cause the client to believe it still holds the lock when the lock has already expired from Redis's perspective. Martin Kleppmann's critique specifically targets this: a process pause (GC, page fault) between acquiring the lock and using it can exceed the TTL.
+
+**3. Network partition during release.** The release command is sent but the TCP connection to Redis is broken. The client does not receive the confirmation. Depending on the client library's retry behavior, the release may never be retried (the library treats the command as failed and does not retry writes by default). The lock sits in Redis until TTL expiry.
+
+**War Story:** At a payments company, we had a distributed lock protecting idempotency key deduplication. The lock TTL was 10 seconds. About once every 2,000 requests, the downstream payment processor took 12-15 seconds to respond (their p99.9 tail latency). Our service would finish processing, try to release the lock, but the lock had already expired and been re-acquired by a retry. The release Lua script returned 0 (token mismatch), we logged it as a warning but did not act on it, and the retry created a duplicate charge. The fix was three-fold: (1) implement a lock renewal thread that extended the TTL every 5 seconds while the operation was in progress, (2) add a circuit breaker on the downstream call so we would not wait 15 seconds, and (3) add a secondary idempotency check at the database level. The lock went from being the sole correctness mechanism to one layer of defense.
+
+#### Follow-up: The team says "just use a PostgreSQL advisory lock instead of Redis -- it is simpler and has real transactions." When is this the right call?
+
+**Answer:**
+
+PostgreSQL advisory locks are underrated and often the correct choice. `SELECT pg_advisory_lock(hash_of_key)` acquires a lock that is automatically released on transaction end or session end. No TTL management, no ownership tokens, no Lua scripts. They are transactional: if the transaction rolls back, the lock releases.
+
+Use PostgreSQL advisory locks when: (1) all lock participants already connect to the same PostgreSQL instance, (2) the lock contention is moderate (not thousands of lock acquisitions per second), and (3) you need the lock's lifecycle tied to a database transaction.
+
+Use Redis locks when: (1) lock participants are different services that do not share a database, (2) you need sub-millisecond lock acquisition (PostgreSQL round-trip is 1-5 ms vs Redis 0.1-0.5 ms), (3) lock throughput is very high, or (4) the protected operation spans multiple systems and cannot be wrapped in a database transaction.
+
+The honest truth is that most teams using Redis for distributed locks would be better served by PostgreSQL advisory locks, because most lock scenarios involve protecting a database operation that is already running inside a PostgreSQL transaction. Adding Redis as a separate lock coordinator introduces a new failure mode (Redis unavailability) and the dual-system consistency problem.
+
+#### Follow-up: How would you monitor distributed lock health in production?
+
+**Answer:**
+
+Four metrics I track:
+
+1. **Lock acquisition latency** (p50, p99). If this starts climbing, it means contention is increasing or the Redis cluster is under pressure.
+2. **Lock hold duration vs TTL ratio.** If the median hold time is 8 seconds and TTL is 10 seconds, you are dangerously close to TTL expiry during normal operations. Alert when the p99 hold duration exceeds 50% of TTL.
+3. **Lock release failure rate.** The percentage of release operations where the ownership token does not match (the lock expired and was re-acquired). This is the leading indicator of correctness bugs. Any non-zero rate should trigger investigation.
+4. **Lock contention rate.** How often an acquisition attempt is blocked (lock already held). High contention means either the critical section is too slow or too many processes are competing. Consider sharding the lock (per-user instead of global) or redesigning the critical section to be shorter.
+
+We built a Grafana dashboard at my previous company with these four metrics per lock name. The most actionable alert was "lock release failure rate > 0.1% over 5 minutes" -- it caught every TTL-related bug before it became a customer-facing issue.
+
+---
+
+### Your DynamoDB bill tripled last month. No one deployed new features. Find the root cause.
+
+**Difficulty:** Senior
+
+**What the interviewer is really testing:** Cost awareness in production database operations, ability to use AWS tooling for forensics, and understanding of DynamoDB's pricing model beyond the basics.
+
+**What weak candidates say:**
+
+"Switch to on-demand mode to save money." This shows they do not understand DynamoDB pricing -- on-demand mode is 6.5x more expensive per request at steady state. Or they say "look at the AWS bill" without knowing which specific DynamoDB metrics to investigate.
+
+**What strong candidates say:**
+
+DynamoDB has five cost axes, and the bill increase must come from one or more of them. I would investigate in this order:
+
+**1. Read/Write capacity consumption.** Check CloudWatch `ConsumedReadCapacityUnits` and `ConsumedWriteCapacityUnits` for the table and all GSIs. Compare with the previous month. If consumed capacity increased but no new features deployed, look for: (a) a change in traffic patterns (seasonal growth, a marketing campaign, a bot), (b) a batch job that was accidentally left running or running more frequently than before, (c) a retry storm caused by throttling (application retries create a positive feedback loop -- throttling causes retries, retries increase consumption, which causes more throttling).
+
+**2. GSI cost.** This is the most common surprise cost. Every write to the base table is replicated to every GSI that projects the modified attribute. If someone added a GSI with `ProjectionType: ALL` on a high-write table, that GSI now doubles the write cost for that table. Check `ConsumedWriteCapacityUnits` per GSI. Also check for GSI throttling backpressure -- if the GSI is throttled, it slows down base table writes, increasing request latency, which can increase concurrent request count and overall capacity consumption.
+
+**3. DynamoDB Streams.** Streams are free to enable, but the Lambda (or other consumer) invocations triggered by streams cost money. If stream processing Lambda functions are failing and retrying (DynamoDB Streams retries failed batches until they succeed or expire), you could have millions of extra Lambda invocations. Check the Lambda concurrent executions and error rates for stream consumers.
+
+**4. Data storage.** DynamoDB charges $0.25/GB/month for storage. If storage grew from 100 GB to 1 TB (maybe TTL was accidentally disabled and old data is not being cleaned up), that is a $225/month increase. Check the table's `ItemCount` and `TableSizeBytes` in the DynamoDB console. Also check GSI storage -- each GSI stores its own copy of projected attributes.
+
+**5. Data transfer.** DynamoDB charges for cross-region data transfer (Global Tables replication), VPC endpoint data processing, and data returned to the client. If `ProjectionExpression` is not used and items are large, read costs include both capacity units and data transfer. A code change that removed `ProjectionExpression` from a high-traffic query could significantly increase costs.
+
+**War Story:** A logistics company I worked with saw their DynamoDB bill go from $4,200/month to $14,800/month in one month. No new features. The root cause was a seemingly innocent change: a developer added a new GSI to enable a back-office search feature. The GSI had `ProjectionType: ALL` on their `shipments` table, which had 50,000 writes per second. That single GSI doubled the write capacity consumption for the entire table. The GSI itself was only queried 10 times per day -- a $10,000/month GSI for a feature used by 3 people. The fix was changing the GSI projection to `KEYS_ONLY` (the search only needed the shipment ID) and paying for individual `GetItem` calls on the base table for the occasional detail fetch. The bill dropped by $9,000/month.
+
+#### Follow-up: How would you set up cost alerting to catch this before the monthly bill arrives?
+
+**Answer:**
+
+Three layers:
+
+1. **AWS Budgets** with a DynamoDB-specific budget. Set a monthly budget for DynamoDB and configure alerts at 50%, 80%, and 100% thresholds with SNS notifications to Slack or PagerDuty. This catches overall cost growth.
+
+2. **CloudWatch per-table alarms.** Create alarms on `ConsumedWriteCapacityUnits` and `ConsumedReadCapacityUnits` at the table level and GSI level. Alert when any metric exceeds 120% of the 7-day rolling average. This catches per-table anomalies before they aggregate into a bill surprise.
+
+3. **AWS Cost Explorer with daily granularity.** Set up a daily report filtered to DynamoDB. Enable "group by resource" to see cost per table. The bill tripling happened over 30 days -- with daily cost monitoring, you would have caught it on day 2 when the daily cost jumped from $140 to $420.
+
+The meta-lesson: database cost monitoring should be as granular as performance monitoring. A cost anomaly is often a symptom of an operational issue (retry storms, missing TTL, over-projected GSIs).
+
+#### Follow-up: The team is on provisioned capacity and is considering switching to on-demand to "never think about capacity again." Walk them through the trade-offs.
+
+**Answer:**
+
+On-demand mode pricing is approximately 6.5x more expensive per request than provisioned capacity at steady state. For a table consuming 10,000 WCU steady-state, provisioned costs roughly $4,700/month. On-demand for the same throughput costs roughly $30,500/month.
+
+On-demand makes financial sense in three scenarios: (1) truly unpredictable traffic with extreme spikes (0 to 50,000 WCU in minutes), (2) development and staging environments with minimal traffic, and (3) new tables where you do not yet know the access pattern.
+
+For production tables with reasonably predictable traffic, provisioned capacity with auto-scaling is almost always cheaper. Set the target utilization to 70%, minimum capacity to your off-peak baseline, and maximum capacity to your peak with headroom. Auto-scaling adjusts within 1-2 minutes, which handles most traffic variations.
+
+The hybrid approach: use provisioned with auto-scaling for steady-state tables, and on-demand for event-driven or burst-heavy tables. DynamoDB lets you switch between modes, but there is a 24-hour cooldown after switching from on-demand back to provisioned.
+
+---
+
+### You are designing a system that needs to keep PostgreSQL, Redis, and Elasticsearch in sync. When a user updates their profile, the relational data, the cache, and the search index all need to reflect the change. How do you ensure consistency?
+
+**Difficulty:** Staff-Level
+
+**What the interviewer is really testing:** Understanding of the fundamental impossibility of consistent dual-writes across independent systems, and practical patterns for achieving eventual consistency with acceptable trade-offs.
+
+**What weak candidates say:**
+
+"I would write to all three in the same API request handler. If any write fails, roll back the others." This is the distributed transaction trap -- there is no rollback mechanism across PostgreSQL, Redis, and Elasticsearch. If the PostgreSQL write succeeds, the Redis write succeeds, and the Elasticsearch write fails, you cannot roll back Redis (the `DEL` might itself fail). They also do not address the case where the application process crashes between write 2 and write 3.
+
+**What strong candidates say:**
+
+There is no way to make three independent systems atomically consistent without a distributed transaction coordinator, and implementing 2PC across PostgreSQL, Redis, and Elasticsearch is not practical. The real question is: what consistency guarantees does the business actually need, and what is the cheapest pattern that satisfies them?
+
+**Pattern 1: Transactional Outbox (my default recommendation).**
+
+Write the profile update AND an "outbox" event to PostgreSQL in the same transaction. A separate process (Debezium polling the outbox table, or a PostgreSQL LISTEN/NOTIFY consumer) reads the outbox events and fans them out to Redis and Elasticsearch. This guarantees that if the profile update committed, the event was also committed. The downstream updates are eventually consistent -- typically within 100-500ms.
+
+Implementation: the `profile_updates` outbox table has columns `id, aggregate_id, event_type, payload, processed_at`. A worker polls for `processed_at IS NULL`, updates Redis (invalidate or update the cached profile), updates Elasticsearch (index the new profile), and marks the event as processed. Idempotent processing is essential because the worker might crash after updating Redis but before updating Elasticsearch.
+
+**Pattern 2: CDC with Debezium.**
+
+Skip the outbox table. Use Debezium to capture WAL changes directly from PostgreSQL and publish them to Kafka. Separate consumers read from Kafka: one updates Redis, another updates the Elasticsearch index. Debezium guarantees exactly-once publication from WAL to Kafka. The consumers handle idempotent processing.
+
+This is cleaner (no outbox table, no polling) but adds Kafka and Debezium to the operational surface area. For a team already running Kafka, this is the preferred approach. For a team that does not, the outbox pattern is simpler to start with.
+
+**Pattern 3: Eventual invalidation (simplest for caching).**
+
+For Redis specifically: do not try to keep the cache in sync. Just invalidate the cache on write (`DEL user:profile:123`). The next read misses the cache, fetches from PostgreSQL, and repopulates. This is the cache-aside pattern. It is eventually consistent (the stale cache entry is gone immediately, the fresh entry appears on the next read) and requires zero event infrastructure.
+
+For Elasticsearch: invalidation is not practical because search needs the data indexed. Use the outbox or CDC pattern for Elasticsearch, and simple invalidation for Redis.
+
+**War Story:** An e-commerce platform I worked on tried Pattern 1 -- writing to PostgreSQL, Redis, and Elasticsearch sequentially in the request handler. One day, the Elasticsearch cluster went into a 45-second recovery (a node restarted due to OOM). During those 45 seconds, every profile update API call hung for 30 seconds (the Elasticsearch client timeout), then returned a 500 error to the user. But the PostgreSQL write had already committed -- so the profile was updated in the database but the user saw an error. The Redis cache had the old data. Search had the old data. The user retried, PostgreSQL returned "nothing changed" (idempotent), Redis and Elasticsearch eventually updated, but the user was confused and support tickets piled up. We migrated to the outbox pattern within the week. The API now writes to PostgreSQL only (latency: 5ms), returns success immediately, and the async worker handles Redis and Elasticsearch. Elasticsearch downtime no longer affects user-facing latency.
+
+#### Follow-up: The outbox table is growing fast because events are being produced faster than the worker can process them. How do you scale the worker?
+
+**Answer:**
+
+Three approaches:
+
+1. **Partition the outbox by aggregate ID.** Run multiple worker instances, each responsible for a range of aggregate IDs (consistent hashing). This parallelizes processing while guaranteeing ordering within each aggregate (a user's profile updates are processed in order by one worker). This is essentially the Kafka consumer group pattern implemented at the outbox level.
+
+2. **Batch processing.** Instead of processing one event at a time, the worker reads 100 events, batches the Redis updates (`PIPELINE`), batches the Elasticsearch updates (`_bulk` API), and marks all 100 as processed in one `UPDATE` statement. Batching can improve throughput 10-50x by amortizing network round-trips.
+
+3. **Switch to CDC.** If the outbox polling pattern hits its scaling limit, migrate to Debezium + Kafka. Kafka's partitioned consumer groups provide natural parallelism, backpressure handling, and replay capability. This is the "graduated" version of the outbox pattern.
+
+The key constraint: within a single aggregate (one user's profile), events must be processed in order. You cannot process event 5 (set name to "Jane") before event 4 (set name to "John") -- you would end up with stale data. Parallelism is safe across aggregates but dangerous within one.
+
+#### Follow-up: How do you detect when PostgreSQL, Redis, and Elasticsearch have drifted out of sync?
+
+**Answer:**
+
+A reconciliation job that runs hourly (or daily, depending on the acceptable drift window):
+
+1. **Sample-based comparison.** Query a random sample of 1,000 user IDs from PostgreSQL. For each, fetch the Redis cached version and the Elasticsearch indexed version. Compare key fields (name, email, updated_at). Log discrepancies.
+
+2. **Checksum comparison.** For each user, compute a hash of the canonical fields in PostgreSQL. Store the hash as a field in the Redis entry and the Elasticsearch document. The reconciliation job queries Elasticsearch for documents where the stored hash does not match the current PostgreSQL hash. This is more efficient than fetching and comparing full records.
+
+3. **Event lag monitoring.** Track the outbox's oldest unprocessed event. If it is more than N minutes old, alert. This is the leading indicator -- if the worker is behind, drift is accumulating. Monitor `processed_at - created_at` as a latency metric in your dashboard.
+
+At one company, we ran the sample comparison as a nightly job and found a drift rate of 0.02% -- caused by the idempotent processing incorrectly deduplicating events when two rapid updates had the same `updated_at` timestamp (sub-second precision). We switched to using the outbox event ID for deduplication instead of timestamps, and the drift dropped to zero.
+
+---
+
+### Your PostgreSQL table has 200 million rows. An engineer adds range partitioning by month to speed things up. Queries are now SLOWER. What went wrong?
+
+**Difficulty:** Senior
+
+**What the interviewer is really testing:** Whether the candidate understands that partitioning is not a universal performance improvement -- it has preconditions, and violating them makes things worse. This is a question where the obvious answer ("partitioning should help") is wrong.
+
+**What weak candidates say:**
+
+"Maybe the partitions are too small. Try partitioning by week instead." They assume the partitioning strategy is correct and just needs tuning. They do not question whether partitioning was appropriate in the first place.
+
+**What strong candidates say:**
+
+Partitioning makes queries faster only when the query planner can **eliminate partitions** -- skip partitions that cannot contain matching rows. If partition pruning does not happen, every query hits every partition, and the overhead of planning across N partitions makes things slower, not faster.
+
+The most likely causes:
+
+**1. Queries do not filter by the partition key.** If the table is partitioned by `created_at` (month), but the hot queries filter by `user_id` or `status` without a `created_at` predicate, the planner cannot prune partitions. A query that previously did one Index Scan on a single table now does N Index Scans (one per partition) and merges results. With 60 monthly partitions, that is 60x the planning overhead and 60 index lookups instead of 1. Check `EXPLAIN ANALYZE` for `Append` nodes with all partitions listed.
+
+**2. The partition key is not in the WHERE clause but is needed for the index.** Before partitioning, a single index on `(user_id, created_at)` served all queries efficiently. After partitioning by month, each partition has its own index. A query `WHERE user_id = 42 ORDER BY created_at` must query each partition's index, get results, and merge-sort them. The planner might even fall back to sequential scans on each partition if it estimates the merge is cheaper.
+
+**3. Excessive partition count.** Each partition is a separate table, and the planner considers each one during planning. With 120 monthly partitions (10 years of data), the planning time itself can exceed the query execution time for simple lookups. PostgreSQL 14+ has improved partition pruning performance, but at 500+ partitions, planning overhead is measurable.
+
+**4. Index-only scans broken.** If the pre-partitioned table had a well-maintained visibility map (enabling index-only scans), partitioning resets this. Each new partition starts with an empty visibility map. Until VACUUM runs on each partition and marks pages as all-visible, index-only scans fall back to regular index scans (requiring heap fetches). On a freshly partitioned table with 200M rows, this transition period can last hours.
+
+**War Story:** A SaaS platform partitioned their `events` table (200M rows) by month to "speed up" a reporting dashboard. The dashboard queries filtered by `tenant_id` and `event_type` -- never by date. After partitioning, the dashboard p99 went from 200ms to 4 seconds. The `EXPLAIN ANALYZE` showed an `Append` node with 36 child `Index Scan` nodes (36 monthly partitions), each scanning its own `(tenant_id, event_type)` index. The fix was not to remove partitioning -- it was to add `AND created_at >= NOW() - INTERVAL '90 days'` to the dashboard queries (which was the actual business requirement anyway; they only needed recent data). With that predicate, the planner pruned 33 of 36 partitions and the p99 dropped to 150ms -- even faster than pre-partitioning because each partition's index was smaller and fit entirely in shared_buffers.
+
+#### Follow-up: When is partitioning genuinely the right call, and what prerequisites must be true?
+
+**Answer:**
+
+Three prerequisites for partitioning to improve performance:
+
+1. **All hot-path queries include the partition key in their WHERE clause.** This is non-negotiable. If even one critical query does not filter by the partition key, that query gets worse.
+
+2. **The table is large enough that partition-level indexes are faster.** Rule of thumb: partitioning helps when the full table's index does not fit in `shared_buffers` but individual partition indexes do. A 200M row table with a 20 GB index that only has 8 GB of shared_buffers benefits from partitioning -- each partition's 500 MB index fits comfortably. A 10M row table with a 1 GB index that fits in memory does not benefit.
+
+3. **You need lifecycle management.** This is the strongest argument for partitioning: dropping old data. `DROP TABLE partition_2023_01` is instant and creates zero dead tuples. `DELETE FROM events WHERE created_at < '2023-02-01'` on a 200M row table takes hours, creates millions of dead tuples, and triggers an aggressive autovacuum. If you have a retention policy, partitioning is almost always worth it for the lifecycle benefit alone, even if query performance stays the same.
+
+#### Follow-up: Can you have a global unique index across all partitions in PostgreSQL?
+
+**Answer:**
+
+No, and this is one of the most frustrating limitations. In PostgreSQL, unique indexes on partitioned tables **must include the partition key**. If the table is partitioned by `created_at`, you cannot create a unique index on just `email` -- it must be `(email, created_at)`. This means two rows with the same email in different partitions can both exist, violating the uniqueness you wanted.
+
+Workarounds: (1) Enforce uniqueness at the application level (check-then-insert with a retry loop). (2) Use a separate, non-partitioned "uniqueness" table with just the unique column and a foreign key to the partitioned table. (3) Redesign: if global uniqueness is critical, partition on the unique column instead (hash partitioning on email). PostgreSQL 15+ improved this somewhat with better unique constraint support, but the partition-key-in-unique-index requirement remains. This is a legitimate reason to reconsider whether partitioning is appropriate for your schema.
+
+---
+
+### You run a Redis-backed leaderboard for a mobile game with 10 million players. An engineer suggests switching the Sorted Set to a PostgreSQL table with an index on score because "we need persistent rankings and Redis might lose data." Evaluate this.
+
+**Difficulty:** Senior
+
+**What the interviewer is really testing:** Whether the candidate can evaluate a proposal by quantifying the actual trade-offs, not just reasoning abstractly. This is another "obvious answer is wrong" question -- the engineer's concern about durability is valid but their solution destroys the feature.
+
+**What weak candidates say:**
+
+"Yes, durability is important, so PostgreSQL is the safer choice." They agree with the proposal's framing without examining the performance implications. Or they say "Redis is always better for leaderboards" without addressing the durability concern.
+
+**What strong candidates say:**
+
+Let me quantify this because the devil is in the numbers.
+
+**Redis Sorted Set performance at 10M members:**
+- `ZADD` (update score): O(log N) = ~23 operations deep in a skip list. In practice, 0.01-0.05 ms.
+- `ZREVRANK` (get player's rank): O(log N). 0.01-0.05 ms.
+- `ZREVRANGE 0 99` (top 100 leaderboard): O(log N + 100). 0.05 ms.
+- Memory: ~10M members * (~50 bytes per member + score) = ~700 MB. Fits on one instance.
+
+**PostgreSQL with btree index on score:**
+- Update score: `UPDATE players SET score = X WHERE id = Y`. Requires an index update, WAL write, potential page split. 1-5 ms.
+- Get player rank: `SELECT COUNT(*) FROM players WHERE score > (SELECT score FROM players WHERE id = Y)`. This is a full index scan of all rows with higher scores. For a median player (rank 5M), this scans 5 million index entries. 2-10 seconds.
+- Top 100: `SELECT * FROM players ORDER BY score DESC LIMIT 100`. Uses the index. 1-5 ms. This one is comparable.
+
+The rank query is the killer. There is no efficient way in PostgreSQL to answer "what is player X's rank among 10 million players?" without scanning. PostgreSQL does not store positional information in btree indexes -- it knows the ordering but not the count of entries before a given value. You could maintain a materialized rank column, but updating it on every score change means updating millions of rows (every player below the changed score shifts by one).
+
+**My recommendation:** Keep the leaderboard in Redis and address the durability concern directly:
+
+1. **Use Redis with AOF (`appendfsync everysec`).** Maximum data loss is 1 second. For a game leaderboard, this is acceptable. If a player's score update from 0.8 seconds ago is lost due to a crash, the impact is negligible.
+
+2. **Use AWS MemoryDB** instead of ElastiCache Redis. MemoryDB writes to a distributed, durable transaction log (similar to DynamoDB's durability model). It is Redis-API compatible with multi-AZ durability. Zero data loss on node failure. This addresses the engineer's concern without sacrificing Redis's data structure advantages.
+
+3. **If regulatory or compliance requirements demand PostgreSQL as the system of record,** write scores to both PostgreSQL (source of truth) and Redis (leaderboard). PostgreSQL stores the canonical score and handles disputes/audits. Redis serves the real-time leaderboard. Reconcile periodically. This is polyglot persistence -- each database doing what it does best.
+
+**War Story:** A gaming studio I advised tried the "just use PostgreSQL" approach for a leaderboard with 5 million players. The rank query took 6 seconds. They tried adding a rank column and updating it with triggers, but each score change triggered an `UPDATE ... SET rank = rank + 1 WHERE score < X` that modified hundreds of thousands of rows. Autovacuum could not keep up. They reverted to Redis within a week. Their final architecture was Redis for the real-time leaderboard (sub-millisecond for all operations) with nightly snapshots to PostgreSQL for analytics, dispute resolution, and compliance.
+
+#### Follow-up: How would you handle leaderboard sharding if the game grows to 500 million players?
+
+**Answer:**
+
+500 million members in a single Redis Sorted Set would consume roughly 35 GB of memory. A single Redis instance with 64 GB can handle it, but `ZREVRANK` on 500M members is O(log 500M) which is still under 1 ms. The issue is not performance but availability -- a single instance is a single point of failure.
+
+Sharding approaches:
+
+1. **Regional leaderboards.** Most games have natural sharding by region (NA, EU, Asia). Each region has its own Redis instance with its own Sorted Set. Players see their regional rank. A global leaderboard is computed periodically by merging the top N from each region. This works because most players care about their regional rank; only the top 1% care about global rank.
+
+2. **Tiered leaderboard.** A top-10,000 leaderboard in one Sorted Set (updated in real-time, tiny data). Below that, bucket players into score ranges (e.g., players with scores 1000-2000). Each bucket is a separate Sorted Set on a different shard. A player's approximate rank is: (number of players in higher buckets) + (rank within their bucket). This gives O(1) for the bucket lookup plus O(log N) within the bucket.
+
+3. **Redis Cluster with hash tags.** Shard the Sorted Set across multiple nodes using hash tags. But this defeats the purpose -- Sorted Set operations are per-key, and a Sorted Set split across nodes loses its ordering guarantees. Approach 1 or 2 is preferred.
+
+#### Follow-up: What happens to the leaderboard during a Redis failover? Players will see stale or missing ranks.
+
+**Answer:**
+
+During failover (15-30 seconds for Sentinel, longer for manual intervention), the leaderboard is unavailable for writes. Reads may work if you read from replicas.
+
+Graceful degradation strategies:
+
+1. **Read from replicas during failover.** Configure the application to fall back to a replica for leaderboard reads if the primary is unreachable. The rank will be slightly stale (by the replication lag, typically <1 second) but available. Writes queue in the application and flush when the new primary is ready.
+
+2. **Cache the last known leaderboard.** The top-100 leaderboard changes slowly (once every few seconds at most). Cache the rendered leaderboard in the application or a CDN with a 5-second TTL. During failover, the CDN serves the slightly stale leaderboard. Players do not notice.
+
+3. **Accept temporary unavailability for rank lookups.** Individual rank queries ("my rank") are hard to cache. During failover, return "rank unavailable, try again shortly" in the UI. Most games already handle this gracefully with a loading spinner.
+
+The key insight: leaderboards are one of the few features where temporary staleness is completely acceptable. No player is harmed by seeing a rank that is 30 seconds old. Design the feature to degrade gracefully rather than trying to make it perfectly available.
+
+---
+
+### A developer inserts 10 million documents into MongoDB in a loop, one at a time, and it takes 3 hours. They expected it to take 10 minutes. What is wrong and how do you fix it?
+
+**Difficulty:** Intermediate
+
+**What the interviewer is really testing:** Understanding of write concern defaults, network round-trip overhead, batching, and WiredTiger write amplification. This is a common real-world scenario where the fix is simple but the understanding of why matters.
+
+**What weak candidates say:**
+
+"MongoDB is just slow for writes, they should use DynamoDB." This is wrong -- MongoDB can handle hundreds of thousands of writes per second on a single node. Or they say "increase the server resources" without diagnosing the actual bottleneck.
+
+**What strong candidates say:**
+
+Three hours for 10 million inserts means roughly 920 inserts per second. A single MongoDB node should handle 30,000-100,000 inserts per second depending on document size and hardware. The throughput is 30-100x below what the hardware can deliver. The bottleneck is not MongoDB; it is the insertion pattern.
+
+**Root cause 1: One-at-a-time inserts with network round-trips.** Each `insertOne()` is a separate network round-trip: client sends the document, waits for the server to acknowledge, then sends the next. If the network latency between the application and MongoDB is 1 ms, the theoretical maximum is 1,000 inserts/second -- close to the observed 920/sec. The fix is `insertMany()` with batches of 1,000-5,000 documents. Each `insertMany()` sends the batch in one network call, amortizing the round-trip. This alone can improve throughput 50-100x.
+
+**Root cause 2: Write concern overhead.** The default `w: 1` waits for the primary to acknowledge each write. If they changed it to `w: "majority"` (perhaps following a best-practices guide without understanding the cost), each write waits for majority replication acknowledgment: primary writes to journal, secondary receives and writes to journal, acknowledgment propagates back. With a 3-node replica set, this adds 2-5 ms per write. At `w: "majority"`, even with batching, throughput caps at around 5,000-10,000 inserts/second because of the majority-acknowledgment latency. For a bulk import, `w: 1` is usually acceptable (the data can be re-imported if the primary fails).
+
+**Root cause 3: Index maintenance.** If the collection has 5 indexes, each insert updates all 5 indexes. With 10 million documents, that is 50 million index updates. Each index update involves a btree page split and WiredTiger cache management. On a collection with many indexes, write throughput is directly proportional to the number of indexes. The fix for bulk imports: drop non-essential indexes before the import, then rebuild them afterward. Index building on 10 million documents in one pass is far faster than incrementally maintaining indexes on 10 million individual inserts.
+
+**The combined fix that drops it to under 5 minutes:**
+
+```javascript
+// 1. Drop non-essential indexes (keep only _id and shard key)
+// 2. Batch inserts
+const BATCH_SIZE = 5000;
+for (let i = 0; i < documents.length; i += BATCH_SIZE) {
+  const batch = documents.slice(i, i + BATCH_SIZE);
+  await db.collection.insertMany(batch, {
+    ordered: false,  // unordered is faster (parallel server-side processing)
+    writeConcern: { w: 1 }
+  });
+}
+// 3. Rebuild indexes
+await db.collection.createIndex({ userId: 1, createdAt: -1 });
+```
+
+The `ordered: false` flag is important -- it tells MongoDB it can process the inserts in any order and in parallel. With `ordered: true` (default), MongoDB processes inserts sequentially and stops on the first error. Unordered inserts can be 2-3x faster because the server can batch internal operations.
+
+**War Story:** A data pipeline at a media company was inserting 50 million events per day into MongoDB using Python's `insert_one()` in a for loop. It took 14 hours. The developer had been adding `time.sleep(0.001)` between inserts "to not overload the database." We removed the sleep (the database was at 3% CPU utilization), switched to `insert_many()` with batches of 5,000, used `ordered: false`, and temporarily dropped 3 indexes that were not needed for the import. The same 50 million inserts completed in 22 minutes. The developer's instinct to "be gentle with the database" was well-intentioned but cost them 13.5 hours per day.
+
+#### Follow-up: What is the difference between ordered and unordered bulk writes, and when would you prefer ordered?
+
+**Answer:**
+
+Ordered bulk writes process documents sequentially. If document 5,000 fails (duplicate key error, validation error), documents 5,001 through 10,000 are not attempted. The client receives an error with the count of successful inserts. This is safe when document order matters and you want to stop on the first error.
+
+Unordered bulk writes process all documents, potentially in parallel on the server. If document 5,000 fails, the server continues processing the remaining documents. The client receives a response listing all errors and all successes. This is faster because: (1) the server can group inserts by shard in a sharded cluster, (2) the server can process independent groups concurrently, and (3) a single failure does not stop the entire batch.
+
+Use ordered when: inserts must be sequential (event logs where later events depend on earlier ones being present), or when you need to stop on the first error to investigate (data quality is critical).
+
+Use unordered for bulk imports, migrations, and any scenario where individual failures should not stop the batch. Handle errors after the batch completes by inspecting the `writeErrors` array.
+
+#### Follow-up: The developer asks "should I use mongoimport instead of writing application code for bulk loads?"
+
+**Answer:**
+
+Yes, for flat-file imports (JSON, CSV, TSV), `mongoimport` is almost always faster than application code for a few reasons: (1) it uses optimal batch sizes internally, (2) it is compiled in Go and avoids driver serialization overhead, (3) it supports `--numInsertionWorkers` for parallel inserts, and (4) it handles connection pooling and retry logic optimally for bulk operations.
+
+`mongoimport --uri "mongodb://..." --collection events --file events.json --jsonArray --numInsertionWorkers 4 --writeConcern "{w:1}"`
+
+With 4 insertion workers on a sharded cluster, `mongoimport` can saturate the write throughput of all shards. For 50 million 1 KB documents, expect 15-30 minutes on a 3-node replica set with SSDs.
+
+Use application code instead when: you need to transform documents during import (enrich, validate, compute derived fields), when you need to coordinate with other systems (update a progress bar, send notifications at milestones), or when the source data is not a flat file (reading from another database, an API, or a message queue).
+
+---
+
+### You are on-call and get paged: "Redis latency spiked from 0.2ms to 50ms." What are the first five things you check, in order?
+
+**Difficulty:** Senior
+
+**What the interviewer is really testing:** Systematic incident response for Redis, prioritized by likelihood and impact. Not just "things that can go wrong with Redis" but the specific diagnostic order an experienced engineer follows under time pressure.
+
+**What weak candidates say:**
+
+"I would check if the server is overloaded and maybe restart Redis." Restarting a stateful data store as a first response is dangerous -- you might lose data and you definitely lose diagnostic information. They also do not have a prioritized checklist.
+
+**What strong candidates say:**
+
+When Redis latency jumps from sub-millisecond to 50ms, something fundamental changed. Here is my diagnostic order, optimized for fastest time-to-diagnosis:
+
+**Check 1: `redis-cli --latency` and `SLOWLOG GET 10` (30 seconds).**
+
+The `SLOWLOG` is the single most valuable diagnostic for Redis latency spikes. It logs every command that exceeded `slowlog-log-slower-than` (default 10ms). If the slowlog shows a specific command pattern (a `KEYS *`, a `SORT` on a million elements, a Lua script doing heavy computation), you have found the smoking gun. A single O(N) command on a large dataset blocks the event loop for all other clients.
+
+The most common culprit I have seen in production: an engineer added `KEYS pattern:*` in a health check that runs every 5 seconds. On 10 million keys, `KEYS *` takes 2-5 seconds during which every other command is blocked.
+
+**Check 2: `INFO memory` -- check `mem_fragmentation_ratio` and swap usage (15 seconds).**
+
+If `mem_fragmentation_ratio < 1.0`, Redis is swapping. Swap turns every memory access into a potential disk operation, causing 1000x latency increase. If `used_memory` is near `maxmemory`, evictions are happening on every write. Each eviction is additional work before the actual command executes.
+
+**Check 3: `INFO clients` -- check `connected_clients` and `blocked_clients` (10 seconds).**
+
+If `connected_clients` jumped from 500 to 50,000, the connection handling overhead itself causes latency. Each new connection consumes memory and kernel resources. A thundering herd of new connections (from a deployment, an autoscaler spinning up pods, or a retry storm) can spike latency. `blocked_clients > 0` means clients are waiting on blocking commands (`BLPOP`, `BRPOP`) -- check if a consumer died and a queue is backed up.
+
+**Check 4: `INFO persistence` -- check `rdb_last_bgsave_status` and `aof_rewrite_in_progress` (10 seconds).**
+
+If `rdb_bgsave_in_progress: 1` or `aof_rewrite_in_progress: 1`, Redis is forking for a background save. The `fork()` call itself can cause a latency spike of 10-50ms on a large dataset (Redis must copy the page table). During the save, copy-on-write amplifies memory usage, potentially causing the OOM killer to start killing processes. Check `latest_fork_usec` -- if it is 50,000 (50ms), that is your latency spike right there.
+
+**Check 5: Network and host-level metrics (60 seconds).**
+
+If none of the above explain it, the problem is outside Redis. Check: (a) network latency between the application and Redis (`redis-cli --latency` from the app server vs from the Redis host itself -- if the difference is large, it is the network), (b) CPU steal on the Redis host (if on a shared VM and the hypervisor is throttling you, `top` shows `%st` > 5%), (c) noisy neighbor on the same host (another container or process consuming I/O bandwidth), (d) kernel-level issues (`dmesg` for OOM events, `vmstat` for swap activity).
+
+**War Story:** At a ride-hailing company, Redis latency spiked to 200ms every hour on the hour. The slowlog was empty -- no single command was slow. `INFO persistence` showed `rdb_bgsave_in_progress: 1` at every spike. The RDB snapshot was configured to run every hour (`save 3600 1`). The Redis instance had 30 GB of data. The `fork()` call took 45ms (`latest_fork_usec: 45000`), and during the snapshot, the write-heavy workload triggered massive copy-on-write, causing memory pressure. The fix was disabling RDB snapshots entirely (they already had AOF enabled with `appendfsync everysec`) and using AOF rewrite instead, which is less disruptive because it is optimized for the current dataset rather than doing a full dump. The hourly latency spikes disappeared. We also switched the monitoring cron from checking `KEYS stats:*` to `SCAN` with a cursor, which eliminated a secondary 800ms spike that happened during monitoring.
+
+#### Follow-up: How do you prevent the KEYS command from ever being used in production?
+
+**Answer:**
+
+Three layers of defense:
+
+1. **Rename the command.** In `redis.conf`: `rename-command KEYS ""` (disables it entirely) or `rename-command KEYS KEYS_DANGER_DO_NOT_USE`. This prevents accidental use. Any code trying to use `KEYS` gets an error.
+
+2. **Code review enforcement.** Add a linter rule or a grep check in CI that flags any use of `KEYS` in application code. The alternative is always `SCAN` with a cursor, which returns results incrementally without blocking the event loop.
+
+3. **Redis ACLs (Redis 6+).** Create application-specific users that do not have permission for dangerous commands: `ACL SETUSER appuser ~* +@all -@dangerous`. The `@dangerous` category includes `KEYS`, `FLUSHALL`, `FLUSHDB`, `DEBUG`, and other commands that should never run in production.
+
+At a previous company, we went further: we ran a nightly audit that used `MONITOR` for 10 seconds on each Redis instance and flagged any `KEYS` usage. This caught a third-party library that was using `KEYS` internally for cache namespace management. We replaced the library.
+
+#### Follow-up: The latency spike lasts exactly 200ms and happens once per minute. SLOWLOG is empty. What specific Redis internal event takes exactly ~200ms?
+
+**Answer:**
+
+If it is exactly periodic and the SLOWLOG is empty (meaning no individual command is slow), the two most likely causes are:
+
+1. **Active expiry cycle.** Redis runs an active key expiration cycle 10 times per second (every 100ms). In each cycle, it samples 20 keys with TTLs and deletes expired ones. If more than 25% of sampled keys are expired, it loops again (up to a time limit of 25ms by default, or 250ms if `hz` is tuned up). On a Redis instance with millions of keys all expiring around the same time (a common pattern when TTLs are set to round numbers like 60s, 300s, or 3600s), the expiry cycle can consume its full time budget. The solution: add jitter to TTLs (`TTL = base_ttl + random(0, 30)`). This spreads expirations over time instead of creating thundering herd expiry.
+
+2. **Lazy freeing of large keys (Redis 4.0+).** When a large key is deleted or expires, Redis 4.0+ can free the memory asynchronously using `lazyfree-lazy-expire yes`. But if this is not enabled, deleting a Hash with 1 million fields blocks the event loop for the duration of the memory deallocation (100-300ms for a 500 MB key). The SLOWLOG would not show this because the `DEL` command itself reports as fast -- the time is spent in memory management after the command completes. Enable `lazyfree-lazy-expire yes`, `lazyfree-lazy-server-del yes`, and `lazyfree-lazy-user-del yes` to move large key deletion to a background thread.
+
+---
+
 # Curated Resources
 
 <Note>

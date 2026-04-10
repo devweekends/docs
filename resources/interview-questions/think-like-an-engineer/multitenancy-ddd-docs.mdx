@@ -1373,3 +1373,507 @@ Tenant configuration lives in a centralized configuration store — typically a 
 For performance-critical paths, I pre-compute the configuration into a resolved form and cache it. Instead of checking "does this tenant have feature X enabled? What is their approval threshold? What is their pricing tier?" on every request, you compute a `TenantProfile` object at configuration change time and cache it. The request hot path reads the pre-computed profile with zero database queries.
 
 The data model separation is important: tenant configuration (how the platform behaves for this tenant) lives in the control plane. Tenant data (the tenant's actual business data) lives in the data plane. This separation means you can cache configuration aggressively without worrying about data freshness of business records, and you can regionalize the data plane for data residency without regionalizing the configuration store.
+
+---
+
+## Advanced Interview Scenarios
+
+These questions target the blind spots. They cover the operational nightmares, the architectural traps where the "obvious" answer is wrong, and the cross-cutting scenarios that separate engineers who have built multi-tenant systems in production from those who have only read about them. Every question below has been seen — in some form — in staff-level and principal-level interviews at companies running multi-tenant platforms at scale.
+
+---
+
+### 13. A single tenant reports that their API responses are 10x slower than usual, but your platform-wide latency dashboards look normal. Walk me through how you debug this.
+
+**What the interviewer is really testing:** Can you debug tenant-specific performance issues in a shared-infrastructure model? Do you understand how aggregated metrics hide per-tenant problems? Do you have a real operational toolkit, or do you just say "check the logs"?
+
+<AccordionGroup>
+<Accordion title="Weak vs. Strong Answer">
+
+**What weak candidates say:**
+
+"I would check the logs and see if there are any errors. Maybe their data is too big. I would add some caching."
+
+This answer reveals no structured debugging methodology, no awareness of per-tenant observability, and no understanding of why platform-wide dashboards miss single-tenant degradation. Jumping straight to "add caching" without diagnosis is the engineering equivalent of a doctor prescribing antibiotics without examining the patient.
+
+**What strong candidates say:**
+
+The first thing I recognize is that platform-wide P50 and P95 metrics are useless here. If you have 10,000 tenants and one is 10x slower, that tenant's latency is buried in the aggregate. This is exactly why per-tenant observability is not optional — it is a core infrastructure requirement.
+
+- **Step 1: Isolate the tenant's traffic.** I query our distributed tracing system (Datadog APM, Jaeger, or Honeycomb) filtered by `tenant_id`. I look at the tenant's P50, P95, and P99 latency over the last 24-48 hours compared to their own historical baseline. I want to know: did this degrade gradually or did it cliff-dive at a specific timestamp? A cliff-dive points to a deployment or a data change. A gradual degradation points to data growth or resource contention.
+
+- **Step 2: Identify the slow layer.** I look at the trace waterfall for the tenant's slowest requests. Is the time spent in the application server (CPU-bound computation or inefficient code path)? In the database (slow queries)? In an external service call (downstream dependency)? In a cache miss pattern? The trace tells me exactly where the milliseconds are going. In my experience, 80% of single-tenant slowness is the database.
+
+- **Step 3: Database deep-dive.** I check `pg_stat_statements` or the slow query log filtered by the tenant's queries. Common culprits: the tenant's data volume has grown past an index threshold — a table scan that was fine at 10K rows is killing performance at 5M rows. Or the tenant triggered a query pattern that hits a missing index — maybe they enabled a reporting feature that generates a query with a filter combination nobody anticipated. I run `EXPLAIN ANALYZE` on the tenant's slowest queries and look for sequential scans, poor join strategies, or missing indexes.
+
+- **Step 4: Check for noisy neighbor contamination.** Even though platform metrics look normal, I check whether this tenant shares a database connection pool, a Kubernetes pod, or a cache instance with a heavy tenant whose background jobs are consuming shared resources. I look at the database's `pg_stat_activity` to see if another tenant's long-running query is holding locks or saturating I/O. I check Kubernetes pod resource utilization — is the pod this tenant's requests route to CPU-throttled because another tenant's request on the same pod is consuming all the CPU?
+
+- **Step 5: Recent changes.** I correlate the degradation timestamp with deployment history, feature flag changes, and the tenant's own configuration changes. Did we deploy a code change that altered a query path? Did the tenant enable a feature that changes their access pattern? Did they import a large dataset?
+
+**War Story:** At a B2B SaaS company I worked at, a tenant reported 8-second API responses. Platform dashboards showed P95 at 200ms — completely normal. We filtered traces by `tenant_id` and found that their `/reports/monthly` endpoint was doing a sequential scan on a 12-million-row `transactions` table. The index existed on `(tenant_id, created_at)`, but the report query filtered on `(tenant_id, category, created_at)` — a three-column filter that the two-column index could not serve efficiently. The fix was a composite index that matched the query. Response time dropped from 8 seconds to 40ms. The root cause was that this tenant was the first to grow large enough to expose the missing index — every other tenant had fewer than 500K rows where the existing index was "good enough." We added per-tenant query performance monitoring (top-10 slowest queries per tenant per hour) as a permanent observability layer after that incident.
+
+</Accordion>
+</AccordionGroup>
+
+#### Follow-up: How do you build per-tenant observability that scales to 50,000 tenants without your monitoring bill bankrupting the company?
+
+You cannot create a separate Grafana dashboard per tenant — that does not scale. Instead, you use high-cardinality observability tools that support `tenant_id` as a first-class dimension.
+
+The approach I have used is: every request emits a metric with `tenant_id` as a tag. But you do not store 50,000 individual time series permanently — that would cost a fortune in Datadog or Prometheus. Instead, you use a two-tier strategy. Tier 1: aggregate metrics (platform-wide P50, P95, P99) are stored at high resolution with long retention — this is your normal dashboard. Tier 2: per-tenant metrics are stored at lower resolution (1-minute granularity instead of 10-second) with shorter retention (7 days instead of 90 days), and you only alert on them when they deviate from the tenant's own baseline by more than a threshold (e.g., P95 latency > 3x their 7-day average).
+
+Tools like Honeycomb are designed exactly for this — they store high-cardinality event data and let you slice by any dimension (including `tenant_id`) at query time without pre-aggregating. If your stack is Prometheus-based, you use recording rules to pre-compute per-tenant percentiles and drop the raw high-cardinality series after a short window.
+
+#### Follow-up: The slow tenant is your largest customer paying $500K/year. They want a guaranteed SLA. What do you do architecturally?
+
+This is the commercial trigger for dedicated infrastructure. I would propose migrating this tenant to a dedicated compute pool — their requests route to dedicated Kubernetes pods (or a dedicated ECS service) with reserved CPU and memory that no other tenant contends for. Their database queries route to a dedicated read replica (or a separate database instance if their data volume justifies it). Their background jobs run in a dedicated queue with guaranteed throughput.
+
+The key is that this should be a routing change, not a code change. Your tenant context propagation layer reads the tenant's tier from the metadata table and routes accordingly. The application code is identical — the same Docker image, the same codebase. Only the infrastructure differs. If your architecture requires a code fork to give a tenant dedicated resources, your tenant routing layer is not abstract enough.
+
+Commercially, dedicated infrastructure costs real money — I have seen it range from $2,000 to $15,000/month depending on the resource profile. That cost should be built into the enterprise pricing tier, not absorbed as a favor. The $500K/year customer can afford it. The danger is offering dedicated infrastructure to win a $50K deal — you will lose money on the infrastructure alone.
+
+---
+
+### 14. You run a shared-schema multi-tenant database with 2,000 tenants. You need to add a non-nullable column to a table with 800 million rows. How do you do this without downtime and without blocking any tenant?
+
+**What the interviewer is really testing:** Do you understand the operational horror of schema migrations in multi-tenant systems? Can you execute a zero-downtime migration on a large shared table? The "obvious" answer — `ALTER TABLE ADD COLUMN NOT NULL DEFAULT` — is a trap in older PostgreSQL versions and always a trap in MySQL.
+
+<AccordionGroup>
+<Accordion title="Weak vs. Strong Answer">
+
+**What weak candidates say:**
+
+"I would just run ALTER TABLE ADD COLUMN with a DEFAULT value. PostgreSQL handles that instantly now."
+
+This answer is partially correct for PostgreSQL 11+ (which made `ADD COLUMN ... DEFAULT` metadata-only for non-volatile defaults) but reveals dangerous overconfidence. It ignores MySQL entirely (where the same operation locks the table for minutes to hours on 800M rows). It ignores the application-layer changes needed. And it misses the fact that adding the NOT NULL constraint with validation on an 800M-row table still requires a full table scan for constraint validation — even in modern PostgreSQL.
+
+**What strong candidates say:**
+
+This is a multi-step migration that I would spread across three deployments to eliminate risk.
+
+- **Deployment 1: Add the column as nullable with a default.** In PostgreSQL 11+, `ALTER TABLE ADD COLUMN new_col TYPE DEFAULT 'value'` is a metadata-only operation — it does not rewrite the table. This is instant regardless of table size. In MySQL, I would use `pt-online-schema-change` (Percona toolkit) or `gh-ost` (GitHub's online schema change tool) to add the column without locking the table. The column is nullable at this point — the application can deploy without breaking.
+
+- **Deployment 2: Backfill existing rows.** I do NOT run `UPDATE table SET new_col = 'value' WHERE new_col IS NULL` as a single statement — on 800M rows, that generates a massive transaction, bloats the WAL, and can lock out other writers. Instead, I backfill in batches: `UPDATE table SET new_col = 'value' WHERE id BETWEEN ? AND ? AND new_col IS NULL` with batch sizes of 10,000-50,000 rows, with a sleep between batches (100-500ms) to avoid saturating disk I/O. I run this during low-traffic hours. The application code is already writing non-null values for new rows (deployed in step 1), so the backfill only touches historical data.
+
+- **Deployment 3: Add the NOT NULL constraint.** In PostgreSQL, `ALTER TABLE ADD CONSTRAINT ... NOT NULL` with `NOT VALID` followed by `VALIDATE CONSTRAINT` in a separate transaction. The `NOT VALID` step is instant — it tells PostgreSQL to enforce the constraint on new writes immediately. The `VALIDATE CONSTRAINT` step scans existing rows to verify compliance but does not hold an exclusive lock — it takes a `SHARE UPDATE EXCLUSIVE` lock that allows concurrent reads and writes. In MySQL, this step still requires careful handling via online DDL or Percona tools.
+
+- **The tenant dimension:** In a multi-tenant shared table, I must ensure that the backfill does not disproportionately impact any single tenant. I batch by tenant — process all rows for tenant A, then tenant B — so that no single tenant experiences sustained write contention. I monitor per-tenant query latency during the backfill and pause if any tenant's P95 exceeds its baseline by more than 2x.
+
+**War Story:** At a SaaS platform with 1,200 tenants on a shared PostgreSQL cluster, we needed to add a `currency` column (NOT NULL, DEFAULT 'USD') to an `invoices` table with 600M rows. An engineer ran the backfill as a single UPDATE — 600M rows in one transaction. The WAL bloated to 180GB, the replication lag on the read replica hit 45 minutes, and read queries started timing out across all tenants because the replica was too far behind. We had to kill the backfill, wait for replication to catch up, and restart with batched updates (50K rows per batch, 200ms pause between batches). The batched approach took 6 hours but had zero observable impact on tenant latency. The lesson: on shared tables with hundreds of millions of rows, a single large transaction is a platform-wide incident waiting to happen.
+
+</Accordion>
+</AccordionGroup>
+
+#### Follow-up: How do you handle schema migrations in a schema-per-tenant model where you have 500 separate schemas?
+
+This is operationally harder than it sounds. You need a migration runner that iterates over all tenant schemas and applies the migration to each one independently. The critical design decisions are:
+
+First, each schema migration must be independently transactional. If the migration fails on tenant schema 247, it must roll back for that schema without affecting schemas 1-246 (which succeeded) or schemas 248-500 (which have not run yet). Your migration runner must track per-schema migration state — not just "migration 42 ran" but "migration 42 ran on schemas 1-246, failed on 247, pending on 248-500."
+
+Second, parallelize with a concurrency limit. Running 500 migrations sequentially takes too long. Running 500 simultaneously overwhelms the database. I typically use a worker pool with 10-20 concurrent migrations, depending on the database's capacity.
+
+Third, have a strategy for schema drift. If migration 42 fails on 3 out of 500 schemas, those 3 schemas are now out of sync with the other 497. Your application must handle both the old and new schema for a period, and you need a reconciliation process to fix the failed schemas. This is where schema-per-tenant gets operationally expensive — it is 500 things that can independently fail instead of one.
+
+#### Follow-up: A teammate suggests "just use a document database so we never have to deal with schema migrations." What is your response?
+
+I would push back, because this trades one problem for a different — and often worse — problem. Document databases like MongoDB do not have schema migrations because they do not enforce schema. But the schema still exists — it is just implicit in your application code instead of explicit in the database.
+
+With a relational database and explicit schema, a migration failure is loud and visible — the migration script fails and you know exactly which tenants are affected. With a document database and implicit schema, "migration" means your application code must handle documents in both the old and new shapes indefinitely. You trade one painful-but-visible migration event for an ongoing tax on every query and every code path that reads the data. Old documents with missing fields, documents with deprecated field names, documents with inconsistent types — these bugs are silent and cumulative.
+
+The honest answer is: schema migrations in multi-tenant relational databases are operationally hard, and you should invest in good tooling (batched migrations, per-tenant tracking, rollback strategies). But that operational cost is lower than the long-term cost of schema anarchy in a document store. The exception is when your data is genuinely unstructured or varies wildly per tenant — in that case, a document model is the right fit. But "I do not want to deal with migrations" is not a sufficient reason.
+
+---
+
+### 15. Your Event Storming workshop just went badly — the domain experts and developers talked past each other for two hours and the wall of sticky notes is a mess. What went wrong and how do you rescue it?
+
+**What the interviewer is really testing:** Do you have practical experience with DDD discovery techniques, or have you only read about Event Storming in a blog post? Can you diagnose facilitation failures? Do you understand that DDD is a social process, not just a modeling technique?
+
+<AccordionGroup>
+<Accordion title="Weak vs. Strong Answer">
+
+**What weak candidates say:**
+
+"Event Storming does not always work. Maybe we should just have the architects draw the domain model and present it to the team."
+
+This misses the entire point of Event Storming. The value is not the diagram — it is the shared understanding built through collaborative discovery. Architects drawing a model in isolation is how you get a domain model that reflects the architect's assumptions, not the business reality.
+
+**What strong candidates say:**
+
+I have seen this happen, and it almost always comes from one of three facilitation failures.
+
+- **Failure 1: No scope boundary.** The facilitator said "let us model our business" instead of "let us model the order-to-delivery lifecycle." Without a focused scope, the workshop balloons — someone is putting stickies about user onboarding while someone else is modeling returns processing, and nobody sees how they connect. The rescue: stop the workshop, pick one specific business process, and restart with only that process on the wall. "We are only modeling what happens between a customer clicking 'Place Order' and the package arriving at their door. Everything else is out of scope for today."
+
+- **Failure 2: Developers dominated.** If the wall is covered in technical terms — "API call," "database write," "queue message" — instead of business terms — "order placed," "payment received," "shipment dispatched" — the developers took over. The domain experts stopped contributing because they could not relate to the vocabulary. The rescue: physically separate the groups. Have the domain experts narrate the business process in their own words while a facilitator translates onto stickies. Then bring the developers in to ask clarifying questions. The domain experts must speak first.
+
+- **Failure 3: Jumping to solutions.** Someone said "this should be a microservice" or "we need Kafka for this" during the workshop. Once solution design enters the conversation, the discovery phase is contaminated — people start modeling what they want to build instead of what the business actually does. The rescue: establish an explicit rule — "no technology, no architecture, no solutions. We are only discovering what the business does today." Put a "parking lot" section on the wall for technical ideas and redirect any solution discussion there.
+
+- **Rescuing the messy wall:** I take photos of the current mess (never throw away work), then I restart with a structured approach. I ask one domain expert to walk me through the process from beginning to end as if they are explaining it to a new hire. I write the events they describe on fresh stickies, in their words, and place them chronologically. This produces a clean "happy path" timeline. Then I ask: "What can go wrong at each step?" and add the exception paths. Then I bring in the rest of the group to identify gaps, conflicts, and hot spots. This structured restart usually produces a clean model in 90 minutes.
+
+**War Story:** I facilitated an Event Storming workshop at a logistics company where the domain experts were warehouse managers and the developers were building a warehouse management system. The first session was a disaster — the developers kept saying "event" and the warehouse managers thought they meant "a thing that happened in the warehouse" (like a forklift accident), not a domain event in the DDD sense. The language gap was not about business concepts — it was about the workshop vocabulary itself. In the second session, I stopped using DDD terminology entirely. I gave the warehouse managers orange stickies and said "write down every important thing that happens between a truck arriving at the dock and the inventory being shelved." They filled the wall in 20 minutes. Then I said "for each of these, what decision had to be made before it happened?" and gave them blue stickies. The output was identical to what a "proper" Event Storming would produce, but without the vocabulary barrier. The lesson: Event Storming is a technique, not a ritual. Adapt the language to the room.
+
+</Accordion>
+</AccordionGroup>
+
+#### Follow-up: How do you translate Event Storming output into actual bounded context boundaries?
+
+Look for clusters and pivots. On the wall, you will see natural groupings — a cluster of events around "order processing," a cluster around "payment," a cluster around "shipping." These clusters are bounded context candidates.
+
+The signals I look for: events within a cluster use the same nouns (same aggregate). Events between clusters use different nouns for similar things ("order" in the order cluster becomes "shipment request" in the shipping cluster — that is two contexts using different language for related concepts, which is a classic bounded context boundary). Policies (lilac stickies) that connect clusters are integration points — the "whenever OrderPaid, start fulfillment" policy sits at the boundary between the Payment context and the Fulfillment context.
+
+I also look for team ownership alignment. If the people who contributed to the "payment" cluster are the payment team and the people who contributed to the "shipping" cluster are the logistics team, you have an organizational boundary that reinforces the domain boundary. Conway's Law is not an obstacle — it is a signal.
+
+#### Follow-up: When would you NOT use Event Storming?
+
+When the domain is simple and well-understood by the team. If you are building a blog, a to-do app, or a standard CRUD admin panel, Event Storming is overhead. The team already knows the domain — the value of Event Storming is discovering complexity in a domain that is not yet well-understood.
+
+Also when you cannot get domain experts in the room. Event Storming without domain experts is just developers guessing at the business model — which is what DDD is specifically designed to prevent. If the domain experts are unavailable, start with user story mapping or domain expert interviews instead. You can always run an Event Storming workshop later when the right people are available.
+
+---
+
+### 16. Two teams are debating whether to use a Shared Kernel between their bounded contexts. Team A says it eliminates duplication. Team B says it creates coupling. Who is right?
+
+**What the interviewer is really testing:** Do you understand the hidden costs of code sharing across bounded contexts? Can you evaluate a trade-off where the "obvious" answer (reduce duplication!) is often wrong? This is a question where DDD beginners always pick the wrong side.
+
+<AccordionGroup>
+<Accordion title="Weak vs. Strong Answer">
+
+**What weak candidates say:**
+
+"Team A is right. DRY principle says we should not duplicate code. A shared library for common models makes sense."
+
+This answer reveals a shallow understanding of DDD and a reflexive application of DRY without considering the coupling trade-offs. In the context of bounded contexts, DRY is frequently the wrong instinct. Duplication across bounded contexts is not the same as duplication within a module.
+
+**What strong candidates say:**
+
+Team B is almost certainly right, and here is why: a Shared Kernel is the most dangerous context mapping pattern because it looks like a good idea on day one and becomes a coupling nightmare by month six.
+
+- **What actually happens with a Shared Kernel:** Team A and Team B share a `common` library containing the `Money` value object, the `Address` value object, and the `UserId` type. Initially, both teams are happy — no duplication. Then Team A needs to add a `currency_conversion_rate` field to `Money` for their billing calculations. Team B does not need this field and does not want the dependency on a currency conversion service. Now both teams are blocked: Team A cannot evolve their model without Team B's approval, and Team B is forced to take a dependency they do not want. After three rounds of this, the "shared" library becomes a political negotiation ground where neither team can move fast.
+
+- **The coupling tax:** Every change to the Shared Kernel requires both teams to agree, test, and deploy together. This destroys the independent deployability that bounded contexts are designed to provide. I have seen Shared Kernels turn into de facto monolithic coupling points where the monthly "shared library release" becomes a coordination ceremony that slows both teams down.
+
+- **When a Shared Kernel is actually appropriate:** Only when the shared concept is genuinely stable, tiny, and unlikely to diverge. A UUID type, a `Money` value object with just `amount` and `currency` (no behavior), or a set of shared domain event schemas (versioned via a schema registry) can work as a Shared Kernel — IF both teams have a fast, low-friction process for making changes (e.g., they are in the same office, same sprint cadence, same CI pipeline). The moment the kernel starts growing or the teams start moving at different speeds, it should be dissolved.
+
+- **What I recommend instead:** Duplicate the value objects. Yes, both teams will have their own `Money` class. This feels wrong to engineers trained on DRY, but it is the right call. Each team's `Money` can evolve independently. Team A's `Money` can grow to include currency conversion behavior. Team B's `Money` can stay simple. The duplication cost is trivial — a few dozen lines of code. The coupling cost of a Shared Kernel is measured in weeks of lost velocity over a year.
+
+**War Story:** At a fintech company, three teams shared a `common-models` library that started with 4 classes and grew to 47 over two years. Every release required coordinating three teams. Merge conflicts in the shared library were a weekly occurrence. One team needed to upgrade Jackson (JSON serializer) for a security patch, but another team's code was incompatible with the new version. The upgrade was blocked for four months. We eventually dissolved the Shared Kernel by having each team fork the classes they needed into their own codebase. The "duplication" was about 2,000 lines of code per team. The velocity improvement was immediate — teams went from bi-weekly coordinated releases to daily independent deployments.
+
+</Accordion>
+</AccordionGroup>
+
+#### Follow-up: If duplication is acceptable across bounded contexts, where do you draw the line? Is there anything that SHOULD be shared?
+
+Three things can be shared without regret:
+
+First, shared schemas for integration events — but shared through a schema registry (Confluent Schema Registry, AWS Glue Schema Registry), not through a shared code library. The schema is a contract, not a dependency. Each team generates their own language-specific classes from the schema. The schema itself is co-owned and versioned with backward compatibility rules.
+
+Second, shared infrastructure libraries — HTTP clients, logging frameworks, tracing instrumentation. These are not domain concepts. They are platform utilities. A shared `TenantContextMiddleware` that extracts `tenant_id` from JWT claims is fine to share because it is infrastructure, not domain logic. But keep these libraries thin and stable — they should change rarely.
+
+Third, shared identity types — a `TenantId` type or a `UserId` type that is just a typed wrapper around a UUID. These change approximately never and provide type safety at boundaries.
+
+Everything else — especially domain entities, value objects with behavior, and business rules — should be duplicated across contexts.
+
+#### Follow-up: How do you handle the situation where two teams independently model the same concept and their models start diverging in incompatible ways?
+
+This is not a bug — it is the system working correctly. If two teams' models of "Customer" are diverging, it is because they genuinely need different things from the concept. The Auth team's `Customer` needs `password_hash` and `mfa_status`. The Billing team's `Customer` needs `payment_method` and `subscription_tier`. These models SHOULD diverge because they serve different purposes.
+
+The integration point is the event contract. When Auth publishes `CustomerRegistered`, the event schema defines the shared understanding: `customer_id`, `email`, `name`. Billing consumes this event and creates its own `BillingCustomer` record with those shared fields plus its own domain-specific fields. The event contract is the only coupling point, and it should be minimal — only the data that the consumer actually needs.
+
+If the divergence causes actual business problems — for example, a customer's name shows as "Jane Smith" in the billing portal but "Jane S. Doe" in the support portal because both contexts store the name independently and one was not updated — the fix is not to merge the models. The fix is to ensure that the `CustomerNameChanged` event is published by the authoritative context (Auth) and consumed by all downstream contexts that cache the name. This is an event propagation problem, not a modeling problem.
+
+---
+
+### 17. An enterprise tenant asks you to completely delete all their data because they are churning. Walk me through the technical execution of tenant offboarding, including the things most engineers forget.
+
+**What the interviewer is really testing:** Do you understand the full surface area of tenant data in a modern system? Can you handle GDPR Article 17 (right to erasure) in practice? The "obvious" answer — run a DELETE query — misses about 80% of where tenant data actually lives.
+
+<AccordionGroup>
+<Accordion title="Weak vs. Strong Answer">
+
+**What weak candidates say:**
+
+"I would run `DELETE FROM tables WHERE tenant_id = ?` on all our tables. Maybe also delete their S3 files."
+
+This answer catches the primary database but misses the majority of where tenant data persists. It shows no awareness of the full data lifecycle, backup retention, derived data stores, or the legal nuances of data deletion.
+
+**What strong candidates say:**
+
+Tenant offboarding is one of the most underestimated engineering challenges in multi-tenant systems. The database DELETE is maybe 20% of the work. Here is the full surface area:
+
+- **Layer 1: Primary database.** Yes, `DELETE FROM orders WHERE tenant_id = ?` across all tenant-scoped tables. But the execution matters. On a table with 800M shared rows, a bulk DELETE of 5M rows (the tenant's data) generates massive WAL, can cause replication lag, and may lock rows that other tenants' queries need. I batch the deletes — 10,000 rows per transaction with a pause between batches, same discipline as the backfill migration. I also verify foreign key relationships — deleting from parent tables before child tables or using CASCADE, but with explicit awareness of what is being cascaded.
+
+- **Layer 2: Search indexes.** If you use Elasticsearch or OpenSearch, tenant documents are indexed there. You need to delete by `tenant_id` query or, if you use per-tenant indexes, drop the index. Elasticsearch delete-by-query is asynchronous and does not immediately free disk space — it marks documents as deleted and reclaims space on the next segment merge. For compliance purposes, you may need to force a segment merge and verify the documents are physically gone.
+
+- **Layer 3: Caches.** Redis, Memcached, CDN caches. If you cache per-tenant data (and you should be), those cache entries contain tenant data that must be invalidated or TTL-expired. For Redis, if you use key prefixes like `tenant:acme:orders:*`, you can use `SCAN` and `DEL` to remove them. For CDN caches, you need to issue cache invalidation requests for any tenant-specific URLs.
+
+- **Layer 4: Object storage.** S3 buckets, Azure Blob Storage. Tenant file uploads, generated reports, export files. If you use a shared bucket with tenant-prefixed paths (`s3://data-bucket/tenants/acme/`), you delete the prefix. If files are scattered across paths, you need a manifest of tenant-owned objects. Do not forget versioned buckets — in S3 with versioning enabled, a DELETE creates a delete marker but the previous versions still exist. You need to delete all versions explicitly.
+
+- **Layer 5: Message queues and event logs.** If you use Kafka, the tenant's events are in your topic partitions. Kafka does not support deleting individual messages — you would need to produce tombstone records or wait for log compaction/retention to expire them. For compliance, you may need to document that Kafka events containing tenant data will be purged after the retention period (e.g., 7 days). For longer-retention topics, you need a strategy — possibly re-creating the topic without the tenant's events.
+
+- **Layer 6: Backups.** This is the one most engineers forget, and it is the hardest. Your nightly database backup from last Tuesday contains the tenant's data. Your S3 cross-region replication copied their files to another region. Your WAL archives contain their transactions. Legally, you typically have two options: (a) document that backup data is retained for the backup retention period and will be purged when the backup expires (most GDPR interpretations accept this with proper documentation), or (b) implement backup-level encryption per tenant and destroy the tenant's encryption key, rendering their data in backups unreadable. Option (b) is more technically sound but requires per-tenant encryption from the start.
+
+- **Layer 7: Logs and analytics.** Application logs, audit logs, analytics event streams. If your logs contain tenant data (and they will — request bodies, user IDs, email addresses in error messages), you need to either purge them or demonstrate that they are anonymized. For structured log stores (Elasticsearch-backed Kibana, Datadog Logs), you can delete by `tenant_id`. For flat log files shipped to S3, you may need to accept the retention-period approach.
+
+- **Layer 8: Third-party systems.** Did you send the tenant's data to Segment? Mixpanel? Salesforce? Stripe? HubSpot? Every third-party integration that received tenant data needs a deletion request. Many SaaS tools have GDPR deletion APIs, but the coverage is inconsistent. You need a manifest of every third-party system that received tenant data and a process for requesting deletion from each one.
+
+**War Story:** At a healthcare SaaS company, a hospital system churned and requested full data deletion under HIPAA. The engineering team deleted the primary database records, the S3 files, and the Elasticsearch index. They thought they were done. Six weeks later, the compliance team discovered that the tenant's patient data was still present in: (1) a Redshift analytics warehouse that received nightly ETL loads, (2) a machine learning training dataset that had been exported to a data science team's S3 bucket, (3) Datadog logs that included patient IDs in error traces, and (4) a staging environment database that was a 3-week-old snapshot of production. The full deletion took 4 additional weeks and involved 6 different teams. After that, we built a "tenant data manifest" — a registry of every system, service, cache, log store, and third-party integration that contains tenant data — and made updating it part of the definition of done for any feature that touches tenant data.
+
+</Accordion>
+</AccordionGroup>
+
+#### Follow-up: How would you design a system from day one to make tenant offboarding easy?
+
+Three architectural decisions that pay off enormously at offboarding time:
+
+First, per-tenant encryption keys. Every tenant's data (database rows, S3 objects, cache entries) is encrypted with a tenant-specific key stored in a KMS (AWS KMS, HashiCorp Vault). To "delete" a tenant's data, you destroy their encryption key. The ciphertext remains in backups and logs but is permanently unreadable. This is called "crypto-shredding" and it is the gold standard for GDPR compliance in multi-tenant systems.
+
+Second, a tenant data manifest. A living document (or better, a programmatic registry) that lists every system where tenant data is stored. When a new feature writes tenant data to a new location (a new cache, a new analytics pipeline, a new third-party integration), the manifest is updated. The offboarding script reads the manifest and executes deletion in each system.
+
+Third, tenant-prefixed storage everywhere. In S3, use `tenants/{tenant_id}/` prefixes. In Redis, use `tenant:{tenant_id}:` key prefixes. In Elasticsearch, use per-tenant indexes or a `tenant_id` field on every document. This makes per-tenant deletion a prefix scan instead of a full table scan.
+
+#### Follow-up: A regulator asks you to prove that the data was actually deleted. How do you provide evidence?
+
+You need an auditable deletion record. Every deletion action (database DELETE, S3 object removal, cache invalidation, third-party API call) is logged with timestamps, the system affected, and the result (success/failure/partial). This log is the audit trail.
+
+For database deletions, I run a post-deletion verification query: `SELECT COUNT(*) FROM every_tenant_table WHERE tenant_id = ?` and log the result (which should be zero for every table). For S3, I list the tenant's prefix after deletion and log the empty result. For third-party systems, I capture the deletion API response.
+
+The deletion log itself must NOT contain the deleted data — only metadata about the deletion. "Deleted 47,293 rows from the orders table for tenant_id acme_corp at 2026-03-15T14:30:00Z, verified 0 remaining rows" is a valid audit entry. Store this deletion log for a regulator-defined retention period (typically 3-5 years for GDPR).
+
+---
+
+### 18. You are building a multi-tenant metering and billing system. How do you accurately track per-tenant resource consumption in a shared-infrastructure model where tenants share compute, storage, and bandwidth?
+
+**What the interviewer is really testing:** Can you design a metering system that is accurate, tamper-resistant, and does not degrade the performance of the system it measures? Do you understand the gap between "we know what the tenant consumed" and "we can bill the tenant for it"?
+
+<AccordionGroup>
+<Accordion title="Weak vs. Strong Answer">
+
+**What weak candidates say:**
+
+"I would count API requests per tenant and charge based on that. Maybe track storage usage too."
+
+This answer confuses metering (measuring consumption) with a pricing model (how you charge). It does not address the hard problems: how do you measure accurately at scale, how do you handle metering in asynchronous workloads, and what happens when the meter disagrees with the customer's expectation.
+
+**What strong candidates say:**
+
+Multi-tenant metering is a data pipeline problem disguised as a billing feature. The core challenge is: you are measuring shared resource consumption at a granularity that does not naturally exist in your infrastructure.
+
+- **What to meter:** The metering dimensions depend on your pricing model, but the common ones are: API requests (by endpoint, by HTTP method), compute time (CPU-seconds consumed by the tenant's requests and background jobs), storage (database rows, S3 objects, total bytes), bandwidth (egress bytes), and feature-specific metrics (messages sent, reports generated, users provisioned). The key insight is to meter at the finest granularity you might ever need, even if your current pricing only uses a subset. Adding a new metering dimension retroactively is extremely hard — you cannot bill for something you did not measure.
+
+- **The metering pipeline architecture:** Every request emits a metering event: `{ tenant_id, resource_type, quantity, timestamp }`. These events are high-volume (potentially millions per hour across all tenants) and must not be in the critical path of the request — a metering failure must never block or slow down the tenant's actual operation. I use an async pipeline: the request handler emits the metering event to a local buffer (in-memory queue or local Kafka producer), which flushes to a central event stream (Kafka topic partitioned by `tenant_id`). A metering aggregation service consumes the stream, aggregates per tenant per time window (1-minute or 5-minute buckets), and writes the aggregated usage to a metering database (often a time-series database like TimescaleDB or ClickHouse).
+
+- **Accuracy and consistency:** Metering must be at-least-once — it is better to slightly over-count than to miss usage (under-counting means lost revenue). The consumer uses idempotent writes with event deduplication (the `event_id` pattern) to prevent double-counting from Kafka redeliveries. For critical billing accuracy, I reconcile the metered usage against independent sources: compare metered API request counts against the API gateway's access logs, compare metered storage against actual S3 object listings. Discrepancies are investigated before billing.
+
+- **The billing boundary:** Metering and billing are separate bounded contexts. Metering answers "how much did tenant X consume?" Billing answers "how much does tenant X owe?" The billing context consumes metering aggregates, applies the tenant's pricing plan (which may include free tiers, volume discounts, committed-use discounts, and overage charges), generates an invoice, and integrates with the payment provider (Stripe Billing, Chargebee, etc.). Keeping these separate means you can change pricing models without changing metering infrastructure.
+
+**War Story:** At a cloud platform company, we initially tracked API usage by counting requests in an API gateway log and aggregating daily. A customer disputed their bill, claiming they made 2M requests that month, not 4M. Investigation revealed the discrepancy: our gateway counted retries as separate requests (a client-side retry after a 503 was counted as 2 requests), and our metering included health check requests from the customer's monitoring system that hit an authenticated endpoint. We had to retroactively define what a "billable request" was (excluding retries of server errors, excluding health checks, excluding preflight CORS requests) and rebuild the metering pipeline with these exclusions. The lesson: define what you are metering with contractual precision BEFORE you build the pipeline. "API requests" is not a definition — "successful and client-error (2xx/4xx) responses to non-preflight requests on production endpoints, excluding automated health checks" is a definition.
+
+</Accordion>
+</AccordionGroup>
+
+#### Follow-up: How do you handle a tenant who says "your meter is wrong, I did not make that many requests"?
+
+This is a trust problem, not a technical problem. You need to give the tenant visibility into their own usage. The best approach is a real-time usage dashboard (or API) that the tenant can access, showing their consumption broken down by dimension (requests by endpoint, storage by type, compute by job). If the tenant can see their usage in real time and it matches their own instrumentation, disputes drop to near-zero.
+
+For disputed bills, you need an audit trail: the raw metering events (stored in an append-only log, like a Kafka topic with long retention or an S3 archive) that were aggregated into the bill. You can replay the raw events, apply the billing rules, and show the tenant exactly which requests contributed to the total. If you cannot produce this audit trail, you have a metering system that is not auditable, and you will lose every billing dispute.
+
+#### Follow-up: How do you prevent metering from becoming a performance bottleneck?
+
+The golden rule: metering must never be in the synchronous request path. The request handler fires a metering event to a local buffer and immediately returns. The buffer flushes asynchronously. If the metering pipeline is down, requests still work — you accumulate a metering backlog that catches up when the pipeline recovers.
+
+For ultra-high-throughput systems (100K+ requests/second), I use client-side aggregation: instead of emitting one metering event per request, the application process aggregates locally (count requests per tenant per endpoint per 10-second window) and emits a single aggregated event. This reduces metering event volume by 100-1000x while maintaining per-tenant accuracy within the aggregation window.
+
+---
+
+### 19. Your team drew bounded context boundaries 18 months ago and they are now clearly wrong — one context has become a "God context" that owns too much, and two contexts that were separated should actually be one. How do you refactor context boundaries in a running system?
+
+**What the interviewer is really testing:** Can you handle the reality that DDD boundaries are not permanent? Do you have a practical migration strategy, or do you only know how to draw greenfield boundaries? This is a senior/staff-level question because most DDD content only covers initial design, not redesign.
+
+<AccordionGroup>
+<Accordion title="Weak vs. Strong Answer">
+
+**What weak candidates say:**
+
+"I would redesign the bounded contexts from scratch using Event Storming and then migrate to the new design."
+
+This answer treats context refactoring as a greenfield exercise, which it is not. In a running system with production traffic, live data, established team ownership, and existing API consumers, you cannot "redesign from scratch." You need an incremental migration strategy that operates on a live system without downtime.
+
+**What strong candidates say:**
+
+Context boundary refactoring is one of the hardest architectural changes you can make, because you are not just moving code — you are moving data ownership, team ownership, and integration contracts. I think about it as two distinct operations: splitting a God context and merging over-separated contexts.
+
+- **Splitting a God context:** Say the "Order Management" context has grown to own orders, inventory, pricing, and promotions — four business capabilities that should be independent. The Strangler Fig pattern applies here. I extract one capability at a time.
+
+  Step 1: Identify the capability with the cleanest data boundary (say, Promotions — it reads product data but has its own tables for promotion rules, coupon codes, and discount calculations). Step 2: Build the new Promotions context as a separate module (or service) with its own data store. Step 3: Implement dual-write — the God context continues to write promotion data to its own tables AND publishes events that the new Promotions context consumes to build its own state. Step 4: Migrate read traffic to the new context. The API gateway routes `/promotions/*` requests to the new context. Step 5: Validate that the new context's data matches the God context's data (reconciliation). Step 6: Stop the dual-write. The new context is the source of truth. Remove the promotion tables and code from the God context.
+
+  Repeat for each capability. The God context shrinks over months, not days. Each extraction is independently deployable and reversible.
+
+- **Merging over-separated contexts:** Say "Customer Profile" and "Customer Preferences" were split into separate contexts, but they always change together, they are owned by the same team, and every feature requires coordinating changes in both. The merger is simpler: move the Preferences context's code and data into the Profile context. Redirect the Preferences API endpoints to the Profile context (or introduce aliases that forward). Deprecate the Preferences context's events and have consumers switch to the Profile context's events with a migration window. Shut down the Preferences context once all consumers have migrated.
+
+- **The hard part is the data migration.** When you split a context, you are copying data from one store to another and then changing the source of truth. During the transition, both stores contain the data, and you need to ensure they stay synchronized until the cutover. The reconciliation job — a background process that compares the two stores row by row and flags discrepancies — is essential. I have never seen a context split where the reconciliation job did not find bugs in the dual-write implementation.
+
+**War Story:** At an e-commerce company, the "Catalog" bounded context had grown to own products, categories, pricing, inventory, and supplier management — five capabilities crammed into one service with a 4-million-line codebase. The first extraction target was Inventory, which had the cleanest data boundary. The extraction took the team 4 months. The most time-consuming part was not the code — it was the 23 downstream consumers that queried the Catalog API for inventory data. Each consumer had to be migrated to the new Inventory API. We used a facade pattern at the Catalog API that proxied inventory requests to the new Inventory service during the transition. After 4 months, the Inventory context was independent, and the Catalog context's codebase was 30% smaller. The remaining extractions (Pricing, Categories, Supplier Management) took 3 months each because the team had established the extraction playbook. Total project: 13 months. But each extraction delivered value independently — the Inventory team deployed 4x more frequently once they were independent.
+
+</Accordion>
+</AccordionGroup>
+
+#### Follow-up: How do you know when your bounded context boundaries are wrong?
+
+Four signals:
+
+First, the "shotgun surgery" signal: every feature change requires modifying code in 3+ contexts. If adding a discount feature requires changes in Order, Pricing, AND Promotions, those contexts might be too granular or the boundaries are in the wrong place.
+
+Second, the "chatty communication" signal: two contexts exchange more events or API calls with each other than they do with the rest of the system. High coupling between two contexts suggests they should be one context.
+
+Third, the "God context" signal: one context has 3x more code, 3x more tables, and 3x more team members than any other context. It is doing too much and should be split.
+
+Fourth, the "orphan context" signal: a context that rarely changes, has no clear owner, and exists only because someone drew a boundary around it 2 years ago. It might not justify being a separate context — merge it into its closest neighbor.
+
+#### Follow-up: How do you manage team ownership transitions during context boundary changes?
+
+This is the organizational dimension that pure technical DDD guidance ignores. When you split a God context, you are creating a new team ownership boundary. When you merge contexts, you are eliminating one.
+
+For splits, the new context needs an owner before the extraction begins — not after. The worst outcome is extracting a context that nobody wants to own, because then it becomes an orphan that degrades over time. I staff the new context with engineers from the God context team who have the most expertise in that capability. They are simultaneously the extraction engineers and the future owners.
+
+For merges, one team absorbs the other's code. This requires honest conversations about team structure. If the "Customer Preferences" team is being dissolved into the "Customer Profile" team, those engineers need new roles or new assignments. Handle the people side first — the code merge is the easy part.
+
+---
+
+### 20. You are in a design review and a senior engineer proposes using Event Sourcing for the Order aggregate because "we need a complete audit trail." What questions do you ask before agreeing, and when would you push back?
+
+**What the interviewer is really testing:** Can you critically evaluate an architectural proposal rather than accepting it because a senior person suggested it? Do you understand the costs of Event Sourcing versus simpler alternatives? This is a "the obvious answer is wrong" question — event sourcing is often overkill for an audit trail.
+
+<AccordionGroup>
+<Accordion title="Weak vs. Strong Answer">
+
+**What weak candidates say:**
+
+"Event Sourcing is great for audit trails. It gives you a complete history of every change. I would agree with the proposal."
+
+This answer accepts the proposal uncritically, which is a red flag at senior+ levels. Event Sourcing does provide a complete audit trail, but it also introduces significant complexity that may not be justified if an audit trail is the only requirement.
+
+**What strong candidates say:**
+
+Before agreeing, I would ask five questions that determine whether the complexity of Event Sourcing is justified:
+
+- **Question 1: "What do you actually need from the audit trail?"** There is a massive difference between "we need to know who changed what and when" (a simple audit log) and "we need to reconstruct the exact state of the order at any point in time" (temporal queries). If the requirement is the former, an append-only `order_audit_log` table with `(order_id, changed_by, changed_at, field_changed, old_value, new_value)` gives you 90% of the value at 10% of the complexity. You keep your simple CRUD model for the Order aggregate and add a change-data-capture (CDC) layer — tools like Debezium can capture every row change and write it to an audit log or Kafka topic automatically, with zero changes to your application code.
+
+- **Question 2: "Do you need temporal queries?"** If the answer is "yes, we need to answer questions like 'what was the state of this order on March 15th at 2pm?'" — then Event Sourcing becomes more justified because replaying events to a point in time is its core strength. But even here, I would evaluate whether a simpler bi-temporal data model (with `valid_from` and `valid_to` columns) could serve the same purpose without the full Event Sourcing machinery.
+
+- **Question 3: "How will you handle reads?"** Event Sourcing stores events, not current state. To answer "what is the current status of order 12345?", you must either replay all events for that order (slow for orders with many events) or maintain a read-side projection (CQRS). CQRS adds a second data store, a projection rebuilding mechanism, and eventual consistency between the write side (events) and the read side (projections). This is a significant architectural commitment. Is the team prepared for that complexity?
+
+- **Question 4: "What is the team's experience with Event Sourcing?"** If nobody on the team has built an event-sourced system before, the learning curve and operational surprises will dominate the first 6-12 months. Event Sourcing has non-obvious gotchas: event schema evolution (what happens when you need to add a field to `OrderPlaced`?), projection rebuilding (when a bug in the projection logic is discovered, can you replay millions of events efficiently?), and snapshot management (when an aggregate has 10,000 events, replaying from scratch on every load is unacceptable — you need snapshots).
+
+- **Question 5: "What is the read-to-write ratio?"** Event Sourcing optimizes for writes (append-only, very fast) at the cost of reads (requires projection or replay). If the Order system is 95% reads and 5% writes (most e-commerce systems), you are optimizing for the minority use case and degrading the majority.
+
+- **When I would push back:** If the only requirement is an audit trail, I would recommend a CDC-based audit log and push back on full Event Sourcing. The cost-benefit does not justify it. I have seen teams adopt Event Sourcing for audit compliance, spend 6 months building the event store and projection infrastructure, and then realize they could have achieved the same audit result with a Debezium + Kafka Connect pipeline that they could have set up in a week.
+
+- **When I would agree:** If the domain genuinely benefits from temporal queries ("what was the portfolio value at market close on March 15th?"), if the domain has complex state machines where the event history IS the business value (trading systems, legal case management), or if the system needs to support retroactive corrections ("we discovered this event was wrong; replay without it and see what the correct state should have been"). These are domains where Event Sourcing is not just justified — it is the natural fit.
+
+**War Story:** At a fintech company, the team adopted Event Sourcing for the entire platform because the compliance team said "we need full audit trails." Eighteen months later, the event store had 2 billion events across 40 aggregate types. Projection rebuilds took 6+ hours. Schema evolution was a constant pain — they had 14 different versions of the `TransactionCreated` event, each with slightly different field structures, and the projection code had to handle all 14. The compliance team's actual audit requirements could have been satisfied with a change-data-capture log that captured the before/after state of each database row. The Event Sourcing architecture provided genuine value for exactly 3 of the 40 aggregate types (portfolio valuation, regulatory reporting, and trade reconciliation). The other 37 were paying the complexity tax with no corresponding benefit. The retrospective conclusion: Event Sourcing is a powerful tool for specific use cases, not a system-wide architecture.
+
+</Accordion>
+</AccordionGroup>
+
+#### Follow-up: If you do adopt Event Sourcing for the Order aggregate, how do you handle event schema evolution when the business requirements change?
+
+This is the operational challenge that Event Sourcing tutorials skip. After 6 months, the `OrderPlaced` event needs a new `shipping_priority` field. You have 500,000 existing `OrderPlaced` events without this field. Three approaches:
+
+First, weak schema evolution: make the new field optional with a default. The projection code handles both versions — events without `shipping_priority` default to "standard." This works for additive changes but breaks down when you need to rename or restructure fields.
+
+Second, upcasting: write a migration function that transforms old event shapes into new shapes at read time. When the projection reads an `OrderPlacedV1` event, the upcaster transforms it into the `OrderPlacedV2` shape before the projection processes it. The old events are never modified in the store — the transformation is applied on the fly. This is clean but adds processing overhead and complexity as the number of versions grows.
+
+Third, event versioning with explicit types: publish `OrderPlacedV2` as a new event type. Old projections continue reading V1. New projections read both V1 and V2. Over time, you deprecate V1. This is the most explicit approach and the one I prefer for breaking changes.
+
+The golden rule: never mutate events in the event store. Events are facts about what happened. If you need to correct an error, publish a compensating event (`OrderPlacedCorrected`), do not edit the original.
+
+#### Follow-up: How do you prevent the event store from becoming a performance bottleneck as it grows to billions of events?
+
+Snapshots and archival. For aggregates with long event histories (thousands of events), store periodic snapshots — a serialized copy of the aggregate's current state after processing N events. To load the aggregate, read the latest snapshot and replay only the events after the snapshot. This bounds the replay cost regardless of total event history length.
+
+For archival, events older than a certain threshold (e.g., 90 days) that have been fully projected can be moved to cold storage (S3, Glacier). The hot event store only contains recent events and snapshots. If you need to rebuild projections from the full history, you read from cold storage — slower, but this is a batch operation, not a latency-sensitive one.
+
+---
+
+### 21. You inherit a multi-tenant system where tenants are identified by subdomain (`acme.yourapp.com`), but the company now wants to support custom domains (`app.acmecorp.com`). This breaks your entire tenant identification strategy. How do you migrate?
+
+**What the interviewer is really testing:** Can you handle a tenant identification strategy migration without downtime? Do you understand the full stack implications — DNS, TLS, CDN, API gateway, application routing? This is a real operational scenario that trips up even experienced engineers because the "simple" change touches every layer.
+
+<AccordionGroup>
+<Accordion title="Weak vs. Strong Answer">
+
+**What weak candidates say:**
+
+"I would add a lookup table that maps custom domains to tenant IDs and check it in the middleware."
+
+This answer gets the application layer roughly right but misses the infrastructure layers entirely. Custom domains require DNS configuration, TLS certificate provisioning, CDN routing changes, and careful handling of the transition period where both subdomain and custom domain must work simultaneously.
+
+**What strong candidates say:**
+
+Custom domain support is a full-stack change that touches DNS, TLS, CDN, load balancer, API gateway, and application routing. The migration must be backward-compatible — existing subdomain URLs must continue working indefinitely.
+
+- **Layer 1: DNS and TLS.** Each custom domain needs a DNS record pointing to your infrastructure. The tenant adds a CNAME record on their domain (`app.acmecorp.com CNAME custom.yourapp.com`). Your infrastructure must accept traffic for any domain, not just `*.yourapp.com`. For TLS, you need a certificate for each custom domain. At scale, this means automated certificate provisioning — Let's Encrypt with the ACME protocol via cert-manager (Kubernetes) or AWS Certificate Manager with automated validation. You cannot pre-provision certificates — they are created on-demand when a tenant configures their custom domain, with a verification step (DNS challenge or HTTP challenge) to prove domain ownership.
+
+- **Layer 2: CDN and load balancer.** Your CDN (CloudFront, Fastly, Cloudflare) must be configured to accept traffic for custom domains. In Cloudflare, this is the "Custom Hostnames" feature (also called SaaS for Cloudflare, an API that lets you programmatically add custom hostnames to your zone). In AWS, this may require a dedicated ALB or CloudFront distribution that handles custom domains separately from your wildcard subdomain distribution. The routing rule: if the incoming domain is `*.yourapp.com`, extract the subdomain as the tenant identifier. If the incoming domain is anything else, look it up in the custom domain registry.
+
+- **Layer 3: Tenant resolution middleware.** The application middleware gets a new resolution strategy. Currently: extract subdomain from `Host` header, look up tenant. New: first, check if the `Host` header matches `*.yourapp.com` — if so, use the subdomain strategy (backward compatible). If not, query the custom domain registry (`SELECT tenant_id FROM custom_domains WHERE domain = ?`). Cache this lookup aggressively (Redis with a 5-minute TTL) because it is on the critical path of every request. The custom domain registry is a new table: `(domain, tenant_id, verified, tls_status, created_at)`.
+
+- **Layer 4: Domain verification.** You must verify that the tenant actually owns the custom domain before you serve traffic on it. Otherwise, anyone could claim `google.com` as their custom domain and intercept traffic. The verification flow: tenant enters their desired domain in settings, your system generates a verification TXT record (`_verification.app.acmecorp.com TXT "yourapp-verify=abc123"`), the tenant adds it to their DNS, your system polls for verification, and only after verification do you provision the TLS certificate and enable routing.
+
+- **Layer 5: Migration strategy.** Existing tenants continue using subdomains. Custom domain support is opt-in. When a tenant configures a custom domain, both URLs work — `acme.yourapp.com` and `app.acmecorp.com` both resolve to the same tenant. The subdomain URL can optionally redirect to the custom domain, but do not break the subdomain URL — existing bookmarks, API integrations, and OAuth redirect URIs depend on it. Add a `canonical_domain` field to the tenant configuration so the application knows which URL to use for links, emails, and OAuth callbacks.
+
+**War Story:** At a SaaS platform with 3,000 tenants, we launched custom domain support and everything worked until we hit the TLS certificate rate limit. Let's Encrypt has a rate limit of 50 certificates per registered domain per week. When 80 tenants configured custom domains in the first week, we hit the limit on day 3. We had to implement certificate pre-provisioning (requesting certificates during domain verification rather than on first request), certificate sharing for tenants on the same apex domain (one wildcard cert for `*.acmecorp.com` if the tenant owns the apex), and a fallback to our default wildcard cert (`*.yourapp.com`) with a redirect when the custom domain cert is not yet provisioned. The lesson: TLS at scale has operational constraints that do not appear in small-scale testing.
+
+</Accordion>
+</AccordionGroup>
+
+#### Follow-up: How do you handle OAuth and SSO callbacks when a tenant switches from subdomain to custom domain?
+
+This is the subtlety that breaks real deployments. OAuth redirect URIs are registered with the identity provider (Auth0, Okta, or your own) and must exactly match the URL that the auth flow redirects to. If the tenant's OAuth redirect was `https://acme.yourapp.com/callback` and they switch to `https://app.acmecorp.com/callback`, the OAuth flow breaks unless the new redirect URI is registered.
+
+The solution is: when a tenant configures a custom domain, automatically register the new redirect URI with the identity provider (most providers have APIs for this). Keep the old subdomain redirect URI registered as well — do not remove it until you are certain no flows depend on it. For SAML SSO (common with enterprise tenants), the tenant's identity provider configuration includes your ACS URL, which also changes with the domain. You must notify the tenant's IT admin to update their IdP configuration — this is a manual, human-coordination step that cannot be automated.
+
+#### Follow-up: How do you prevent a malicious user from configuring someone else's domain as their custom domain?
+
+The domain verification step is the defense. The tenant must prove ownership by adding a DNS TXT record that only the domain owner can create. Your system generates a unique verification token (`yourapp-verify=<random-token>`) and instructs the tenant to add it as a TXT record on their domain. Your system queries DNS for the record and only activates the custom domain if the token matches. Without this verification, any tenant could claim any domain and potentially intercept traffic intended for the domain's actual owner.
+
+Additionally, once a domain is verified and active for one tenant, reject any attempt by another tenant to claim the same domain. The custom domain registry should have a unique constraint on the `domain` column.
+
+---
+
+### 22. A product manager asks you to build a feature that lets support agents "log in as" any tenant to debug issues. How do you design this without creating a security nightmare?
+
+**What the interviewer is really testing:** Can you balance operational necessity with security principles? Do you understand the audit, consent, and least-privilege implications of tenant impersonation? This is a question where the quick-and-dirty answer ("give support agents a master password") is a career-ending security mistake.
+
+<AccordionGroup>
+<Accordion title="Weak vs. Strong Answer">
+
+**What weak candidates say:**
+
+"I would create an admin account that can switch between tenants. Maybe a dropdown in the admin panel that lets you select a tenant."
+
+This answer creates an unaudited, unrestricted, permanent backdoor into every tenant's data. No consent mechanism, no time limits, no audit trail, no least-privilege scoping. This design would fail any SOC2 or HIPAA audit immediately.
+
+**What strong candidates say:**
+
+Tenant impersonation is a legitimate operational need — support agents must be able to see what the customer sees to debug issues. But the implementation must satisfy four security principles: auditability, consent, least privilege, and time-bounding.
+
+- **Principle 1: Auditability.** Every impersonation session is logged with: which agent, which tenant, when it started, when it ended, and what actions were taken during the session. This log is immutable (append-only, stored in a tamper-evident store) and accessible to the compliance team. If a support agent impersonates a tenant and something goes wrong, you need a complete record of what they did.
+
+- **Principle 2: Consent (for regulated industries).** In healthcare (HIPAA) and some financial services contexts, accessing a customer's data requires a documented reason. The impersonation flow should require the agent to select a reason ("customer-reported bug," "billing investigation," "security audit") that is logged with the session. For the strictest compliance regimes, the tenant may need to explicitly grant access (a "grant support access" toggle in their settings).
+
+- **Principle 3: Least privilege.** A support agent impersonating a tenant should NOT have full admin access to the tenant's account. They should have read-only access by default. Write access (if needed) should require a separate approval step. The impersonation role should be a scoped, read-only view of the tenant's data — the agent can see what the customer sees but cannot modify orders, change settings, or access sensitive fields (payment card numbers, passwords). Map impersonation to a specific RBAC role (`support-viewer`) that has been explicitly designed with limited permissions.
+
+- **Principle 4: Time-bounding.** Impersonation sessions expire automatically after a short window (30-60 minutes). The agent must re-initiate impersonation for a new session. There is no "permanently logged in as customer" mode. This limits the blast radius of a compromised support agent account.
+
+- **Implementation architecture:** The impersonation flow issues a short-lived JWT with special claims: `{ sub: "agent-123", impersonating_tenant: "acme", role: "support-viewer", exp: <30-min-from-now>, impersonation_reason: "ticket-4567" }`. The application middleware detects the `impersonating_tenant` claim and sets the tenant context to "acme" while also logging all actions under the agent's identity (not the tenant's). This is critical — the audit log must show "agent-123 viewed order #789 while impersonating tenant acme" not "tenant acme viewed order #789." The RLS policy still scopes data to the impersonated tenant, preventing the agent from accidentally accessing other tenants.
+
+**War Story:** At a B2B SaaS company, the support team initially had a "god mode" — a database role that bypassed RLS and let support agents query any tenant's data directly via a SQL tool. During a SOC2 audit, the auditor asked "who accessed Tenant X's data in the last 90 days?" and the answer was "we do not know — the god mode role is shared across 15 support agents with no individual logging." The audit finding was severe. We built a proper impersonation system with individual agent auth, per-session audit logs, and time-bounded access. The impersonation system took 3 weeks to build. The SOC2 finding took 6 months to close because the auditor required 90 days of clean audit logs before they would clear it. Build the impersonation system correctly from the start — retrofitting security and audit is always more expensive than building it in.
+
+</Accordion>
+</AccordionGroup>
+
+#### Follow-up: How do you prevent a compromised support agent account from being used to exfiltrate tenant data?
+
+Defense in depth. First, support agent accounts must have MFA enforced — no exceptions. Second, implement anomaly detection on impersonation patterns: an agent who impersonates 50 different tenants in one hour, or an agent who impersonates a high-value enterprise tenant they have never interacted with before, triggers an alert. Third, rate-limit impersonation: each agent can have at most 3 concurrent impersonation sessions and can initiate at most 20 sessions per day. Fourth, for the most sensitive tenants (enterprise, regulated), require dual approval — the agent requests impersonation, and a team lead approves it before the session is granted. This adds friction to legitimate support work but dramatically limits the damage a compromised account can do.
+
+#### Follow-up: How does impersonation interact with the tenant's own audit log? Should the tenant see that a support agent was in their account?
+
+Yes — transparency builds trust. The tenant's activity log should show impersonation sessions with clear labeling: "Support Agent (agent-123) viewed your order history at 2026-03-15 14:32 UTC — Reason: investigating ticket #4567." The tenant should be able to see all support access sessions for their account, including the reason, duration, and actions taken. Some enterprise customers contractually require this visibility. Hiding support access from the tenant's audit log is both a trust violation and a compliance risk — if a tenant ever discovers that their data was accessed without their knowledge, the reputational damage is severe.

@@ -2104,3 +2104,474 @@ Auth monitoring is one of those areas where generic application metrics (latency
 
 </Accordion>
 </AccordionGroup>
+
+---
+
+## Advanced Interview Scenarios
+
+These questions are designed to separate engineers who have read about security from engineers who have lived it. Each scenario has a "trap" -- a naive answer that sounds reasonable but reveals a lack of production experience. The strong answers reference specific tools, real metrics, actual incidents, and the kind of hard-won judgment that only comes from debugging auth systems at 2 AM.
+
+<Note>
+**How to use this section:** These are scenario-based questions where the interviewer is testing your instincts, not your vocabulary. The right answer often involves asking clarifying questions, acknowledging uncertainty, and walking through your reasoning out loud. An interviewer asking these wants to hear you think, not recite.
+</Note>
+
+### S1. Your on-call engineer gets paged at 3 AM: "Users are randomly getting logged out." Walk me through your investigation.
+
+<AccordionGroup>
+<Accordion title="What weak candidates say">
+"I'd check if the token expired or the session got deleted. Maybe there's a bug in the logout flow."
+
+This answer jumps to conclusions without gathering data. "Random" is the key word -- truly random symptoms almost always point to infrastructure, not application logic.
+</Accordion>
+
+<Accordion title="What strong candidates say">
+The word "randomly" tells me this is probably not a code bug -- code bugs are deterministic. My first instinct is infrastructure.
+
+**Minute 0-5: Triage scope.**
+- Is this all users or a subset? Check the auth error rate dashboard. If it is 100% of logins failing, the auth service or its dependencies are down. If it is 5-10% of users, it is more subtle.
+- Are there geographic patterns? If users in eu-west-1 are affected but us-east-1 is fine, I am looking at a regional issue.
+- When did it start? Correlate with recent deployments (check the CI/CD pipeline for deploys in the last 2 hours), infrastructure changes, and certificate expirations.
+
+**The five most common causes I have seen in production:**
+
+1. **Redis session store failover or eviction.** If sessions live in Redis and Redis hit its `maxmemory` limit, it starts evicting keys based on the eviction policy (usually `volatile-lru` or `allkeys-lru`). Sessions get silently deleted. Users appear "randomly" logged out because eviction order depends on access patterns. I once debugged this at a company processing 2M sessions -- a marketing campaign doubled traffic, Redis hit 6GB memory limit, and sessions for the least-recently-active users started disappearing. Fix: monitor Redis memory usage with `INFO memory`, set `maxmemory-policy` to `noeviction` for session stores (better to reject new sessions than silently kill existing ones), and scale the cluster.
+
+2. **JWKS cache expiration + auth provider latency.** If the JWKS endpoint has a cache TTL of 5 minutes and the auth provider has a latency spike, cached keys expire and the service cannot fetch new ones. All JWT validations fail until the JWKS endpoint recovers. Users see "logged out" when their next API call returns 401. Fix: cache JWKS with a longer TTL (24h), refresh in the background, and serve stale keys if the refresh fails.
+
+3. **Load balancer cookie routing mismatch.** If you are using sticky sessions without a centralized session store, and the load balancer rebalanced (scaling event, deployment, health check failure), users get routed to a server that does not have their session. Classic symptom: "random" logouts that correlate with deployment windows.
+
+4. **Clock skew on a node.** JWT `exp` validation compares the token's expiration against the server's wall clock. If one node in the cluster has a clock 15 minutes fast (NTP drift, misconfigured VM), that node rejects tokens that other nodes accept. Users hitting that node appear randomly logged out. Fix: run `chronyc tracking` on the affected nodes, enforce NTP, and add 30-60 second leeway to JWT validation.
+
+5. **SameSite cookie changes after a browser update.** Chrome and Firefox periodically tighten cookie behavior. If your auth cookies did not have explicit `SameSite` attributes and a browser update changed the default from `None` to `Lax`, cross-site requests (iframes, third-party integrations) stop sending the cookie. This hits a subset of users (those on the updated browser version) and looks random.
+
+**What I would NOT do:** Deploy a "fix" without understanding root cause. Random logouts can be caused by multiple overlapping issues, and a premature fix can mask the real problem.
+</Accordion>
+</AccordionGroup>
+
+#### Follow-ups
+
+<AccordionGroup>
+<Accordion title="How would you distinguish between a Redis eviction issue and a JWT validation issue?">
+Check the HTTP response codes. Redis eviction causes the server to not find the session at all -- the server returns 401 because it thinks the user is unauthenticated (no session found). JWT validation failures return 401 but with different error messages in the logs: "token expired" vs "invalid signature" vs "unknown kid." If your structured logging includes the auth failure reason (and it should), `grep` for the failure type. Also, Redis evictions are visible via the `evicted_keys` stat in `INFO stats` -- if that counter is climbing, that is your smoking gun. JWT validation failures would correlate with JWKS fetch errors or clock skew alerts. Different root causes leave different fingerprints in the telemetry.
+</Accordion>
+
+<Accordion title="How do you prevent this class of problem from recurring?">
+Three investments. First, **auth-specific health checks** -- not just "is the service up" but "can we validate a token right now, end-to-end?" A synthetic login that runs every 60 seconds catches issues before users notice. Second, **canary deployments for auth changes** -- route 5% of traffic to the new version and monitor auth error rates for 15 minutes before proceeding. Third, **Redis memory alerting** at 70% capacity, not 90% -- by the time Redis is at 90%, you are already evicting sessions under load spikes. At Shopify's scale, they run Redis Cluster with dedicated instances for session storage separated from cache workloads, specifically to prevent cache eviction from killing auth.
+</Accordion>
+</AccordionGroup>
+
+**War Story:** In 2022, a mid-sized fintech saw 8% of users getting randomly logged out every Tuesday and Thursday between 2-4 PM. The cause? A batch job that ran biweekly performed heavy database writes, which caused PostgreSQL replication lag on the read replica. Their auth middleware verified refresh tokens against the read replica. Newly rotated refresh tokens had not replicated yet, so the old token appeared "not rotated" and the system treated it as reuse -- triggering family revocation and logging the user out. The fix was to read refresh tokens from the primary, not the replica. Total debugging time: 3 days. Time to fix once identified: 4 lines of code.
+
+---
+
+### S2. A product manager asks you to add "Login with Google" to your app. It sounds simple. What can go wrong?
+
+<AccordionGroup>
+<Accordion title="What weak candidates say">
+"We just add the Google OAuth library, get the client ID and secret, and redirect users. Google handles the hard parts."
+
+This answer treats third-party login as a plug-and-play feature. The implementation is straightforward -- the edge cases will eat you alive.
+</Accordion>
+
+<Accordion title="What strong candidates say">
+The OAuth/OIDC flow itself is well-documented and most libraries handle it correctly. The real complexity is in the account linking, security edge cases, and the decisions Google does not make for you.
+
+**The five problems that ship dates do not account for:**
+
+1. **Account linking collisions.** A user signs up with email/password as john@gmail.com. Later, they click "Login with Google" using the same email. Are these the same account? If you create a new account, the user now has two accounts with fragmented data. If you auto-link them, an attacker who controls the email can hijack accounts. The safe pattern: if the email is already registered, prompt the user to log in with their existing method first, then link the Google identity. Never auto-merge based on email alone unless the email is verified by both providers.
+
+2. **Email verification trust.** Google guarantees the `email_verified` claim in the ID token is accurate. But what about "Login with GitHub" where the email might not be verified? Or "Login with Apple" where the user can choose to hide their email? You cannot treat all OIDC providers identically. I have seen production systems where an attacker signed up for a GitHub account with someone else's unverified email, used "Login with GitHub" on the target app, and gained access to the victim's account because the app trusted the email claim without checking `email_verified`. Build a provider-specific trust matrix.
+
+3. **Redirect URI validation bypass.** The OAuth spec requires the redirect URI to be registered in advance. But misconfigured redirect URI validation is one of the most common OAuth vulnerabilities. Open redirects via subdomain wildcards (`*.example.com`), path confusion (`example.com/callback/../admin`), and parameter pollution can all redirect the authorization code to an attacker-controlled endpoint. Lock your redirect URIs to exact-match, not patterns.
+
+4. **Token storage and the "what if Google revokes access" problem.** If a user authenticates exclusively via Google and later unlinks their Google account (or Google suspends them), they are locked out of your app. You need a fallback -- either require a password as a backup credential, or offer alternative recovery paths. This is a product decision masquerading as a technical one.
+
+5. **Scope creep in consent screens.** Marketing wants the user's Google Calendar access for a feature. Now your consent screen asks for `calendar.readonly` alongside `openid email profile`. Users see a scary permissions screen and abandon the flow -- conversion drops 20-30%. Google's own research shows that each additional scope beyond basic profile reduces sign-up completion rates. Request minimum scopes at login, then use incremental authorization to request additional scopes only when the user first needs that feature.
+
+**The implementation I would propose:** Use a managed auth library (NextAuth.js, Passport.js, Auth0) that handles the OIDC flow, token exchange, and ID token validation. Implement an explicit account linking flow with email verification checks. Store the Google `sub` claim (the stable user identifier) as the link key -- never rely on email alone because users can change their Google email. Set up monitoring for Google's OIDC discovery endpoint changes and certificate rotations.
+</Accordion>
+</AccordionGroup>
+
+#### Follow-ups
+
+<AccordionGroup>
+<Accordion title="What happens if Google changes their OIDC signing keys and your app does not pick it up?">
+All new Google logins fail because your app cannot validate the ID token signature. This is why you never hardcode Google's public keys -- always fetch them dynamically from the JWKS endpoint (`https://www.googleapis.com/oauth2/v3/certs`) and cache with a TTL. Google typically rotates keys every few weeks and publishes both old and new keys during a transition window. If your JWKS cache is stale (TTL too long and background refresh failed), you reject valid tokens. The defense: cache with a 24-hour TTL, refresh hourly in the background, and if signature validation fails with all cached keys, perform one on-demand JWKS refresh before returning 401. This exact pattern is described in Google's OIDC documentation.
+</Accordion>
+
+<Accordion title="A user reports that they can see another user's profile after logging in with Google. What happened?">
+The most likely cause is a race condition in the OAuth callback handler. If two users complete the Google OAuth flow nearly simultaneously and your callback handler is not idempotent, state confusion can occur. Classic bug: the callback uses a session variable to track the OAuth state parameter, but under concurrent requests, the session gets overwritten. User A starts the flow (state=abc), User B starts the flow (state=xyz), User B's state overwrites User A's in the session, User A's callback arrives with state=abc but the session expects xyz -- the handler either crashes or falls through to the wrong user context. Fix: bind the OAuth state to a signed, per-request cookie or use a PKCE code verifier that is cryptographically tied to the specific authorization request. Never store OAuth flow state in a shared session variable.
+</Accordion>
+</AccordionGroup>
+
+**War Story:** A Series B startup added "Login with Google" and saw a 15% sign-up conversion increase. Two weeks later, a user reported seeing another user's dashboard. Root cause: their Redis-backed session store was configured with `allkeys-lru` eviction and 256MB max memory. Under load, the OAuth callback wrote the Google user's profile to a session key, but between the write and the redirect, Redis evicted the key. The redirect landed on a new session creation path, which reused a session ID from the pool that happened to belong to a different user who had just logged out but whose session had not been fully cleaned. The fix required three changes: separate Redis instances for auth sessions vs. cache, `noeviction` policy on the session instance, and cryptographic binding between the OAuth state parameter and the session ID.
+
+---
+
+### S3. Your CEO reads a headline about a breach at a competitor and asks: "Could this happen to us?" The breach involved stolen API keys from a public GitHub repo. How do you respond?
+
+<AccordionGroup>
+<Accordion title="What weak candidates say">
+"We don't commit secrets to GitHub. We use environment variables."
+
+This answer is dangerously overconfident. "We don't do that" is never a security guarantee -- it is a hope.
+</Accordion>
+
+<Accordion title="What strong candidates say">
+The honest answer to the CEO is: "Let me verify within 24 hours." Confidence without evidence is worse than uncertainty with a plan.
+
+**Here is what I would do in the next 24 hours:**
+
+**Hour 1: Scan for existing exposure.**
+- Run `truffleHog` or `gitleaks` against our entire Git history (not just the current HEAD -- secrets can live in old commits that are no longer visible in the current codebase). At a previous company, this scan found an AWS root account key committed in 2019 and removed from the next commit -- but still in Git history, still valid, never rotated.
+- Check GitHub's secret scanning alerts (available on all public repos and GitHub Enterprise). GitHub automatically scans for patterns matching AWS keys, Stripe keys, Slack tokens, etc. and alerts the repo owner.
+- Scan our CI/CD pipeline configurations. GitHub Actions workflow files, Terraform state files, Docker build logs, and deployment scripts are all common places secrets leak.
+
+**Hour 2-4: Assess current controls.**
+- Do we have pre-commit hooks that block secrets? (tools: `git-secrets`, `detect-secrets` by Yelp, `gitleaks`). If not, install them today.
+- Do we have CI pipeline scanning? (Snyk, GitGuardian, GitHub Advanced Security). Pre-commit hooks are a first line but developers can bypass them with `--no-verify`.
+- Are our API keys scoped and rotatable? A leaked API key with full admin access is catastrophic. A leaked API key with read-only access to a non-sensitive endpoint is a nuisance. Least privilege on API keys is the blast radius control.
+- Do we use a secrets manager? (Vault, AWS Secrets Manager, Doppler). If secrets are in environment variables managed by the secrets manager, they never transit through developer machines or Git.
+
+**Hour 4-8: Implement missing controls.**
+- If we found exposed secrets: rotate immediately, assess blast radius, determine if data was accessed (check access logs for the compromised credential).
+- If pre-commit hooks are missing: install `gitleaks` as a pre-commit hook, push to all developer machines via a setup script, and add it to the CI pipeline.
+- If we do not have a secrets rotation schedule: create one. AWS recommends 90-day rotation for IAM access keys. I would push for 30 days on high-privilege keys and automatic rotation via Secrets Manager for database credentials.
+
+**The response to the CEO:** "Here is what we found, here is what we fixed, here is what we are implementing to prevent it, and here is our ongoing monitoring plan. I'd also like 2 engineering days to implement automated secret scanning in our CI pipeline and a rotation schedule for all production API keys."
+
+**The meta-lesson:** The CEO's question is really "are we secure?" The answer is never "yes" -- it is "here is what we have done, here is what we are doing next, and here is the risk we are accepting." Security is a posture, not a state.
+</Accordion>
+</AccordionGroup>
+
+#### Follow-ups
+
+<AccordionGroup>
+<Accordion title="A scan reveals that a valid AWS access key was committed to a public repo 6 months ago. What's your next move?">
+Assume it has been compromised. AWS CloudTrail is your forensic tool -- pull all API calls made with that access key for the last 6 months. Look for: S3 bucket enumeration, IAM role creation (attackers create persistent backdoors), EC2 instance launches (cryptocurrency mining), data exfiltration from S3 or RDS. Rotate the key immediately. If CloudTrail shows suspicious activity, this is now a security incident with notification requirements. The 6-month window is concerning -- sophisticated attackers who find keys in public repos often wait weeks before using them to avoid detection correlation. GitGuardian's research shows that the median time for an exposed secret to be exploited is under 4 minutes for high-value targets like AWS keys. Six months of exposure means you should assume the worst and verify via CloudTrail.
+</Accordion>
+
+<Accordion title="How do you handle secrets in CI/CD pipelines specifically?">
+Never store secrets in pipeline configuration files (`.github/workflows/*.yml`, `Jenkinsfile`, `.gitlab-ci.yml`) as plaintext. Use the CI platform's secrets injection mechanism (GitHub Actions Secrets, GitLab CI/CD Variables marked as protected and masked, Jenkins Credentials). For AWS, use OIDC federation with your CI provider -- GitHub Actions can assume an AWS IAM role directly without any static credentials. The workflow requests a short-lived OIDC token from GitHub, exchanges it for temporary AWS credentials from STS, and those credentials expire in 1 hour. Zero static secrets, zero key rotation burden. This is the pattern AWS and GitHub jointly recommend as of 2024. For Terraform state files, never store them locally -- use S3 with encryption and access logging, and treat state files as secrets because they often contain database passwords and API keys in plaintext.
+</Accordion>
+</AccordionGroup>
+
+**War Story:** In 2023, Toyota disclosed that a contractor accidentally committed an access key to a public GitHub repository for their T-Connect service. The key was exposed for nearly 5 years (2017-2022) and potentially compromised email addresses and customer management numbers for 296,019 customers. The key had access to a server that stored customer data including email addresses and management numbers. The fix took minutes -- rotate the key. The damage assessment took months. The lesson: a single developer mistake in 2017, with no pre-commit scanning, no secret rotation, and no monitoring for credential use, created a 5-year exposure window. The cost of prevention (pre-commit hooks + 90-day rotation) was trivially small compared to the cost of the incident.
+
+---
+
+### S4. You are designing the auth system for a public developer API platform (think Stripe, Twilio, or GitHub). What are the key design decisions?
+
+<AccordionGroup>
+<Accordion title="What weak candidates say">
+"I'd use OAuth 2.0 with API keys. Developers get a key, they put it in the header, and we validate it."
+
+This conflates two different access patterns and ignores the lifecycle management, scoping, and developer experience that make API platforms successful or miserable to integrate with.
+</Accordion>
+
+<Accordion title="What strong candidates say">
+A developer API platform has two fundamentally different auth consumers: the developer's server (machine-to-machine, high trust, programmatic) and the developer's end users (human, delegated access, varying trust). Each needs a different auth mechanism.
+
+**Decision 1: API keys for server-to-server.**
+API keys are the right default for the server-to-server case. Developers hate OAuth for simple integrations -- Stripe's success is partly because `curl -u sk_live_xxx:` just works. But API key design has critical nuances:
+
+- **Two key types: publishable and secret.** Stripe's `pk_live_` and `sk_live_` pattern is the gold standard. Publishable keys can be embedded in client-side code (they can only create tokens, not read data). Secret keys must stay server-side and have full API access. This is not just a naming convention -- they are different credentials with different permission scopes.
+- **Test vs. live keys.** Every developer gets a sandbox (`sk_test_`) and production (`sk_live_`) key pair. Test keys hit sandbox data. This prevents developers from accidentally running tests against production data. Stripe processes $1T+ annually and attributes part of their developer experience success to this separation.
+- **Key rolling without downtime.** Support two active keys simultaneously. The developer generates a new key, updates their servers, then revokes the old key. At no point is there a window where no key works. Twilio calls this "secondary auth tokens."
+- **Scoped keys (restricted keys).** Let developers create keys with limited permissions: "this key can only send SMS, not read account data." Stripe's restricted keys support per-resource granular scoping. This enables least-privilege for different services within the developer's architecture.
+
+**Decision 2: OAuth 2.0 for user-delegated access.**
+When the developer's application needs to act on behalf of their end users (e.g., a GitHub App that reads a user's repositories), OAuth 2.0 Authorization Code + PKCE is the right flow. The developer's app never sees the user's credentials -- they get a scoped access token.
+
+**Decision 3: Webhook authentication.**
+The platform sends webhooks to the developer's server. The developer needs to verify these are genuine. Use HMAC-SHA256 signing with a per-developer webhook secret. Include a timestamp in the signed payload and reject webhooks older than 5 minutes (replay protection). Stripe's `stripe-signature` header is the industry reference implementation. Provide signature verification libraries in every major language so developers do not implement HMAC verification incorrectly.
+
+**Decision 4: Rate limiting by key.**
+Rate limits must be per-API-key, not per-IP (developers may have multiple services behind one IP, or use serverless functions with dynamic IPs). Return rate limit headers (`X-RateLimit-Limit`, `X-RateLimit-Remaining`, `X-RateLimit-Reset`) on every response so developers can implement backoff. Stripe returns 429 with a `Retry-After` header and includes rate limit status on every 200 response.
+
+**Decision 5: Idempotency for safety.**
+Include an `Idempotency-Key` header that developers can set on mutating requests. If a request is retried (network failure, timeout), the same idempotency key returns the original response instead of creating a duplicate. This is an auth-adjacent concern that directly impacts developer trust in the platform.
+</Accordion>
+</AccordionGroup>
+
+#### Follow-ups
+
+<AccordionGroup>
+<Accordion title="A developer's API key is leaked in a client-side JavaScript bundle. How does your platform handle this?">
+If it is a publishable key (`pk_live_`), this is expected and acceptable -- publishable keys are designed for client-side use with limited scope (typically only tokenization, not reading data). If it is a secret key (`sk_live_`), this is a critical incident for that developer. The platform should: (1) automatically detect exposed keys using GitHub's secret scanning partnership program (GitHub notifies the API provider when a matching key pattern is found in a public repo), (2) notify the developer immediately via email, dashboard alert, and webhook, (3) provide a one-click key rotation in the dashboard, and (4) optionally auto-revoke if the key is used from a suspicious pattern after notification. Stripe, Twilio, AWS, and over 200 other providers participate in GitHub's secret scanning program, which catches exposed keys within minutes of being pushed.
+</Accordion>
+
+<Accordion title="How do you handle API versioning alongside authentication?">
+API versioning and auth are orthogonal but interact at the key level. My approach: the API key itself is version-agnostic, but the developer can set a default API version in their dashboard (Stripe's `api_version` header pattern). Auth mechanisms should be stable across API versions -- never break authentication behavior in a version change. If you need to deprecate an auth mechanism (e.g., removing Basic Auth in favor of Bearer tokens), give at least 12 months of deprecation warnings, track which developers are still using the old mechanism, and email them directly. Stripe's API versioning documentation is the reference implementation: each developer is pinned to the API version at the time they started, and they opt into upgrades.
+</Accordion>
+</AccordionGroup>
+
+**War Story:** When Heroku suffered a breach in April 2022, attackers accessed a database containing hashed and salted OAuth tokens for GitHub integrations. Heroku had to revoke all OAuth tokens, which broke CI/CD pipelines for millions of developers. The cascading impact was enormous -- builds failed worldwide, deploys halted, and developers scrambled to re-authorize. The lesson for API platform designers: when you design your token storage, assume a breach will happen and design the revocation mechanism to be as targeted as possible. Heroku had to revoke all tokens because they could not determine which specific tokens were accessed. If they had implemented per-session or per-device token tracking with access logging, they could have revoked only the potentially compromised subset.
+
+---
+
+### S5. Your team just deployed a new authorization policy engine (OPA/Cedar). A week later, a customer reports they can no longer access a feature they used yesterday. Nothing in their account changed. How do you debug this?
+
+<AccordionGroup>
+<Accordion title="What weak candidates say">
+"I'd check their role and permissions in the database. Maybe someone changed their role."
+
+This answer ignores the most likely cause -- the new policy engine -- and jumps to the most obvious but least probable explanation.
+</Accordion>
+
+<Accordion title="What strong candidates say">
+When a customer loses access after a policy engine deployment, the most likely cause is the policy engine itself -- not a change to the user's account. Authorization bugs are among the hardest to debug because they are silent (no error, no crash, just a 403) and context-dependent (works for one user, fails for another).
+
+**My debugging framework:**
+
+**Step 1: Reproduce the denial.**
+Get the exact request that is failing. What endpoint, what HTTP method, what resource ID, what user ID. Fire the same request in a staging environment with the same user context. If it works in staging but not production, you have a deployment or data inconsistency issue.
+
+**Step 2: Get the policy evaluation trace.**
+This is why policy engines like OPA and Cedar are superior to hardcoded if-statements -- they produce evaluation traces. In OPA, call the `/v1/data` endpoint with `?explain=full` to get a step-by-step trace of which rules were evaluated and which conditions failed. In Cedar, the `is_authorized()` API returns a `Diagnostics` object that lists which policies were satisfied and which were not. Without this trace, you are guessing. With it, you can see exactly which policy clause denied the request.
+
+**Step 3: Check for policy regression.**
+Compare the currently deployed policy bundle against the previous version. `diff` the Rego/Cedar policy files. Common causes of silent authorization regressions:
+- **Default-deny rule ordering.** In OPA, policies are evaluated as a set of rules that contribute to a decision. If a new deny rule was added that is more general than intended, it overrides a more specific allow rule. For example, a new rule that denies access to all resources in a "draft" state might also deny access to resources the user created themselves.
+- **Missing attribute in the policy input.** The new policy checks an attribute (e.g., `input.user.department`) that the calling service does not populate. The attribute is `null`, the policy comparison fails, and access is denied. This is the most common OPA regression I have seen -- the policy author tested with complete input data, but production services send incomplete context.
+- **Timestamp or cache issues.** If the policy bundle is cached and the new version has not propagated to all nodes, some users hit old policies and some hit new ones. Symptoms look "random."
+
+**Step 4: Check for data changes, not just policy changes.**
+Authorization decisions depend on both policy (rules) and data (attributes). Even if the policy did not change, the data it evaluates might have. Did the user's group membership change in the IdP? Did a resource's classification change? Did a tenant's feature flags change? In ABAC systems, the "policy didn't change" answer is incomplete -- the attributes the policy evaluates are equally important.
+
+**Step 5: Implement authorization regression testing.**
+After fixing the issue, write a test case: "User with role X accessing resource Y should return ALLOW." Build a suite of these golden-path authorization tests and run them on every policy deployment. OPA has a built-in test framework (`opa test`) that evaluates policies against fixtures. This is the authorization equivalent of database migration tests -- you would not deploy a schema change without testing it, and you should not deploy a policy change without testing it.
+</Accordion>
+</AccordionGroup>
+
+#### Follow-ups
+
+<AccordionGroup>
+<Accordion title="How do you prevent authorization regressions from reaching production?">
+Three layers. First, **policy unit tests** -- write tests for every authorization rule using OPA's `opa test` or Cedar's policy testing framework. Tests should cover both allow and deny cases, with special attention to edge cases like null attributes and inherited permissions. Second, **canary evaluation** -- deploy the new policy alongside the old one, evaluate both for every request, but enforce only the old policy. Log any divergences (old policy allows, new policy denies). Review divergences before switching enforcement to the new policy. Spotify published a talk about using this "shadow mode" pattern for their authorization migrations. Third, **blast radius limiting** -- roll out new policies to one tenant or one service at a time, not globally. If the policy breaks, only one tenant is affected while you fix it.
+</Accordion>
+
+<Accordion title="How does authorization debugging change at 1000 policies vs 10?">
+At 10 policies, you can read them all and reason about interactions. At 1000, you need tooling. OPA's `opa eval --partial` command evaluates policies and shows exactly which rules contributed to the decision. Cedar's analysis tools can verify whether two policies conflict (one allows what another denies for the same request). At scale, the critical investment is **authorization decision logging** -- log every authorization decision with the full input context, the policies evaluated, and the result. Store these in a queryable system (Elasticsearch, BigQuery). When a customer reports "I can't access X," you query the decision log: `user_id=4572 AND resource=/orders/789 AND decision=DENY` and get the exact policy clause that denied them, with the full attribute context. Without this, debugging 1000 policies is needle-in-a-haystack.
+</Accordion>
+</AccordionGroup>
+
+**War Story:** A healthcare SaaS company deployed a new Cedar-based policy engine to replace their hardcoded authorization logic. Within 48 hours, three hospitals reported that nurses could not access patient vitals -- a patient safety issue. Root cause: the new policy required a `department_id` attribute on the user context. The EHR integration that populated user attributes included `department_id` for doctors but not for nurses (nurses in this system were associated with wards, not departments). The policy evaluated `department_id = null`, which matched no allow rules, so access was denied. The fix was a 2-line policy change to check `ward_id` as an alternative. But the real fix was adding a pre-deployment authorization audit: evaluate the new policy against a sample of 10,000 real production requests and flag any decision changes before deploying.
+
+---
+
+### S6. The "obvious" answer is wrong: Your security team mandates 90-day password rotation for all users. Argue against this policy with evidence.
+
+<AccordionGroup>
+<Accordion title="What weak candidates say">
+"Yeah, 90-day rotation is a pain but it's a best practice for security compliance."
+
+This answer accepts the premise without questioning it. Mandatory password rotation is one of the most well-studied examples of a security practice that actually reduces security.
+</Accordion>
+
+<Accordion title="What strong candidates say">
+I would push back on this policy with evidence from NIST, Microsoft, and empirical research -- and I have won this argument at a previous company.
+
+**The evidence against mandatory rotation:**
+
+NIST Special Publication 800-63B (Digital Identity Guidelines, 2017, reaffirmed 2024) explicitly recommends against periodic password rotation. Their exact language: "Verifiers SHOULD NOT require memorized secrets to be changed arbitrarily (e.g., periodically)." Microsoft's identity team published research in 2019 recommending the removal of password expiration policies, and Azure AD default security baselines no longer include mandatory rotation.
+
+**Why rotation makes security worse:**
+
+1. **Predictable password mutations.** When forced to change passwords every 90 days, users follow predictable patterns: `Password1!` becomes `Password2!` becomes `Password3!`. Research from UNC Chapel Hill (2010, Komanduri et al.) found that given a user's previous password, researchers could crack 17% of their new passwords within 5 guesses. Mandatory rotation encourages minimal-diff changes, not stronger passwords.
+
+2. **Increased help desk load and workaround behavior.** A Microsoft study found that mandatory rotation policies doubled password-related help desk tickets. Users who cannot remember their new password write it on sticky notes, store it in unencrypted files, or reuse it across services. Each of these behaviors is worse than keeping a strong, unique password longer.
+
+3. **False sense of security.** A 90-day rotation policy does not help if the password is compromised and used within 89 days. It only helps if the attacker steals the password and waits more than 90 days to use it, which is not how credential attacks work. Credential stuffing attacks use stolen passwords within hours, not months.
+
+**What I would propose instead:**
+
+- **Breach-based rotation:** Monitor credentials against breach databases (Have I Been Pwned API, Enzoic). If a user's password appears in a breach, force rotation immediately. This catches actual compromise, not calendar dates.
+- **Strong password policy:** Minimum 12 characters, no complexity requirements (research shows complexity rules reduce entropy because users pick predictable patterns), check against common password lists and breach databases at creation time.
+- **MFA as the real protection.** A compromised password with MFA enabled is far less dangerous than a fresh password without MFA. Invest in MFA adoption, not rotation frequency.
+- **Event-based rotation for service accounts.** For machine credentials (API keys, database passwords, service account tokens), automated rotation every 30-90 days is appropriate because these are generated (not memorized), managed by secrets managers, and benefit from limiting exposure windows. The key distinction: machine credentials can be randomly generated and automatically deployed -- the problems with human password rotation do not apply.
+
+**How to present this to the security team:** "I understand the intent behind the 90-day policy -- limiting the window of exposure for compromised credentials. I'd like to achieve the same goal more effectively with breach-based rotation and mandatory MFA, which NIST 800-63B recommends as the modern approach. Here is the evidence..." Frame it as achieving the same security objective through more effective means, not as weakening security.
+</Accordion>
+</AccordionGroup>
+
+#### Follow-ups
+
+<AccordionGroup>
+<Accordion title="The security team says 'we need it for SOC 2 compliance.' Are they right?">
+Not exactly. SOC 2 requires "logical and physical access controls" but does not prescribe specific password rotation periods. The auditor evaluates whether your controls are effective and consistently applied. A policy of "breach-based rotation + MFA + minimum 12 characters + monitoring" is defensible to a SOC 2 auditor if you can demonstrate it is enforced and effective. I have been through SOC 2 audits where we successfully defended this exact position. The key is documentation: write a formal password policy that explains why you use breach-based rotation instead of periodic rotation, cite the NIST 800-63B guidance, and show the auditor your monitoring and enforcement mechanisms. That said, some auditors are more conservative than others, and some enterprise customers have their own security questionnaires that specifically ask for rotation periods. In those cases, you may need to implement per-tenant rotation policies as a business decision, not a security one.
+</Accordion>
+
+<Accordion title="What about privileged accounts -- admin access, root accounts, break-glass credentials?">
+Different rules for different risk profiles. Privileged accounts warrant more aggressive rotation because the blast radius of compromise is larger. For cloud root accounts (AWS root, GCP org admin): these should have no standing credentials at all -- use OIDC federation for programmatic access and treat the root password as a break-glass credential stored in a physical safe. For application admin accounts: short-lived, just-in-time access provisioned via a PAM (Privileged Access Management) tool like CyberArk or HashiCorp Boundary. The admin requests elevated access for a stated reason, gets a time-limited credential (1-4 hours), and the credential is automatically revoked. This is better than rotation because the credential's lifetime is hours, not days. For break-glass credentials: store them in a sealed envelope (or encrypted vault) and rotate after every use. Audit trail is mandatory.
+</Accordion>
+</AccordionGroup>
+
+**War Story:** In 2019, Microsoft officially removed password expiration policies from their Windows security baseline recommendations. Their internal research, analyzing telemetry from millions of Azure AD accounts, found that organizations with mandatory rotation had a higher rate of compromised accounts than those with breach-based monitoring and MFA enforcement. The reason: rotation led to weaker passwords (predictable patterns) and increased credential reuse across services. Microsoft's Alex Weinert published a blog post titled "Your Pa$$word doesn't matter" that showed password spray attacks (trying common passwords against many accounts) were 10x more likely to succeed against organizations with rotation policies because users converged on predictable, minimally-different passwords.
+
+---
+
+### S7. You inherit a monolith that stores user sessions in a database table with no encryption. The app has 500K monthly active users. Design a migration to modern session management without downtime.
+
+<AccordionGroup>
+<Accordion title="What weak candidates say">
+"I'd migrate everything to Redis with JWTs and deploy it over a weekend."
+
+Big-bang migrations of auth systems are how you get a P0 incident at 2 AM on Sunday that locks out 500K users.
+</Accordion>
+
+<Accordion title="What strong candidates say">
+This is a migration that requires zero-downtime execution because sessions are the live nerve of every user interaction. Get this wrong and you lock out all 500K users simultaneously.
+
+**My phased migration plan:**
+
+**Phase 0: Assess the current state (1-2 days).**
+- Query the session table: how many active sessions, average session size, read/write QPS, distribution of session ages. At 500K MAU with typical 30-day session windows, expect 200K-500K active session rows.
+- Benchmark current session lookup latency: if it is a primary key lookup in PostgreSQL, it is probably 1-5ms. Redis will bring this to 0.1-0.5ms, but the existing latency may be acceptable -- do not over-optimize.
+- Check what the session contains: just the user ID, or is there cart data, feature flags, partial form state? The session payload size affects Redis memory planning.
+
+**Phase 1: Add Redis as a write-through cache (1 week).**
+Deploy Redis alongside the existing database. Modify the session middleware to: on session read, check Redis first. Cache miss? Read from PostgreSQL, write to Redis, return. On session write, write to both Redis and PostgreSQL (dual-write). On session delete, delete from both.
+
+This phase has zero risk -- the database remains the source of truth. If Redis fails, the app falls back to PostgreSQL with a performance penalty but no data loss. Monitor Redis hit rate: it should approach 95%+ within a day as active sessions warm the cache.
+
+**Phase 2: Migrate existing sessions to Redis (1 week).**
+Run a background migration script that reads all active sessions from PostgreSQL and writes them to Redis. Batch the reads (1000 sessions per query) and write to Redis using `MSET` with pipeline mode. At 500K sessions of ~1KB each, this uses ~500MB of Redis memory -- trivially small. Set a Redis TTL equal to each session's remaining lifetime (session expiry minus current time).
+
+After migration, Redis hit rate should be ~100%. The PostgreSQL table is still there as a fallback.
+
+**Phase 3: Make Redis the primary, PostgreSQL the fallback (1 week).**
+Flip the read path: read from Redis first, do not fall back to PostgreSQL (log a warning if Redis returns a miss for a session that should exist). Writes still go to both. Monitor for any sessions that exist in PostgreSQL but not Redis (the migration missed them or they were created during a Redis outage).
+
+**Phase 4: Remove PostgreSQL session writes (1 week).**
+Stop writing sessions to PostgreSQL. Redis is now the sole session store. Keep the PostgreSQL session table read-only for 30 days as a safety net (you can re-enable writes if Redis has issues).
+
+**Phase 5: Drop the PostgreSQL session table (after 30 days).**
+Verify that no application code references the session table. Drop it.
+
+**Encryption:**
+At Phase 1, add encryption to the session data before writing to Redis. Use AES-256-GCM with a key managed by KMS (AWS KMS, Vault transit secrets engine). The session data in Redis is encrypted at the application layer. If Redis is compromised, the attacker gets ciphertext, not session data. Encrypt the session data, not the session key (the key is just a random ID used for lookup).
+
+**Total timeline:** 4-5 weeks, zero downtime, rollback possible at every phase.
+</Accordion>
+</AccordionGroup>
+
+#### Follow-ups
+
+<AccordionGroup>
+<Accordion title="What Redis configuration is critical for session storage?">
+Five settings that matter. (1) **Persistence:** Enable AOF (Append Only File) with `appendfsync everysec` -- you lose at most 1 second of sessions on crash, which is acceptable. RDB snapshots alone are not sufficient because you could lose minutes of sessions. (2) **Eviction policy:** Set `maxmemory-policy noeviction`. For session stores, silently evicting sessions is unacceptable -- it is better to reject new session creation (which surfaces as a visible error) than to silently log out existing users. (3) **Memory:** Provision 2x the estimated session memory to handle traffic spikes without eviction pressure. At 500K sessions of 1KB each, provision 1GB minimum. (4) **Replication:** Run Redis with at least one replica for failover. Use Redis Sentinel or Redis Cluster for automatic failover in under 30 seconds. (5) **Connection pooling:** Use a connection pool (ioredis, Jedis pool) sized to your application's concurrency. At 500K MAU, plan for 5-10K concurrent session operations during peak.
+</Accordion>
+
+<Accordion title="How do you handle the dual-write consistency problem?">
+During Phase 1-3, you are dual-writing to Redis and PostgreSQL. If one write succeeds and the other fails, you have inconsistency. The pragmatic approach: write to Redis first (the fast path), then write to PostgreSQL asynchronously. If the PostgreSQL write fails, log a warning but do not fail the request -- Redis is the primary by this point, and the PostgreSQL write is a safety net, not a critical path. For the session create operation specifically, use a database transaction that writes to both, with Redis as the fallback if the transaction fails. The key insight: session data is ephemeral by nature (it expires). Temporary inconsistency between Redis and PostgreSQL is acceptable because the worst case is a user's session exists in one store but not the other, and the TTL will clean up stale entries.
+</Accordion>
+</AccordionGroup>
+
+**War Story:** Shopify's session infrastructure serves over 1 million requests per second during flash sales (Black Friday, product drops). Their session store migration from MySQL to a custom Redis-based system took 18 months and was done in 7 phases. The critical insight from their engineering blog: they kept MySQL as a fallback for 6 months after the migration was "complete" because edge cases kept surfacing -- session serialization format differences between Ruby marshaling and Redis encoding, race conditions during concurrent session updates, and session affinity issues during pod restarts. Their public post-mortem attributed the successful migration to one principle: "never remove the old system until the new system has survived a Black Friday."
+
+---
+
+### S8. A penetration tester reports a critical finding: your application's password reset flow is vulnerable to account takeover. The reset token is a timestamp-based hash. Redesign the flow.
+
+<AccordionGroup>
+<Accordion title="What weak candidates say">
+"We should make the token more random and add expiration."
+
+This answer treats the symptom (weak token) without addressing the systemic design flaws that make password reset flows one of the most common attack vectors.
+</Accordion>
+
+<Accordion title="What strong candidates say">
+Password reset is the backdoor to your authentication system. If the reset flow is weak, it does not matter how strong your login is -- the attacker resets the password and walks in through the front door. This is one of the most attacked flows in any application.
+
+**Why timestamp-based tokens are broken:**
+If the reset token is `SHA256(user_email + timestamp)`, the attacker knows the email (the reset was triggered for a specific account) and can guess the timestamp with second-level precision. They generate candidate tokens for every second in a 60-second window and try each one. That is 60 attempts -- trivially brute-forceable. Even with minute-level precision, 60 attempts over a day's window is only 1,440 tries.
+
+**My redesigned flow:**
+
+**Token generation:**
+Generate a 256-bit cryptographically random token using `crypto.randomBytes(32)` (Node.js), `secrets.token_urlsafe(32)` (Python), or the OS CSPRNG. The token has no relationship to the user, the timestamp, or any other predictable input. Store a SHA-256 hash of the token in the database (not the raw token -- same principle as refresh token storage). This way, a database leak does not expose usable reset tokens.
+
+**Token delivery:**
+Send the token in a link: `https://app.com/reset?token=<base64url_token>`. The link goes to the email on file. Never reveal whether the email exists in the system -- always respond with "if an account exists for that email, a reset link has been sent." This prevents account enumeration.
+
+**Token validation:**
+- **Single-use:** After the token is used (password is changed), delete it from the database. A token can never be reused.
+- **Short-lived:** 15-30 minute expiration. Not 24 hours, not "until used." The window should be long enough for a user to check their email but short enough to limit the exposure if the email is compromised.
+- **Rate-limited:** Maximum 3 reset requests per email per hour. Maximum 10 reset requests per IP per hour. This prevents token-flooding attacks (where the attacker triggers hundreds of resets hoping to receive one via email interception).
+- **Invalidate on password change or new reset request.** If the user requests a second reset, invalidate the first token. If the user logs in and changes their password manually, invalidate all pending reset tokens.
+
+**Post-reset actions:**
+After a successful password reset: revoke ALL active sessions and refresh tokens for that user (the password change might be due to account compromise -- stale sessions on the attacker's device should not survive). Send a notification email to the user confirming the password was changed, including the IP and user agent that performed the reset. If MFA is enabled, require MFA verification before the reset completes (not after).
+
+**Defense against email interception:**
+If the user has MFA enabled, require MFA as part of the reset flow. The reset link gets them to the reset page, but they must enter their TOTP/passkey before the new password is accepted. This prevents account takeover even if the attacker intercepts the email.
+
+**The design principle:** The password reset flow should be at least as secure as the login flow. If login requires MFA, reset should require MFA. If login has brute-force protection, reset should have brute-force protection. Most teams spend months securing login and then build reset in an afternoon -- attackers know this.
+</Accordion>
+</AccordionGroup>
+
+#### Follow-ups
+
+<AccordionGroup>
+<Accordion title="What about 'security questions' as an alternative reset mechanism?">
+Security questions should not exist in any system built after 2015. Sarah Palin's email was hacked in 2008 using the security question "Where did you meet your spouse?" -- the answer was publicly available. Research from Google (Bonneau et al., 2015) found that security questions are either easy to guess (mother's maiden name, city of birth) or easy to forget (favorite food from 10 years ago). They are a liability, not a control. If you need an alternative reset mechanism, use: (1) backup codes generated at account creation (stored as hashed, single-use), (2) a secondary verified email address, or (3) for high-security accounts, an identity verification flow (photo ID upload, verified by support staff). But never security questions.
+</Accordion>
+
+<Accordion title="How do you handle the 'forgot password' flow for an account that only uses social login (Google/GitHub)?">
+If the user registered exclusively via Google, they do not have a password to reset. The "forgot password" flow should detect this and redirect them to re-authenticate with their linked provider. If their Google account is compromised or locked, this is where backup recovery methods matter: backup codes generated at initial sign-up, a verified secondary email, or a customer support identity verification flow. The trap: some apps let social-login-only users set a password via the reset flow. This creates a password for an account that never had one, which might bypass MFA (if MFA was enforced on the social login but not on the new password login). If you allow this, ensure the new password path also requires MFA.
+</Accordion>
+</AccordionGroup>
+
+**War Story:** In 2012, a hacker took over journalist Mat Honan's entire digital life -- Apple ID, Gmail, Twitter, Amazon -- in a cascading chain that started with a password reset. The attacker called Apple support, provided the last four digits of Honan's credit card (obtained from Amazon's support, which displayed them), and got a password reset for his Apple ID. From there, they used the Apple email to reset his Gmail, and from Gmail reset his Twitter. The entire chain exploited the weakest link: the password reset flow's identity verification at Apple and the information disclosure at Amazon. The lesson: password reset flows are not isolated -- they are part of a chain of trust across services. The weakest reset flow in the chain determines the security of all accounts linked by email.
+
+---
+
+### S9. Your application encrypts sensitive data at rest using AES-256. A compliance auditor asks: "Who can decrypt this data, and how do you know?" Walk through your answer.
+
+<AccordionGroup>
+<Accordion title="What weak candidates say">
+"Only the application can decrypt it because the encryption key is in our environment variables."
+
+This answer confuses "where the key is stored" with "who has access to the key." If the encryption key is in an environment variable, anyone with access to the deployment configuration, the container runtime, the CI/CD pipeline, or the host OS can read it.
+</Accordion>
+
+<Accordion title="What strong candidates say">
+This is the question that separates "we encrypt data" from "we have a defensible encryption architecture." The auditor is not asking whether you encrypt -- they are asking whether you control the key lifecycle.
+
+**My answer to the auditor:**
+
+**Layer 1: What is encrypted and with what.**
+We use envelope encryption via AWS KMS (or HashiCorp Vault Transit). The data is encrypted with a Data Encryption Key (DEK) using AES-256-GCM. The DEK itself is encrypted by a Key Encryption Key (KEK) managed by KMS. The encrypted DEK is stored alongside the encrypted data. The KEK never leaves KMS.
+
+**Layer 2: Who can decrypt.**
+To decrypt data, a principal needs two things: (1) access to the encrypted DEK (stored in our database), and (2) permission to call KMS Decrypt to unwrap the DEK. KMS Decrypt permission is controlled by an IAM policy that grants access to exactly three IAM roles:
+- The application service role (production app servers).
+- The data engineering role (for analytical pipelines, with request logging).
+- The break-glass admin role (requires two-person approval to assume).
+
+No human has standing access to decrypt production data. The break-glass role requires an approval workflow (PagerDuty + Slack confirmation from two engineers), automatically expires after 4 hours, and every KMS Decrypt call is logged in CloudTrail with the caller's identity, timestamp, and the key ARN used.
+
+**Layer 3: How I know (audit trail).**
+Every KMS Decrypt call is recorded in AWS CloudTrail. I can query: "show me every data decryption event for the last 30 days, grouped by IAM principal." If an unauthorized principal decrypted data, it shows up here. We have a CloudWatch alarm that fires if any IAM principal outside the three authorized roles calls KMS Decrypt on our data key. This alarm has triggered twice in the past year -- both were misconfigured service roles in staging that were using the production KMS key. Caught within 5 minutes.
+
+**Layer 4: Key rotation.**
+KMS automatically rotates the KEK annually (configurable). Old key versions are retained to decrypt old data. New data is encrypted with the new key version. We do not need to re-encrypt all data on rotation because envelope encryption means only the DEK needs to be re-wrapped -- and KMS handles this transparently. For the DEK, we rotate per-record (each sensitive record gets its own DEK at write time), so compromise of one DEK exposes only one record.
+
+**What I would highlight to the auditor:** "The critical property is that the master key never leaves the HSM boundary. Our application code never sees the KEK -- it receives a DEK, uses it in memory to decrypt, and the DEK is garbage-collected. We can prove access control through IAM policies and prove access history through CloudTrail. And we test this quarterly by running a 'can you decrypt production data?' exercise with a test account that should not have access."
+</Accordion>
+</AccordionGroup>
+
+#### Follow-ups
+
+<AccordionGroup>
+<Accordion title="What happens if AWS KMS goes down? Can you still decrypt data?">
+If KMS is unavailable, you cannot unwrap DEKs, and you cannot decrypt data. This is the availability trade-off of external key management. Mitigations: (1) cache unwrapped DEKs in application memory for the duration of the process lifecycle -- not on disk, not in Redis, only in-process memory that disappears on restart. If the app is already running and has cached DEKs, KMS downtime does not affect active sessions. (2) KMS is a regional service with a 99.999% SLA (5 nines). Multi-region replication of KMS keys with cross-region failover provides an additional availability layer. (3) For the truly paranoid: Vault Transit secrets engine with a local Vault cluster provides the same envelope encryption pattern without a cloud dependency, but you take on operational responsibility for the HSM. In practice, I have never seen a production outage caused by KMS unavailability in 6+ years of AWS usage -- but I have seen outages caused by IAM policy misconfigurations that prevented KMS access. Test your IAM policies as part of your disaster recovery drills.
+</Accordion>
+
+<Accordion title="A developer argues that application-level encryption is unnecessary because the database already uses TDE (Transparent Data Encryption). Are they right?">
+They are solving a different threat. TDE encrypts the database files on disk -- it protects against physical theft of the disk or unauthorized filesystem access. But TDE decrypts transparently on every database query. Anyone with database query access (the application, a DBA, a compromised service with a database connection string, a SQL injection exploit) sees plaintext. Application-level encryption means the database stores ciphertext. Even if an attacker gets full SQL access, they get encrypted blobs, not sensitive data. They would additionally need KMS Decrypt permission to get the actual values. TDE and application-level encryption are complementary layers, not alternatives. Use TDE as the baseline (it is free/cheap on all major cloud databases) and add application-level encryption for the most sensitive fields (SSNs, payment data, health records) where the extra protection and audit trail justify the query-time and indexing trade-offs.
+</Accordion>
+</AccordionGroup>
+
+**War Story:** In the 2019 Capital One breach, the attacker exploited an SSRF vulnerability to obtain temporary IAM credentials from the EC2 metadata endpoint. Those credentials had permissions to call KMS Decrypt and access S3 buckets containing customer data. The encryption was there -- AES-256, KMS-managed keys. But the IAM role attached to the vulnerable server had overly broad KMS permissions. The encryption was only as strong as the access policy on the key. Capital One had done the hard part (encryption at rest) but stumbled on the "who can decrypt" question -- the answer was "anyone who compromises a web server." The fix: principle of least privilege on KMS policies. The web server role should have had permission to encrypt (write new data) but not decrypt (read existing data). Decryption permissions should have been scoped to specific backend services that actually needed to read sensitive fields.
