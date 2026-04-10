@@ -9,11 +9,17 @@ icon: "shield-halved"
 
 Linux security is multi-layered. Understanding these mechanisms is essential for infrastructure engineers building secure container platforms and debugging permission issues.
 
+Think of the kernel's security architecture like a building's security system. DAC (Unix permissions) is the lock on your office door -- the owner controls who gets a key. Capabilities are like giving the janitor a key that only opens supply closets, not the server room. Seccomp is the front desk that checks your ID against a list of approved visitors before you even reach the elevator. And LSM (SELinux/AppArmor) is the security policy that says "even if you have a key, you cannot enter this area during these hours." Each layer catches what the previous one missed.
+
 <Info>
 **Interview Frequency**: High (especially for container/cloud roles)  
 **Key Topics**: LSM framework, capabilities, seccomp-bpf, SELinux/AppArmor  
 **Time to Master**: 12-14 hours
 </Info>
+
+<Warning>
+**A senior engineer would say**: "The most common container escape vectors exploit the gap between what a container *appears* to isolate and what it *actually* isolates. Namespaces provide visibility isolation, cgroups provide resource isolation, but neither provides *security* isolation. That is the job of capabilities, seccomp, and LSM -- and if you do not configure all three, your containers are a thin veneer over a shared kernel."
+</Warning>
 
 ---
 
@@ -64,7 +70,7 @@ Linux security is multi-layered. Understanding these mechanisms is essential for
 
 ## Capabilities: Dividing Root Power
 
-Traditional Unix: UID 0 (root) can do everything. Capabilities break this into ~40 distinct privileges.
+Traditional Unix: UID 0 (root) can do everything. This is the "all or nothing" problem -- a web server that needs to bind to port 80 must run as root, which means it can also load kernel modules, reboot the machine, and read every file on the system. Capabilities break root's monolithic power into ~40 distinct privileges, each independently grantable. A process can have the ability to bind to privileged ports (`CAP_NET_BIND_SERVICE`) without having the ability to override file permissions (`CAP_DAC_OVERRIDE`).
 
 ### Common Capabilities
 
@@ -125,67 +131,104 @@ Each process has multiple capability sets:
 ### Working with Capabilities
 
 ```bash
-# View process capabilities
+# View process capabilities -- these are bitmasks stored in the
+# process's struct cred (kernel credential structure). Each bit
+# corresponds to one capability. The kernel checks CapEff on every
+# privileged operation via the capable() function.
 cat /proc/$$/status | grep Cap
-# CapInh: 0000000000000000
-# CapPrm: 0000003fffffffff
-# CapEff: 0000003fffffffff
-# CapBnd: 0000003fffffffff
-# CapAmb: 0000000000000000
+# CapInh: 0000000000000000  <- Inheritable: preserved across execve
+# CapPrm: 0000003fffffffff  <- Permitted: max caps this process can have
+# CapEff: 0000003fffffffff  <- Effective: what the kernel actually checks
+# CapBnd: 0000003fffffffff  <- Bounding: absolute ceiling, cannot grow
+# CapAmb: 0000000000000000  <- Ambient: survives exec of unprivileged binaries
 
-# Decode capability bits
+# Decode capability bits -- turns the hex bitmask into human-readable
+# capability names. Essential for debugging "why can't this process do X?"
 capsh --decode=0000003fffffffff
 
-# View capabilities of a process
+# View capabilities of a specific process by PID
 getpcaps $$
 
-# Set file capabilities (run as non-root but with cap)
+# Set file capabilities -- this embeds capability metadata in the
+# file's extended attributes (xattr: security.capability). When the
+# kernel executes this binary, it adds these capabilities to the
+# process's effective and permitted sets, even if the process is not root.
+# "+ep" means add to both effective (e) and permitted (p) sets.
 sudo setcap cap_net_bind_service=+ep /path/to/binary
 
-# View file capabilities
+# View file capabilities -- check what caps are embedded in a binary
 getcap /path/to/binary
 
-# Run with specific capabilities
+# Run with specific capabilities -- capsh is a capability-aware shell.
+# This drops root privileges but retains the specified capabilities.
 capsh --caps="cap_net_bind_service+eip" -- -c "./my_server"
 
-# Drop all capabilities except specific ones
+# Drop all capabilities except specific ones -- this is the principle
+# of least privilege in action. The process starts with ALL caps
+# (because it runs as root), then drops everything except what it needs.
 capsh --drop=all --caps="cap_net_raw+eip" -- -c "./my_program"
 ```
 
+<Tip>
+**Debugging tip**: When debugging capability-related permission denials, the fastest approach is: (1) strace the process and look for `EPERM` errors, (2) identify which syscall returned `EPERM`, (3) look up which capability that syscall requires (the man page for the syscall or `man 7 capabilities` has a mapping), (4) verify the process does not have that capability with `getpcaps <pid>`. This is faster than trial-and-error with `--cap-add`.
+</Tip>
+
 ### Kernel Capability Checks
 
+Understanding how the kernel checks capabilities helps you reason about permission denials from first principles. Every privileged operation in the kernel calls `capable()` or `ns_capable()` before proceeding.
+
 ```c
-// Kernel checks capabilities like this:
-// kernel/capability.c
+// kernel/capability.c -- this is the entry point for ALL capability checks.
+// When you see "Operation not permitted" (EPERM), it ultimately traces
+// back to one of these functions returning false.
 
 bool capable(int cap)
 {
+    // Delegates to ns_capable with the initial user namespace.
+    // This is the "traditional root check" -- are you root in the
+    // REAL (init) user namespace? In a container with user namespaces,
+    // you might be UID 0 inside the container but NOT capable() in
+    // the init namespace, which is why user namespaces provide isolation.
     return ns_capable(&init_user_ns, cap);
 }
 
 bool ns_capable(struct user_namespace *ns, int cap)
 {
+    // First, validate the capability number is within range (0-40ish).
+    // cap_valid() prevents out-of-bounds access on the bitmask.
     if (unlikely(!cap_valid(cap)))
         return false;
     
+    // security_capable() is an LSM hook -- it calls into SELinux,
+    // AppArmor, or whatever LSM is loaded. The LSM can DENY the
+    // capability even if the process's CapEff bitmask has the bit set.
+    // This is how SELinux can prevent a root process from doing things
+    // that root would normally be allowed to do.
     if (security_capable(current_cred(), ns, cap, CAP_OPT_NONE) == 0)
         return true;
     
     return false;
 }
 
-// Example: binding to privileged port
-// net/ipv4/af_inet.c
+// Example: binding to a privileged port (< 1024)
+// net/ipv4/af_inet.c -- this is the actual code path that runs when
+// your web server calls bind() on port 80. inet_prot_sock(net) returns
+// the threshold (default 1024). If the port is below the threshold AND
+// the process lacks CAP_NET_BIND_SERVICE, the bind fails with EACCES.
 if (snum < inet_prot_sock(net) &&
     !ns_capable(net->user_ns, CAP_NET_BIND_SERVICE))
     return -EACCES;
+// Note: ns_capable checks against net->user_ns, not init_user_ns.
+// This means a process that is root inside a user namespace CAN bind
+// to port 80 inside that namespace's network stack. This is the
+// mechanism that enables rootless containers to run web servers.
 ```
 
 ---
 
 ## Linux Security Modules (LSM)
 
-LSM provides hooks throughout the kernel for mandatory access control:
+LSM provides hooks throughout the kernel for mandatory access control. The key insight about LSM is that it is a *framework*, not a policy. It defines *where* security decisions are made (the hooks), but the actual policy (what is allowed or denied) is implemented by the specific LSM module (SELinux, AppArmor, or BPF LSM). Multiple LSMs can be stacked -- a single operation might pass through SELinux, AppArmor, AND BPF LSM checks, and ALL must approve for the operation to proceed.
 
 ### LSM Architecture
 
@@ -462,29 +505,51 @@ Filter system calls with BPF programs:
 #include <linux/filter.h>
 #include <sys/prctl.h>
 
-// Simple filter using libseccomp
+// libseccomp provides a high-level C API that compiles down to BPF
+// bytecode. Without libseccomp, you would have to write raw BPF
+// instructions manually (a painful exercise in register manipulation).
 #include <seccomp.h>
 
 int setup_seccomp(void)
 {
     scmp_filter_ctx ctx;
     
-    // Default: kill on disallowed syscall
+    // SCMP_ACT_KILL is the default action for any syscall NOT explicitly
+    // whitelisted below. The kernel will send SIGKILL to the process
+    // immediately -- no signal handler, no cleanup, instant death.
+    // This is the most secure default. For debugging, use SCMP_ACT_LOG
+    // (allow but log to audit) or SCMP_ACT_TRAP (send SIGSYS, which
+    // can be caught for custom error handling).
     ctx = seccomp_init(SCMP_ACT_KILL);
     if (!ctx)
         return -1;
     
-    // Allow specific syscalls
+    // Whitelist the minimal set of syscalls the program needs.
+    // This is an allowlist approach -- everything is denied by default,
+    // and you explicitly permit only what is necessary. This is more
+    // secure than a denylist (blocking specific dangerous syscalls)
+    // because new syscalls added to the kernel are automatically blocked.
     seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(read), 0);
     seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(write), 0);
     seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(exit), 0);
     seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(exit_group), 0);
     
-    // Allow open only for specific fd range
+    // Conditional rules -- allow open() only with O_RDONLY flag.
+    // This demonstrates argument filtering: seccomp can inspect syscall
+    // arguments, not just the syscall number. Here, SCMP_A1 means
+    // "check argument 1 (the flags parameter of open)." This prevents
+    // the process from opening files for writing even if it has the
+    // open() syscall available.
     seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(open), 1,
                      SCMP_A1(SCMP_CMP_EQ, O_RDONLY));
     
-    // Load the filter
+    // seccomp_load() compiles the rules into BPF bytecode and installs
+    // the filter via prctl(PR_SET_SECCOMP). Once loaded, the filter
+    // cannot be removed or relaxed -- only made MORE restrictive by
+    // adding additional filters (which are evaluated in order, with
+    // the most restrictive result winning). This is a deliberate
+    // security property: a compromised process cannot disable its own
+    // seccomp filter.
     if (seccomp_load(ctx) < 0) {
         seccomp_release(ctx);
         return -1;
@@ -494,6 +559,10 @@ int setup_seccomp(void)
     return 0;
 }
 ```
+
+<Warning>
+**Production gotcha**: Seccomp filters are inherited by child processes and survive `execve()`. If you install a filter that is too restrictive, child processes (or the program you exec into) may fail in unexpected ways. A common mistake: blocking `clone()` in the seccomp filter, which prevents the process from creating threads. Docker's default seccomp profile carefully allows `clone()` with specific flag combinations to permit threading while blocking `clone(CLONE_NEWUSER)` (which could be used for privilege escalation).
+</Warning>
 
 ### Docker Seccomp Profile
 
@@ -537,40 +606,62 @@ docker run --security-opt seccomp=/path/to/profile.json myimage
 
 ## eBPF LSM
 
-Write custom security policies with eBPF:
+BPF LSM is the newest addition to the LSM family (merged in Linux 5.7, around 2020). It lets you write custom security policies as eBPF programs that attach to the same LSM hooks used by SELinux and AppArmor. The advantage is that you can deploy and modify policies at runtime without rebooting, recompiling the kernel, or writing complex SELinux policy modules. This is a game-changer for organizations that need dynamic security policies (e.g., blocking access to specific files based on real-time threat intelligence).
 
 ```c
-// Custom LSM program
+// This BPF program attaches to the file_open LSM hook. It runs every
+// time ANY process on the system opens a file. The kernel calls
+// security_file_open() from vfs_open(), which dispatches to all
+// registered LSM modules including our BPF program. If we return
+// a negative errno, the open is denied.
 SEC("lsm/file_open")
 int BPF_PROG(restrict_file_open, struct file *file)
 {
     const char *filename;
     char buf[256];
     
+    // BPF_CORE_READ traverses the kernel struct chain:
+    // file -> f_path.dentry -> d_name.name
+    // This gives us the filename component (not the full path!).
+    // d_name.name is the dentry's short name -- "shadow", not "/etc/shadow".
+    // For full path checking, you would need to walk the dentry tree
+    // upward, which is complex in BPF due to loop restrictions.
     filename = BPF_CORE_READ(file, f_path.dentry, d_name.name);
     bpf_probe_read_kernel_str(buf, sizeof(buf), filename);
     
-    // Block access to /etc/shadow
+    // Block access to /etc/shadow -- the character-by-character comparison
+    // is necessary because BPF does not support strcmp(). The BPF verifier
+    // requires bounded loops and known-size comparisons. In production,
+    // you would use a BPF hash map to store blocked filenames and do a
+    // map lookup instead of string matching.
     if (buf[0] == 's' && buf[1] == 'h' && buf[2] == 'a' &&
         buf[3] == 'd' && buf[4] == 'o' && buf[5] == 'w') {
-        return -EPERM;
+        return -EPERM;  // Deny -- kernel translates this to "Permission denied"
     }
     
-    return 0;  // Allow
+    return 0;  // Allow -- returning 0 means "this LSM module approves"
 }
 
+// Protect a critical process from being killed. This attaches to the
+// task_kill LSM hook, which the kernel calls from kill_pid_info()
+// before delivering any signal. By returning -EPERM for SIGKILL to
+// our protected PID, we make the process unkillable (except by the
+// kernel itself, e.g., OOM killer, which bypasses LSM hooks).
 SEC("lsm/task_kill")
 int BPF_PROG(restrict_kill, struct task_struct *p,
              struct kernel_siginfo *info, int sig,
              const struct cred *cred)
 {
-    // Block SIGKILL to specific process
     if (sig == SIGKILL && BPF_CORE_READ(p, pid) == protected_pid) {
         return -EPERM;
     }
     return 0;
 }
 ```
+
+<Note>
+**A senior engineer would say**: "BPF LSM gives you the security enforcement power of SELinux with the deployment speed of a feature flag. I can push a new security policy to 10,000 servers in minutes without touching the kernel, the boot config, or the SELinux policy compiler. For zero-day response, that speed difference matters."
+</Note>
 
 ---
 
@@ -622,27 +713,52 @@ int BPF_PROG(restrict_kill, struct task_struct *p,
 ### Docker Security Options
 
 ```bash
-# Run with minimal capabilities
+# Drop ALL capabilities, then add back only what the app needs.
+# This is the principle of least privilege. Docker's default grants
+# ~14 capabilities, which is more than most apps need. nginx only
+# needs CAP_NET_BIND_SERVICE (to bind port 80) and CAP_CHOWN/SETUID
+# (to drop to the nginx user after binding). Everything else is attack surface.
 docker run --cap-drop=all --cap-add=net_bind_service nginx
 
-# No new privileges (block setuid)
+# no-new-privileges prevents privilege escalation via setuid binaries.
+# Without this flag, a process inside the container could execute a
+# setuid binary (e.g., /usr/bin/passwd) and temporarily gain elevated
+# capabilities. The PR_SET_NO_NEW_PRIVS prctl flag makes this impossible --
+# execve() will not grant additional privileges, even for setuid binaries.
 docker run --security-opt=no-new-privileges:true myapp
 
-# Custom seccomp profile
+# Custom seccomp profile -- override Docker's default profile with
+# your own. Useful for apps that need syscalls blocked by default
+# (e.g., ptrace for debuggers) or for tightening the filter further.
 docker run --security-opt seccomp=profile.json myapp
 
-# Custom AppArmor profile
+# Custom AppArmor profile -- applies mandatory access control beyond
+# what capabilities and seccomp provide. AppArmor can restrict file
+# paths, network access patterns, and mount operations.
 docker run --security-opt apparmor=my-profile myapp
 
-# Read-only rootfs
+# Read-only rootfs -- the container cannot modify any files in its
+# filesystem. This prevents attackers from installing backdoors, modifying
+# binaries, or writing persistent malware. The --tmpfs flag creates a
+# writable tmpfs mount for /tmp (because most apps need a writable tmp).
 docker run --read-only --tmpfs /tmp myapp
 
-# Run as non-root
+# Run as non-root -- even inside the container. UID 1000 has no special
+# kernel privileges. Combined with --cap-drop=all, this means the process
+# has essentially zero kernel privileges -- it can only do what any
+# unprivileged user can do, plus whatever capabilities you explicitly added.
 docker run --user 1000:1000 myapp
 
 # Completely unprivileged (rootless Docker)
-# Docker daemon runs as non-root user
+# The Docker daemon itself runs as a non-root user. This means even a
+# container escape only gives the attacker the privileges of an unprivileged
+# user on the host -- a massive improvement over traditional Docker where
+# the daemon runs as root.
 ```
+
+<Tip>
+**Debugging tip**: To see exactly what security restrictions are applied to a running container, use `docker inspect` and look at the `HostConfig` section. Key fields: `SecurityOpt` (seccomp and AppArmor profiles), `CapAdd`/`CapDrop` (capabilities), `Privileged` (if true, all security is disabled -- very bad), and `ReadonlyRootfs`. For Kubernetes pods, use `kubectl get pod <name> -o yaml` and look at `spec.containers[].securityContext`.
+</Tip>
 
 ### Kubernetes Pod Security
 
@@ -677,45 +793,76 @@ spec:
 
 ### Capability Denied
 
+The key to debugging capability denials is understanding which kernel function called `capable()` and for which specific capability. The error path is: your syscall -> kernel subsystem -> `capable(CAP_XXX)` returns false -> `return -EPERM`.
+
 ```bash
-# Check what capabilities a process has
+# Step 1: Check what capabilities the process currently has.
+# CapEff is the one that matters -- it is what the kernel checks.
+# Decode the hex value with capsh to see human-readable names.
 cat /proc/<pid>/status | grep Cap
+# CapEff: 0000000000000000  <- No capabilities! That is your problem.
 
-# Check what capability is needed
-# Look for "Operation not permitted" in strace
+# Step 2: Find which syscall is failing and which cap it needs.
+# strace shows the raw EPERM return. Cross-reference the failing
+# syscall with 'man 7 capabilities' which lists the capability
+# required by each privileged operation.
 strace -f ./myapp 2>&1 | grep EPERM
+# bind(3, {sa_family=AF_INET, sin_port=htons(80)}, 16) = -1 EPERM
+# -> This is bind() on port 80, which requires CAP_NET_BIND_SERVICE.
 
-# Common: check if binary has file capabilities
+# Step 3: Check if the binary has file capabilities set.
+# File capabilities are stored as extended attributes and are applied
+# when the binary is executed (similar to setuid, but finer-grained).
 getcap /path/to/binary
 
-# Add file capability
+# Step 4: Set the needed file capability.
+# "+ep" means add to effective (e) and permitted (p) sets.
 sudo setcap cap_net_bind_service=+ep /path/to/binary
 ```
 
+<Warning>
+**Common trap**: `CAP_SYS_ADMIN` is the "kitchen sink" capability -- it covers dozens of unrelated operations (mount, ptrace, keyctl, BPF, namespace creation, and more). If your process needs `CAP_SYS_ADMIN`, pause and ask why. In many cases, a more specific capability exists, or the operation can be redesigned to avoid needing elevated privileges. Granting `CAP_SYS_ADMIN` to a container is almost as dangerous as running it as `--privileged`.
+</Warning>
+
 ### SELinux Denials
 
+SELinux denials are logged as AVC (Access Vector Cache) messages in the audit subsystem. Reading these messages is a skill that every infrastructure engineer working on RHEL/CentOS/Fedora systems needs.
+
 ```bash
-# Check for denials
+# Check for denials -- -m avc filters for SELinux Access Vector Cache
+# messages. -ts recent shows only recent denials (last 10 minutes).
 ausearch -m avc -ts recent
 
-# Example denial:
+# Example denial (let's parse every field):
 # type=AVC msg=audit(...): avc: denied { read } for pid=1234
-#   comm="myapp" name="secret" dev="sda1" ino=12345
-#   scontext=system_u:system_r:httpd_t:s0
-#   tcontext=system_u:object_r:admin_home_t:s0
-#   tclass=file
+#   comm="myapp"                          <- Process command name
+#   name="secret"                         <- Target file name
+#   dev="sda1" ino=12345                  <- Device and inode of target
+#   scontext=system_u:system_r:httpd_t:s0 <- Source context (the process)
+#   tcontext=system_u:object_r:admin_home_t:s0  <- Target context (the file)
+#   tclass=file                           <- Object class (file, socket, etc.)
 
-# What this means:
-# Process with type httpd_t tried to read file with type admin_home_t
-# There's no allow rule for this
+# Translation: "Process running as type httpd_t tried to read a file
+# labeled admin_home_t. The SELinux policy has no 'allow' rule permitting
+# httpd_t to read admin_home_t files, so the access was denied."
 
-# Generate and install policy to allow
+# Quick fix option 1: Generate a policy module from the denial.
+# audit2allow reads the AVC denial and creates the minimal policy rule
+# to allow it. The -M flag creates a loadable policy module (.pp file).
 ausearch -m avc -ts recent | audit2allow -M myfix
 semodule -i myfix.pp
 
-# Or fix by changing file context
+# Quick fix option 2: Change the file's SELinux label to something
+# httpd_t is already allowed to access. This is often the BETTER fix
+# because it uses existing policy rather than adding new rules.
 chcon -t httpd_sys_content_t /path/to/file
+# Use restorecon -v /path/to/file to reset to the default context
+# defined in the system's file context database.
 ```
+
+<Tip>
+**Debugging tip**: Before using `audit2allow` blindly, understand what you are allowing. Run `audit2allow -a` (without -M) first to see the raw allow rules it would generate. If you see `allow httpd_t admin_home_t:file { read write execute }`, pause -- that is a very broad permission. The denial might indicate a misconfigured file label rather than a missing policy rule. Fix the label first (`restorecon`), and only add new policy rules if the label is correct.
+</Tip>
 
 ### AppArmor Denials
 
@@ -736,16 +883,34 @@ aa-logprof
 
 ### Seccomp Violations
 
-```bash
-# Check for seccomp kills
-dmesg | grep seccomp
+Seccomp violations are the trickiest to debug because, by default, seccomp kills the process without leaving much evidence. The process just dies with SIGSYS or SIGKILL, and you are left wondering what happened.
 
-# Run with tracing to see what's blocked
+```bash
+# Check for seccomp kills -- the kernel logs seccomp violations to
+# dmesg with the syscall number that was blocked. This is your starting
+# point: look up the syscall number in /usr/include/asm/unistd_64.h
+# to find the syscall name.
+dmesg | grep seccomp
+# audit: seccomp action=kill pid=1234 comm="myapp" syscall=101
+# syscall 101 = ptrace on x86_64
+
+# Run with strace to see what the app tries to do before it dies.
+# strace itself uses ptrace, so it intercepts syscalls BEFORE seccomp
+# sees them. This means strace output shows what the app tried to do,
+# even if seccomp would have blocked it. Useful for building a whitelist.
 strace -f ./myapp 2>&1 | head -100
 
-# Use audit mode in seccomp profile to log without blocking
+# Use audit mode to log without blocking -- change the default action
+# from KILL/ERRNO to LOG. The app runs normally, and every syscall that
+# WOULD have been blocked is logged to the audit subsystem instead.
+# Run the app through its full test suite in this mode to capture all
+# the syscalls it needs, then build your allowlist from the logs.
 # "defaultAction": "SCMP_ACT_LOG"
 ```
+
+<Note>
+**A senior engineer would say**: "The correct workflow for building a seccomp profile is: (1) run with `SCMP_ACT_LOG` under production-like load, (2) collect all the syscalls the app actually uses, (3) create an allowlist profile from that data, (4) test in `SCMP_ACT_ERRNO` mode (deny with error, not kill) to catch edge cases, (5) promote to `SCMP_ACT_KILL` for production. Skipping steps 1-2 and guessing which syscalls your app needs is how you get 3 AM pages."
+</Note>
 
 ---
 
@@ -865,6 +1030,142 @@ strace -f ./myapp 2>&1 | head -100
 | AppArmor | Profile-based access | Per-program |
 | Namespaces | Resource isolation | Per-container |
 | Cgroups | Resource limits | Per-container |
+
+---
+
+## Interview Deep-Dive
+
+<AccordionGroup>
+  <Accordion title="A container running with --privileged was compromised. Walk me through the attack surface and how each security layer was bypassed.">
+    **What the interviewer is testing**: Understanding of what `--privileged` actually disables, and why it is considered the nuclear option for container security.
+
+    **Strong answer framework**:
+
+    `--privileged` is not a single flag -- it is a shorthand that disables *every* security mechanism Docker applies to containers:
+
+    1. **All capabilities granted**: The container gets the full capability set (`CapEff = 0000003fffffffff`). This means it can `mount` filesystems, load kernel modules (`CAP_SYS_MODULE`), access raw block devices (`CAP_SYS_RAWIO`), ptrace any process (`CAP_SYS_PTRACE`), and modify network configuration (`CAP_NET_ADMIN`).
+
+    2. **Seccomp disabled**: No syscall filtering at all. The container can call `kexec_load` (replace the running kernel), `init_module` (load a kernel module), `mount` (mount any filesystem), and every other syscall the kernel supports.
+
+    3. **AppArmor/SELinux disabled**: No mandatory access control. The container can access any file, socket, or device the kernel exposes, with no policy-based restrictions.
+
+    4. **All devices accessible**: `/dev` is populated with ALL host devices, not just the safe subset Docker normally provides. The container can read and write directly to `/dev/sda` (the host's disk), `/dev/mem` (physical memory), and `/dev/kmem` (kernel memory).
+
+    5. **No read-only mounts**: Sysfs and procfs are mounted read-write, allowing the container to modify kernel parameters, cgroup settings, and more.
+
+    **Attack path for a compromised privileged container**:
+    - Mount the host filesystem: `mount /dev/sda1 /mnt` -- now you have full read/write access to the host's root filesystem
+    - Write an SSH key to the host's `/root/.ssh/authorized_keys`
+    - Or load a kernel module that gives you a root shell on the host
+    - Or write directly to `/dev/kmem` to modify kernel memory
+
+    **What impresses interviewers**: "The only reason to use `--privileged` is when the container genuinely needs to manage hardware or the kernel -- for example, a storage driver or a network plugin. In those cases, prefer `--cap-add` for the specific capability needed rather than `--privileged`, and combine it with a custom seccomp profile that allows only the specific dangerous syscalls the tool actually uses."
+  </Accordion>
+
+  <Accordion title="Explain the difference between user namespaces and capabilities. When would you use one versus the other for container security?">
+    **What the interviewer is testing**: Understanding of two orthogonal security mechanisms that are often confused, and practical judgment about which to apply.
+
+    **Strong answer framework**:
+
+    **Capabilities** control WHAT a process can do. They are fine-grained privilege bits checked by `capable()` throughout the kernel. A process with `CAP_NET_BIND_SERVICE` can bind to port 80 regardless of its UID. Capabilities answer the question: "Does this process have permission to perform this specific privileged operation?"
+
+    **User namespaces** control WHO the process appears to be. They create a mapping between UIDs inside the namespace and UIDs outside. A process that is UID 0 (root) inside a user namespace might be UID 100000 (nobody) on the host. User namespaces answer the question: "Even if this process thinks it is root, what is its actual privilege level on the host?"
+
+    **The critical interaction**: Inside a user namespace, a process can have ALL capabilities -- but those capabilities only apply within the scope of that namespace. A container running as root in a user namespace has `CAP_SYS_ADMIN` inside the container (so it can mount filesystems within the container), but it CANNOT mount host filesystems because its capabilities are scoped to its user namespace. The kernel checks `ns_capable(user_ns, CAP_SYS_ADMIN)` and verifies that the user namespace matches.
+
+    **When to use each**:
+    - **Capabilities alone**: When you trust the container not to be compromised but want to limit the blast radius. Drop unnecessary capabilities and keep the ones the app needs. Example: a web server that needs `CAP_NET_BIND_SERVICE` but nothing else.
+    - **User namespaces**: When you want defense-in-depth against container escape. Even if an attacker gains root inside the container and exploits a kernel vulnerability, they land as an unprivileged user on the host. Example: multi-tenant platforms where containers run untrusted code.
+    - **Both together**: The strongest configuration. Run the container in a user namespace AND with minimal capabilities. The user namespace limits the scope of any capabilities, and dropping unnecessary capabilities further reduces the attack surface within that scope.
+
+    **What impresses interviewers**: Mention that Kubernetes historically did not support user namespaces for pods, making capabilities the primary in-cluster defense. User namespace support for pods reached beta in Kubernetes 1.28 (around 2023) and is a significant improvement for multi-tenant clusters. If the interviewer asks about Kubernetes specifically, knowing this timeline shows you track the ecosystem.
+  </Accordion>
+
+  <Accordion title="How would you design a seccomp profile for a production microservice? Walk me through the methodology.">
+    **What the interviewer is testing**: Practical security engineering -- not just knowing what seccomp is, but knowing how to apply it safely in production without breaking things.
+
+    **Strong answer framework**:
+
+    Building a seccomp profile is a four-phase process:
+
+    **Phase 1: Discovery** (capture what the app actually needs)
+    ```bash
+    # Run the application with SCMP_ACT_LOG as the default action.
+    # This logs every syscall the app makes without blocking anything.
+    # Run under production-like load, including startup, steady state,
+    # graceful shutdown, and error paths (connection failures, disk full, etc.)
+    docker run --security-opt seccomp=audit-all.json myapp
+    # Collect logs for 24-48 hours to capture infrequent code paths
+    # (log rotation, health checks, graceful restarts, etc.)
+    ```
+
+    **Phase 2: Analysis** (build the allowlist)
+    ```bash
+    # Extract unique syscall names from audit logs
+    ausearch -m seccomp --raw | audit2allow -a
+    # Cross-reference with the app's dependencies -- if the app uses
+    # Go, add syscalls needed by the Go runtime (clone, futex, epoll_*).
+    # If it uses glibc, add glibc's internal syscalls (set_robust_list, etc.)
+    ```
+
+    **Phase 3: Testing** (validate without risk)
+    - Set default action to `SCMP_ACT_ERRNO` (return error, do not kill)
+    - Run full test suite and smoke tests
+    - Monitor for unexpected `EPERM`/`ENOSYS` errors in application logs
+    - Iterate: add any missing syscalls discovered during testing
+
+    **Phase 4: Deployment** (production hardening)
+    - Set default action to `SCMP_ACT_KILL_PROCESS` (not `SCMP_ACT_KILL_THREAD` -- you want the whole process to die, not just one thread, to avoid corrupted state)
+    - Deploy with canary strategy: apply to 1% of pods, monitor for crashes
+    - Keep the `SCMP_ACT_LOG` profile available as a quick rollback
+
+    **What impresses interviewers**: "I never build seccomp profiles by hand-guessing syscalls. I instrument the application under realistic load and build the allowlist from observed behavior. The edge cases -- the syscalls only used during error handling or annual log rotation -- are the ones that hand-built profiles miss, and they cause 3 AM pages six months after deployment."
+  </Accordion>
+
+  <Accordion title="A developer says 'SELinux keeps blocking my app so I just set it to permissive.' How do you respond?">
+    **What the interviewer is testing**: Ability to balance security with developer productivity, and practical knowledge of how to resolve SELinux issues without disabling security.
+
+    **Strong answer framework**:
+
+    Setting SELinux to permissive system-wide is the security equivalent of removing the smoke detectors because they beeped during cooking. The alarms are annoying, but they are protecting you from a real fire.
+
+    **Why permissive is dangerous**: In permissive mode, SELinux logs denials but does not enforce them. This means: (1) every application on the system loses MAC protection, not just the one having issues, (2) the developer's app might work in permissive but rely on operations that a compromised process could also exploit, (3) you lose the security benefit for ALL containers and services on that host.
+
+    **The right approach**:
+
+    1. **Diagnose the specific denial**: Run `ausearch -m avc -ts recent` and identify exactly which operation is being blocked. Usually it is one or two specific file accesses or network operations.
+
+    2. **Fix the label first**: The most common cause of SELinux denials is a file with the wrong security context. `restorecon -Rv /path/to/app` resets labels to the system default. If someone copied files with `cp` instead of `cp --context` or `install`, the labels will be wrong.
+
+    3. **Use a boolean if one exists**: SELinux booleans are pre-built policy switches for common scenarios. `setsebool -P httpd_can_network_connect on` is much safer than writing a custom policy module.
+
+    4. **Generate a targeted policy module**: If the denial is legitimate (the app really does need an operation that the default policy does not allow), use `audit2allow` to generate a minimal policy module. Review the generated rules before installing.
+
+    5. **If you must reduce enforcement, do it per-domain**: `semanage permissive -a httpd_t` sets only the httpd domain to permissive. Every other domain on the system remains in enforcing mode. This is the scalpel approach versus the sledgehammer of system-wide permissive.
+
+    **What impresses interviewers**: "I would never set SELinux to permissive system-wide in production. Instead, I would diagnose the specific denial, fix the file labels or add a targeted boolean, and if necessary set only the affected domain to permissive temporarily while we develop a proper policy module. The goal is to keep enforcement active for everything else on the system."
+  </Accordion>
+
+  <Accordion title="How does the kernel enforce that a seccomp filter cannot be removed or weakened once installed?">
+    **What the interviewer is testing**: Deep kernel-level understanding of seccomp's security guarantees -- not just the user-facing behavior but the implementation that makes it trustworthy.
+
+    **Strong answer framework**:
+
+    Seccomp's immutability is enforced by several kernel mechanisms:
+
+    **1. One-way flag**: When a process calls `prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER)`, the kernel sets the `TIF_SECCOMP` flag on the task. There is no corresponding `prctl` to clear this flag. The kernel simply does not provide a code path to remove it.
+
+    **2. Filter chain is append-only**: Each new `seccomp()` call adds a filter to the beginning of a linked list. The kernel evaluates all filters for every syscall and returns the most restrictive result (using a priority ordering: KILL > TRAP > ERRNO > TRACE > LOG > ALLOW). You can make the filter stricter but never looser, because adding a new ALLOW rule does not override an existing KILL rule from an earlier filter.
+
+    **3. Inherited across fork/exec**: The `seccomp` filter is stored in the task's `seccomp.filter` pointer, which is inherited by child processes created via `fork()` or `clone()`. On `execve()`, the filter is preserved (unless the binary has certain privilege elevation attributes, in which case `no_new_privs` blocks the exec entirely). This means a compromised child process cannot escape the parent's filter.
+
+    **4. PR_SET_NO_NEW_PRIVS**: Docker and container runtimes set the `no_new_privs` flag before installing the seccomp filter. This flag, once set, cannot be cleared (same one-way design). It prevents `execve()` from granting additional privileges via setuid or file capabilities, which would be a way to escape the seccomp sandbox.
+
+    **5. Kernel memory protection**: The BPF bytecode for the filter is stored in kernel memory (allocated with `kmalloc` and referenced via the task's `seccomp.filter`). User space has no way to modify kernel memory (barring a kernel exploit), so the filter code itself is tamper-proof.
+
+    **What impresses interviewers**: "The security of seccomp relies on the kernel being the trusted enforcement layer. The filter is installed BY user space but enforced IN kernel space. Once installed, the only way to remove it is to exit the process (or exploit a kernel vulnerability). This is a fundamentally different security model from user-space sandboxes, which can be bypassed by corrupting the sandbox's memory."
+  </Accordion>
+</AccordionGroup>
 
 ---
 

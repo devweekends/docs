@@ -4,13 +4,17 @@ description: "REST endpoints, async patterns, webhooks, and rate limiting for LL
 icon: "code"
 ---
 
-Designing robust APIs for LLM applications requires careful consideration of latency, error handling, streaming, and scalability.
+Designing robust APIs for LLM applications requires careful consideration of latency, error handling, streaming, and scalability. Unlike traditional REST APIs where response times are measured in low milliseconds, LLM API calls routinely take 1-30 seconds depending on model size and output length. This single fact reshapes nearly every design decision -- from timeout configuration to client-side UX patterns.
+
+Think of an LLM API like a restaurant kitchen: a regular API is the microwave (fast, predictable), while an LLM API is the slow-roasted brisket (worth the wait, but your customers need updates). Your API design needs to account for that fundamental difference.
 
 ---
 
 ## Core API Patterns
 
 ### Synchronous Chat Endpoint
+
+The synchronous pattern is the simplest to reason about: the client sends a request and waits for the full response. Use this when response times are acceptable (under ~5 seconds) and the client can tolerate blocking. For anything longer, consider streaming or async jobs below.
 
 ```python
 from fastapi import FastAPI, HTTPException, Depends
@@ -19,10 +23,18 @@ from typing import List, Optional
 from openai import AsyncOpenAI
 
 app = FastAPI()
+
+# Initialize the client at module level so it's reused across requests.
+# Creating a new client per request wastes connection pool resources
+# and adds ~50-100ms of overhead from TLS handshake.
 client = AsyncOpenAI()
 
 class Message(BaseModel):
+    # Constrain to valid OpenAI roles -- reject garbage early rather than
+    # burning tokens on an API call that will fail downstream
     role: str = Field(..., pattern="^(system|user|assistant)$")
+    # 100K chars is roughly ~25K tokens -- a safety net against
+    # accidentally sending entire databases as context
     content: str = Field(..., min_length=1, max_length=100000)
 
 class ChatRequest(BaseModel):
@@ -30,6 +42,8 @@ class ChatRequest(BaseModel):
     model: str = "gpt-4o"
     temperature: float = Field(0.7, ge=0, le=2)
     max_tokens: int = Field(1000, ge=1, le=4096)
+    # user_id enables per-user rate limiting and abuse tracking.
+    # OpenAI also recommends passing this for their own abuse detection.
     user_id: Optional[str] = None
 
 class ChatResponse(BaseModel):
@@ -40,7 +54,12 @@ class ChatResponse(BaseModel):
 
 @app.post("/v1/chat", response_model=ChatResponse)
 async def chat(request: ChatRequest):
-    """Synchronous chat completion endpoint"""
+    """Synchronous chat completion endpoint.
+    
+    Production tip: Set a reasonable client-side timeout (30-60s).
+    If your gateway (nginx, ALB) has a shorter timeout than your
+    LLM call, users get 504s while you still pay for the completion.
+    """
     
     try:
         response = await client.chat.completions.create(
@@ -62,10 +81,16 @@ async def chat(request: ChatRequest):
         )
     
     except Exception as e:
+        # In production, never leak raw exception messages to clients.
+        # Log the full error server-side but return a sanitized message.
         raise HTTPException(status_code=500, detail=str(e))
 ```
 
 ### Streaming Endpoint
+
+Streaming is the most important pattern in LLM API design. Without it, users stare at a blank screen for 5-20 seconds wondering if anything is happening. With streaming, the first token typically arrives in 200-500ms, and the user sees the response "typing" in real-time -- the same pattern that makes ChatGPT feel responsive.
+
+Under the hood, this uses Server-Sent Events (SSE): a simple HTTP-based protocol where the server holds the connection open and pushes data chunks. Think of it like a news ticker -- the server keeps broadcasting updates until it's done.
 
 ```python
 from fastapi import FastAPI
@@ -80,7 +105,11 @@ class StreamRequest(BaseModel):
 async def stream_response(
     request: StreamRequest
 ) -> AsyncGenerator[str, None]:
-    """Generate SSE stream"""
+    """Generate SSE stream.
+    
+    Each chunk follows the SSE format: "data: {json}\n\n"
+    The double newline is required by the SSE spec to delimit events.
+    """
     
     try:
         stream = await client.chat.completions.create(
@@ -95,33 +124,51 @@ async def stream_response(
                     "content": chunk.choices[0].delta.content,
                     "finish_reason": chunk.choices[0].finish_reason
                 }
+                # SSE format: each event is "data: ...\n\n"
                 yield f"data: {json.dumps(data)}\n\n"
         
+        # Signal stream completion -- clients watch for this sentinel
         yield "data: [DONE]\n\n"
     
     except Exception as e:
+        # Stream errors inline so the client can handle them gracefully
+        # rather than getting a broken connection with no context
         yield f"data: {json.dumps({'error': str(e)})}\n\n"
 
 @app.post("/v1/chat/stream")
 async def chat_stream(request: StreamRequest):
-    """Server-Sent Events streaming endpoint"""
+    """Server-Sent Events streaming endpoint.
+    
+    Production pitfall: If you use nginx or a CDN in front of this,
+    you MUST disable response buffering. Otherwise nginx will collect
+    the entire response before forwarding it, defeating the purpose
+    of streaming entirely.
+    """
     
     return StreamingResponse(
         stream_response(request),
         media_type="text/event-stream",
         headers={
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-            "X-Accel-Buffering": "no"  # Disable nginx buffering
+            "Cache-Control": "no-cache",       # Don't cache streaming responses
+            "Connection": "keep-alive",         # Keep the connection open
+            "X-Accel-Buffering": "no"           # Disable nginx buffering
+            # For AWS ALB, set idle timeout > expected stream duration
+            # For CloudFront, enable chunked transfer encoding
         }
     )
 ```
+
+<Warning>
+**Common streaming pitfall**: Many reverse proxies and load balancers buffer responses by default. If your stream "works locally but not in production," check your proxy configuration first. For nginx, add `proxy_buffering off;` in the location block. For AWS ALB, increase the idle timeout to at least 60 seconds.
+</Warning>
 
 ---
 
 ## Async Job Pattern
 
-For long-running LLM tasks:
+For long-running LLM tasks (document summarization, multi-step agents, RAG pipelines over large corpora), synchronous endpoints fall apart. The client's HTTP connection times out, the load balancer kills the request, and you've wasted compute with nothing to show for it.
+
+The async job pattern solves this by decoupling submission from completion. It works like a dry cleaner: you drop off clothes (submit a job), get a ticket number (job ID), and come back later to pick them up (poll or receive a webhook). This pattern is essential when processing takes more than ~30 seconds.
 
 ```python
 from fastapi import FastAPI, BackgroundTasks
@@ -131,7 +178,9 @@ import uuid
 import asyncio
 from datetime import datetime
 
-# In-memory store (use Redis in production)
+# In-memory store (use Redis in production).
+# Why Redis? Because in-memory dicts vanish on restart and don't
+# work across multiple server instances behind a load balancer.
 jobs = {}
 
 class JobStatus(BaseModel):
@@ -149,7 +198,13 @@ class AsyncJobRequest(BaseModel):
     webhook_url: Optional[str] = None
 
 async def process_job(job_id: str, request: AsyncJobRequest):
-    """Background job processor"""
+    """Background job processor.
+    
+    In production, consider using Celery, Dramatiq, or a message queue 
+    (SQS, Redis Streams) instead of FastAPI BackgroundTasks. Background
+    tasks die if the server restarts mid-processing, and they compete 
+    for the same event loop as your API handlers.
+    """
     
     jobs[job_id]["status"] = "processing"
     
@@ -229,6 +284,10 @@ async def cancel_job(job_id: str):
 
 ## Webhook Integration
 
+Webhooks are the "don't call us, we'll call you" pattern. Instead of your client polling every few seconds asking "is my job done yet?" (which wastes bandwidth and adds latency), the server proactively notifies the client when something interesting happens.
+
+This is the preferred pattern for production LLM systems because it eliminates polling overhead and reduces time-to-notification from your poll interval down to near-zero. The tradeoff: the receiver must expose a public HTTP endpoint, which adds complexity for clients behind firewalls.
+
 ```python
 import httpx
 from typing import Optional
@@ -238,18 +297,28 @@ import hashlib
 
 class WebhookConfig(BaseModel):
     url: HttpUrl
-    secret: Optional[str] = None
+    secret: Optional[str] = None  # HMAC secret for payload signing
     events: List[str] = ["job.completed", "job.failed"]
 
 class WebhookSender:
-    """Send webhook notifications"""
+    """Send webhook notifications with retry logic.
+    
+    Production considerations:
+    - Always sign payloads so receivers can verify authenticity
+    - Use exponential backoff to avoid hammering a struggling endpoint
+    - Log every delivery attempt for debugging failed webhooks
+    - Consider a webhook delivery table/queue for persistence
+    """
     
     def __init__(self, timeout: float = 30.0, max_retries: int = 3):
         self.timeout = timeout
         self.max_retries = max_retries
     
     def _sign_payload(self, payload: str, secret: str) -> str:
-        """Create HMAC signature for webhook"""
+        """Create HMAC-SHA256 signature for webhook payload.
+        Receivers verify this to ensure the webhook came from us,
+        not from an attacker spoofing our webhook URL.
+        """
         return hmac.new(
             secret.encode(),
             payload.encode(),
@@ -321,6 +390,10 @@ async def send_webhook(url: str, job_data: dict, secret: str = None):
 
 ## Rate Limiting
 
+Rate limiting for LLM APIs is doubly important: not only do you need to protect your service from abuse, but every excess request costs you real money in inference charges. A single runaway script can burn through hundreds of dollars in minutes. Unlike traditional APIs where excess requests are just CPU cycles, LLM requests have direct cost implications.
+
+LLM APIs need two dimensions of rate limiting: request count (how many calls) and token count (how much compute). A user making 10 requests with 100K tokens each is very different from 10 requests with 100 tokens each, even though the request count is identical.
+
 ```python
 from fastapi import Request, HTTPException
 from starlette.middleware.base import BaseHTTPMiddleware
@@ -330,12 +403,17 @@ from dataclasses import dataclass
 
 @dataclass
 class RateLimitConfig:
-    requests_per_minute: int = 60
-    requests_per_hour: int = 1000
-    tokens_per_minute: int = 100000
+    requests_per_minute: int = 60     # Protects against request floods
+    requests_per_hour: int = 1000     # Limits sustained heavy usage
+    tokens_per_minute: int = 100000   # Protects against cost spikes
 
 class RateLimiter:
-    """Token bucket rate limiter"""
+    """Token bucket rate limiter.
+    
+    Why token bucket? It allows short bursts while enforcing average rate.
+    A user can fire 10 rapid requests, then naturally slows down --
+    much better UX than a hard sliding window that rejects request #61.
+    """
     
     def __init__(self):
         self.requests = defaultdict(list)  # user_id -> list of timestamps
@@ -425,6 +503,10 @@ app.add_middleware(RateLimitMiddleware)
 
 ## API Versioning
 
+API versioning is inevitable for LLM applications. Models improve, response formats evolve, new capabilities (tool use, structured outputs, vision) get added. If you don't version from day one, you'll either break every existing client integration or freeze your API forever. Neither is acceptable.
+
+Use URL-path versioning (`/v1/`, `/v2/`) for LLM APIs. It's the most visible, most cacheable, and easiest to route at the load balancer level. Header-based versioning is theoretically cleaner but makes debugging, logging, and documentation harder in practice.
+
 ```python
 from fastapi import FastAPI, APIRouter
 from enum import Enum
@@ -433,7 +515,7 @@ class APIVersion(str, Enum):
     V1 = "v1"
     V2 = "v2"
 
-# Version 1 router
+# Version 1 router -- this is your stable, battle-tested API
 v1_router = APIRouter(prefix="/v1", tags=["v1"])
 
 @v1_router.post("/chat")
@@ -449,10 +531,10 @@ class ChatRequestV2(BaseModel):
     model: str = "gpt-4o"
     temperature: float = 0.7
     max_tokens: int = 1000
-    # New V2 fields
-    response_format: Optional[dict] = None
-    tools: Optional[List[dict]] = None
-    stream: bool = False
+    # New V2 fields -- additive changes that would break V1 clients
+    response_format: Optional[dict] = None  # JSON mode, structured output
+    tools: Optional[List[dict]] = None       # Function calling support
+    stream: bool = False                     # Unified streaming toggle
 
 @v2_router.post("/chat")
 async def chat_v2(request: ChatRequestV2):
@@ -463,11 +545,13 @@ async def chat_v2(request: ChatRequestV2):
 app.include_router(v1_router)
 app.include_router(v2_router)
 
-# Deprecation headers
+# Deprecation headers -- notify clients that V1 is going away.
+# The "Sunset" header tells clients the exact date V1 will be removed.
+# The "Link" header tells clients where to go instead.
+# This follows RFC 8594 (The Sunset HTTP Header Field).
 @v1_router.post("/chat", deprecated=True)
 async def chat_v1_deprecated(request: ChatRequest):
     response = await chat_v1(request)
-    # Add deprecation header
     return JSONResponse(
         content=response,
         headers={
@@ -478,9 +562,15 @@ async def chat_v1_deprecated(request: ChatRequest):
     )
 ```
 
+<Tip>
+**Version migration tip**: When deprecating a version, track which API keys are still hitting the old version. Send targeted emails 90, 60, 30, and 7 days before sunset. The teams that don't migrate are usually the ones that will file the loudest support tickets when you cut them off.
+</Tip>
+
 ---
 
 ## Request Validation
+
+Request validation in LLM APIs serves a different purpose than in traditional APIs. Yes, you're catching malformed input -- but more importantly, you're preventing expensive mistakes. A validation miss that lets through a 500K character message means you just burned $5-10 on a single API call that was probably a mistake. Validate aggressively at the boundary; it's the cheapest place to catch errors.
 
 ```python
 from pydantic import BaseModel, Field, validator
@@ -492,6 +582,8 @@ class Message(BaseModel):
     
     @validator("role")
     def validate_role(cls, v):
+        # Only allow valid OpenAI/Anthropic message roles.
+        # "tool" was added for function calling; "function" is deprecated.
         allowed = ["system", "user", "assistant", "tool"]
         if v not in allowed:
             raise ValueError(f"role must be one of {allowed}")
@@ -499,6 +591,9 @@ class Message(BaseModel):
     
     @validator("content")
     def validate_content(cls, v):
+        # These limits protect against accidental data dumps.
+        # 100K chars is roughly 25K tokens -- enough for almost
+        # any legitimate use case.
         if len(v) > 100000:
             raise ValueError("content exceeds maximum length of 100000")
         if len(v.strip()) == 0:
@@ -507,18 +602,23 @@ class Message(BaseModel):
 
 class ChatRequest(BaseModel):
     messages: List[Message] = Field(..., min_items=1, max_items=100)
+    # Regex prevents injection of special characters in model names
     model: str = Field("gpt-4o", pattern="^[a-zA-Z0-9-]+$")
     temperature: float = Field(0.7, ge=0, le=2)
+    # 128K supports models with large output windows (e.g., Claude 3.5)
     max_tokens: int = Field(1000, ge=1, le=128000)
+    # OpenAI supports max 4 stop sequences
     stop: Optional[List[str]] = Field(None, max_items=4)
     
     @validator("messages")
     def validate_messages(cls, v):
-        # Must have at least one user message
+        # A conversation without a user message is meaningless --
+        # catch this before burning API credits
         if not any(m.role == "user" for m in v):
             raise ValueError("must include at least one user message")
         
-        # System message must be first if present
+        # System message must be first. Putting it elsewhere produces
+        # unpredictable behavior across different model providers.
         system_indices = [i for i, m in enumerate(v) if m.role == "system"]
         if system_indices and system_indices[0] != 0:
             raise ValueError("system message must be first")
@@ -556,6 +656,8 @@ async def validation_error_handler(request: Request, exc: ValueError):
 
 ## Health and Status Endpoints
 
+Health endpoints are not optional for production LLM APIs -- they're how your load balancer, Kubernetes, and monitoring systems know whether your service is alive and ready to serve traffic. The distinction between "alive" (liveness) and "ready" (readiness) matters: a service can be alive but not ready if it's still loading model weights, warming caches, or waiting for a downstream provider to come back online.
+
 ```python
 from fastapi import FastAPI
 from pydantic import BaseModel
@@ -588,11 +690,18 @@ async def health():
 
 @app.get("/status", response_model=DetailedStatus)
 async def status():
-    """Detailed status with provider checks"""
+    """Detailed status with provider checks.
+    
+    This endpoint is heavier than /health -- it actually tests
+    downstream dependencies. Don't hit this every second from
+    your load balancer; use /health for that. Reserve /status
+    for dashboards and on-call debugging.
+    """
     
     providers = {}
     
-    # Check OpenAI
+    # Check OpenAI -- a lightweight API call that validates credentials
+    # and connectivity without burning completion tokens
     try:
         await client.models.list()
         providers["openai"] = "healthy"
@@ -633,6 +742,8 @@ async def live():
 
 ## API Response Standards
 
+A consistent response envelope makes life dramatically easier for API consumers. Every response should follow the same shape: a success flag, data, an optional error, and metadata. This means clients don't need to guess whether a 200 response contains `result`, `data`, `output`, or `response` -- it's always in the same place.
+
 ```python
 from pydantic import BaseModel
 from typing import TypeVar, Generic, Optional
@@ -640,7 +751,13 @@ from typing import TypeVar, Generic, Optional
 T = TypeVar("T")
 
 class APIResponse(BaseModel, Generic[T]):
-    """Standard API response wrapper"""
+    """Standard API response wrapper.
+    
+    Every endpoint returns this shape. Clients can write one
+    generic handler rather than per-endpoint parsing logic.
+    The 'meta' field carries pagination, rate limit info,
+    or any other context that isn't the primary data.
+    """
     success: bool
     data: Optional[T] = None
     error: Optional[APIError] = None
@@ -680,6 +797,74 @@ async def list_models():
 | Streaming | SSE for real-time |
 | Async Jobs | Webhooks + polling |
 | Health | /health, /ready, /live |
+
+---
+
+## Interview Deep-Dive
+
+<AccordionGroup>
+  <Accordion title="Why would you choose streaming SSE over WebSockets for an LLM API, and when might WebSockets be the better choice?">
+    **What interviewers are testing**: Whether you understand the tradeoffs between unidirectional and bidirectional real-time protocols in the specific context of LLM inference.
+
+    **Strong answer**: SSE is the right default for LLM APIs because the communication pattern is inherently unidirectional during generation -- the server streams tokens to the client. SSE works over standard HTTP, plays well with existing load balancers and CDNs, automatically reconnects on disconnection, and requires no special client libraries (the browser's `EventSource` API handles it natively). WebSockets add bidirectional capability you rarely need during token streaming, and they require sticky sessions or special load balancer configuration.
+
+    Choose WebSockets when you need the client to send signals mid-stream -- for example, a "stop generating" button, real-time editing where the user is typing while the model is responding, or multi-turn conversational interfaces where latency of establishing new connections matters. The tradeoff is operational complexity: WebSocket connections are stateful, harder to load-balance, and don't work through all corporate proxies.
+
+    The key insight is that SSE gives you 90% of the UX benefit with 30% of the operational cost. Most production LLM APIs (OpenAI, Anthropic, Google) chose SSE for exactly this reason.
+  </Accordion>
+
+  <Accordion title="How would you design rate limiting for a multi-tenant LLM API where different customers have different pricing tiers?">
+    **What interviewers are testing**: Systems design thinking around fairness, cost management, and graceful degradation under load.
+
+    **Strong answer**: You need a multi-dimensional rate limiting strategy. First, define limits per tier across three axes: requests per minute (RPM), tokens per minute (TPM), and concurrent requests. A free tier might get 20 RPM / 40K TPM / 3 concurrent; an enterprise tier might get 500 RPM / 2M TPM / 50 concurrent.
+
+    Implementation-wise, use a distributed rate limiter backed by Redis (not in-memory, since you're running multiple API server instances). The token bucket algorithm is ideal here because it allows natural bursting while enforcing average rates. You need two token buckets per customer: one for request count, one for token count.
+
+    The subtle part is token estimation -- you don't know the output token count until after generation. Solution: estimate input tokens before the call (using tiktoken or a character heuristic), reserve a buffer for expected output, then reconcile after completion. If the actual usage exceeds the reservation, deduct from the next window rather than retroactively rejecting a completed request.
+
+    Return `X-RateLimit-Limit`, `X-RateLimit-Remaining`, and `X-RateLimit-Reset` headers on every response so clients can implement client-side throttling proactively. Return 429 with a `Retry-After` header when limits are exceeded.
+  </Accordion>
+
+  <Accordion title="Your LLM API is experiencing 5-second cold starts when a new model version is deployed. How do you handle this without impacting users?">
+    **What interviewers are testing**: Understanding of deployment strategies, graceful degradation, and the specific challenges of deploying ML model serving infrastructure.
+
+    **Strong answer**: This is a blue-green or canary deployment problem with the added wrinkle that "warming up" an LLM serving instance takes meaningful time. The approach depends on your infrastructure:
+
+    If you're calling an external provider (OpenAI, Anthropic), you don't control cold starts, but you control fallback. Implement a provider fallback chain: if the primary returns errors or latency exceeds a threshold, route to a secondary provider. This requires abstracting your provider interface so the caller doesn't know which model is responding.
+
+    If you're self-hosting models, use rolling deployments with health checks that include a "warmup" phase. The readiness probe shouldn't return healthy until the model has completed at least one inference request. Keep the old version's pods running until the new version is fully warm. Use Kubernetes' `maxUnavailable: 0` and `maxSurge` to ensure you always have capacity.
+
+    For the API layer itself, implement a circuit breaker pattern: if error rates on the new version exceed a threshold within the first few minutes, automatically roll back traffic to the previous version. Track latency percentiles (p50, p99), not just averages, because cold starts affect tail latency disproportionately.
+  </Accordion>
+
+  <Accordion title="How do you handle idempotency in an async LLM job API where network failures can cause duplicate submissions?">
+    **What interviewers are testing**: Distributed systems fundamentals applied to an AI-specific context, especially around cost and correctness.
+
+    **Strong answer**: Idempotency in LLM APIs is critical because duplicate processing means duplicate cost -- and with expensive models, a retry storm can burn thousands of dollars in minutes.
+
+    The standard pattern is client-supplied idempotency keys. The client generates a unique key (UUID) per logical operation and includes it in the request header (e.g., `Idempotency-Key: abc-123`). On the server side, before processing a job, check if that key already exists in your store. If it does, return the existing result without reprocessing.
+
+    Implementation details that matter: store the idempotency key with its result in Redis or a database with a TTL (typically 24-48 hours). The key must be stored *before* processing begins, not after -- otherwise, two concurrent identical requests will both start processing. Use an atomic "set if not exists" operation. If the job is still processing when a duplicate arrives, return the job status (pending/processing) rather than starting a new one.
+
+    The edge case people miss: what if the initial request fails halfway through? You need to distinguish between "request received but processing failed" (should retry) and "request completed" (return cached result). Store the idempotency record with a status field, and only return cached results for completed successes.
+  </Accordion>
+
+  <Accordion title="Walk through how you would design the error handling strategy for a production LLM API that wraps multiple model providers.">
+    **What interviewers are testing**: Production engineering maturity, specifically around failure modes unique to LLM inference.
+
+    **Strong answer**: LLM APIs have failure modes that traditional APIs don't: content filtering rejections, context length exceeded, model overloaded (429s from the provider), malformed model output, and timeouts due to variable generation time. Each requires different handling.
+
+    Layer 1 -- Input validation: Catch malformed requests, token count estimation (reject prompts that would exceed context window), and content policy pre-screening before burning any API credits. Return 400 with specific error codes.
+
+    Layer 2 -- Provider errors: Wrap each provider call in a retry-with-backoff for transient errors (429, 500, 503, network timeouts). Use exponential backoff with jitter to avoid thundering herd. After max retries, attempt fallback to a secondary provider. Return 502 or 503 with the provider-specific error sanitized (never leak provider details to end users).
+
+    Layer 3 -- Output validation: The model might return empty content, malformed JSON (when you expected structured output), or content that violates your policies. Validate model output before returning it. If output is invalid, retry with the same prompt up to 2 times (LLM outputs are non-deterministic, so a retry often works), then return a graceful error.
+
+    Layer 4 -- Consistency: Use a standard error envelope across all error types. Every error response should include an error code (machine-readable), a message (human-readable), and a request ID (for support debugging). Map all internal errors to a finite set of external error codes so clients can handle them programmatically.
+
+    The key principle: fail fast on client errors (4xx), retry on server errors (5xx), and always prefer returning a degraded response over returning nothing.
+  </Accordion>
+</AccordionGroup>
 
 ---
 
