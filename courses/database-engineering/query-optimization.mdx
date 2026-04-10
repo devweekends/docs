@@ -13,6 +13,8 @@ icon: "bolt"
 
 Every developer eventually faces the dreaded slow query. This module teaches you a systematic approach to diagnose performance issues and apply the right fixes.
 
+**The most important mindset shift in query optimization:** Stop guessing. The difference between a junior and a senior engineer facing a slow query is that the junior starts adding indexes, while the senior runs `EXPLAIN ANALYZE` first. Over 80% of query performance problems become obvious once you read the execution plan. The plan tells you exactly where time is being spent -- you just need to learn the language it speaks.
+
 <Info>
 **Estimated Time**: 10-12 hours  
 **Hands-On**: Real-world slow query analysis  
@@ -126,20 +128,27 @@ ALTER SYSTEM SET log_statement = 'all';
 ### EXPLAIN Options
 
 ```sql
--- Basic plan (estimates only)
+-- Basic plan (estimates only -- does NOT run the query)
+-- Use this when you want to see the plan without side effects (e.g., DELETE/UPDATE)
 EXPLAIN SELECT * FROM orders WHERE user_id = 123;
 
--- With actual execution (runs the query!)
+-- With actual execution (RUNS the query! Be careful with INSERT/UPDATE/DELETE)
+-- Wrap destructive queries in a transaction and ROLLBACK:
+--   BEGIN; EXPLAIN ANALYZE DELETE FROM orders WHERE ...; ROLLBACK;
 EXPLAIN ANALYZE SELECT * FROM orders WHERE user_id = 123;
 
--- Full analysis with buffer stats
+-- Full analysis with buffer stats (the gold standard for production debugging)
+-- BUFFERS shows how many 8KB pages were read from cache vs disk
+-- This is often more useful than timing for diagnosing I/O problems
 EXPLAIN (ANALYZE, BUFFERS, TIMING, FORMAT TEXT)
 SELECT * FROM orders WHERE user_id = 123;
 
--- JSON format for programmatic analysis
+-- JSON format for programmatic analysis (useful for tools like pganalyze, dalibo)
 EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON)
 SELECT * FROM orders WHERE user_id = 123;
 ```
+
+**Practical tip:** Always use `EXPLAIN (ANALYZE, BUFFERS)` rather than plain `EXPLAIN ANALYZE`. The BUFFERS output is what separates a superficial analysis from a real diagnosis. Without it, you know a node took 50ms, but you do not know whether that was 50ms of CPU computation or 50ms of waiting for disk reads.
 
 ### Anatomy of a Plan
 
@@ -188,16 +197,18 @@ Limit  (cost=0.43..8.45 rows=10 width=152) (actual time=0.025..0.042 rows=10 loo
   </Accordion>
   
   <Accordion title="Index Only Scan" icon="bolt">
-    All data from index, no table access needed.
+    All data comes from the index itself -- no heap (table) access needed. This is the fastest scan type because it avoids the random I/O of fetching rows from the table.
     
     ```
     Index Only Scan using idx_orders_user_status on orders  (cost=0.42..4.44 rows=1 width=16)
       Index Cond: (user_id = 123)
-      Heap Fetches: 0
+      Heap Fetches: 0     -- 0 means the visibility map was current (table recently vacuumed)
     ```
     
     **Best case scenario!**
-    **Requires**: Covering index, recently vacuumed table
+    **Requires**: A covering index (includes all columns the query needs) AND a recently vacuumed table (so the visibility map is up-to-date).
+    
+    **Common pitfall:** If `Heap Fetches` is close to the row count, you are losing most of the benefit of an index-only scan. This usually means VACUUM has not run recently enough. Check `pg_stat_user_tables.n_dead_tup` for the table.
     **Watch for**: `Heap Fetches > 0` means some table access needed
   </Accordion>
   
@@ -659,3 +670,51 @@ LIMIT 20;
 <Card title="Module 6: PostgreSQL Internals" icon="arrow-right" href="/courses/database-engineering/internals">
   Understand how PostgreSQL works under the hood
 </Card>
+
+---
+
+## Interview Deep-Dive
+
+<AccordionGroup>
+  <Accordion title="A query that was running in 50ms yesterday is now taking 30 seconds. Nothing in the application changed. Walk me through your diagnosis.">
+    **Strong Answer:**
+
+    - This is a classic plan regression scenario. The query itself did not change, but something the planner depends on did. My diagnosis checklist, in order of likelihood:
+    - (1) Statistics changed. Run `EXPLAIN ANALYZE` and compare estimated rows vs. actual rows. If the estimates are wildly off (e.g., estimated 100 rows, actual 500,000), the planner chose a nested loop where it should have chosen a hash join, or an index scan where it should have chosen a sequential scan. Fix: run `ANALYZE` on the affected tables. If a specific column has skewed distribution, increase its statistics target: `ALTER TABLE orders ALTER COLUMN status SET STATISTICS 1000; ANALYZE orders;`
+    - (2) An index was dropped, became invalid, or bloated. Check `pg_stat_user_indexes` for the relevant indexes. Check if a concurrent REINDEX failed partway, leaving an invalid index. Check index size vs. table size ratio -- if the index is larger than the table, it is severely bloated and needs REINDEX CONCURRENTLY.
+    - (3) Table bloat. If autovacuum has been struggling (check `n_dead_tup` in `pg_stat_user_tables`), the table may have doubled in size with dead tuples. Sequential scans now read 2x the data. The planner's cost estimates may also be wrong because `pg_class.relpages` reflects the bloated size.
+    - (4) Memory pressure. If another workload consumed shared_buffers or the OS page cache was evicted (perhaps a backup ran), the same query now hits disk instead of cache. Check `EXPLAIN (ANALYZE, BUFFERS)` -- if `Buffers: read` is high where it was previously all `shared hit`, this is the cause.
+    - (5) Lock contention. The query itself is fast, but it is waiting for a lock held by another transaction. Check `pg_stat_activity` for `wait_event_type = 'Lock'`.
+
+    **Follow-up: How would you prevent plan regressions from happening in the first place?**
+
+    Three strategies: (1) Pin critical query plans using prepared statements with `plan_cache_mode = force_custom_plan` for queries that are sensitive to parameter values. (2) Monitor plan changes using pg_stat_statements -- track the mean_exec_time over time and alert when it jumps by more than 3x. (3) For the most critical queries, maintain a test suite that runs EXPLAIN on production-like data volumes and asserts on the plan shape (e.g., "this query must use Index Scan, not Seq Scan"). This catches regressions before deployment.
+  </Accordion>
+
+  <Accordion title="Explain the difference between a Hash Join, Merge Join, and Nested Loop Join. When does the planner choose each, and when does it get it wrong?">
+    **Strong Answer:**
+
+    - **Nested Loop**: For each row in the outer relation, scan the inner relation for matches. O(n * m) in the worst case, but with an index on the inner relation's join column, the inner scan is O(log m) per row, making it O(n * log m). The planner chooses this when the outer relation is small (a few hundred rows or fewer) and the inner relation has a good index. It gets it wrong when the planner underestimates the outer relation's cardinality -- estimating 100 rows but getting 100,000 turns a fast plan into a catastrophe.
+    - **Hash Join**: Build a hash table from the smaller relation (the "build" side), then probe it with each row from the larger relation (the "probe" side). O(n + m) with O(min(n,m)) memory. The planner chooses this for equi-joins when neither side has a useful sort order and at least one side fits in work_mem. Watch for `Batches: 4` in EXPLAIN -- this means the hash table did not fit in work_mem and spilled to disk, dramatically slowing the join. Fix: increase work_mem for the session, or add an index to enable a nested loop instead.
+    - **Merge Join**: Sort both relations on the join key, then merge them like a zipper. O(n log n + m log m) for the sorts, then O(n + m) for the merge. The planner chooses this when both sides are already sorted (from an index scan or a preceding sort) or when the result itself needs to be sorted. Merge joins are rare in OLTP but common in analytics and data warehouse queries with large sorted result sets.
+    - The planner gets it wrong most often on nested loops: a cardinality underestimate on the outer side turns what should be a hash join into a devastating nested loop. If you see a nested loop with `loops=500000` in the inner child, that is almost certainly a mis-estimate. Run ANALYZE, increase statistics targets on the relevant columns, or in extreme cases use `SET enable_nestloop = off` for that specific query session to force the planner away from the bad plan.
+
+    **Follow-up: Can you force a specific join type in PostgreSQL? Should you?**
+
+    You can disable join types using `SET enable_hashjoin = off`, `SET enable_mergejoin = off`, etc. This is a blunt instrument -- I would only use it as a temporary workaround with a comment explaining why and a ticket to fix the underlying statistics issue. A better approach is pg_hint_plan extension which lets you annotate individual queries with hints like `/*+ HashJoin(orders users) */` without affecting the global planner behavior. The principle: fix the inputs (statistics, indexes) rather than overriding the outputs (plan choices).
+  </Accordion>
+
+  <Accordion title="How do you optimize a query that aggregates data across 500 million rows for a real-time dashboard?">
+    **Strong Answer:**
+
+    - You do not. Real-time aggregation over 500M rows is fundamentally incompatible with sub-second response times on a single PostgreSQL instance. The correct approach is pre-aggregation at an appropriate granularity.
+    - **Strategy 1: Materialized views with periodic refresh.** Create a materialized view that pre-computes daily/hourly aggregates. Refresh it every N minutes with `REFRESH MATERIALIZED VIEW CONCURRENTLY`. The dashboard queries the materialized view (which has thousands of rows, not millions) and responds in milliseconds. The tradeoff is data staleness bounded by the refresh interval.
+    - **Strategy 2: Summary tables maintained by triggers.** For true real-time needs, maintain a summary table that is updated incrementally. An AFTER INSERT trigger on the events table increments the counter in the summary table. The dashboard reads the summary table. The tradeoff is write overhead (every insert triggers a summary update) and complexity in handling UPDATE/DELETE on the source table.
+    - **Strategy 3: BRIN-indexed partitioned table with partition pruning.** If the dashboard always filters by time range (e.g., last 30 days), partition the table by month. The query only scans 1-2 partitions instead of the full 500M rows. Combined with a BRIN index on the timestamp, this can reduce the scan to a manageable subset.
+    - **Strategy 4: External OLAP engine.** For truly complex real-time analytics, replicate the data to ClickHouse, Apache Druid, or TimescaleDB which are purpose-built for analytical aggregations. PostgreSQL's logical replication can feed these systems with minimal lag.
+
+    **Follow-up: What is the difference between REFRESH MATERIALIZED VIEW and REFRESH MATERIALIZED VIEW CONCURRENTLY?**
+
+    Without CONCURRENTLY, the refresh takes an ACCESS EXCLUSIVE lock on the materialized view -- all readers block until the refresh completes. For a large aggregation, that could be minutes of downtime for the dashboard. With CONCURRENTLY, PostgreSQL builds the new data in a temporary location and then swaps it in atomically, allowing readers to continue querying the old data during the rebuild. The cost: CONCURRENTLY requires a unique index on the materialized view and takes roughly 2x the time because it must diff the old and new versions. Always use CONCURRENTLY in production.
+  </Accordion>
+</AccordionGroup>

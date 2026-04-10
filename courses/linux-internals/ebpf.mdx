@@ -846,4 +846,55 @@ int xdp_drop_icmp(struct xdp_md *ctx)
 
 ---
 
+## Interview Deep-Dive
+
+<AccordionGroup>
+  <Accordion title="You need to build a production monitoring tool that tracks the latency of every disk I/O operation per container. Describe your eBPF-based approach, including the specific program types, maps, and how you would handle the per-container attribution." icon="message">
+    **Strong Answer:**
+
+    - I would use two tracepoint programs: `tracepoint/block/block_rq_issue` to record when a block I/O request is dispatched to the device driver, and `tracepoint/block/block_rq_complete` to record when it completes. On issue, I would store the timestamp keyed by `(dev, sector)` in a BPF hash map. On completion, I would look up the start time, compute the delta, and emit a latency event.
+    - For per-container attribution, I would use `bpf_get_current_cgroup_id()` at the issue tracepoint to capture the cgroup ID of the process that initiated the I/O. I would store this alongside the timestamp in the hash map, so the completion handler can attribute the latency to the correct container even though the completion runs in interrupt context (where the "current" task is arbitrary).
+    - For efficient data export, I would use a `BPF_MAP_TYPE_PERCPU_HASH` map keyed by `(cgroup_id, latency_bucket)` to build a per-container latency histogram directly in kernel space. The user-space agent reads this map periodically (every 5-10 seconds), aggregates across CPUs, and exports to Prometheus. This approach avoids per-event ring buffer overhead.
+    - For production safety: bounded map sizes (10240 entries), PERCPU maps to avoid lock contention, and the programs attach to stable tracepoints (not kprobes) for kernel version compatibility.
+
+    **Follow-up:** What happens if the hash map fills up because I/O requests are issued faster than they complete?
+
+    **Follow-up Answer:**
+
+    - If the `(dev, sector)` tracking map fills up, `bpf_map_update_elem()` returns `-ENOSPC` and the entry is silently dropped. The corresponding completion event will not find a matching start timestamp and will skip that I/O. This means we lose visibility into some requests during extreme load, but the program remains safe and does not crash or block I/O. To mitigate, I would size the map based on the expected maximum I/O queue depth across all devices (for NVMe with 64K queue depth per queue, this could be large). I would also add a per-CPU counter for dropped entries so the monitoring system can alert when we are losing data.
+  </Accordion>
+
+  <Accordion title="Explain the BPF verifier in detail. What invariants does it enforce, why are bounded loops necessary, and describe a real scenario where a valid program is rejected by the verifier." icon="message">
+    **Strong Answer:**
+
+    - The BPF verifier is a static analyzer that runs at program load time (before any execution) and simulates every possible execution path through the program. It maintains a state machine tracking the type, value range, and liveness of each register and stack slot at every instruction.
+    - Key invariants enforced: First, termination -- every loop must have a provable upper bound. The verifier tracks loop iterations and rejects programs where it cannot prove the loop exits within a bounded number of iterations. Second, memory safety -- every pointer dereference must be preceded by a bounds check. If `bpf_map_lookup_elem()` returns a pointer, the verifier marks it as "possibly NULL" and requires an explicit NULL check before dereferencing. Third, type safety -- the verifier tracks which registers contain pointers to map values, packet data, stack, or scalars, and ensures they are used correctly (you cannot pass a packet pointer where a map pointer is expected). Fourth, privilege -- certain helper functions require `CAP_BPF` or `CAP_SYS_ADMIN`.
+    - A real rejection scenario: you write a program that iterates over a linked list of variable length in packet data. Even if you add `if (i >= MAX_ITERATIONS) break;`, the verifier might reject it because the packet pointer arithmetic creates too many possible states. The verifier explores states exponentially, and complex pointer arithmetic with conditional branches can exceed the instruction count limit (1 million verified instructions). The fix is to restructure the code to reduce branching complexity, use `bpf_loop()` helper (kernel 5.17+), or split the logic into multiple tail-called programs.
+
+    **Follow-up:** How does BPF CO-RE (Compile Once, Run Everywhere) interact with the verifier to enable cross-kernel portability?
+
+    **Follow-up Answer:**
+
+    - CO-RE works by embedding relocation information in the compiled BPF program's ELF file. When you use `BPF_CORE_READ(task, pid)`, the compiler emits a relocation record saying "access field `pid` at offset X in struct `task_struct`." At load time, libbpf reads the running kernel's BTF (BPF Type Format) data to find the actual offset of `pid` in the current kernel's `task_struct`, which may differ from the compile-time offset. libbpf patches the BPF instructions to use the correct offset before submitting to the verifier. The verifier then sees a program with correct offsets for the running kernel and validates it normally. If the field does not exist at all (e.g., a field removed in a newer kernel), libbpf can detect this and handle it gracefully (returning a default value or disabling that part of the program).
+  </Accordion>
+
+  <Accordion title="Compare XDP and TC (traffic control) BPF programs for packet processing. When would you choose each, and what are the performance characteristics?" icon="message">
+    **Strong Answer:**
+
+    - XDP (eXpress Data Path) programs run at the earliest possible point in the network receive path, before the kernel allocates an `sk_buff` structure. They operate on raw `xdp_md` contexts with direct packet data access. TC BPF programs run later, after `sk_buff` allocation, at the traffic control layer in both ingress and egress paths.
+    - Performance difference is significant: XDP can process 10-20 million packets per second per core because it avoids the overhead of sk_buff allocation (~200-300 cycles per packet). TC processes 2-5 million packets per second per core, which is still much faster than iptables but slower than XDP.
+    - I would choose XDP for: DDoS mitigation (drop malicious packets before they consume memory), load balancing (redirect packets to different NICs or CPUs), and simple packet filtering (firewalling at line rate). Facebook's Katran load balancer and Cloudflare's DDoS mitigation use XDP.
+    - I would choose TC for: more complex packet manipulation (full sk_buff available with all parsed headers), egress path processing (XDP only works on ingress), container networking (Cilium uses TC BPF for pod-to-pod traffic because it needs access to socket-level metadata), and when compatibility with the full networking stack is needed (TC programs can interact with connection tracking, netfilter marks, etc.).
+    - XDP limitations: cannot modify packets that need fragmentation (no access to GSO), cannot directly interact with the socket layer, requires NIC driver support for native mode (falls back to generic/slower mode otherwise).
+
+    **Follow-up:** How does AF_XDP enable zero-copy packet processing, and when would you use it instead of regular XDP?
+
+    **Follow-up Answer:**
+
+    - AF_XDP is a socket type that works with XDP to deliver raw packets directly to user space without kernel copying. An XDP program uses `XDP_REDIRECT` with `bpf_redirect_map()` to send packets to an `XSKMAP` (XDP socket map). The user-space application creates an AF_XDP socket with shared UMEM (user memory), where packet data is DMA'd directly from the NIC into user-space-accessible memory. This achieves true zero-copy: the packet data is never copied by the kernel. I would use AF_XDP when the application needs to process every packet (not just filter/drop), such as custom protocol implementations, high-frequency trading network stacks, or DPDK-like applications that want kernel bypass without the complexity of a full DPDK setup. The trade-off versus pure XDP is that AF_XDP requires user-space processing latency, while XDP programs run to completion in the kernel.
+  </Accordion>
+</AccordionGroup>
+
+---
+
 Next: [Tracing Infrastructure →](/courses/linux-internals/tracing)

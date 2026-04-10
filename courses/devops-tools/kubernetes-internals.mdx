@@ -198,15 +198,16 @@ roleRef:
 
 Admission controllers intercept requests before persistence:
 
-**Mutating Admission** (modifies objects):
-- Add default resource limits
-- Inject sidecar containers (Istio)
-- Add labels/annotations
+**Mutating Admission** (modifies objects before they are stored):
+- Add default resource limits (LimitRanger admission controller)
+- Inject sidecar containers (this is exactly how Istio injects Envoy proxies -- your Deployment YAML has one container, but the pod ends up with two)
+- Add labels/annotations automatically
 
-**Validating Admission** (rejects invalid objects):
-- Enforce naming conventions
-- Require specific labels
-- Block privileged containers
+**Validating Admission** (rejects invalid objects without modifying them):
+- Enforce naming conventions (e.g., all Deployments must start with the team prefix)
+- Require specific labels (e.g., every pod must have an `owner` label)
+- Block privileged containers (critical for security compliance)
+- OPA/Gatekeeper and Kyverno are the most popular policy engines for custom validation rules
 
 ```yaml
 # Example: Always pull images (via admission controller)
@@ -393,7 +394,11 @@ The **kubelet** runs on every node and manages pods assigned to that node.
 └─────────────────────────────────────────────────────────────────┘
 ```
 
-**CRI (Container Runtime Interface)** abstracts the container runtime. Kubernetes does not care if you use containerd, CRI-O, or something else.
+**CRI (Container Runtime Interface)** abstracts the container runtime. Kubernetes does not care if you use containerd, CRI-O, or something else -- as long as it speaks CRI. This is a pattern you see throughout Kubernetes: define an interface, and let implementations compete. CSI does the same for storage, CNI for networking. This pluggable architecture is why Kubernetes adapts to so many environments.
+
+<Tip>
+**Production gotcha**: Docker was removed as a container runtime in Kubernetes 1.24. This does not mean you cannot use Docker-built images -- images are OCI-standard and work with any runtime. It means the kubelet no longer talks to the Docker daemon directly. containerd (which Docker uses internally) is the recommended runtime. If you see "dockershim has been removed" errors during upgrades, migrate to containerd.
+</Tip>
 
 ### Pod Sandbox and Containers
 
@@ -603,6 +608,55 @@ kubectl describe deployment my-deployment
 6. **Kubelet uses CRI** - pluggable container runtimes
 7. **CNI implements pod networking** - Calico, Cilium, Flannel, etc.
 8. **CSI implements storage** - pluggable storage backends
+
+---
+
+## Interview Deep-Dive
+
+<AccordionGroup>
+  <Accordion title="Your cluster has three etcd nodes and one loses its disk. The cluster is still operational. Walk me through your recovery strategy and the risks at each step." icon="circle-question">
+    **Strong Answer:**
+    - With 3 nodes and 1 down, we still have quorum (2 out of 3), so the cluster is fully operational for reads and writes. But we are now running without fault tolerance -- losing one more node would make etcd read-only and freeze the entire control plane.
+    - Step one is to remove the failed member from the etcd cluster using `etcdctl member remove <member-id>`. This is critical because etcd still counts the dead member toward quorum calculations. Removing it makes the cluster a 2-node cluster with quorum of 2, which is still not fault tolerant but at least etcd is not waiting for the dead node during write consensus.
+    - Step two is to provision a new etcd node (new disk, fresh etcd data directory), add it to the cluster with `etcdctl member add`, and start etcd on the new node with the `--initial-cluster-state=existing` flag. The new node joins as a learner and syncs the full dataset from the leader via snapshot transfer.
+    - Step three is to verify cluster health: `etcdctl endpoint health --cluster` and `etcdctl endpoint status --write-out=table` to confirm the new member is caught up and the leader is healthy.
+    - The risk window is between step one and step three -- during that time, you have only 2 nodes, and losing either one means total cluster failure. This is why some teams run 5-node etcd clusters in production: you can lose 2 nodes and still have quorum.
+
+    **Follow-up: Why does etcd require odd-numbered clusters, and what happens if you run 4 nodes instead of 3?**
+
+    A 4-node cluster requires quorum of 3 (n/2 + 1). It tolerates only 1 failure, the same as a 3-node cluster. But 4 nodes cost more and have higher write latency because the leader must wait for 3 acknowledgments instead of 2. The 4th node adds cost and latency without improving fault tolerance. This is why etcd (and Raft in general) always recommends odd numbers: 3 nodes tolerates 1 failure, 5 tolerates 2, 7 tolerates 3.
+  </Accordion>
+
+  <Accordion title="A pod has been in Pending state for 20 minutes. Using your knowledge of scheduler internals, walk me through every possible reason and how you would systematically diagnose it." icon="circle-question">
+    **Strong Answer:**
+    - I would start with `kubectl describe pod <name>` and look at the Events section. The scheduler writes a FailedScheduling event with a specific message.
+    - **Resource exhaustion**: "0/5 nodes are available: 5 Insufficient cpu." The scheduler's NodeResourcesFit filter eliminated all nodes. Fix: scale down other workloads, add nodes, or reduce the pod's resource requests.
+    - **Taints not tolerated**: "0/5 nodes are available: 3 node(s) had untolerated taint {key=value:NoSchedule}." The TaintToleration filter eliminated those nodes. Fix: add a toleration to the pod, or remove the taint from nodes.
+    - **NodeSelector/NodeAffinity mismatch**: "0/5 nodes are available: 5 node(s) did not match Pod's node selector." Fix: label the nodes correctly or update the pod spec.
+    - **PVC not bound**: "persistentvolumeclaim 'data' not found" or "waiting for first consumer." The pod cannot schedule until its volume is available. Check if the StorageClass exists and if the CSI driver is healthy.
+    - **Pod topology spread constraint violation**: The scheduler cannot place the pod without violating the spread constraint (e.g., maxSkew=1 across zones). Fix: add nodes in the required topology, or relax the constraint to `whenUnsatisfiable: ScheduleAnyway`.
+    - **ResourceQuota exceeded**: If the namespace has a ResourceQuota and the pod would exceed it, the API server rejects the pod creation entirely (it never reaches the scheduler). Check `kubectl describe resourcequota -n <namespace>`.
+    - **Scheduler not running**: If the kube-scheduler pod itself is down, no pods get scheduled. Check `kubectl get pods -n kube-system | grep scheduler`.
+
+    **Follow-up: How does the scheduler's scoring phase actually decide between two nodes that both pass filtering?**
+
+    Each scoring plugin assigns a score from 0 to 100 per node, and scores are weighted. The default plugins include LeastAllocated (prefers nodes with more free resources, for spreading), BalancedResourceAllocation (prefers nodes where CPU and memory ratios are similar, avoiding one being full while the other is empty), and ImageLocality (prefers nodes that already have the container image cached, saving pull time). The final score is the weighted sum. You can customize weights in a scheduler profile, and you can even write your own scoring plugins using the scheduling framework.
+  </Accordion>
+
+  <Accordion title="Explain the admission controller pipeline. How would you use it to enforce a company-wide policy that all pods must have resource limits?" icon="circle-question">
+    **Strong Answer:**
+    - After authentication and authorization, the API server runs the request through two chains of admission controllers: mutating admission (can modify the object), then validating admission (can only accept or reject).
+    - For the policy "all pods must have resource limits," there are several approaches at different layers:
+    - **LimitRange (built-in)**: A LimitRange with default limits automatically injects resource limits into pods that do not specify them. This mutates the pod spec. It solves the problem but only within a single namespace, and it applies a one-size-fits-all default.
+    - **Validating Admission Webhook**: Deploy a webhook (using OPA/Gatekeeper, Kyverno, or a custom service) that rejects any pod creation where `spec.containers[*].resources.limits` is not set. This is a hard enforcement -- no pod gets through without limits. Kyverno makes this declarative with a simple ClusterPolicy YAML.
+    - **Mutating Admission Webhook**: You could also deploy a mutating webhook that injects default limits if not present, similar to LimitRange but with more sophisticated logic (different defaults per label, per namespace, per team).
+    - In practice, I use Kyverno or OPA Gatekeeper because they work cluster-wide, are declarative (policy as code), and can enforce dozens of policies simultaneously (require labels, block privileged containers, enforce image registry whitelists).
+
+    **Follow-up: What happens if a mutating webhook is down or slow? Does it block all pod creation?**
+
+    Yes, by default. If the webhook is configured with `failurePolicy: Fail` (the default), and the webhook service is unreachable, the API server rejects the request. This is why admission webhooks are a critical dependency -- a broken webhook can block all deployments cluster-wide. The safer option for non-critical policies is `failurePolicy: Ignore`, which lets requests through if the webhook is unavailable. For critical security policies, you keep `Fail` but ensure the webhook is highly available (multiple replicas, PDB, priority class) and has a very low timeout (5 seconds or less).
+  </Accordion>
+</AccordionGroup>
 
 ---
 

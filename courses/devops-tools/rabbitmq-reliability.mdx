@@ -7,15 +7,371 @@ icon: "rabbit"
 
 # RabbitMQ Reliability
 
-Content for RabbitMQ reliability module.
+In messaging systems, reliability means one thing: messages must not be lost, and they must not be processed more than intended. When you are processing payments, dispatching orders, or recording financial transactions, a lost message is real money lost. This chapter covers every layer of the reliability stack -- from the producer confirming the broker received a message, to the broker persisting it to disk, to the consumer acknowledging it was processed.
 
-## Key Concepts
-
-- Message queuing
-- AMQP protocol
-- Exchanges and queues
-- Reliability patterns
+Think of it like sending a certified letter. You need confirmation that the post office received it (publisher confirms), that the post office stored it safely (persistence and durability), and that the recipient signed for it (consumer acknowledgments). Skip any step and you have a gap where the letter can vanish.
 
 ---
 
-Next module 
+## The Three Pillars of Message Safety
+
+For a message to be truly safe end-to-end, three things must all be true:
+
+1. **Publisher confirms** -- The producer knows the broker received and stored the message.
+2. **Durable queues + persistent messages** -- The broker writes the message to disk so it survives restarts.
+3. **Consumer acknowledgments** -- The broker only deletes the message after the consumer confirms it was processed.
+
+Skip any one of these, and you have a window where messages can be lost.
+
+---
+
+## 1. Publisher Confirms
+
+By default, when a producer publishes a message, it gets no feedback about whether the broker received it. The message could be lost due to a network issue, and the producer would never know. Publisher confirms close this gap.
+
+```python
+import pika
+import json
+
+connection = pika.BlockingConnection(pika.ConnectionParameters('localhost'))
+channel = connection.channel()
+
+# Enable publisher confirms on this channel
+# After this, every publish gets a confirmation (ack or nack) from the broker
+channel.confirm_delivery()
+
+channel.queue_declare(queue='orders', durable=True)
+
+def publish_with_confirmation(order):
+    """Publish a message and handle confirmation or failure."""
+    try:
+        channel.basic_publish(
+            exchange='',
+            routing_key='orders',
+            body=json.dumps(order),
+            properties=pika.BasicProperties(
+                delivery_mode=2,  # Persistent -- broker writes to disk before confirming
+            ),
+            mandatory=True,  # Return the message if it cannot be routed to any queue
+        )
+        # If we get here without an exception, the broker confirmed receipt
+        print(f"Confirmed: order {order['id']}")
+    except pika.exceptions.UnroutableError:
+        # Message could not be routed to any queue (no matching binding)
+        print(f"UNROUTABLE: order {order['id']} -- check exchange/queue bindings")
+    except pika.exceptions.NackError:
+        # Broker explicitly rejected the message (e.g., disk full, queue limit reached)
+        print(f"REJECTED: order {order['id']} -- broker nacked, retry or alert")
+
+# Publish orders with confirmation
+for i in range(5):
+    publish_with_confirmation({"id": f"ORD-{i}", "amount": 99.99})
+
+connection.close()
+```
+
+<Warning>
+**Publisher confirms add latency** because the broker must persist the message before confirming. For high-throughput scenarios, use asynchronous confirms (batch confirms) rather than waiting for each message individually. The trade-off is latency versus safety -- in most systems, the added milliseconds are well worth the guarantee.
+</Warning>
+
+---
+
+## 2. Message Persistence and Durable Queues
+
+Persistence is about surviving broker restarts. If the RabbitMQ server restarts (upgrade, crash, host reboot), you need both the queue definition and the messages inside it to survive.
+
+```python
+# Step 1: Declare the queue as durable (queue metadata survives restart)
+channel.queue_declare(queue='payments', durable=True)
+
+# Step 2: Publish messages as persistent (message body written to disk)
+channel.basic_publish(
+    exchange='',
+    routing_key='payments',
+    body=json.dumps({"payment_id": "pay-123", "amount": 250.00}),
+    properties=pika.BasicProperties(
+        delivery_mode=2,  # 1 = transient (in-memory only), 2 = persistent (written to disk)
+    )
+)
+```
+
+**Both are required.** A durable queue with transient messages loses the messages on restart. A persistent message in a non-durable queue loses the entire queue (and all messages) on restart.
+
+### What "Persistent" Actually Means Under the Hood
+
+Persistent does not mean the message is fsynced to disk on every publish. RabbitMQ batches disk writes for performance. There is a small window (typically a few hundred milliseconds) where a persistent message is in the OS page cache but not yet fsynced. If the broker process crashes, the OS usually flushes the cache. But if the machine loses power, those buffered messages could be lost.
+
+For true durability, combine persistent messages with publisher confirms. The broker only sends a confirm after the message is written to disk (or replicated to a quorum, for quorum queues).
+
+---
+
+## 3. Consumer Acknowledgments
+
+The broker needs to know when it is safe to delete a message. Without acknowledgments, two things can go wrong: the consumer crashes mid-processing and the message is lost, or the consumer is slow and the broker keeps re-delivering messages.
+
+### Auto-Ack: Fast but Dangerous
+
+```python
+# auto_ack=True -- the broker deletes the message the instant it is delivered
+# If your consumer crashes AFTER receiving but BEFORE processing, the message is gone
+channel.basic_consume(
+    queue='payments',
+    on_message_callback=callback,
+    auto_ack=True  # DO NOT use this for anything you cannot afford to lose
+)
+```
+
+### Manual Ack: Safe for Production
+
+```python
+def process_payment(ch, method, properties, body):
+    payment = json.loads(body)
+    try:
+        # Process the payment -- this is where the real work happens
+        charge_customer(payment)
+        update_database(payment)
+
+        # Only acknowledge AFTER all processing is complete
+        # If the worker crashes before this line, the message goes back to the queue
+        ch.basic_ack(delivery_tag=method.delivery_tag)
+        print(f"Processed and acked: {payment['payment_id']}")
+
+    except Exception as e:
+        print(f"Failed: {e}")
+        # Reject the message -- requeue=False sends it to the dead letter exchange
+        # requeue=True puts it back in the queue (careful: can cause infinite retry loops)
+        ch.basic_nack(delivery_tag=method.delivery_tag, requeue=False)
+
+channel.basic_qos(prefetch_count=10)  # Allow up to 10 unacked messages per consumer
+channel.basic_consume(queue='payments', on_message_callback=process_payment)
+```
+
+### Prefetch: Controlling the Flow
+
+Prefetch count limits how many unacknowledged messages a consumer can have at once. This is critical for two reasons:
+
+```python
+# Without prefetch: RabbitMQ sends messages as fast as possible
+# Problem 1: If consumer is slow, thousands of messages pile up in its memory
+# Problem 2: Round-robin distribution means slow consumers get the same share as fast ones
+
+# With prefetch: RabbitMQ only sends the next message when the consumer has capacity
+channel.basic_qos(prefetch_count=1)   # Conservative: one at a time, perfect fairness
+channel.basic_qos(prefetch_count=10)  # Balanced: allows batching for throughput
+channel.basic_qos(prefetch_count=100) # Aggressive: high throughput, less fairness
+```
+
+<Tip>
+**Choosing prefetch count**: Start with a low number (1-10) and increase only if throughput is insufficient. A prefetch of 1 gives perfect load balancing but adds round-trip latency per message. A prefetch of 50-100 improves throughput by allowing the consumer to have work ready in its local buffer, but slow consumers may accumulate more messages than fast ones.
+</Tip>
+
+---
+
+## 4. High Availability with Quorum Queues
+
+A single RabbitMQ node is a single point of failure. If that node goes down, all queues on it are unavailable. Quorum queues replicate data across multiple nodes using the Raft consensus algorithm, so the queue continues to operate even if a minority of nodes fail.
+
+### Declaring a Quorum Queue
+
+```python
+# Quorum queues are declared by setting the x-queue-type argument
+channel.queue_declare(
+    queue='critical-orders',
+    durable=True,  # Quorum queues are always durable (this is enforced)
+    arguments={
+        'x-queue-type': 'quorum',           # Use Raft-based replication
+        'x-quorum-initial-group-size': 3,    # Replicate across 3 nodes (must be odd for majority)
+    }
+)
+```
+
+### How Quorum Queues Work
+
+```
+Write path (Raft consensus):
+  Producer ──▶ Leader node
+                  │
+                  ├──▶ Follower 1 (replicate)
+                  ├──▶ Follower 2 (replicate)
+                  │
+                  │  Wait for MAJORITY to confirm (2 out of 3)
+                  │
+                  └──▶ Confirm to producer
+
+If leader fails:
+  Followers detect failure ──▶ Election ──▶ New leader chosen
+  Queue continues serving with no data loss (majority had the data)
+```
+
+### Quorum Queues vs Classic Mirrored Queues
+
+| Feature | Classic Mirrored | Quorum Queue |
+|---------|-----------------|--------------|
+| **Replication** | Synchronous to all mirrors | Raft consensus (majority) |
+| **Performance** | Slower (waits for all mirrors) | Faster (waits for majority) |
+| **Partition handling** | Complex, error-prone | Built-in Raft leader election |
+| **Data safety** | Can lose data during partitions | Consistent (Raft guarantees) |
+| **Status** | Deprecated in RabbitMQ 3.13+ | Recommended for production |
+
+<Warning>
+**Classic mirrored queues are deprecated.** If you are starting a new project or upgrading, use quorum queues for any queue that needs high availability. They are safer, faster, and simpler to operate.
+</Warning>
+
+---
+
+## 5. Clustering for Production
+
+A RabbitMQ cluster shares metadata (exchanges, bindings, users) across all nodes but does not share messages by default. Messages live on the node that hosts their queue. Quorum queues add cross-node message replication on top of this.
+
+### Cluster Setup
+
+```bash
+# On node 2, join node 1's cluster
+rabbitmqctl stop_app
+rabbitmqctl reset
+rabbitmqctl join_cluster rabbit@node1
+rabbitmqctl start_app
+
+# Verify cluster health
+rabbitmqctl cluster_status
+
+# Set the partition handling strategy (do this before partitions happen)
+# pause_minority: the minority partition stops accepting connections (safe choice)
+# In rabbitmq.conf:
+# cluster_partition_handling = pause_minority
+```
+
+### Load Balancing Client Connections
+
+Clients should connect through a load balancer that distributes connections across all cluster nodes. If one node goes down, the load balancer routes new connections to surviving nodes.
+
+```python
+# Client-side connection with multiple hosts (failover)
+import pika
+
+# Try each host in order until one succeeds
+parameters = [
+    pika.ConnectionParameters(host='rabbit-node1'),
+    pika.ConnectionParameters(host='rabbit-node2'),
+    pika.ConnectionParameters(host='rabbit-node3'),
+]
+
+# Pika tries each parameter set in order
+connection = pika.BlockingConnection(parameters)
+```
+
+---
+
+## 6. Handling Failures Gracefully
+
+### Retry with Backoff
+
+When processing a message fails, blindly requeuing it creates an infinite retry loop that wastes CPU and floods logs. Instead, implement delayed retry with exponential backoff using dead letter exchanges and TTL.
+
+```python
+# Set up a retry mechanism using DLX and message TTL
+# Messages that fail go to a "wait" queue with a TTL, then route back to the main queue
+
+# Main queue: failed messages route to the retry exchange
+channel.queue_declare(
+    queue='orders',
+    durable=True,
+    arguments={
+        'x-dead-letter-exchange': 'retry-exchange',
+        'x-dead-letter-routing-key': 'orders-retry',
+    }
+)
+
+# Retry queue: messages wait here for 30 seconds, then route back to main queue
+channel.exchange_declare(exchange='retry-exchange', exchange_type='direct')
+channel.queue_declare(
+    queue='orders-retry',
+    durable=True,
+    arguments={
+        'x-dead-letter-exchange': '',          # Default exchange routes to named queue
+        'x-dead-letter-routing-key': 'orders', # Route back to the main 'orders' queue
+        'x-message-ttl': 30000,                # Wait 30 seconds before retrying
+    }
+)
+channel.queue_bind(exchange='retry-exchange', queue='orders-retry', routing_key='orders-retry')
+
+# In the consumer: reject failures to trigger the retry cycle
+def on_message(ch, method, properties, body):
+    retry_count = (properties.headers or {}).get('x-retry-count', 0)
+
+    if retry_count >= 3:
+        # Max retries exceeded -- send to dead letter queue for manual investigation
+        print(f"Max retries exceeded, sending to DLQ")
+        ch.basic_nack(delivery_tag=method.delivery_tag, requeue=False)
+        return
+
+    try:
+        process_order(body)
+        ch.basic_ack(delivery_tag=method.delivery_tag)
+    except Exception as e:
+        print(f"Retry {retry_count + 1}/3: {e}")
+        ch.basic_nack(delivery_tag=method.delivery_tag, requeue=False)
+```
+
+### Connection Recovery
+
+Network blips and broker restarts will sever your AMQP connections. Production applications must handle reconnection automatically.
+
+```python
+# Use pika's built-in connection recovery for automatic reconnection
+import pika
+
+parameters = pika.ConnectionParameters(
+    host='localhost',
+    connection_attempts=5,        # Try 5 times before giving up
+    retry_delay=2,                # Wait 2 seconds between attempts
+    heartbeat=30,                 # Detect dead connections within 30 seconds
+    blocked_connection_timeout=60, # Timeout if broker is blocking due to resource alarm
+)
+
+# For production, wrap your consumer in a reconnection loop
+while True:
+    try:
+        connection = pika.BlockingConnection(parameters)
+        channel = connection.channel()
+        channel.basic_consume(queue='orders', on_message_callback=process_order)
+        channel.start_consuming()
+    except pika.exceptions.AMQPConnectionError as e:
+        print(f"Connection lost: {e}, reconnecting in 5 seconds...")
+        time.sleep(5)
+    except KeyboardInterrupt:
+        break
+```
+
+---
+
+## Reliability Checklist
+
+Use this checklist before going to production:
+
+- Publisher confirms are enabled on all channels that publish critical messages
+- Queues are declared as durable (or use quorum queue type)
+- Messages are published with `delivery_mode=2` (persistent)
+- Consumers use manual acknowledgments (`auto_ack=False`)
+- Prefetch count is set to a reasonable value (not unlimited)
+- Dead letter exchanges are configured for failed message handling
+- Retry logic uses exponential backoff, not immediate requeue
+- Connection recovery handles network failures and broker restarts
+- Quorum queues are used for high-availability requirements
+- Cluster partition handling is set to `pause_minority`
+- Monitoring alerts are configured for queue depth, unacked messages, and memory alarms
+
+---
+
+## Key Takeaways
+
+- Message safety requires three things working together: publisher confirms, persistent messages in durable queues, and consumer acknowledgments
+- Auto-ack is only acceptable for non-critical, disposable messages -- use manual acks for everything else
+- Quorum queues use Raft consensus for high availability and are the recommended replacement for mirrored queues
+- Prefetch count controls the balance between throughput and fair load distribution
+- Implement dead letter exchanges and retry with backoff instead of infinite requeue loops
+- Always build connection recovery into your client applications -- network failures are not exceptional, they are routine
+
+---
+
+Next: [Kafka Crash Course →](/courses/devops-tools/kafka-overview)

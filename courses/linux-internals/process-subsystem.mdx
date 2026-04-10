@@ -822,4 +822,55 @@ printf("Involuntary context switches: %ld\n", usage.ru_nivcsw);
 
 ---
 
+## Interview Deep-Dive
+
+<AccordionGroup>
+  <Accordion title="A containerized Java application is experiencing high tail latency. You suspect involuntary context switches. Walk me through how you would diagnose this and what kernel-level mechanisms are involved." icon="message">
+    **Strong Answer:**
+
+    - First, I would check the container's cgroup CPU stats: `cat /sys/fs/cgroup/<path>/cpu.stat` to see `nr_throttled` and `throttled_usec`. If the throttling count is high, the CFS bandwidth controller is capping the container's CPU time, which forces involuntary context switches even when the application has work to do. This is the single most common cause of tail latency in containerized workloads.
+    - Simultaneously, I would check `/proc/<pid>/status` for `nonvoluntary_ctxt_switches`. A high ratio of involuntary to voluntary switches means the scheduler is preempting the process, not that the process is yielding willingly. I would correlate this with `perf stat -e context-switches,cpu-migrations` to see whether the process is also migrating between CPUs, which causes cache-cold execution.
+    - At the scheduler level, CFS enforces CPU bandwidth using a quota/period model. If the container has `cpu.max = "50000 100000"` (50ms per 100ms period), any burst that consumes the 50ms quota within the first 30ms of the period will cause the container to be throttled for the remaining 70ms. This creates latency spikes that look periodic.
+    - The fix depends on the root cause: if it is throttling, increase the CPU limit or use `cpu.burst` in cgroups v2 to allow temporary burst above quota. If it is cache thrashing from CPU migrations, pin the container to specific cores with `cpuset.cpus`. If it is genuine oversubscription, reduce co-located workloads.
+
+    **Follow-up:** How does the CFS red-black tree interact with CPU bandwidth throttling?
+
+    **Follow-up Answer:**
+
+    - When a task's cgroup exhausts its bandwidth quota, the CFS dequeues the task's `sched_entity` from the per-CPU runqueue's red-black tree. The task remains in a throttled state until the next period boundary, when the quota is replenished and the task is re-enqueued. During throttling, the task does not appear in the rb-tree at all, so the scheduler's `pick_next_task_fair()` function simply picks the next lowest-vruntime task from whatever is left. When the throttled task returns, it re-enters with its accumulated vruntime, so it does not get an unfair advantage.
+  </Accordion>
+
+  <Accordion title="Explain precisely what happens at the kernel level when pthread_create() is called. How does the resulting thread differ from a process created by fork()?" icon="message">
+    **Strong Answer:**
+
+    - `pthread_create()` in glibc ultimately calls `clone()` with specific flags: `CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND | CLONE_THREAD | CLONE_SYSVSEM | CLONE_SETTLS | CLONE_PARENT_SETTID | CLONE_CHILD_CLEARTID`. The critical flags are `CLONE_VM` (share virtual address space), `CLONE_FILES` (share file descriptor table), and `CLONE_THREAD` (same thread group, same PID from user-space perspective).
+    - Inside the kernel, `do_fork()` allocates a new `task_struct` via `dup_task_struct()`. Because `CLONE_VM` is set, it does not call `dup_mm()` to copy the memory descriptor -- instead, the new task shares the parent's `mm_struct`, incrementing its reference count. This means both threads see identical page tables and any memory write by one thread is immediately visible to the other.
+    - A `fork()`, by contrast, calls `clone(SIGCHLD, 0)` which omits all sharing flags. The kernel copies the `mm_struct` with copy-on-write semantics (marking all writable pages as read-only in both parent and child page tables), copies the `files_struct` (giving the child independent file descriptor table), and assigns a new TGID.
+    - The practical difference is that threads share everything by default and use synchronization primitives (mutexes, futexes) to coordinate, while processes are isolated by default and use IPC (pipes, sockets, shared memory) to communicate. The kernel treats both as `task_struct` entries -- the scheduler does not distinguish between threads and processes.
+
+    **Follow-up:** What is the role of CLONE_THREAD specifically, and what breaks if you omit it while keeping CLONE_VM?
+
+    **Follow-up Answer:**
+
+    - `CLONE_THREAD` puts the new task into the same thread group as the parent, meaning they share the same TGID (which is what `getpid()` returns). Without it, the new task gets its own TGID, so it appears as a separate process to user space (different PID from `ps`), even though it shares the address space via `CLONE_VM`. Signals sent to the PID would only target one of them, `wait()` semantics change, and the thread group leader relationship is broken. This is essentially what `vfork()` does in a limited way. Omitting `CLONE_THREAD` while keeping `CLONE_VM` creates a dangerous hybrid: two "processes" sharing memory without the signal and exit semantics that threading requires, which is why POSIX threads always use both flags together.
+  </Accordion>
+
+  <Accordion title="You have a latency-critical application running on a 64-core server. The application uses 8 threads. Design the CPU isolation and scheduling strategy you would use, and explain the kernel mechanisms involved." icon="message">
+    **Strong Answer:**
+
+    - I would isolate 8 cores (say cores 8-15) from the general-purpose scheduler using `isolcpus=8-15` on the kernel command line. This removes these cores from the CFS load balancer, so no other tasks will be scheduled there unless explicitly pinned. I would also add `nohz_full=8-15` to disable the timer tick on those cores when only one task is running, eliminating periodic interrupts that cause jitter. Finally, `rcu_nocbs=8-15` offloads RCU callback processing to housekeeping cores.
+    - For the application itself, I would use `taskset -c 8-15` or `sched_setaffinity()` to pin threads to the isolated cores, one thread per core. I would set the scheduling policy to `SCHED_FIFO` with a priority of 50 using `chrt -f 50`, which ensures these threads preempt any remaining kernel threads that might slip onto these cores.
+    - On the housekeeping cores (0-7), I would keep all system services, IRQ handling, and kernel threads. I would use `irqaffinity=0-7` or manually set `/proc/irq/*/smp_affinity` to keep hardware interrupts away from the isolated cores.
+    - At the hardware level, I would disable C-states deeper than C1 on the isolated cores (via `/sys/devices/system/cpu/cpu*/cpuidle/state*/disable`) to avoid wake-up latency, and set the CPU governor to `performance` to lock frequency at maximum.
+
+    **Follow-up:** What residual sources of jitter remain even after this configuration, and how would you measure them?
+
+    **Follow-up Answer:**
+
+    - Even with full isolation, several sources remain: System Management Interrupts (SMIs) from the BIOS/firmware that cannot be masked by the OS (typically 50-150 microseconds), hardware performance monitoring interrupts if perf counters overflow, and TLB shootdown IPIs when other cores modify shared page tables. I would measure residual jitter using `cyclictest -m -p 99 -i 100 -h 1000 -D 5m -a 8 -t 1`, which runs a high-priority real-time thread and measures the delta between expected and actual wake-up times. The histogram output reveals the worst-case latency spikes. For SMI detection specifically, `perf stat -e msr/smi/` on Intel platforms counts SMI events.
+  </Accordion>
+</AccordionGroup>
+
+---
+
 Next: [Memory Management Internals →](/courses/linux-internals/memory-management)

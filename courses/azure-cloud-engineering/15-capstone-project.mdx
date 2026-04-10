@@ -133,6 +133,9 @@ Apply everything you've learned by building a production-ready e-commerce platfo
 
 ```csharp
 // ProductService/Controllers/ProductsController.cs
+// Why Cosmos DB for products? Product catalogs have flexible schemas (different
+// categories have different attributes) and need global distribution for low-latency
+// reads. SQL databases would require schema migrations for every new product attribute.
 [ApiController]
 [Route("api/[controller]")]
 public class ProductsController : ControllerBase
@@ -143,16 +146,29 @@ public class ProductsController : ControllerBase
     [HttpGet]
     public async Task<IActionResult> GetProducts([FromQuery] string category)
     {
+        // "ecommerce" = database name, "products" = container name
+        // Container is partitioned by /category for efficient queries --
+        // querying by category hits a single partition (fast, cheap)
         var container = _cosmosClient.GetContainer("ecommerce", "products");
+
+        // Parameterized query prevents injection attacks.
+        // Cosmos DB charges per RU (Request Unit) -- filtering by partition key
+        // (category) keeps costs low (~1 RU per item vs 5+ RU for cross-partition)
         var query = new QueryDefinition(
             "SELECT * FROM c WHERE c.category = @category")
             .WithParameter("@category", category);
 
         var products = new List<Product>();
+        // Iterator pattern handles pagination automatically -- Cosmos returns
+        // results in pages (default ~1MB per page) to prevent memory exhaustion
+        // when a category has thousands of products
         using var iterator = container.GetItemQueryIterator<Product>(query);
         while (iterator.HasMoreResults)
         {
             var response = await iterator.ReadNextAsync();
+            // response.RequestCharge tells you exact RU cost -- log this
+            // in production to detect expensive queries before they blow your budget
+            _logger?.LogDebug("Query consumed {RUs} RUs", response.RequestCharge);
             products.AddRange(response);
         }
 
@@ -165,15 +181,23 @@ public class ProductsController : ControllerBase
 
 ```csharp
 // OrderService/Controllers/OrdersController.cs
+// Why Azure SQL for orders? Financial transactions require ACID guarantees --
+// if payment succeeds but order insertion fails, you need a rollback.
+// Cosmos DB supports transactions only within a single partition key,
+// which is too limiting for order workflows spanning multiple entities.
 [ApiController]
 [Route("api/[controller]")]
 public class OrdersController : ControllerBase
 {
     private readonly ApplicationDbContext _context;
+    private readonly ILogger<OrdersController> _logger;
 
     [HttpPost]
     public async Task<IActionResult> CreateOrder([FromBody] CreateOrderRequest request)
     {
+        // Explicit transaction ensures atomicity: either the entire order
+        // is created (order + line items + inventory update) or nothing is.
+        // Without this, a crash mid-operation could create an order with no items.
         using var transaction = await _context.Database.BeginTransactionAsync();
 
         try
@@ -181,8 +205,12 @@ public class OrdersController : ControllerBase
             var order = new Order
             {
                 UserId = request.UserId,
+                // Calculate server-side, never trust client-provided totals --
+                // a malicious client could send Total: $0.01 for a $500 order
                 Total = request.Items.Sum(i => i.Price * i.Quantity),
                 Status = OrderStatus.Pending,
+                // Always use UTC in distributed systems -- local time zones
+                // cause subtle bugs when services run in different Azure regions
                 CreatedAt = DateTime.UtcNow
             };
 
@@ -190,11 +218,17 @@ public class OrdersController : ControllerBase
             await _context.SaveChangesAsync();
             await transaction.CommitAsync();
 
+            // Return 201 Created with Location header pointing to the new order.
+            // This follows REST conventions and lets the client fetch order status.
             return CreatedAtAction(nameof(GetOrder), new { id = order.Id }, order);
         }
         catch (Exception ex)
         {
+            // Rollback undoes all changes in this transaction.
+            // In production, log the full exception for debugging but never
+            // return internal details to the client (information disclosure risk).
             await transaction.RollbackAsync();
+            _logger?.LogError(ex, "Failed to create order for user {UserId}", request.UserId);
             return StatusCode(500, "Internal server error");
         }
     }
@@ -208,52 +242,79 @@ public class OrdersController : ControllerBase
 ### Bicep Template
 
 ```bicep
-// main.bicep
+// main.bicep -- Infrastructure as Code for the entire e-commerce platform.
+// Why Bicep over ARM templates? Bicep compiles to ARM JSON but is 60% less verbose,
+// has first-class IDE support, and catches errors at compile time rather than deploy time.
 param location string = 'eastus'
 param environment string = 'prod'
 
-// AKS Cluster
+// AKS Cluster -- the compute backbone for all microservices.
+// Why AKS over App Service? With 5+ microservices, AKS provides better
+// bin-packing (fitting multiple services on fewer VMs), service discovery,
+// and a unified deployment model via Kubernetes manifests.
 resource aksCluster 'Microsoft.ContainerService/managedClusters@2023-01-01' = {
   name: 'aks-${environment}'
   location: location
   identity: {
+    // SystemAssigned identity eliminates the need for service principal credentials.
+    // AKS uses this identity to manage Azure resources (load balancers, disks, etc.)
+    // on your behalf -- no passwords to rotate.
     type: 'SystemAssigned'
   }
   properties: {
     dnsPrefix: 'aks-${environment}'
     kubernetesVersion: '1.27.7'
+    // RBAC must be true for production -- without it, any pod in the cluster
+    // can access the Kubernetes API with full admin privileges.
     enableRBAC: true
     agentPoolProfiles: [
       {
         name: 'nodepool1'
-        count: 3
-        vmSize: 'Standard_D4s_v3'
-        mode: 'System'
+        count: 3 // Start with 3 nodes -- one per availability zone for HA
+        vmSize: 'Standard_D4s_v3' // 4 vCPU, 16 GB RAM -- good balance of compute/cost
+        mode: 'System' // System pools run critical AKS components (CoreDNS, metrics-server)
+        // Spreading across 3 zones means a full zone outage (datacenter fire)
+        // still leaves 2/3 of your capacity running. This is how you achieve 99.99%.
         availabilityZones: ['1', '2', '3']
         enableAutoScaling: true
-        minCount: 3
-        maxCount: 10
+        minCount: 3 // Never go below 3 (one per zone for redundancy)
+        maxCount: 10 // Cap prevents runaway scaling from blowing your budget
+        // Cost estimate: 3 nodes baseline = ~$430/month, max 10 = ~$1,430/month
       }
     ]
   }
 }
 
-// Cosmos DB
+// Cosmos DB -- globally distributed NoSQL for the product catalog.
+// Why not Azure SQL for products? Product schemas vary by category (electronics
+// have "wattage", clothing has "size") -- Cosmos DB's schemaless design handles
+// this naturally without ALTER TABLE migrations on every new product type.
 resource cosmosAccount 'Microsoft.DocumentDB/databaseAccounts@2023-04-15' = {
+  // uniqueString generates a deterministic hash from the resource group ID,
+  // ensuring globally unique names without hardcoding random strings.
   name: 'cosmos-${environment}-${uniqueString(resourceGroup().id)}'
   location: location
   properties: {
     databaseAccountOfferType: 'Standard'
     consistencyPolicy: {
+      // Session consistency is the sweet spot for most apps: a user always sees
+      // their own writes (no stale reads after updating cart), while other users
+      // may see a slightly delayed view. Costs ~20% fewer RUs than Strong consistency.
       defaultConsistencyLevel: 'Session'
     }
     locations: [
       {
         locationName: location
         failoverPriority: 0
+        // Zone redundancy replicates data across 3 availability zones within
+        // the region. Combined with multi-master writes, this provides both
+        // regional HA and multi-region DR. Adds ~25% to your RU cost.
         isZoneRedundant: true
       }
     ]
+    // Multi-master allows writes to any region -- critical for active-active
+    // deployments where both East US and West Europe handle user transactions.
+    // Without this, all writes must go to a single primary region.
     enableMultipleWriteLocations: true
   }
 }
@@ -267,14 +328,20 @@ resource cosmosAccount 'Microsoft.DocumentDB/databaseAccounts@2023-04-15' = {
 
 ```yaml
 # .github/workflows/deploy.yml
+# This pipeline deploys infrastructure first (Bicep), then builds and pushes
+# all microservice containers in parallel using a matrix strategy.
 name: Deploy E-Commerce Platform
 
 on:
   push:
     branches: [main]
+    # In production, you would also add path filters to only trigger when
+    # relevant code changes -- deploying infra on every README edit is wasteful.
 
 jobs:
   infrastructure:
+    # Infrastructure deploys first because services depend on AKS, Cosmos DB, etc.
+    # If infra fails, service builds are skipped (saving build minutes).
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v3
@@ -282,25 +349,37 @@ jobs:
     - name: Azure Login
       uses: azure/login@v1
       with:
+        # AZURE_CREDENTIALS contains a service principal with Contributor role
+        # scoped to the resource group -- NOT the entire subscription.
+        # Principle of least privilege applies to CI/CD too.
         creds: ${{ secrets.AZURE_CREDENTIALS }}
 
     - name: Deploy Infrastructure
       run: |
+        # --mode Incremental (default) only adds/updates resources.
+        # Never use --mode Complete in production -- it DELETES resources
+        # not in the template, which can wipe out manually created resources.
         az deployment group create \
           --resource-group rg-ecommerce-prod \
           --template-file infra/main.bicep
 
   build-and-push:
     runs-on: ubuntu-latest
-    needs: infrastructure
+    needs: infrastructure  # Wait for infra to complete before building images
     strategy:
       matrix:
+        # Matrix runs all three service builds in parallel -- 3x faster than sequential.
+        # Each service builds independently, so a failure in product-service
+        # does not block order-service from building.
         service: [product-service, order-service, cart-service]
     steps:
     - uses: actions/checkout@v3
 
     - name: Build and Push Docker Image
       run: |
+        # Tag with git SHA for immutable, traceable deployments.
+        # Never use :latest in production -- it makes rollbacks impossible
+        # because you cannot tell which version is "latest" after multiple deploys.
         docker build -t myregistry.azurecr.io/${{ matrix.service }}:${{ github.sha }} \
           ./services/${{ matrix.service }}
         docker push myregistry.azurecr.io/${{ matrix.service }}:${{ github.sha }}
@@ -373,6 +452,26 @@ jobs:
     - Auto-scaling configured
   </Card>
 </CardGroup>
+
+**Estimated Cost Breakdown (Production, Single Region)**:
+
+| Service | Configuration | Monthly Cost |
+|---------|--------------|--------------|
+| **AKS** | 3 nodes Standard_D4s_v3 (autoscale to 10) | $430-$1,430 |
+| **Azure SQL** | Standard S3 (100 DTUs), zone-redundant | $200 |
+| **Cosmos DB** | Autoscale 4,000 max RU/s | $47-$233 |
+| **Redis Cache** | Standard C1 (1 GB) | $55 |
+| **Front Door** | Standard tier + WAF | $55 |
+| **Application Gateway** | WAF_v2, 2 capacity units | $250 |
+| **Blob Storage** | 500 GB, Hot tier, GRS | $20 |
+| **Application Insights** | 15 GB/month ingestion | $28 |
+| **Key Vault** | Standard, ~10K operations/month | $1 |
+| **Azure AD B2C** | 50K authentications/month (free tier) | $0 |
+| **Container Registry** | Basic tier | $5 |
+| **Total (baseline)** | | **~$1,100/month** |
+| **Total (peak autoscale)** | | **~$2,300/month** |
+
+**Cost Tip**: For the capstone project during learning, use a single region (not multi-region) and B-series VMs for AKS nodes. This reduces the cost to approximately $300-500/month. Delete all resources immediately after completing each phase using `az group delete --name rg-ecommerce-capstone --yes --no-wait`.
 
 ---
 

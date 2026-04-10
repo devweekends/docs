@@ -9,16 +9,42 @@ icon: "bolt"
 
 Signals are the Unix equivalent of hardware interrupts for user-space processes. While they seem simple (send a signal, catch it in a handler), their internal implementation is a masterpiece of kernel-to-user-space context switching.
 
+Think of a signal like a fire alarm in an office building. You are at your desk working (executing instructions). The alarm goes off (signal delivered). You stop what you are doing, save your place (signal frame on stack), follow the evacuation procedure (signal handler), and then return to your desk and resume exactly where you left off (rt_sigreturn restores context). The complexity arises because the "alarm" can fire at any instant -- even in the middle of writing a sentence.
+
+<Info>
+**Mastery Level**: Senior Systems Engineer  
+**Key Internals**: Signal frames, `rt_sigreturn`, async-signal safety, `signalfd`, `sigaltstack`  
+**Prerequisites**: [Process Internals](/operating-systems/processes), [System Calls](/operating-systems/os-fundamentals)  
+**Time to Master**: 4-6 hours
+</Info>
+
 ---
 
 ## 1. How Signals Are Delivered
 When a process receives a signal (e.g., `SIGSEGV` or `SIGINT`), the kernel doesn't just call a function. It must force the user process to execute a handler at an **arbitrary point in its execution**.
 
 ### The Delivery Flow
-1.  **Generation**: A process calls `kill()` or the hardware triggers an exception.
-2.  **Pending State**: The kernel marks the signal as "pending" in the process's `task_struct`.
-3.  **Check on Return**: The kernel checks for pending signals every time it's about to return to user-space (e.g., after a syscall or an interrupt).
-4.  **Signal Delivery**: If a signal is pending and not masked, the kernel initiates the delivery.
+1.  **Generation**: A process calls `kill()` or the hardware triggers an exception (e.g., divide-by-zero generates `SIGFPE`, invalid memory access generates `SIGSEGV`).
+2.  **Pending State**: The kernel marks the signal as "pending" in the process's `task_struct`. For standard signals (1-31), only one instance is recorded -- if three `SIGINT` arrive before the first is delivered, the process sees one. For real-time signals (32-64), the kernel queues each instance.
+3.  **Check on Return**: The kernel checks for pending signals every time it is about to return to user-space (e.g., after a syscall or an interrupt). This is the critical detail: signals are never delivered in the middle of kernel execution. The kernel finishes its work, then inspects the pending mask right before the `sysret`/`iret` instruction.
+4.  **Signal Delivery**: If a signal is pending and not masked, the kernel initiates the delivery by rewriting the user-space stack and instruction pointer.
+
+```c
+// Simplified from kernel/signal.c -- the "check on return" logic
+static void do_signal(struct pt_regs *regs) {
+    struct ksignal ksig;
+
+    // Dequeue the next pending, unblocked signal
+    if (get_signal(&ksig)) {
+        // Rewrite the user stack to execute the handler
+        handle_signal(&ksig, regs);
+        return;
+    }
+
+    // No signal pending -- restore original user context and return
+    restore_saved_sigmask();
+}
+```
 
 ---
 
@@ -46,37 +72,232 @@ Signals are **asynchronous**. They can arrive while your program is in the middl
 If your program is inside `malloc()` (which holds a global lock) and a signal arrives whose handler also calls `malloc()`, you will **deadlock** with yourself.
 
 ### The Rules
--   Only call **Async-Signal Safe** functions in a signal handler (e.g., `write`, `read`, `_exit`).
--   Never use standard I/O (`printf`, `fopen`) or memory allocation (`malloc`, `free`).
--   Common practice: Set a global `volatile sig_atomic_t` flag and handle the logic in your main loop.
+-   Only call **Async-Signal Safe** functions in a signal handler (e.g., `write`, `read`, `_exit`). The full list is defined by POSIX and includes about 120 functions -- when in doubt, check `man 7 signal-safety`.
+-   Never use standard I/O (`printf`, `fopen`) or memory allocation (`malloc`, `free`). These hold internal locks that your main code may already be holding when the signal arrives.
+-   Common practice: Set a global `volatile sig_atomic_t` flag and handle the logic in your main loop. This is the "self-pipe trick" generalized: the handler does the absolute minimum (set a flag or write a byte to a pipe), and the main loop does the real work.
+
+**Practical tip**: The `volatile` keyword alone is not enough. You must use `sig_atomic_t` because the C standard only guarantees atomic access for this type in signal contexts. Using `volatile int` on a platform where `int` writes are not atomic would create a data race between the handler and the main thread.
 
 ---
 
 ## 4. Signal Stacks: `sigaltstack`
-If a process suffers a **Stack Overflow**, it receives a `SIGSEGV`. However, to handle that signal, the kernel needs to push a signal frame onto the stack. If the stack is full, the kernel can't push the frame, and the process is killed instantly.
--   *Solution*: `sigaltstack()`. This allows a process to define a separate, dedicated stack for signal handlers.
+If a process suffers a **Stack Overflow**, it receives a `SIGSEGV`. However, to handle that signal, the kernel needs to push a signal frame onto the stack. If the stack is full, the kernel cannot push the frame, and the process is killed instantly -- a catch-22.
+-   *Solution*: `sigaltstack()`. This allows a process to define a separate, dedicated stack (typically 8-32 KB) for signal handlers. The handler then runs on a completely different memory region, independent of the overflowed stack.
+
+**Practical tip**: This is how crash-reporting libraries (Google Breakpad, Sentry Native) capture stack traces even on stack overflow. They register a `SIGSEGV` handler with `SA_ONSTACK` and a pre-allocated alternate stack, allowing them to dump diagnostics before the process dies.
+
+```c
+// Setting up an alternate signal stack
+stack_t ss;
+ss.ss_sp = malloc(SIGSTKSZ);   // SIGSTKSZ is typically 8192 bytes
+ss.ss_size = SIGSTKSZ;
+ss.ss_flags = 0;
+sigaltstack(&ss, NULL);
+
+// Register handler with SA_ONSTACK so it uses the alternate stack
+struct sigaction sa;
+sa.sa_handler = crash_handler;
+sa.sa_flags = SA_ONSTACK;       // Use alternate stack for this handler
+sigemptyset(&sa.sa_mask);
+sigaction(SIGSEGV, &sa, NULL);
+```
 
 ---
 
 ## 5. Signals vs. Threads
-In a multi-threaded process:
--   **Direct Signals**: Generated by a specific thread (e.g., `SIGSEGV`, `SIGFPE`, `SIGILL`) are delivered only to that thread.
--   **Process-wide Signals**: (e.g., `SIGINT`, `SIGTERM`) are delivered to **one arbitrary thread** that doesn't have the signal masked.
+In a multi-threaded process, signals interact with the threading model in subtle ways. Think of it like a phone call to an office: a call to a specific extension (synchronous signal) reaches one person, while a call to the main line (asynchronous signal) is routed to whoever picks up first.
+
+-   **Synchronous / Thread-directed Signals**: Signals caused by a specific thread's own execution (e.g., `SIGSEGV` from a bad pointer dereference, `SIGFPE` from a divide-by-zero, `SIGILL` from an invalid instruction) are delivered only to that thread. The thread caused the fault, so only it can meaningfully handle it.
+-   **Asynchronous / Process-wide Signals**: Signals sent from outside (e.g., `SIGINT` from Ctrl+C, `SIGTERM` from `kill`) are delivered to **one arbitrary thread** that does not have the signal masked. The kernel picks the first eligible thread it finds.
+-   **Thread-targeted Signals**: `pthread_kill(thread, sig)` sends a signal to a specific thread regardless of whether it is synchronous or asynchronous.
+
+**Practical tip**: The standard pattern for multi-threaded daemons is to block all signals in every worker thread using `pthread_sigmask`, then dedicate one thread to call `sigwait()` (or use `signalfd` with `epoll`). This eliminates the unpredictability of "which thread gets the signal?" and avoids async-signal-safety concerns entirely in worker code.
+
+```c
+// Worker thread setup: block all signals so the dedicated thread handles them
+void *worker(void *arg) {
+    sigset_t all;
+    sigfillset(&all);
+    pthread_sigmask(SIG_BLOCK, &all, NULL);  // Block everything in this thread
+
+    // ... do work safely without worrying about signal interruption ...
+    return NULL;
+}
+
+// Dedicated signal-handling thread
+void *signal_thread(void *arg) {
+    sigset_t wait_set;
+    sigemptyset(&wait_set);
+    sigaddset(&wait_set, SIGINT);
+    sigaddset(&wait_set, SIGTERM);
+
+    int sig;
+    // sigwait blocks until one of the masked signals arrives
+    sigwait(&wait_set, &sig);
+    printf("Caught signal %d, initiating graceful shutdown\n", sig);
+    // ... coordinate shutdown with worker threads ...
+    return NULL;
+}
+```
 
 ---
 
 ## 6. Modern Alternative: `signalfd`
 Handling signals is painful due to async-safety issues. Linux provides `signalfd`, which allows you to receive signals as data from a file descriptor.
--   You mask the signals normally.
--   You `read()` from the signalfd.
+-   You mask the signals normally (block them from being delivered as interrupts).
+-   You `read()` from the signalfd -- this returns a `struct signalfd_siginfo` containing the signal number, sender PID, and other metadata.
 -   This converts the asynchronous signal into a **synchronous event**, making it safe to use with `epoll` and standard libraries.
+
+The result is that signals become just another file descriptor event, composable with your existing event loop. No more worrying about async-signal safety, no more self-pipe tricks.
+
+```c
+// Block SIGINT and SIGTERM from default delivery
+sigset_t mask;
+sigemptyset(&mask);
+sigaddset(&mask, SIGINT);
+sigaddset(&mask, SIGTERM);
+sigprocmask(SIG_BLOCK, &mask, NULL);
+
+// Create a file descriptor that delivers these signals as readable data
+int sfd = signalfd(-1, &mask, SFD_NONBLOCK);
+
+// Now add sfd to your epoll set alongside sockets, timers, etc.
+// When SIGINT arrives, epoll_wait returns sfd as readable.
+struct signalfd_siginfo info;
+read(sfd, &info, sizeof(info));
+printf("Received signal %d from PID %d\n", info.ssi_signo, info.ssi_pid);
+```
+
+---
+
+## 7. Interview Deep Dive
+
+<AccordionGroup>
+  <Accordion title="How does the kernel deliver a signal to a user-space process?">
+    The kernel does not "call" the handler. It rewrites the user stack:
+    
+    1. Saves the full register context (RIP, RSP, RFLAGS, general-purpose registers) onto the user stack as a **signal frame**.
+    2. Overwrites the saved RIP in the trap frame to point to the user's signal handler.
+    3. Returns to user space via `sysret`/`iret`. The CPU resumes at the handler address.
+    4. When the handler returns, it falls through to a **restorer** stub that calls `rt_sigreturn`.
+    5. The kernel reads the saved context from the signal frame, restores all registers, and resumes the original code path.
+    
+    A senior engineer would note that this is also a security-sensitive area: if an attacker can corrupt the signal frame on the stack, they can hijack `rt_sigreturn` to set arbitrary register values (a technique known as SROP -- Sigreturn-Oriented Programming).
+  </Accordion>
+
+  <Accordion title="What is async-signal safety and why does it matter?">
+    Async-signal safety means a function can be safely called from within a signal handler. The danger: a signal can arrive while the main code is holding an internal lock (e.g., inside `malloc`). If the handler also calls `malloc`, the thread deadlocks against itself -- it is waiting for a lock it already holds, but it cannot return to the main code to release it.
+    
+    POSIX defines about 120 async-signal-safe functions (e.g., `write`, `read`, `_exit`, `signal`). Everything else -- `printf`, `malloc`, `syslog`, any function that takes a lock -- is unsafe.
+    
+    The production-grade pattern: do the minimum in the handler (set a `volatile sig_atomic_t` flag or write a byte to a self-pipe), then handle the real logic in your main event loop.
+  </Accordion>
+
+  <Accordion title="Compare signalfd to traditional signal handlers. When would you choose each?">
+    **Traditional handlers** are necessary when:
+    - You need to handle synchronous signals like `SIGSEGV` (signalfd cannot catch these).
+    - You are writing a library that must not impose an event-loop architecture on the caller.
+    
+    **signalfd** is better when:
+    - You already have an event loop (`epoll`/`select`/`poll`).
+    - You want to avoid async-signal-safety headaches entirely.
+    - You need to handle process-lifecycle signals (`SIGTERM`, `SIGCHLD`, `SIGHUP`).
+    
+    In modern service architectures, signalfd (or the equivalent `signal_fd` in Go via `os/signal.Notify`) is the standard approach. It turns an asynchronous interrupt into a synchronous, pollable event -- composable with all other I/O.
+  </Accordion>
+</AccordionGroup>
 
 ---
 
 ## Summary for Senior Engineers
 -   **Signal handlers are not normal functions**: They run on a modified stack with a kernel-injected return path.
 -   **The `rt_sigreturn` syscall** is the only way to safely exit a signal handler and restore the machine state.
--   **Async-safety** is non-negotiable. If you ignore it, your program will flake out under load.
+-   **Async-safety** is non-negotiable. If you ignore it, your program will flake out under load, producing deadlocks that only reproduce in production.
 -   **Use `signalfd`** in modern applications to avoid the complexities of asynchronous handlers.
+-   **Block signals in worker threads** and handle them in a dedicated thread or event loop -- this is the pattern used by every serious multi-threaded daemon.
+-   **Always set up `sigaltstack`** if you need to handle `SIGSEGV` for crash reporting, because the default stack may already be overflowed.
+
+---
+
+## Interview Deep-Dive
+
+<AccordionGroup>
+  <Accordion title="A multi-threaded server occasionally hangs under load. You suspect a signal handler is calling malloc(), which deadlocks with the main thread's malloc(). How would you diagnose this, and what is the correct way to handle signals in a multi-threaded application?">
+    **Strong Answer:**
+
+    This is a classic async-signal-safety violation, and it is one of the most insidious bugs because it only manifests under specific timing conditions -- the signal must arrive exactly while the main thread holds the heap lock.
+
+    Diagnosis:
+    - **Attach GDB to the hung process**: `gdb -p PID`, then `thread apply all bt`. Look for two stack frames on the same thread stuck in malloc/free-related functions. One frame will be the normal malloc call, and above it the signal handler's malloc call waiting for the same lock. Since signals run on the interrupted thread's stack, both frames belong to the same OS thread, creating a self-deadlock.
+    - **strace -e signal**: Run the server under strace to see which signals are being delivered and when.
+    - **Core dump analysis**: If the process was killed, examine the core dump for a thread whose stack shows a signal handler frame interleaved with a malloc frame.
+
+    The correct approach for multi-threaded signal handling:
+
+    1. **Block all signals in all worker threads**: At thread creation, use `pthread_sigmask(SIG_BLOCK, ...)` to block all signals (except synchronous ones like SIGSEGV/SIGBUS that cannot be meaningfully blocked).
+    2. **Dedicate one thread for signal handling**: Create a thread that calls `sigwait()` in a loop. This converts asynchronous signals into synchronous events -- `sigwait` returns the signal number, and the handler thread can safely call any function because it is running in a normal execution context, not a signal context.
+    3. **Alternative: signalfd**: On Linux, use `signalfd()` to receive signals as file descriptor events. Integrate with your epoll loop. This is even better for event-driven architectures because signals become just another event source.
+
+    If you absolutely must use a signal handler (e.g., for SIGSEGV crash handling), the handler must only call async-signal-safe functions. The safest pattern: set a `volatile sig_atomic_t` flag in the handler and check it in the main loop.
+
+    **Follow-up: Why can SIGSEGV not be handled via sigwait() or signalfd()?**
+
+    SIGSEGV is a synchronous signal -- it is generated by the specific instruction that caused the fault, and the kernel delivers it to the specific thread that executed that instruction. Blocking SIGSEGV and waiting for it with sigwait in a different thread does not work because the faulting thread is stuck at the faulting instruction and cannot proceed. The signal must be handled on the faulting thread's stack so the handler can either fix the condition (e.g., map the missing page for a JIT compiler) or terminate gracefully. This is fundamentally different from asynchronous signals like SIGINT, which are not tied to a specific instruction.
+  </Accordion>
+
+  <Accordion title="Explain the signal frame mechanism. When the kernel delivers a signal, how does it ensure the process returns to exactly where it was after the handler completes?">
+    **Strong Answer:**
+
+    Signal delivery is one of the most elegant kernel-to-user-space interactions in Unix. The mechanism is essentially: the kernel hijacks the process's return to user space, forces it to execute the handler, and then the handler "returns" through a kernel-provided trampoline that restores the original state.
+
+    Step by step:
+    - **Signal becomes pending**: When a signal is generated (via `kill()`, hardware exception, etc.), the kernel sets a bit in the target process's `pending` signal mask.
+    - **Check on return to user space**: Every time the kernel is about to return to user space (after a syscall, interrupt, or page fault), it checks for pending unmasked signals via `do_signal()`.
+    - **Build the signal frame**: The kernel saves the entire user-space register context (all general-purpose registers, RFLAGS, RIP, RSP, FPU/SSE state) onto the user's stack as a `struct rt_sigframe`. This frame also contains a small piece of code: the "restorer" trampoline (or a pointer to it in the vDSO).
+    - **Modify the return context**: The kernel changes the return RIP to point to the user's signal handler function. The return RSP is adjusted to account for the signal frame. Arguments are set up per the calling convention (signal number in RDI, `siginfo_t` pointer in RSI, `ucontext_t` in RDX for `SA_SIGINFO` handlers).
+    - **Return to user space**: The kernel does its normal return (SYSRET or IRET). The CPU resumes in user space, but at the signal handler instead of the original code.
+    - **Handler executes and returns**: The handler's `ret` instruction transfers control to the restorer trampoline.
+    - **Restorer calls rt_sigreturn**: The trampoline code executes the `rt_sigreturn` syscall. The kernel reads the `rt_sigframe` from the user stack, validates it, and restores all registers. The process resumes exactly where it was when the signal arrived.
+
+    The security implication: if an attacker can corrupt the signal frame on the stack, they can forge arbitrary register values via `rt_sigreturn` -- a technique called SROP (Sigreturn-Oriented Programming). Modern kernels add cookies/canaries to the signal frame to detect tampering.
+
+    **Follow-up: What happens if a second signal arrives while the first signal's handler is executing?**
+
+    By default, the kernel blocks the signal being handled (same signal number) during handler execution -- this prevents recursive handler invocation. Other signals are delivered normally, which can interrupt the running handler. If the second signal's handler also modifies shared state, you get nested signal frames on the stack. Each handler returns through its own `rt_sigreturn`, unwinding in LIFO order. The `SA_NODEFER` flag disables the automatic blocking, allowing recursive delivery of the same signal -- this is almost never what you want and leads to stack overflow under signal storms.
+  </Accordion>
+
+  <Accordion title="Your application uses signalfd to handle SIGTERM for graceful shutdown. During testing, you notice that SIGTERM sometimes arrives but the signalfd never becomes readable. What could cause this?">
+    **Strong Answer:**
+
+    This is a subtle bug that I have seen in production, and it comes down to the signal mask configuration.
+
+    The most likely cause: **the signal is not blocked in all threads.** For signalfd to work correctly, the signal must be blocked in every thread. If any thread does not have SIGTERM blocked, the kernel delivers the signal to that thread using the default disposition (terminate the process) instead of queuing it for the signalfd. The signalfd never sees it because the signal was already consumed.
+
+    Common scenarios where this happens:
+    - **Thread created before signal mask setup**: If you create threads before calling `pthread_sigmask(SIG_BLOCK, ...)`, those threads inherit the original (unblocked) signal mask. The signal gets delivered to one of those early threads.
+    - **Library spawns threads**: Some libraries (glibc's DNS resolver, OpenSSL, logging frameworks) create helper threads that inherit the signal mask from the creating thread. If you blocked SIGTERM in your main thread after the library initialized, the library's threads have the old mask.
+    - **Race condition during setup**: If SIGTERM arrives between the `signalfd()` call and the `pthread_sigmask()` call, the signal is delivered with default behavior.
+
+    The fix: block signals as the very first action in `main()`, before creating any threads or initializing any libraries:
+
+    ```c
+    int main() {
+        sigset_t mask;
+        sigemptyset(&mask);
+        sigaddset(&mask, SIGTERM);
+        sigaddset(&mask, SIGINT);
+        pthread_sigmask(SIG_BLOCK, &mask, NULL);  // Block FIRST
+        int sfd = signalfd(-1, &mask, SFD_NONBLOCK);
+        // Now create threads, initialize libraries, etc.
+    }
+    ```
+
+    **Follow-up: Can signalfd be used across a fork()? What about after exec()?**
+
+    The signalfd file descriptor is inherited across fork() and refers to the same kernel signalfd object. Both parent and child can read signals from it, but a given signal is consumed by whichever reader gets it first. The child also inherits the signal mask. After exec(), the signal mask is preserved but the signalfd file descriptor is closed if it was marked `O_CLOEXEC` (which `SFD_CLOEXEC` sets). Without `O_CLOEXEC`, the fd survives exec but the new program likely does not know about it. The practical advice: for services that fork workers, each worker should create its own signalfd rather than sharing the parent's.
+  </Accordion>
+</AccordionGroup>
+
+---
 
 Next: [Debugging & Performance Observability](/operating-systems/debugging-performance) →

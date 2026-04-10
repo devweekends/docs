@@ -59,7 +59,7 @@ restart, and the network is unreliable.
     the system continues to elect leaders and process client commands.
 
 Design rule: **Raft always chooses safety over liveness**.
-If the cluster is too unstable, it will prefer to not make progress rather than risk data corruption.
+If the cluster is too unstable, it will prefer to not make progress rather than risk data corruption. This is a deliberate philosophical choice: it is better for a banking system to temporarily stop accepting transfers than to allow two conflicting transfers to both succeed. In practice, the liveness pauses are short (typically a few election timeouts, measured in seconds) because once the network stabilizes, a leader is elected quickly.
 
 ---
 
@@ -83,7 +83,7 @@ Follower ──(timeout)──▶ Candidate ──(wins election)──▶ Leade
 
 ### 2.2 Terms as a Logical Clock
 
-Time is divided into **terms**:
+Time is divided into **terms** -- think of them as “presidential administrations.” Each term has at most one leader, and when a new term begins, the old leader's authority is immediately revoked:
 
 - Each term starts with an **election**
 - At most **one leader per term**
@@ -94,7 +94,7 @@ Nodes store `currentTerm`. Whenever they see a **higher term** in a message, the
 1. Update their `currentTerm`
 2. Step down to **Follower**
 
-**Rule of thumb**: *“Higher term wins.”*
+**Rule of thumb**: *”Higher term wins.”* This is Raft's version of a logical clock -- it provides a total ordering of leadership epochs without relying on synchronized physical clocks. If a node receives a message with term 7 while it is still in term 5, it knows it has missed leadership changes and must defer to the more recent authority.
 
 ### 2.3 Persistent and Volatile State
 
@@ -344,7 +344,7 @@ for N from lastLogIndex down to commitIndex+1:
         break
 ```
 
-Note the extra condition `log[N].term == currentTerm` – this is essential for **Leader Completeness**.
+Note the extra condition `log[N].term == currentTerm` -- this is essential for **Leader Completeness** and is one of the most subtle parts of the protocol. Without it, a new leader could "accidentally" commit an entry from a previous term that was not actually agreed upon by a majority in that previous term. The Raft paper (Figure 8) has a famous example of this -- it is a favorite interview question. Make sure you can walk through it on a whiteboard.
 
 ---
 
@@ -655,3 +655,41 @@ Example 30–60 second summary:
 
 Once Raft feels *boringly obvious* to you, you're ready to tackle Paxos at the same depth and compare trade-offs in real
 system designs.
+
+---
+
+## Interview Deep-Dive
+
+<AccordionGroup>
+  <Accordion title="Walk me through the 'Figure 8' scenario in Raft. Why can a leader not commit entries from previous terms, and what would go wrong if it did?">
+    **Strong Answer:**
+    - The Figure 8 scenario demonstrates why a Raft leader must not count entries from a previous term as committed, even if they are replicated to a majority. The sequence: in term 2, leader S1 replicates an entry to S2 but crashes before achieving majority. In term 3, S5 (which never received that entry) wins the election and appends a different entry at the same log index. S5 crashes. In term 4, S1 becomes leader again and sees its old term-2 entry on S1 and S2 -- a majority. If S1 declares this committed, but then crashes and S5 wins term 5, S5 would overwrite that entry with its own term-3 value, violating the safety guarantee that committed entries are never lost.
+    - Raft's solution: a leader only commits entries from its current term. When a current-term entry is committed (replicated to a majority), all preceding entries are implicitly committed because the Log Matching Property guarantees that if two logs agree on an entry, they agree on all preceding entries. So S1 in term 4 must first replicate a new term-4 entry to a majority; once that is committed, the earlier term-2 entry is also committed by implication.
+    - This is a subtle but critical safety invariant. It ensures that the election restriction (voters reject candidates with less up-to-date logs) is sufficient to guarantee that any future leader has all committed entries.
+
+    **Follow-up: How does this constraint affect write latency in practice?**
+
+    In practice, the impact is minimal. When a new leader is elected, it immediately sends a no-op entry for the current term. This no-op is replicated to a majority within one round-trip, which implicitly commits all pending entries from previous terms. The latency cost is one additional round-trip at the start of each new term. Since leader elections are rare in a well-tuned cluster (once every few minutes to hours), the amortized cost is negligible. etcd and TiKV both implement this no-op optimization.
+  </Accordion>
+
+  <Accordion title="How does Raft handle the scenario where a follower's log diverges from the leader's log? What is the log repair mechanism?">
+    **Strong Answer:**
+    - Log divergence occurs when a follower received entries from a previous leader that were never committed, and the current leader has different entries at those positions. When the new leader sends AppendEntries, it includes prevLogIndex and prevLogTerm -- the index and term of the entry immediately preceding the new entries. The follower checks if it has an entry at prevLogIndex with the matching term. If not, it rejects the AppendEntries.
+    - Upon rejection, the leader decrements nextIndex for that follower and retries with an earlier prevLogIndex. This "back-up" process continues until the leader finds a matching point -- the latest log entry where the leader and follower agree. Once found, the leader sends all entries from that point forward, and the follower overwrites any conflicting entries.
+    - The naive approach backs up one entry at a time, which can be slow if the divergence is large (e.g., a follower was partitioned for thousands of entries). Optimizations include: the follower returning the conflicting term and the first index of that term, so the leader can skip an entire term at once. etcd implements this optimization.
+
+    **Follow-up: Is it ever possible for a committed entry to be overwritten during log repair?**
+
+    No, and this is Raft's core safety guarantee. A committed entry has been replicated to a majority. For a new leader to be elected, it must receive votes from a majority, and voters reject candidates whose logs are less up-to-date. Since any two majorities overlap, at least one voter has the committed entry, and it will not vote for a candidate that lacks it. Therefore, any elected leader has all committed entries in its log, and log repair only overwrites uncommitted entries -- entries that were on a minority of nodes and for which no client received a success response.
+  </Accordion>
+
+  <Accordion title="You are operating a Raft-based system (etcd) and observe frequent leader elections causing service disruptions. What are the likely causes and how would you fix them?">
+    **Strong Answer:**
+    - Frequent elections mean followers are timing out because they are not receiving heartbeats from the leader in time. The common causes are: (1) Network latency or jitter exceeding the heartbeat interval. If heartbeats are sent every 100ms but network latency spikes to 200ms, followers time out. (2) The leader is experiencing GC pauses or CPU starvation, preventing it from sending heartbeats on schedule. (3) Disk I/O latency on the leader -- etcd writes to disk on every committed entry, and slow disks cause the leader to fall behind. (4) Election timeout is too aggressive relative to the network conditions.
+    - Fixes: (1) Increase the election timeout (etcd recommends 10x the round-trip time between nodes). (2) Ensure the leader runs on dedicated hardware with fast SSDs (etcd is extremely sensitive to disk latency -- the recommendation is p99 fsync under 10ms). (3) Tune the GC of the leader's runtime (Go's GC in etcd's case -- reduce GOGC if necessary). (4) Enable the Pre-Vote extension, which prevents nodes with network issues from disrupting stable leaders by requiring a pre-election check. (5) Monitor and alert on leader election frequency -- more than one election per hour in a healthy cluster is a red flag.
+
+    **Follow-up: What is the Pre-Vote mechanism and how does it prevent disruptive elections?**
+
+    Pre-Vote adds a preliminary round before a real election. When a follower's election timer fires, instead of immediately incrementing its term and starting a real election, it sends a PreVote request asking "Would you vote for me if I started an election?" Other nodes respond based on whether the requester's log is up-to-date and whether they have recently heard from a leader. If the majority says "no" (because they have a functioning leader), the disruptive node does not proceed. This prevents a partitioned or slow node from repeatedly incrementing the global term and forcing unnecessary leader step-downs. Without Pre-Vote, a single node in a degraded network state can destabilize the entire cluster by triggering continuous elections.
+  </Accordion>
+</AccordionGroup>

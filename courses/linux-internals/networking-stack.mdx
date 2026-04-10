@@ -894,4 +894,56 @@ sudo tcpconnect-bpfcc
 
 ---
 
+## Interview Deep-Dive
+
+<AccordionGroup>
+  <Accordion title="A high-traffic web server is dropping packets even though CPU utilization is only 40%. Explain the possible causes at different layers of the network stack and how you would diagnose each." icon="message">
+    **Strong Answer:**
+
+    - Packet drops at 40% average CPU can happen because network processing is concentrated on specific CPUs rather than evenly distributed. The key diagnostic is `cat /proc/net/softnet_stat` where each line represents a CPU. Column 1 is processed packets, column 2 is dropped packets (due to full backlog), and column 3 is time_squeeze events (softirq was cut short because it ran too long). If drops are concentrated on one or two CPUs, the problem is RSS (Receive Side Scaling) misconfiguration -- packets are not being distributed across cores.
+    - At the NIC level: `ethtool -S eth0 | grep -i drop` shows hardware-level drops. `rx_missed_errors` means the NIC's ring buffer overflowed because the driver did not process packets fast enough. Fix: increase ring buffer size with `ethtool -G eth0 rx 4096` or enable interrupt coalescing to batch processing.
+    - At the socket level: `ss -nmp | grep -E "rcv_space|rmem"` shows per-socket buffer utilization. If `rmem_alloc` approaches `rmem_max`, the socket buffer is full because the application is not reading fast enough. Fix: increase `net.core.rmem_max` and `net.ipv4.tcp_rmem`.
+    - At the conntrack level: `cat /proc/sys/net/netfilter/nf_conntrack_count` vs `nf_conntrack_max`. If the connection tracking table is full, new connections are dropped with `nf_conntrack: table full, dropping packet` in dmesg. Fix: increase `nf_conntrack_max` or reduce timeout values.
+    - At the application level: if the server uses `accept()` in a single thread, the listen backlog (`somaxconn`) could overflow. `ss -tlnp` shows the Send-Q (backlog limit) and Recv-Q (current backlog). Fix: increase `net.core.somaxconn` and use `SO_REUSEPORT` for multi-threaded accept.
+
+    **Follow-up:** How does NAPI prevent interrupt storms and what is the trade-off?
+
+    **Follow-up Answer:**
+
+    - Without NAPI, the NIC raises one hardware interrupt per received packet. At 1 million packets per second, that is 1 million interrupts per second, each costing 1-2 microseconds, consuming 100% of a CPU core just handling interrupts. NAPI (New API) converts to a polling model: the first packet triggers an interrupt, the driver disables further interrupts for that queue and schedules a NAPI poll in softirq context. The poll function processes up to a budget (default 64) packets per invocation without any interrupts. When the poll finds no more packets, it re-enables interrupts. The trade-off is latency versus throughput: under low load, NAPI adds a small delay because the first packet triggers an interrupt but subsequent ones wait for the poll cycle. Under high load, NAPI is strictly better because it amortizes interrupt overhead across many packets. Busy polling (`net.core.busy_poll`) can further reduce latency by having the application poll the NIC directly in user-space, eliminating even the softirq scheduling delay.
+  </Accordion>
+
+  <Accordion title="Explain TCP BBR congestion control versus CUBIC. When would you deploy BBR in production, and what are the risks?" icon="message">
+    **Strong Answer:**
+
+    - CUBIC is a loss-based congestion control algorithm: it increases the congestion window following a cubic function and reduces it when packet loss is detected. The assumption is that packet loss signals congestion. This works well when the only cause of loss is buffer overflow, but on modern networks with deep buffers (bufferbloat), CUBIC fills the buffers before detecting loss, causing high latency. On lossy links (wireless, long-haul), CUBIC misinterprets non-congestion loss as congestion and unnecessarily reduces throughput.
+    - BBR (Bottleneck Bandwidth and RTT) is a model-based algorithm that estimates the bottleneck bandwidth and minimum RTT, then sets the congestion window to `bandwidth * RTT`. It does not react to loss directly but instead maintains a model of the path's capacity. BBR periodically probes for more bandwidth (ProbeUp phase) and lower RTT (ProbeRTT phase).
+    - I would deploy BBR for: long-distance paths with high bandwidth-delay product (CDN to end users), paths with non-congestion loss (mobile networks), and any scenario where bufferbloat causes high latency under load. Google reports 2-25% throughput improvement on YouTube with BBR.
+    - Risks: BBR v1 has fairness issues when competing with CUBIC flows -- it can be overly aggressive and starve CUBIC connections. BBR v2 (still evolving) addresses this with explicit loss detection. BBR also requires accurate RTT measurement, so it may behave poorly behind TCP proxies that terminate connections. In shared hosting environments, deploying BBR on some servers but not others can create unfairness. I would test with A/B deployment and monitor both throughput and fairness metrics before fleet-wide rollout.
+
+    **Follow-up:** How does the kernel implement per-socket congestion control selection?
+
+    **Follow-up Answer:**
+
+    - The kernel allows different TCP connections to use different congestion control algorithms. The default is set via `net.ipv4.tcp_congestion_control`, but individual sockets can override it with `setsockopt(fd, IPPROTO_TCP, TCP_CONGESTION, "bbr", 3)`. Internally, each `tcp_sock` has a `ca_ops` pointer to a `tcp_congestion_ops` structure containing function pointers for `cong_avoid()`, `ssthresh()`, `undo_cwnd()`, etc. When the TCP state machine processes ACKs or detects loss, it calls through these function pointers. Congestion control modules register via `tcp_register_congestion_control()` and are loaded as kernel modules (`tcp_bbr.ko`). This pluggable design allows seamless A/B testing at the application level.
+  </Accordion>
+
+  <Accordion title="You are designing a service mesh sidecar proxy at the kernel level using eBPF. How would you short-circuit the network stack to avoid the overhead of going through the full TCP/IP stack for pod-to-pod communication on the same host?" icon="message">
+    **Strong Answer:**
+
+    - The key insight is that for same-host pod-to-pod traffic, packets currently traverse: application -> socket layer -> TCP -> IP -> netfilter -> bridge -> veth -> IP -> TCP -> socket layer -> application. Most of this processing is wasted because the source and destination are on the same machine.
+    - Using eBPF at the `sockops` and `sk_msg` program types, I can short-circuit this. First, a `BPF_PROG_TYPE_SOCK_OPS` program attached to the cgroup intercepts socket operations. When `connect()` is called and the destination IP belongs to a local pod (checked via a BPF hash map of local pod IPs), the program records the socket pair in a `BPF_MAP_TYPE_SOCKHASH` map.
+    - Then, a `BPF_PROG_TYPE_SK_MSG` program is attached to the sockhash map. When data is written to a socket in the map, the sk_msg program redirects the data directly from the source socket's send buffer to the destination socket's receive buffer using `bpf_msg_redirect_hash()`. The data never enters the TCP/IP stack, never gets encapsulated in IP headers, never traverses netfilter, and never crosses a veth pair.
+    - This is exactly how Cilium implements its socket-level load balancing and transparent encryption bypass for same-host traffic. The performance improvement is dramatic: latency drops from 50-100 microseconds (full stack traversal) to 5-10 microseconds (socket-to-socket redirect), and CPU overhead drops by 60-80%.
+
+    **Follow-up:** What are the observability implications of this short-circuiting, and how do you maintain visibility into the traffic?
+
+    **Follow-up Answer:**
+
+    - The major implication is that traditional network observability tools -- tcpdump, iptables counters, conntrack, kprobes on TCP functions -- will not see this traffic because it never enters the network stack. This is a significant operational concern. To maintain visibility, the eBPF programs themselves must implement observability: the sk_msg program can update per-connection byte counters in BPF maps, emit events to a ring buffer for detailed tracing, and maintain latency histograms. Cilium solves this with its Hubble observability layer, which reads these BPF maps and provides a flow log equivalent to what tcpdump would show. The key design principle is that when you bypass the kernel's built-in observability, you must replace it with eBPF-based equivalents.
+  </Accordion>
+</AccordionGroup>
+
+---
+
 Next: [Tracing & Profiling →](/courses/linux-internals/tracing-profiling)

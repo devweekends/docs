@@ -10,6 +10,8 @@ icon: "database"
 
 ## Why Cache LLM Responses?
 
+Think of LLM caching like a restaurant kitchen. If ten customers order the same dish, a smart kitchen does not cook it from scratch each time -- it prepares a batch and plates from that. LLM caching works the same way: identical or semantically similar requests get served from a stored result instead of burning GPU cycles and dollars on a fresh inference.
+
 LLM calls are expensive and slow:
 
 | Metric | Without Caching | With Caching |
@@ -120,7 +122,11 @@ messages = optimizer.build_prompt(
 
 ## Exact Match Caching
 
-Cache identical requests with deterministic settings:
+Cache identical requests with deterministic settings.
+
+<Warning>
+**Caching pitfall**: Only cache requests where `temperature=0`. With any temperature above zero, the model is intentionally non-deterministic -- you would be returning stale creative output and masking the intended variety. A common production bug is caching all responses regardless of temperature, then wondering why the chatbot sounds repetitive.
+</Warning>
 
 ```python
 import hashlib
@@ -611,3 +617,68 @@ invalidator.on_event("product_updated", {"product_id": "123"})
 <Card title="Embeddings Deep Dive" icon="arrow-right" href="/ai-engineering/embeddings">
   Master embedding models and similarity search
 </Card>
+
+## Interview Deep-Dive
+
+<AccordionGroup>
+  <Accordion title="Explain the difference between exact-match caching, semantic caching, and prompt prefix caching for LLMs. When would you use each?">
+    **Strong Answer:**
+    - These are three fundamentally different caching strategies operating at different layers, and a strong production system usually combines all three.
+    - Exact-match caching hashes the entire request (model, messages, temperature, all parameters) and returns a stored response for identical requests. The hit rate depends entirely on how often users send exactly the same query. For internal tools, customer support bots with common FAQs, and batch processing with repeated inputs, exact-match cache hit rates can reach 30-50%. The critical constraint is to only cache deterministic requests where temperature equals 0. If you cache responses from temperature 0.7 calls, you are serving stale creative output and killing the intended variety. I have seen this exact bug in production -- users complained the chatbot gave the same answer to every question because someone cached non-deterministic responses.
+    - Semantic caching uses embedding similarity to match queries by meaning rather than exact text. "What is machine learning?" and "Can you explain ML to me?" would hit the same cache entry if their embedding similarity exceeds a threshold (typically 0.92-0.95). This dramatically increases hit rates for user-facing applications where people phrase the same question differently. The tradeoff is the cost of an embedding call per cache lookup (though embeddings are 100x cheaper than completions), the risk of false positives (returning a cached answer for a question that is similar but meaningfully different), and the O(N) comparison against the cache for each lookup unless you use a vector index.
+    - Prompt prefix caching is a provider-side optimization (OpenAI offers this natively). When multiple requests share the same long prefix (same system prompt, same few-shot examples), the provider caches the KV-cache for that prefix and gives you a 50% discount on cached input tokens. You do not manage this cache yourself -- you just structure your prompts so the static content comes first and the dynamic content comes last. The optimization is: put your 2000-token system prompt and 1000-token few-shot examples at the top, and the user's 50-token question at the bottom. Every request after the first gets 3000 tokens at half price.
+    - My production stack layers all three: prompt prefix caching reduces per-request cost at the provider level, exact-match caching eliminates redundant API calls entirely for repeated queries, and semantic caching catches the paraphrased queries that exact-match misses.
+
+    **Red Flags:** Candidate conflates these three types, suggests caching all LLM responses regardless of temperature, or does not know about OpenAI's native prompt caching.
+
+    **Follow-up: How do you set the similarity threshold for semantic caching, and what happens if you set it wrong?**
+
+    The threshold is a precision-recall tradeoff. Too high (0.98+) and the cache rarely hits because queries need to be near-identical -- you get the cost of embedding lookups with almost no benefit. Too low (0.85) and you get false positives: the cache returns an answer about Python the programming language for a question about Python the snake. I calibrate the threshold empirically using a labeled dataset of query pairs annotated as "same intent" or "different intent." I compute the embedding similarity for all pairs and find the threshold that maximizes F1 score on the "same intent" classification. In my experience, 0.92-0.95 is the sweet spot for most customer-facing applications. For safety-critical applications (medical, legal), I push it to 0.97+ because a false positive could give dangerously wrong information. I also segment the cache by context: a query about "returns" in the context of a retail support bot should not match a cached answer about "returns" from a programming support bot. Context keys in the cache prevent cross-domain contamination.
+  </Accordion>
+
+  <Accordion title="You are building a multi-layer cache for an LLM application: L1 in-memory, L2 Redis, L3 semantic. Walk me through the read path, the write path, and how you handle cache consistency.">
+    **Strong Answer:**
+    - The read path checks layers in order of speed. L1 (in-memory dictionary with TTL) is checked first -- sub-millisecond latency, lives in the application process, perfect for hot queries. If L1 misses, check L2 (Redis) -- 1-5ms latency, shared across all application instances, persists across restarts. If L2 misses, check L3 (semantic cache backed by a vector store) -- 10-50ms latency because it requires an embedding call plus similarity search. If all three miss, call the LLM, get the response, and populate all three layers on the write path.
+    - The write path writes to all layers simultaneously after an LLM call. L1 gets the exact query-response pair with a short TTL (60-300 seconds for hot data). L2 gets the same pair with a longer TTL (1-24 hours). L3 gets the query embedding and response, stored until eviction.
+    - The critical detail most people miss is the backfill on read. If L2 hits but L1 missed, I backfill L1 from L2 so subsequent requests for the same query are served from the fastest layer. Same for L3 to L2 backfill. This is the same principle CPU caches use -- a slower cache hit should populate all faster caches above it.
+    - Cache consistency is managed through TTLs and event-based invalidation. TTLs handle gradual staleness: L1 has the shortest TTL so stale data ages out fastest from the hottest cache. Event-based invalidation handles immediate changes: when a product price changes, I publish an invalidation event that clears all cache entries matching a pattern (any query containing that product name) across all three layers. The invalidation fan-out goes from bottom to top: clear L3 first (most entries), then L2, then broadcast to all instances to clear L1.
+    - One gotcha: the semantic cache (L3) cannot be invalidated by exact key because it is similarity-based. For event-based invalidation of L3, I either clear the entire context partition or re-embed the invalidation pattern and clear all entries within a similarity radius.
+
+    **Red Flags:** Candidate describes a flat cache without layering, does not mention backfill from slower to faster layers, or has no invalidation strategy beyond TTL expiry.
+
+    **Follow-up: How do you measure and optimize cache hit rates in production?**
+
+    I instrument every cache lookup to log hit/miss, which layer hit, lookup latency, and the query fingerprint. The primary metric is aggregate hit rate across all layers, but the more actionable metric is hit rate per layer. If L1 hit rate is low but L2 is high, my L1 TTL might be too short or my L1 max-size is too small -- hot entries are getting evicted before they are reused. If L2 hit rate is low but L3 is high, my exact-match cache is not capturing the variety of user phrasings and semantic caching is doing the heavy lifting. For optimization, I analyze the miss log: I cluster cache misses by semantic similarity and look for clusters where many similar queries all missed the cache. If a cluster has 50 similar queries and none hit the semantic cache, the similarity threshold might be too high for that domain. I also track cache freshness: the average age of served cached responses. If 90% of served responses are from 23 hours ago (near TTL expiry), the cache is serving stale data and I need either shorter TTLs or event-based invalidation for that content type. I set up dashboards showing hit rate, cost savings (estimated by multiplying hits by average LLM call cost), and latency improvement (p50 and p95 of cached vs uncached response times).
+  </Accordion>
+
+  <Accordion title="Cache invalidation is the hardest problem in computer science. How do you invalidate LLM caches when the underlying knowledge changes?">
+    **Strong Answer:**
+    - The classic quote is that there are two hard problems in computer science: cache invalidation, naming things, and off-by-one errors. For LLM caches, this is especially hard because the relationship between source data changes and cached responses is fuzzy -- a product price change does not just invalidate the one cached response about that product's price; it potentially invalidates any response that mentioned pricing.
+    - I use a three-strategy approach. First, time-based TTLs as the baseline guarantee. Every cache entry has a maximum TTL that ensures it is eventually refreshed even if I miss an invalidation event. For rapidly changing data (stock prices, inventory levels), TTLs are minutes. For slow-changing data (company policies, product descriptions), TTLs are hours to days. This is the safety net.
+    - Second, event-driven invalidation for known change events. When the product catalog updates, the pricing API changes, or a new policy document is published, the system publishes an invalidation event. The cache listener receives the event and invalidates all entries matching the affected domain. The tricky part is mapping a data change to the right cache entries. I use cache tags: every cached response is tagged with the data sources it depends on (e.g., tags `["product:123", "pricing:q4-2025"]`). When product 123 changes, I invalidate all entries tagged with `product:123`.
+    - Third, versioned caching for prompt and model changes. When I update a system prompt or switch models, the entire cache is logically stale because a new model or prompt would generate different responses. I include a prompt version hash and model identifier in the cache key, so a prompt change automatically starts a new cache namespace without requiring explicit invalidation.
+    - The thing most people get wrong is trying to be too precise with invalidation. If you spend more engineering time on surgical cache invalidation than you save from caching, you have over-optimized. For most LLM applications, aggressive TTLs (1-4 hours) plus event-driven invalidation for the highest-impact changes (pricing, availability, critical policies) covers 95% of cases.
+
+    **Red Flags:** Candidate says "just use short TTLs" without considering event-driven invalidation, does not think about prompt or model version changes invalidating the cache, or tries to build a perfect invalidation system instead of accepting pragmatic staleness bounds.
+
+    **Follow-up: What if your cache serves a stale response that gives a user incorrect pricing information? How do you prevent that?**
+
+    For high-stakes data like pricing, I do not cache the LLM response at all for the data-dependent portion. Instead, I separate the response into a cached template (the conversational structure and tone) and a live data lookup (the actual price). The LLM generates a response with a placeholder like "The price of [PRODUCT] is [PRICE]," and the application fills in the live price from the source-of-truth database at serving time. This hybrid approach gives me caching benefits for the expensive LLM generation while ensuring live data is always current. For cases where the LLM needs the price to reason (not just insert it), I include the price in the prompt context at request time rather than relying on cached responses. The cache still helps because the prompt prefix (system prompt, examples) is cached via the provider's prefix caching, and only the dynamic portion (current price, user question) is new.
+  </Accordion>
+
+  <Accordion title="Your LLM application costs $50,000/month in API calls. The CTO wants this halved. Design a caching strategy to get there.">
+    **Strong Answer:**
+    - First, I would profile the spend to understand where the money goes. I would break down costs by: endpoint (which features use the most tokens), model (GPT-4o vs GPT-4o-mini), request type (how many are unique vs repeated), and token composition (how much is system prompt vs user input vs output). At most companies I have seen, 60-70% of the token spend is the system prompt being resent identically on every request.
+    - Quick win number one: prompt prefix caching. If 70% of our token spend is the system prompt, and OpenAI gives 50% off cached prefix tokens, that is an immediate 35% cost reduction with zero code changes beyond restructuring our prompts (static prefix first, dynamic content last). On $50K/month, that saves $17,500.
+    - Quick win number two: exact-match caching with Redis. I would analyze request logs and identify the repeat rate. For internal tools and support bots, 20-40% of queries are repeats. Implementing exact-match caching with a 24-hour TTL on deterministic (temperature=0) requests would eliminate those API calls entirely. Conservatively, if 25% of requests are cacheable repeats, that saves another $8,000 on the remaining $32,500.
+    - Medium-term win: semantic caching for the remaining non-exact-repeat traffic. With a 0.93 similarity threshold, I would expect an additional 10-15% cache hit rate on queries that are paraphrases of cached queries. That saves another $2,500-3,500.
+    - Model optimization: audit which requests actually need GPT-4o versus GPT-4o-mini. For straightforward classification, formatting, and simple Q-and-A, GPT-4o-mini at $0.15/$0.60 per million tokens is 17x cheaper than GPT-4o at $2.50/$10.00. If 40% of current GPT-4o requests can be downgraded to mini without quality loss, that saves significantly.
+    - Combined realistic projection: prefix caching ($17,500) plus exact-match ($8,000) plus semantic ($3,000) gets to roughly $28,500 in savings, which is a 57% reduction. Adding model downgrading pushes it past 60% comfortably. Total cost of implementation: one Redis instance ($50/month), engineering time for caching layer (1-2 weeks), and ongoing monitoring.
+
+    **Red Flags:** Candidate suggests only one strategy instead of layering multiple approaches, does not profile the spend first, or proposes solutions that require months of engineering for marginal gains.
+
+    **Follow-up: How do you prevent cache warming issues when you deploy a new version of your application?**
+
+    Cache cold starts after deployment are a real problem -- for the first few hours, every request misses the cache and hits the LLM API, creating a latency spike and cost burst. I use three strategies. First, pre-warming: before deployment, I run the top 500 most common queries (extracted from production logs) through the new application version and populate the cache. This covers 30-40% of expected traffic immediately. Second, gradual rollout: I deploy the new version to 10% of traffic first, which warms the shared Redis cache (L2) from the small traffic slice. By the time I roll out to 100%, the L2 cache is already warm. Third, stale-while-revalidate: during the warming period, I allow serving slightly stale responses from the old cache (if still available) while the new cache populates in the background. The stale response has a "refresh-in-background" flag that triggers an async LLM call to populate the new cache without making the user wait.
+  </Accordion>
+</AccordionGroup>

@@ -108,3 +108,63 @@ db.users.updateOne(
 - Use `updateOne()` and `updateMany()`.
 - Always use **Update Operators** (like `$set`, `$inc`) unless you want to replace the whole document.
 - **Upsert** creates a document if it doesn't exist.
+
+## Interview Deep-Dive
+
+<AccordionGroup>
+<Accordion title="You have a counter field that tracks page views on a document. Hundreds of concurrent requests are incrementing it simultaneously. How does MongoDB handle this, and what could go wrong?">
+
+**Strong Answer:**
+
+- MongoDB's `$inc` operator is atomic at the single-document level. This means that when 500 concurrent requests each call `updateOne({ _id: pageId }, { $inc: { views: 1 } })`, every increment is applied correctly. MongoDB serializes concurrent modifications to the same document using WiredTiger's document-level locking. No increments are lost, no race conditions -- the final count is exactly 500.
+- This is one of MongoDB's genuine strengths compared to a naive read-modify-write pattern. If you instead read the document, increment the count in application code, and write it back, you get classic lost updates. Thread A reads views=100, Thread B reads views=100, both write views=101 instead of views=102. `$inc` avoids this entirely because the increment happens server-side.
+- What could go wrong at scale: write contention. If thousands of requests per second all modify the same document, they serialize on that document's lock. Each write waits for the previous one to complete. You effectively create a single-threaded bottleneck on that one document. I have seen this cause p99 latency spikes from 5ms to 500ms on hot documents.
+- The solution for high-write-throughput counters is the "Distributed Counter" or "Write Sharding" pattern. Instead of one document per page, create N counter shards: `{ pageId: "abc", shard: 0, views: 0 }`, `{ pageId: "abc", shard: 1, views: 0 }`, etc. Each increment picks a random shard (e.g., `shard: Math.floor(Math.random() * 10)`) to distribute the write load. To get the total, aggregate: `db.counters.aggregate([{ $match: { pageId: "abc" } }, { $group: { _id: null, total: { $sum: "$views" } } }])`.
+- This is a classic trade-off: the write path is fast and distributed, but the read path requires an aggregation. For page view counters where you read the count far less often than you increment it, this is an excellent trade-off. Companies like Lyft and Uber use this pattern for real-time metrics.
+
+**Follow-up: What if you need an exact, consistent count at all times, not just eventual consistency? Does the distributed counter pattern still work?**
+
+- If you need the exact count on every read, the distributed counter pattern adds read latency (the aggregation) but the count is still exact at the moment the aggregation runs -- it is not eventually consistent, it is "consistent at query time." Each shard has the correct value; you are just summing them.
+- Where you lose consistency is if an increment and a read happen concurrently. The read might see the state before or after the increment depending on timing. For true linearizable reads (every read sees every write that completed before it), you need `readConcern: "linearizable"`, which forces the read to go to the primary and confirm it is still the leader. This adds ~5-15ms latency per read.
+- The practical question is: do you really need exact real-time counts? For page views, "approximately 1.2 million" is fine. For financial balances, exact counts are mandatory -- but financial balances should probably not use the distributed counter pattern at all. Use a single document with `$inc` and accept the write serialization, or use a transaction to update a balance with proper validation.
+
+</Accordion>
+
+<Accordion title="Explain upsert in MongoDB. When is it useful, and what are the gotchas that trip people up in production?">
+
+**Strong Answer:**
+
+- Upsert is a portmanteau of "update" and "insert." When you specify `{ upsert: true }`, MongoDB first tries to find a document matching the filter. If it finds one, it updates it. If it does not, it creates a new document using the filter fields plus the update operators. It is an atomic "create-or-update" operation.
+- The primary use case is idempotent data synchronization. If you are syncing user profiles from an external system, you do not know whether the user already exists in your collection. Without upsert, you would need to `findOne` first, then either `insertOne` or `updateOne` based on the result -- two operations with a race condition between them. With upsert, it is one atomic operation: `updateOne({ externalId: "abc" }, { $set: { name: "Alice", email: "alice@example.com" } }, { upsert: true })`.
+- Gotcha number one: the filter fields become part of the new document on insert, but this can be surprising. If your filter is `{ status: "active", email: "alice@example.com" }` and you upsert with `$set: { name: "Alice" }`, the inserted document will have `status: "active"`, `email: "alice@example.com"`, and `name: "Alice"`. But if you use `$set` on one of the filter fields -- `{ $set: { email: "new@example.com" } }` -- the document gets the filter value `email: "alice@example.com"` overwritten by the `$set` value `email: "new@example.com"`. The interaction between filter fields and update operators during upsert insert is a common source of bugs.
+- Gotcha number two: without a unique index on the filter fields, concurrent upserts can create duplicates. If two requests simultaneously check for `{ externalId: "abc" }` and both find nothing, both attempt an insert -- resulting in two documents with the same `externalId`. The fix is a unique index on `externalId`. The unique index turns the race condition into a duplicate key error for the second request, which you catch and retry as an update.
+- Gotcha number three: `$setOnInsert`. This operator only applies its fields when the upsert results in an insert, not an update. It is invaluable for setting defaults like `createdAt: new Date()` that should only be set once. Without it, you either overwrite `createdAt` on every update or need to handle it in application logic.
+
+**Follow-up: You are using upsert with a unique index. Under high concurrency, you occasionally see 'duplicate key error' followed by a successful retry. Is this acceptable in production, or is it a sign of a design problem?**
+
+- This is actually the correct and expected behavior under high concurrency. It is not a design problem -- it is the optimistic concurrency pattern working as intended. The unique index prevents duplicates, the duplicate key error signals a conflict, and the retry succeeds because the document now exists and the operation becomes an update.
+- The concern is performance: if the error rate is high (say, 20% of upserts result in duplicate key errors), you are wasting work. Each failed upsert is a full round trip that accomplished nothing. At that point, consider front-loading a read: do a `findOne` first to check existence, then either insert or update. The race condition still exists, but you reduce the error rate from 20% to the fraction of requests that arrive in the narrow window between the read and the write.
+- MongoDB drivers handle this pattern well. In the Node.js driver, you catch the `MongoError` with code 11000 (duplicate key) and retry. Most ORMs like Mongoose expose this as a specific error type. Keep the retry count bounded (2-3 retries max) to avoid infinite loops in pathological cases.
+
+</Accordion>
+
+<Accordion title="What is the difference between $set and $unset, and when would you use $unset over setting a field to null? Why does this distinction matter for schema design?">
+
+**Strong Answer:**
+
+- `$set` assigns a value to a field (creating it if it does not exist). `$unset` removes the field from the document entirely. Setting a field to null with `$set: { phone: null }` keeps the field present with an explicit null value; `$unset: { phone: "" }` removes the field as if it never existed.
+- The distinction matters for three reasons: query behavior, index efficiency, and schema consistency.
+- Query behavior: `{ phone: null }` matches documents where `phone` is explicitly null AND documents where `phone` does not exist at all. So if some documents have `phone: null` and others lack the `phone` field entirely, `find({ phone: null })` returns both groups. This is confusing and can cause bugs. If you consistently use `$unset` for "no value," then `{ phone: { $exists: true, $eq: null } }` has clear semantics.
+- Index efficiency: a sparse index skips documents where the indexed field does not exist. If you `$unset` the phone field, the document is excluded from a sparse index on `phone`, keeping the index small. If you `$set` phone to null, the document IS included in the index with a null entry. For a collection where 80% of documents have no phone number, the sparse index is 80% smaller than a regular index -- significant memory and performance savings.
+- Schema consistency: choosing one convention and sticking with it (either "absent means no value" or "null means no value") prevents the confusing mixed state. My preference is to use `$unset` for optional fields that are not set, and reserve null for explicitly "this was asked about and the answer is nothing." For example, `middleName: null` means "we confirmed they have no middle name" while the absence of `middleName` means "we haven't asked yet."
+- In Mongoose, this maps to schema definitions. A field with `required: false` and no default will be absent if not provided. A field with `default: null` will always be present. The choice affects your queries, indexes, and data semantics downstream.
+
+**Follow-up: You have a collection with 50 million documents. Some have a 'deletedAt' field set to null, others do not have the field at all. You need to query for 'non-deleted' documents efficiently. What do you do?**
+
+- This is a real-world mess caused by inconsistent schema conventions. A query like `{ deletedAt: null }` matches both groups (explicitly null and field absent), so functionally it works. But it cannot use a sparse index efficiently because documents with `deletedAt: null` are in the index while documents without `deletedAt` are not.
+- The performant fix depends on whether you can run a migration. If you can, normalize all documents to one convention. I would run `db.collection.updateMany({ deletedAt: null }, { $unset: { deletedAt: "" } })` to remove the explicit null values, making all "non-deleted" documents consistently lack the `deletedAt` field. Then create a sparse index on `{ deletedAt: 1 }`. Now, querying for deleted documents uses the sparse index (small, fast), and querying for non-deleted documents uses `{ deletedAt: { $exists: false } }`.
+- If you cannot run a migration (the collection is too large or too active), create a partial index: `db.collection.createIndex({ deletedAt: 1 }, { partialFilterExpression: { deletedAt: { $exists: true } } })`. This indexes only documents with a `deletedAt` field, keeping the index small. For non-deleted queries, the query planner knows to use a different strategy.
+- Long term, enforce the convention at the application layer (Mongoose schema) and at the database layer (JSON Schema validation) so the mixed state never recurs.
+
+</Accordion>
+</AccordionGroup>

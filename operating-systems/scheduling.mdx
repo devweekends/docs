@@ -280,27 +280,101 @@ typedef struct {
 
 void schedule(Process proc[], int n, int iterations) {
     for (int i = 0; i < iterations; i++) {
-        // Find process with lowest pass
+        // Find process with lowest pass -- this is the one that has
+        // received the least CPU relative to its ticket allocation.
+        // In a real scheduler, this would be a min-heap for O(log n).
         int best = 0;
         for (int j = 1; j < n; j++) {
             if (proc[j].pass < proc[best].pass) best = j;
         }
 
         printf("Iteration %d: Running PID %d (Pass %d)\n", i, proc[best].pid, proc[best].pass);
+        // After running, advance the pass counter by stride.
+        // High-ticket (high-share) processes have small strides,
+        // so their pass value grows slowly -- they get picked more often.
         proc[best].pass += proc[best].stride;
     }
 }
 
 int main() {
+    // Tickets determine CPU share: 100/(100+50+50) = 50% for PID 1.
+    // Stride = BIG_STRIDE / tickets -- fewer tickets means larger stride,
+    // which means slower accumulation and less frequent scheduling.
     Process proc[] = {
-        {1, 100, BIG_STRIDE/100, 0}, // 50% CPU
-        {2, 50, BIG_STRIDE/50, 0},   // 25% CPU
-        {3, 50, BIG_STRIDE/50, 0}    // 25% CPU
+        {1, 100, BIG_STRIDE/100, 0}, // 50% CPU (stride=100)
+        {2, 50, BIG_STRIDE/50, 0},   // 25% CPU (stride=200)
+        {3, 50, BIG_STRIDE/50, 0}    // 25% CPU (stride=200)
     };
     schedule(proc, 3, 12);
     return 0;
 }
 ```
+
+---
+
+---
+
+## Interview Deep-Dive
+
+<AccordionGroup>
+  <Accordion title="You are designing a scheduler for a system that must handle both interactive web requests (p99 latency under 50ms) and batch ML training jobs (maximize GPU/CPU throughput). How would you approach this, and what existing Linux mechanisms would you use?">
+    **Strong Answer:**
+
+    This is the classic latency-vs-throughput tension, and the answer is not a single scheduler but a combination of mechanisms that create priority separation between the two workload classes.
+
+    My approach:
+    - **CPU isolation**: Use `isolcpus` or cpusets to dedicate specific cores to each workload class. Give the web service 8 cores and the ML training 24 cores on a 32-core machine. The web service cores run with the `schedutil` governor for responsive frequency scaling; the ML cores run with the `performance` governor for maximum throughput.
+    - **Cgroups v2 CPU controller**: Even within the shared cores, set CPU bandwidth limits. The web service cgroup gets `cpu.weight = 500` (high priority) and the ML cgroup gets `cpu.weight = 100`. Under contention, the web service gets 5x the CPU share. Additionally, set `cpu.max` on the ML cgroup to ensure it cannot consume more than its allocated cores' worth of CPU time.
+    - **Scheduling class separation**: For the most latency-sensitive web request handler threads, consider using `SCHED_FIFO` with a moderate priority (e.g., 50). This gives them preemptive priority over all `SCHED_NORMAL` tasks, ensuring they run immediately when work arrives. The ML training runs under default `SCHED_NORMAL` (CFS/EEVDF). The risk with SCHED_FIFO is that a bug in the web service could starve everything else, so always set `rlimit_rttime` as a safety valve.
+    - **NUMA awareness**: If the server is multi-socket, bind the web service to one NUMA node and the ML training to the other. This prevents cross-node memory access latency from affecting web request processing.
+
+    The trade-off I would not accept: putting both workloads on the same cores and relying solely on nice values. Nice values influence CFS weight, but under heavy load, even a nice -20 task can see 10-20ms scheduling delays if there are enough nice 0 tasks competing. Niceness is best-effort, not a guarantee. For SLA-bound workloads, physical isolation (dedicated cores) is the only reliable approach.
+
+    **Follow-up: What happens if the web service occasionally needs more cores than its allocation during a traffic spike? How would you handle elastic scaling without losing latency guarantees?**
+
+    Use cpusets with a "burst" pool. Designate 4 cores as a burst pool that is shared between workloads. The web service has affinity to its dedicated 8 cores plus the 4 burst cores. The ML training also has affinity to its 24 cores plus the same 4 burst cores. On the burst cores, the cgroup CPU weight ensures the web service wins when both contend. This way, the web service can elastically expand to 12 cores during spikes while the ML training gracefully yields on the shared cores. The ML training's throughput drops slightly during spikes but recovers immediately after.
+  </Accordion>
+
+  <Accordion title="Walk through how CFS determines the time slice for a process. What happens when you have 1000 runnable processes versus 4?">
+    **Strong Answer:**
+
+    CFS does not assign fixed time slices like Round Robin. Instead, it uses a dynamic approach based on two parameters: `sched_latency_ns` (default 6ms for up to 8 tasks) and `sched_min_granularity_ns` (default 0.75ms).
+
+    The algorithm:
+    - **Few tasks (N <= sched_nr_latency, default 8)**: Each task gets `sched_latency_ns / N` weighted by its nice value. With 4 equal-weight tasks: each gets 6ms / 4 = 1.5ms per scheduling round. This means every task runs at least once every 6ms, giving good interactive responsiveness.
+    - **Many tasks (N > 8)**: The time slice would become `6ms / N`. For 1000 tasks, that is 6 microseconds -- less than the context switch cost. So CFS clamps at `sched_min_granularity_ns` (0.75ms). With 1000 tasks, the effective scheduling period becomes 1000 * 0.75ms = 750ms. This means a task might wait 750ms between runs. Interactive responsiveness degrades significantly.
+
+    The vruntime mechanism:
+    - CFS always picks the task with the lowest `vruntime` from the red-black tree. When a task runs for `delta` actual time, its vruntime increases by `delta * (NICE_0_LOAD / weight)`. A high-priority task (nice -20, weight ~88761) accumulates vruntime slowly, so it stays at the front of the tree longer. A low-priority task (nice +19, weight ~15) accumulates vruntime quickly and gets displaced.
+
+    With 1000 processes: the red-black tree has 1000 nodes. Insertion and deletion are O(log 1000) = ~10 operations. The `min_vruntime` (leftmost node) is cached, so selection is O(1). The scheduler is still efficient -- the problem is not algorithmic overhead but the sheer number of tasks competing for finite CPU time.
+
+    The practical lesson: if you have 1000 runnable processes and care about latency, you have an architecture problem, not a scheduling problem. The solution is to reduce the number of runnable tasks (use async I/O instead of thread-per-connection, use connection pooling) or increase the number of cores.
+
+    **Follow-up: How does the nice value actually translate to CPU share in CFS?**
+
+    Each nice level maps to a weight via a lookup table. Nice 0 has weight 1024 (the baseline). Each nice level changes the weight by approximately 1.25x. Nice -1 has weight 1277, nice -20 has weight 88761, nice +19 has weight 15. The CPU share for a task is `task_weight / sum_of_all_weights`. So two tasks at nice 0 each get 50%. One task at nice 0 and one at nice 5 (weight ~335): the nice 0 task gets 1024/(1024+335) = 75%, the nice 5 task gets 25%. The 1.25x factor per level was chosen so that each nice level corresponds to roughly 10% less CPU time, which gives administrators a predictable tuning knob.
+  </Accordion>
+
+  <Accordion title="Explain the Convoy Effect in FCFS scheduling and how it manifests in real production systems. Have you seen it outside of CPU scheduling?">
+    **Strong Answer:**
+
+    The Convoy Effect occurs when many short tasks queue behind one long task, leading to poor resource utilization and high average wait time. In FCFS CPU scheduling, if a CPU-bound process holds the CPU for 500ms, ten I/O-bound processes (each needing 1ms of CPU time) wait the full 500ms before getting their turn. The I/O devices sit idle because their processes are waiting in the CPU queue, not submitting I/O requests. The system's overall throughput collapses because the CPU and I/O devices cannot overlap their work.
+
+    In production, the Convoy Effect appears in many contexts beyond CPU scheduling:
+
+    - **Database lock queues**: A single transaction holding a row lock for a long time (full table scan with row-level locking) blocks dozens of short transactions behind it. The short transactions could complete in microseconds but wait milliseconds for the lock. This is why databases use MVCC (Multi-Version Concurrency Control) -- readers do not block writers and vice versa, breaking the convoy.
+    - **Network I/O scheduling**: On a shared network link, a single large TCP flow (a backup job sending 10GB) can fill the switch buffer, causing small latency-sensitive packets (database queries, health checks) to queue behind it. This is head-of-line blocking. The solution is QoS (Quality of Service) -- separate queues for different traffic classes with priority scheduling.
+    - **Garbage collection**: In a GC-managed runtime (Java, Go), a stop-the-world GC pause is the ultimate convoy effect. Every application thread stops while the GC runs. Concurrent GC algorithms (ZGC, Shenandoah, Go's tri-color GC) break this convoy by doing most GC work concurrently with application threads.
+    - **Kubernetes pod scheduling**: If a large pod (requesting 64 CPUs) is ahead in the scheduling queue, smaller pods (1 CPU each) cannot be scheduled until the scheduler finds a node for the large pod -- even if there are plenty of nodes suitable for the small pods. This is why Kubernetes has priority classes and preemption.
+
+    The general principle: any time you have a shared queue with heterogeneous request sizes and FIFO ordering, you will see the Convoy Effect. The fix is always some form of preemption, prioritization, or parallel processing.
+
+    **Follow-up: How does the Shortest Job First (SJF) algorithm solve the Convoy Effect, and why can it not be used in OS CPU scheduling?**
+
+    SJF is provably optimal for minimizing average waiting time. By running the shortest job first, you minimize the waiting time for the majority (short jobs) at a small cost to the minority (long jobs). The problem is that in CPU scheduling, you do not know the length of the next CPU burst. SJF requires future knowledge. The best approximation is exponential averaging of past burst lengths, but this is inaccurate for processes with variable behavior. MLFQ solves this by using observed behavior: new processes start at high priority (assumed short) and get demoted if they use their full time slice (revealed as long). This approximates SJF without requiring predictions.
+  </Accordion>
+</AccordionGroup>
 
 ---
 

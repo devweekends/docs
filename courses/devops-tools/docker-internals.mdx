@@ -141,15 +141,24 @@ cat /sys/fs/cgroup/memory/docker/<container_id>/memory.limit_in_bytes
 
 #### What Happens When Limits Are Exceeded
 
-- **Memory**: The OOM (Out of Memory) killer terminates the process
-- **CPU**: Process is throttled, not killed
-- **PIDs**: Fork bomb protection - fork() syscalls fail
+This is critical to understand because the failure modes are completely different depending on the resource:
+
+- **Memory**: The OOM (Out of Memory) killer **terminates the process immediately** -- no graceful shutdown, no cleanup. Your app just disappears. This is the most common cause of mysterious container "crashes" in production.
+- **CPU**: The process is **throttled, not killed**. It still runs, just slower. Users experience increased latency rather than errors. This is usually the better failure mode, which is why some teams prefer CPU limits over memory limits.
+- **PIDs**: Fork bomb protection -- `fork()` syscalls return errors. This prevents a runaway process from spawning thousands of children and taking down the host.
 
 ```bash
-# The infamous OOM kill
+# The infamous OOM kill -- the container is terminated instantly
 docker run --memory=10m alpine dd if=/dev/zero of=/dev/null
 # Container gets killed when it exceeds 10MB
+
+# Check if a container was OOM-killed
+docker inspect --format='{{.State.OOMKilled}}' container_name
 ```
+
+<Tip>
+**Production gotcha**: Java applications are especially prone to OOM kills because the JVM allocates memory upfront. A container with `--memory=512m` running a JVM with `-Xmx512m` will be killed because the JVM also needs memory for metaspace, thread stacks, and native allocations. Set `-Xmx` to about 75% of your container memory limit (e.g., `-Xmx384m` for a 512MB container).
+</Tip>
 
 ### 3. Union Filesystems - The Layer Cake
 
@@ -177,15 +186,21 @@ Container Layer (Read-Write):
 
 #### Copy-on-Write (CoW) Strategy
 
-When a container modifies a file from a lower layer:
+Copy-on-write is a resource-sharing strategy borrowed from operating systems. Think of it like a shared library book -- everyone reads the same copy, but if someone wants to write notes in the margins, they photocopy the page first and write on the copy.
+
+When a container modifies a file from a lower (read-only) layer:
 1. The file is **copied up** to the container's writable layer
 2. The modification happens on the copy
 3. The original file in the image layer remains unchanged
 
 This is why:
-- **100 containers from the same image share the base layers** (massive space savings)
-- **Container startup is instant** (no copying, just layer on top)
-- **Deleting a file does not reduce image size** (whiteout file created instead)
+- **100 containers from the same image share the base layers** -- massive space savings; you do not have 100 copies of Ubuntu on disk
+- **Container startup is instant** -- no copying the entire filesystem, just adding an empty writable layer on top
+- **Deleting a file does not reduce image size** -- a "whiteout" marker is created in the upper layer that hides the file, but the original bytes still exist in the lower layer
+
+<Tip>
+**Performance implication**: The first write to any file from a lower layer incurs a copy-up penalty. For write-heavy workloads (like databases), this overhead is significant. That is why databases should always write to volumes, not to the container's writable layer.
+</Tip>
 
 #### Storage Drivers
 
@@ -327,14 +342,19 @@ Since containers share the host kernel, a kernel vulnerability affects all conta
 
 ### Root in Container vs Root on Host
 
-By default, root inside a container is UID 0 - the same as host root. If a container escapes, it has root privileges on the host.
+By default, root inside a container is UID 0 -- the same as host root. This means a container escape (via kernel exploit, misconfigured mount, or exposed Docker socket) gives the attacker full root access to the host. Think of it like a jail where the inmates have the warden's keys -- the walls only matter if the keys stay outside.
 
 **Mitigation: User Namespaces**
 
 ```bash
-# Map container root to unprivileged host user
+# Map container root (UID 0) to an unprivileged host user (e.g., UID 100000).
+# Even if an attacker escapes the container, they land as a nobody on the host.
 docker run --userns-remap=default nginx
 ```
+
+<Warning>
+**The Docker socket is the crown jewel**: Mounting `/var/run/docker.sock` into a container (common in CI/CD setups) gives that container full control over the Docker daemon -- which means full root access to the host. Never mount the Docker socket unless absolutely necessary, and when you do, use read-only mode or a proxy like [Docker Socket Proxy](https://github.com/Tecnativa/docker-socket-proxy) that restricts API calls.
+</Warning>
 
 ### Capabilities
 
@@ -440,6 +460,48 @@ docker run --rm --security-opt seccomp=unconfined strace -f nginx
 5. **Docker is a stack**: CLI -> dockerd -> containerd -> runc
 6. **OCI standards** ensure portability across container runtimes
 7. **Security requires understanding** - shared kernel means shared risk
+
+---
+
+## Interview Deep-Dive
+
+<AccordionGroup>
+  <Accordion title="A security team asks you to evaluate whether Docker containers provide sufficient isolation for running untrusted code from third-party vendors. What is your assessment?" icon="circle-question">
+    **Strong Answer:**
+    - My short answer is no -- not by default. Containers share the host kernel, and kernel vulnerabilities can lead to container escapes. CVE-2019-5736 (runc vulnerability) demonstrated that a malicious container could overwrite the host runc binary and gain root access to the host. For untrusted code, the shared kernel is an unacceptable attack surface.
+    - For running untrusted workloads, I would recommend one of three approaches depending on the security requirements. First, gVisor (Google's user-space kernel) intercepts syscalls and implements a subset of Linux in user space. The untrusted code never touches the real kernel. The trade-off is performance overhead (~5-15% for syscall-heavy workloads) and incomplete syscall coverage. Second, Kata Containers run each container inside a lightweight VM, giving you hardware-level isolation with near-container ergonomics. The trade-off is higher memory usage (each "container" boots a minimal VM kernel) and slower startup. Third, Firecracker (from AWS, powers Lambda) provides microVM isolation with very fast boot times (~125ms) and minimal memory overhead (~5MB per VM).
+    - If the team insists on standard Docker containers, I would layer defenses: user namespaces (so root in the container maps to a nobody on the host), seccomp profiles that restrict syscalls to a minimal allowlist, AppArmor or SELinux mandatory access controls, dropping all capabilities with `--cap-drop=ALL`, and read-only filesystems. But even with all of these, I would not call it "sufficient" for genuinely adversarial code -- defense in depth reduces risk but does not eliminate the fundamental shared-kernel exposure.
+
+    **Follow-up: How do user namespaces change the security model, and why are they not enabled by default in Docker?**
+
+    User namespaces remap UID 0 (root) inside the container to a high-numbered unprivileged UID on the host (e.g., 100000). If an attacker escapes the container, they land as an unprivileged user on the host, dramatically limiting the damage. They are not enabled by default because they introduce complexity: file ownership on bind mounts becomes confusing (files appear owned by nobody), some applications break when they detect they are not "real" root, and there are subtle interactions with storage drivers. Docker has been improving support over time, but many teams still disable it for compatibility. For untrusted workloads, the friction is worth accepting.
+  </Accordion>
+
+  <Accordion title="Explain copy-on-write in Docker, and then tell me why running a database directly on the container's writable layer is a performance disaster." icon="circle-question">
+    **Strong Answer:**
+    - Copy-on-write means that when a container needs to modify a file from a read-only image layer, OverlayFS copies the entire file from the lower layer to the container's writable upper layer before the modification happens. The original file remains unchanged in the lower layer. All subsequent reads and writes for that file go to the upper layer copy.
+    - For a database like PostgreSQL, the write pattern is catastrophic. A database does random I/O across many data files. Every first write to a data page triggers a copy-up from the lower layer. The copy-up is a synchronous operation that blocks the write. For a busy database, this means hundreds or thousands of copy-ups at startup, each involving a full-file copy (not just the modified page). After the copy-up, subsequent writes to that file are at native speed, but the initial penalty is significant.
+    - Beyond performance, there is a correctness issue. The container's writable layer is ephemeral -- it vanishes when the container is removed. A `docker rm` destroys the database. Even a `docker restart` is safe (writable layer survives), but `docker rm` followed by `docker run` starts with a fresh layer and no data.
+    - The fix is volumes. A named volume or bind mount bypasses the union filesystem entirely. The database reads and writes directly to the volume's filesystem (ext4, XFS, etc.) with zero copy-on-write overhead. The volume persists independently of the container lifecycle.
+    - In my experience, this is the single most impactful performance and reliability fix for teams running databases in Docker. I have seen PostgreSQL write throughput improve 3-5x just by switching from container-layer storage to a named volume.
+
+    **Follow-up: If 100 containers are created from the same image, how much disk space do the image layers consume?**
+
+    The image layers are shared. Whether you run 1 container or 100, the base layers exist only once on disk. Each container adds only its own thin writable layer (typically a few kilobytes to megabytes, depending on what the container writes at runtime). This is the efficiency of copy-on-write: a team running 100 microservice instances from the same Node.js base image does not have 100 copies of Node.js on disk. The deduplication happens at the storage driver level (OverlayFS lower directories are shared).
+  </Accordion>
+
+  <Accordion title="Your organization mounts /var/run/docker.sock into CI/CD containers so they can build Docker images. A security auditor flags this. Explain the risk and propose alternatives." icon="circle-question">
+    **Strong Answer:**
+    - Mounting the Docker socket into a container gives that container full, unrestricted access to the Docker daemon API. The Docker daemon runs as root on the host. This means the CI container can: start new privileged containers, mount the host filesystem, access any container on the host, pull/push any image, and effectively has root access to the entire host machine. If the CI job runs untrusted code (e.g., building a pull request from an external contributor), that code inherits full host root access.
+    - This is not a theoretical risk. In practice, attackers exploit this by running `docker run -v /:/host --privileged alpine chroot /host` from inside the CI container -- this gives them a root shell on the host.
+    - Alternatives, in order of preference: First, use Kaniko (Google's in-container image builder). Kaniko builds Docker images from a Dockerfile entirely in user space, without a Docker daemon. It runs as a regular container and pushes directly to a registry. This is the standard approach for Kubernetes-based CI (Tekton, GitHub Actions on GKE). Second, use BuildKit's rootless mode, which runs the build daemon as a non-root user. Third, use Podman, which is daemonless and can build images without a socket. Fourth, if you must expose the Docker daemon, use a Docker Socket Proxy (like Tecnativa's) that restricts API calls -- allow image build and push but block container creation, volume mounts, and privileged operations.
+    - The broader principle: CI/CD pipelines are a high-value target for supply chain attacks. Minimizing privileges in the build environment is not optional -- it is a core security requirement.
+
+    **Follow-up: The team uses Docker-in-Docker (dind) as an alternative. Is that safe?**
+
+    Docker-in-Docker (running a Docker daemon inside a container) is better than mounting the host socket because the inner daemon is isolated from the host daemon. However, it still typically runs as privileged (`--privileged` flag), which disables most of Docker's security features. A container escape from the inner Docker daemon can reach the outer Docker daemon. The best dind alternative is running in rootless mode or using sysbox (a container runtime that enables Docker-in-Docker without `--privileged`). But in most cases, Kaniko or BuildKit is still the preferred approach because it eliminates the daemon entirely.
+  </Accordion>
+</AccordionGroup>
 
 ---
 

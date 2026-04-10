@@ -83,3 +83,68 @@ db.users.drop()
 - Use `deleteOne()` to remove a single document.
 - Use `deleteMany()` to remove multiple documents.
 - Be careful! Deleted data cannot be easily recovered without a backup.
+
+## Interview Deep-Dive
+
+<AccordionGroup>
+<Accordion title="Your application needs to comply with GDPR 'right to be forgotten' requests. A user requests complete deletion of their data. Walk me through how you handle this in a MongoDB-backed system.">
+
+**Strong Answer:**
+
+- GDPR right-to-erasure is more complex than calling `deleteOne` on the user document. The regulation requires deletion of all personal data across all systems where it is stored. In a MongoDB application, this typically means data spread across multiple collections, embedded in other documents, and potentially replicated to analytics systems.
+- Step one: build a data map. Before you can delete a user's data, you need to know everywhere it lives. In MongoDB, this means auditing every collection. The user document itself is obvious. But their data might also be embedded in order documents (shipping address, name), in review documents (author name, email), in message threads (sender info), and in denormalized caches across the system.
+- Step two: design a deletion cascade. For each collection, decide the appropriate action. For the user document: hard delete. For orders: you probably need to keep the order for financial records, but anonymize the personal data -- replace the customer name with "Deleted User," remove the email, hash the address. For reviews: either delete the review or anonymize the author. For messages: this gets legally nuanced -- the message might be personal data of both the sender and the recipient.
+- Step three: implement it atomically. Use a MongoDB transaction to ensure all deletions and anonymizations happen together. If any step fails, the whole operation rolls back. This prevents a state where the user document is deleted but their reviews still show their name.
+- Step four: handle secondary systems. If your data flows into Elasticsearch for search, a data warehouse for analytics, or cloud backups, those systems need purging too. MongoDB's Change Streams can trigger downstream cleanup -- when the user document is deleted, a consumer listens for the delete event and purges the user from Elasticsearch and flags the backup for selective redaction.
+- Step five: verify and audit. Log the deletion request, the timestamp, and confirmation that all systems were purged. GDPR requires you to respond to erasure requests within 30 days. Your system should track the request lifecycle.
+- One production gotcha: MongoDB backups. If you take daily snapshots and retain them for 90 days, a deleted user's data persists in those backups for up to 90 days. GDPR allows this (backup retention is a legitimate exception), but you should document it in your privacy policy and ensure backups are encrypted and access-controlled.
+
+**Follow-up: The user had 200,000 embedded references across 15 collections. The deletion transaction takes 45 seconds and keeps timing out. How do you solve this?**
+
+- MongoDB transactions have a default 60-second lifetime, and long-running transactions hold locks that degrade performance for other operations. A 45-second transaction across 200,000 document updates is pushing the limit and will cause problems under load.
+- The solution is to break the operation into phases and accept that the deletion is not instantaneous but is eventually complete. Phase one (in a transaction): mark the user as "deletion-in-progress" and immediately delete or anonymize their user document and any high-visibility data (profile, public reviews). This takes milliseconds. Phase two (background job): iterate through each collection and update embedded references in batches of 1,000, outside a transaction. Each batch is its own atomic operation. If the process crashes, it resumes from where it left off because you can query for documents still referencing the deleted user ID.
+- During the deletion process, the user's primary document is already gone, so they cannot log in or be found via search. The embedded references (like their name on an old order) are stale but being cleaned up. The deletion appears immediate to the user and any external observer, even though the full cleanup takes minutes.
+- This is the pattern Shopify described in their GDPR compliance architecture -- immediate soft-delete of the primary record, followed by asynchronous cascade cleanup with idempotent retry.
+
+</Accordion>
+
+<Accordion title="Compare soft deletes versus hard deletes versus TTL-based automatic deletion. When would you use each strategy, and what are the operational implications of each?">
+
+**Strong Answer:**
+
+- Each strategy serves a different purpose and carries different operational costs. The choice depends on data retention requirements, query patterns, and compliance constraints.
+- **Hard deletes** (`deleteOne`, `deleteMany`) physically remove documents from the collection. Use them when data truly has no future value and storage cost matters. The danger is irreversibility -- there is no undo without a backup. Hard deletes can also break referential integrity if other documents reference the deleted document by `_id`. In my experience, hard deletes are appropriate for temporary data: session tokens, one-time verification codes, expired cache entries.
+- **Soft deletes** (setting `isDeleted: true` and `deletedAt: new Date()`) keep the document in the collection but filter it out of normal queries. The data is still there for auditing, analytics, accidental-deletion recovery, and legal holds. The operational cost is that every query in your application must include `{ isDeleted: { $ne: true } }` or equivalent. Miss one query, and deleted data leaks into the UI. Mongoose middleware can automate this with a pre-find hook that injects the filter, but it is a maintenance burden. Soft deletes also increase collection size over time -- if 30% of your 100-million-document collection is soft-deleted, you are paying for storage and index maintenance on 30 million dead documents.
+- **TTL indexes** (`createIndex({ createdAt: 1 }, { expireAfterSeconds: 86400 })`) tell MongoDB to automatically delete documents after a specified time. This is perfect for ephemeral data: session records, temporary tokens, IoT sensor readings, log entries. The deletion runs on a background thread every 60 seconds. The operational implication: deletion is not instant. A document with a TTL of 24 hours might survive for 24 hours and 60 seconds. Do not rely on TTL for security-critical expiration (use application-level checks in addition to TTL).
+- The pattern I use most often in production: soft deletes for business entities (users, orders, products) with a scheduled job that hard-deletes soft-deleted records older than 90 days. TTL indexes for operational data (sessions, caches, temp files). Direct hard deletes only for data that is explicitly temporary and has no downstream dependencies.
+
+**Follow-up: Your soft-deleted collection has grown to 500 million documents, 60% of which are soft-deleted. Queries are slowing down. How do you fix this without downtime?**
+
+- The core problem is that 300 million soft-deleted documents are in every index and every query scan, even though they are never returned. The index on `{ userId: 1, createdAt: -1 }` has 500 million entries when only 200 million are "alive."
+- Fix one: create partial indexes that exclude soft-deleted documents. `db.collection.createIndex({ userId: 1, createdAt: -1 }, { partialFilterExpression: { isDeleted: { $ne: true } } })`. This index only contains the 200 million active documents, making it 60% smaller and proportionally faster. The query must include the partial filter expression for MongoDB to use the partial index, so update your queries to explicitly include `isDeleted: { $ne: true }`.
+- Fix two: archive the soft-deleted documents to a separate collection or a cold storage tier. Write a background migration script that moves soft-deleted documents older than X days from the active collection to an `archived_collection`. Use `bulkWrite` in batches of 5,000 to avoid blocking the working set. After migration, the active collection shrinks from 500M to 200M documents, and all queries speed up.
+- Fix three (on MongoDB Atlas): use Online Archive. Atlas can automatically tier cold data to cheaper S3-backed storage that is still queryable via federated queries. Soft-deleted documents older than a threshold are moved automatically, reducing active collection size without any custom migration code.
+
+</Accordion>
+
+<Accordion title="You accidentally ran deleteMany({}) on a production collection with 10 million documents. There is no filter -- it deletes everything. What happens internally in MongoDB during this operation, and what is your recovery plan?">
+
+**Strong Answer:**
+
+- Internally, `deleteMany({})` with an empty filter performs a collection scan and deletes every document one by one. Despite feeling instantaneous when you hit enter, it is not -- for 10 million documents, this operation takes minutes. During execution, each document deletion is atomic, but the overall operation is not transactional (unless wrapped in a transaction). This means if you kill the operation midway, some documents are deleted and some are not.
+- What happens at the storage level: WiredTiger marks each document's space as available for reuse but does not immediately return the disk space to the OS. The collection's data files retain their size on disk (this is similar to how a SQL database behaves after a mass DELETE without VACUUM). To reclaim disk space, you would need to run `compact` on the collection or do an initial sync of a replica set member.
+- The indexes are also updated: each document deletion removes the corresponding entries from every index on the collection. For a collection with 5 indexes and 10 million documents, that is 50 million index entry deletions. This is why `deleteMany({})` is slower than `drop()` -- `drop()` simply removes the collection's files entirely, while `deleteMany({})` processes each document and index entry individually.
+- Recovery plan, in order of preference. First: restore from a backup. If you are on Atlas, use point-in-time restore to roll the collection back to one minute before the accidental delete. This is the fastest and cleanest recovery. On self-hosted, restore from your most recent `mongodump` or LVM/filesystem snapshot.
+- Second: if you have a replica set and caught the mistake immediately, check if you can recover from the oplog. The oplog contains the insert operations that originally created those documents. If the oplog is large enough to contain the full history of the collection (unlikely for a large collection), you could replay the inserts. More realistically, the oplog only contains recent operations.
+- Third: if you have application-level logs (API request logs with the payloads), you might be able to reconstruct the data by replaying the writes. This is a last resort and will not capture data from direct database operations.
+- The lesson: production databases should have strict RBAC. The application user should not have permission to run `deleteMany` without a filter. A database proxy or ORM-level guard that rejects empty-filter deletes is worth implementing.
+
+**Follow-up: What is the difference between deleteMany({}) and drop() in terms of what is preserved and what is lost?**
+
+- `deleteMany({})` removes all documents but preserves the collection itself, including all its indexes, validation rules, collation settings, and any collection-level options. After `deleteMany({})`, the collection is empty but structurally intact. New inserts immediately work, and existing indexes are ready to serve queries.
+- `drop()` removes the collection entirely: all documents, all indexes, all validation rules, all metadata. It is as if the collection never existed. If you start inserting into the same collection name, MongoDB creates a new collection from scratch with no indexes (except the default `_id` index), no validation, and no custom options.
+- The practical difference matters most for indexes. If your collection had 8 carefully tuned indexes, `drop()` destroys them all. Recreating 8 indexes on a collection after reimporting 10 million documents can take 10-30 minutes depending on the data and hardware. `deleteMany({})` preserves those indexes, so after restoring the data, the indexes update incrementally as documents are reinserted.
+- Performance-wise, `drop()` is nearly instant regardless of collection size (it is just deleting files), while `deleteMany({})` processes every document and index entry. For deliberately clearing a collection, `drop()` followed by recreating indexes is often faster than `deleteMany({})` if the collection is large.
+
+</Accordion>
+</AccordionGroup>

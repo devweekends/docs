@@ -673,4 +673,57 @@ nvme smart-log /dev/nvme0
 
 ---
 
+## Interview Deep-Dive
+
+<AccordionGroup>
+  <Accordion title="Explain how io_uring achieves lower syscall overhead than traditional read/write. Walk through the shared memory ring buffer design and explain SQPOLL mode." icon="message">
+    **Strong Answer:**
+
+    - Traditional I/O requires one syscall per operation: each `read()` or `write()` call costs 200-500 CPU cycles for the user-kernel transition alone. For a database doing 100K IOPS, that is 5-10% CPU spent purely on syscall overhead.
+    - io_uring eliminates this by using two memory-mapped ring buffers shared between user space and the kernel. The Submission Queue (SQ) is where user space writes Submission Queue Entries (SQEs) describing I/O operations. The Completion Queue (CQ) is where the kernel writes Completion Queue Entries (CQEs) with results. Both are lock-free single-producer single-consumer rings, so no synchronization is needed for typical operation.
+    - In normal mode, user space fills SQEs, then calls `io_uring_enter()` to notify the kernel. The kernel processes the SQEs and writes CQEs. This batches multiple operations per syscall, amortizing the transition cost. Submitting 32 operations requires only 1 syscall instead of 32.
+    - SQPOLL mode eliminates even that single syscall. The kernel spawns a dedicated polling thread (`io_sq_thread`) that continuously polls the SQ for new entries. When user space writes an SQE, the kernel thread picks it up without any syscall at all. The kernel thread sleeps after `sq_thread_idle` milliseconds of inactivity and is woken by a subsequent `io_uring_enter()` call. This achieves true zero-syscall I/O submission for sustained workloads.
+    - Additional optimizations: registered files (`io_uring_register_files()`) avoid per-operation file descriptor lookup, and registered buffers (`io_uring_register_buffers()`) avoid per-operation page pinning. Combined, these can reduce per-I/O overhead to under 100 cycles.
+
+    **Follow-up:** What are the security implications of SQPOLL mode, and why does it require elevated privileges?
+
+    **Follow-up Answer:**
+
+    - SQPOLL requires `CAP_SYS_ADMIN` (or `IORING_SETUP_SQPOLL` with the newer `IORING_FEAT_SQPOLL_NONFIXED` flag on recent kernels) because the kernel thread runs on behalf of the user process and continuously consumes CPU cycles even when the process is not actively submitting I/O. A malicious user could create many SQPOLL io_uring instances to consume CPU resources in the kernel, effectively creating a kernel-space denial of service. Additionally, the kernel thread runs with the credentials of the creating process, so careful accounting is needed to charge CPU time correctly to the right cgroup. Recent kernel versions (5.19+) have improved this with per-ring CPU accounting and the ability to limit SQPOLL to specific CPUs.
+  </Accordion>
+
+  <Accordion title="You are choosing an I/O scheduler for a fleet of NVMe-backed database servers. Compare mq-deadline, kyber, and 'none', and explain your recommendation." icon="message">
+    **Strong Answer:**
+
+    - For NVMe-backed database servers, my recommendation is `none` (no scheduler), with the caveat that workload testing should validate this.
+    - `mq-deadline` maintains separate read and write queues with deadline guarantees: reads default to 500ms deadline, writes to 5000ms. It prioritizes reads over writes because reads are typically in the synchronous path. This is valuable for HDD where seeking is expensive and reordering requests by sector can save milliseconds. But NVMe devices have no seek time, so reordering adds latency without reducing device-side cost.
+    - `kyber` uses a token-based system with target latencies for reads and writes. When I/O latency exceeds the target, kyber reduces the number of in-flight requests (throttles) to reduce queueing. This is useful for shared environments where multiple workloads compete for NVMe bandwidth. However, for a dedicated database server, the database's own I/O scheduler (InnoDB's adaptive flushing, PostgreSQL's bgwriter) already manages I/O prioritization.
+    - `none` passes I/O requests directly to the NVMe device with no kernel-side reordering or scheduling. NVMe devices have internal schedulers optimized for their flash topology (channel interleaving, die-level parallelism), and the device's 64K queue depth per submission queue means it can handle massive parallelism. Adding a kernel scheduler on top adds latency (microseconds per request for lock acquisition and queue insertion) without improving throughput.
+    - The exception: if multiple containers share the NVMe with different priority classes, I would use `kyber` or `mq-deadline` with I/O cgroup limits to prevent noisy neighbors.
+
+    **Follow-up:** How does the blk-mq multi-queue architecture map to NVMe submission queues?
+
+    **Follow-up Answer:**
+
+    - NVMe devices expose multiple hardware submission/completion queue pairs (typically one per CPU core). The blk-mq layer creates per-CPU software staging queues that map to these hardware queues. When a thread submits I/O, the request enters the software queue for the thread's current CPU, is optionally processed by the I/O scheduler, and then dispatched to the corresponding hardware submission queue. This per-CPU design eliminates cross-CPU lock contention: each CPU has its own software queue feeding its own hardware queue. The mapping is configurable via `/sys/block/nvme0n1/queue/nr_requests` (per-queue depth) and `irq_affinity` (which CPUs handle completion interrupts). For optimal performance, the completion interrupt for a hardware queue should be handled by the same CPU that submitted the I/O, keeping the data cache warm.
+  </Accordion>
+
+  <Accordion title="A production service is experiencing periodic I/O latency spikes of 50-100ms on an SSD that normally serves requests in under 1ms. How would you investigate this at the block layer level?" icon="message">
+    **Strong Answer:**
+
+    - First, I would capture the I/O latency distribution with `sudo biolatency-bpfcc -D 10` (grouped by device) to confirm the bimodal pattern: most I/Os under 1ms with a tail at 50-100ms. Then `sudo biosnoop-bpfcc -d nvme0n1` to see individual slow I/Os with their PID, operation type, sector, and size.
+    - Common causes of periodic I/O spikes on SSDs: First, garbage collection -- SSD firmware periodically reclaims erased blocks, which can stall writes for 10-100ms. This manifests as periodic write latency spikes regardless of host activity. Check with `nvme smart-log /dev/nvme0` for wear leveling counts. Second, journal commits -- ext4/XFS periodically commit journal transactions (default every 5 seconds), which issues synchronous writes that can queue behind other I/O. Check with `bpftrace -e 'kprobe:jbd2_journal_commit_transaction { printf("%s\n", comm); }'`. Third, filesystem metadata operations -- `sync`, `fsync`, or flusher threads writing dirty pages can cause queue depth spikes.
+    - At the block layer, I would check queue depth using `bpftrace` to trace `block_rq_issue` and `block_rq_complete` events, computing the instantaneous queue depth. If the spike correlates with high queue depth, the device is saturated. If the spike happens at low queue depth, the device itself is stalling (firmware GC, thermal throttling, or defective NAND).
+    - I would also check the I/O scheduler: `cat /sys/block/nvme0n1/queue/scheduler` -- if it is not `none`, try switching to rule out scheduler-induced delays. And check I/O cgroup throttling: `cat /sys/fs/cgroup/<path>/io.stat` for the relevant device.
+
+    **Follow-up:** How would you distinguish between device-side stalls and kernel-side queueing delays?
+
+    **Follow-up Answer:**
+
+    - I would trace both `block_rq_issue` (when the kernel dispatches the request to the driver) and `block_rq_complete` (when the device signals completion). The delta between issue and complete is purely device-side latency. Separately, I would trace `block_rq_insert` (when the request enters the scheduler queue) and `block_rq_issue` -- this delta is kernel scheduler queueing time. If the device-side delta shows spikes, the SSD is stalling. If the scheduler delta shows spikes, the kernel is holding requests in the queue (possibly throttled by cgroup I/O limits or the scheduler's admission control).
+  </Accordion>
+</AccordionGroup>
+
+---
+
 Next: [Networking Stack →](/courses/linux-internals/networking-stack)

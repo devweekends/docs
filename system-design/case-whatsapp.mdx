@@ -723,41 +723,252 @@ class TypingIndicatorService:
 
 | Decision | Choice | Reasoning |
 |----------|--------|-----------|
-| **Protocol** | WebSocket | Bidirectional, low latency |
-| **Message DB** | Cassandra | High write throughput, time-series |
-| **Session Store** | Redis | Fast lookups, TTL support |
-| **Message Queue** | Kafka | Reliable message routing |
-| **Media** | S3 + CDN | Scalable, cost-effective |
-| **Push** | FCM/APNS | Platform native notifications |
-| **Encryption** | Signal Protocol | Industry standard E2E |
+| **Protocol** | WebSocket | Bidirectional, low latency. A single WebSocket connection handles both sending and receiving, unlike HTTP which requires separate requests. At WhatsApp's scale (60M concurrent connections), the memory per connection (~10KB) totals ~600GB -- a significant infrastructure cost, but far cheaper than HTTP polling overhead. WhatsApp famously ran 2M+ connections per server using Erlang. |
+| **Message DB** | Cassandra | 100B messages/day requires extreme write throughput distributed across many nodes. Cassandra's leaderless replication and partition-by-conversation-ID gives perfect data locality -- all messages in a chat are on the same partition, making chat history retrieval a single-partition scan. The trade-off: no cross-partition joins, but messaging doesn't need joins. |
+| **Session Store** | Redis | Sub-millisecond lookups for "which gateway server is user X connected to?" are critical for message routing latency. Redis TTL automatically cleans up stale sessions when connections drop. The entire session dataset (500M users x 100 bytes) is ~50GB, easily fitting in a Redis cluster. |
+| **Message Queue** | Kafka | Reliable message routing between gateway servers with durability guarantees. If a gateway server crashes, messages in Kafka are not lost. Kafka also serves as the event backbone for analytics, presence updates, and delivery receipts. |
+| **Media** | S3 + CDN | Media messages (images, videos) are far larger than text. Uploading to S3 with a pre-signed URL keeps binary data off the messaging pipeline. CDN delivery puts media close to the recipient. WhatsApp compresses images to ~100KB before upload, which is why received photos look slightly lower quality than originals. |
+| **Push** | FCM/APNS | Platform-native push notifications are the only way to wake a mobile app when the WebSocket connection is closed (user backgrounded the app or phone is sleeping). FCM/APNS handle the last-mile delivery to billions of devices at zero cost to you. |
+| **Encryption** | Signal Protocol | Industry standard E2E encryption. The server cannot read message content -- it only routes encrypted blobs. This has architectural implications: server-side search is impossible (must be client-side), backup encryption is the user's responsibility, and content moderation requires client-side reporting rather than server-side scanning. |
 
 ## Common Interview Questions
 
 <Accordion title="How do you ensure message ordering?">
-1. Use TIMEUUID in Cassandra (includes timestamp)
-2. Client-side sequence numbers for conversation
-3. Deliver messages in batches, sorted by timestamp
-4. Handle network reordering by buffering and sorting
+1. Use TIMEUUID in Cassandra (includes timestamp) -- this provides a globally unique, time-ordered identifier for each message
+2. Client-side sequence numbers per conversation -- each message gets an incrementing sequence number that the sender assigns. This catches reordering even when server clocks drift
+3. Deliver messages in batches, sorted by timestamp, to ensure the recipient sees them in order
+4. Handle network reordering by buffering: hold messages for a short window (e.g., 500ms) before displaying, to allow late-arriving earlier messages to slot into the correct position
+
+**Key nuance**: Perfect global ordering is impossible in a distributed system (you would need a single serialization point, which is a bottleneck). Per-conversation ordering is sufficient and achievable. Two messages from different senders in the same group chat may arrive in different orders on different devices -- and that is acceptable because there is no causal dependency between them.
 </Accordion>
 
 <Accordion title="How do you handle message delivery to multiple devices?">
-1. Store all device sessions for each user
-2. Fan out message to all connected devices
-3. Track delivery status per device
-4. Show latest status (delivered if any device received)
+1. Store all device sessions for each user (phone, tablet, web) in the session store
+2. Fan out message to all connected devices -- this is a small fan-out (typically 2-3 devices per user) unlike the massive fan-out in Twitter's timeline
+3. Track delivery status per device, but show the aggregate status to the sender: "delivered" means at least one device received it
+4. Handle conflict resolution: if a user reads a message on their phone, mark it as read across all devices by propagating the read receipt
+
+**Design trade-off**: WhatsApp Web and WhatsApp Desktop used to proxy through the phone (phone was the source of truth). They later moved to independent multi-device support where each device has its own encryption keys and can operate independently. This is architecturally more complex but provides better UX when the phone is offline.
 </Accordion>
 
 <Accordion title="How do you scale WebSocket connections?">
-1. Horizontal scaling of gateway servers
-2. Consistent hashing for user→gateway mapping
-3. Redis pub/sub for cross-gateway routing
-4. Each gateway handles ~1M connections (64GB RAM)
+1. Horizontal scaling of gateway servers -- each gateway handles WebSocket connections independently
+2. Consistent hashing for user-to-gateway mapping: `gateway = hash(user_id) % num_gateways`. This ensures reconnections go to the same gateway (preserving session state) unless the gateway pool changes
+3. Redis pub/sub or Kafka for cross-gateway message routing: when User A on Gateway 1 sends a message to User B on Gateway 3, Gateway 1 publishes to a channel that Gateway 3 subscribes to
+4. Each gateway server handles ~1-2M connections with 64GB RAM. WhatsApp's original Erlang-based servers famously handled 2M+ connections per server
+
+**Scale math**: 60M concurrent connections / 2M per server = 30 gateway servers minimum. Add 2x for redundancy = 60 servers. This is a surprisingly small cluster for a service used by 2 billion people.
 </Accordion>
 
 <Accordion title="How do you handle network partitions?">
-1. Queue messages during partition
-2. Retry with exponential backoff
-3. Client-side message caching
-4. Sync on reconnection
-5. Accept eventual consistency (chat doesn't need strong consistency)
+1. Queue messages during partition -- the sender's gateway stores the message in a durable queue (Kafka) until the recipient's gateway is reachable
+2. Retry with exponential backoff and jitter to avoid thundering herd when the partition heals
+3. Client-side message caching -- the client stores sent messages locally and resends on reconnection if they never received a server acknowledgment
+4. Sync on reconnection: when a device comes back online, it requests all messages since its last-known sequence number. The server sends a batch of missed messages
+5. Accept eventual consistency -- chat does not need strong consistency. A message arriving 5 seconds late is fine; a message being lost is not. Design for at-least-once delivery with client-side deduplication.
+
+**What impresses interviewers**: Mention the "offline queue" pattern. Messages for offline users are stored in a per-user durable queue. When the user reconnects, the queue is drained in order. This queue has a TTL (e.g., 30 days) -- messages older than 30 days are dropped. WhatsApp reportedly stores offline messages for up to 30 days.
+</Accordion>
+
+### Key Trade-offs
+
+| Decision | Option A | Option B | Recommendation |
+|----------|----------|----------|----------------|
+| Connection protocol | HTTP long polling | WebSocket | **WebSocket** for the primary path. At 1.15M messages/sec, HTTP polling adds catastrophic overhead -- each poll is a full HTTP request/response cycle with headers, connection setup, and teardown. WebSocket provides a persistent bidirectional channel with per-message overhead of ~6 bytes (frame header). The server cost difference is roughly 10x. WhatsApp's Erlang-based servers famously handled 2M+ concurrent connections per server because Erlang's lightweight process model maps naturally to persistent connections. |
+| Message storage | SQL (PostgreSQL) | NoSQL (Cassandra) | **Cassandra** for messages, PostgreSQL for user profiles. At 100B messages/day (1.15M writes/sec), no single-leader relational database can handle the write volume. Cassandra's distributed write path, tunable consistency, and natural time-series partitioning (partition by conversation_id, cluster by timestamp) are a perfect fit. The trade-off: no cross-partition queries, so searching across conversations requires a separate search index. PostgreSQL handles user profiles, contacts, and group membership where ACID guarantees and JOINs matter. |
+| Message ordering | Total ordering (single leader) | Causal ordering (per-sender) | **Causal (per-sender) ordering** for 1:1 chats and per-group ordering for groups. Total ordering across all senders requires a single serialization point, which becomes a throughput bottleneck at 1.15M messages/sec. Per-sender ordering guarantees that all messages from User A appear in the order A sent them, while concurrent messages from different senders may interleave differently on different devices. For groups, route all messages through a partition leader per group to get total ordering within the group. The trade-off: you lose global consistency, but users do not notice -- two messages sent simultaneously by different people have no inherent ordering. |
+| Delivery guarantee | At-most-once | At-least-once | **At-least-once with client-side deduplication.** A lost message is far worse than a duplicate message -- users will tolerate seeing "hi" twice, but a lost payment confirmation or emergency message is unacceptable. Use message_id-based deduplication on the client to suppress duplicates. The trade-off: deduplication requires the client to maintain a set of recently seen message IDs, adding ~100KB of client memory. For SMS fallback (offline users), at-most-once may be preferable because SMS has per-message cost (~$0.01). |
+| Media delivery | Through message pipeline | Direct upload to CDN | **Direct upload to CDN (S3 + CloudFront).** Media files (100KB-10MB) must never flow through the gateway servers -- they would saturate the WebSocket connections and block text message delivery. The client uploads encrypted media directly to object storage via a pre-signed URL, then sends a small message containing the media URL and decryption key through the message pipeline. The trade-off: two network round-trips for media (upload + message), but this decouples the high-throughput text path from the high-bandwidth media path. Without this separation, a 500-member group photo would consume 500x the bandwidth on the gateway. |
+| Presence system | Push to all contacts | Pull on demand | **Pull on demand.** Eagerly pushing presence updates to all contacts creates a fan-out bomb: 500M DAU with 100 contacts each = 50B presence notifications per day. Instead, subscribe to a user's presence only when their chat window is open. This reduces fan-out from "all contacts" to "1-3 people actively being viewed" at any moment. The trade-off: presence status is not visible in the contact list without opening the chat. WhatsApp made this product choice deliberately -- the contact list shows "last seen" from a cache, not real-time presence. |
+
+### Common Candidate Mistakes
+
+```
+Mistake 1: Using HTTP polling instead of WebSocket
+  At 1M+ messages per second, HTTP polling adds enormous overhead
+  (HTTP headers, connection setup/teardown per message). WebSocket
+  provides a persistent bidirectional channel. The difference in
+  server costs is roughly 10x.
+
+Mistake 2: Storing messages in a relational database
+  100B messages/day = 1.15M writes/sec. PostgreSQL or MySQL cannot
+  handle this write volume on a single cluster without extreme
+  sharding complexity. Cassandra's distributed write path handles
+  this natively. Use Cassandra for messages, PostgreSQL for user
+  profiles and metadata.
+
+Mistake 3: Not discussing E2E encryption implications
+  With E2E encryption, the server is blind to message content.
+  This means: no server-side search (must search on client),
+  no server-side spam filtering (must rely on client-side
+  reporting), and backup encryption is the user's responsibility.
+  These are significant product and architecture constraints that
+  interviewers expect you to acknowledge.
+
+Mistake 4: Treating group chat as "just send to everyone"
+  A 500-member group chat means each message triggers 499 delivery
+  operations. Without batching and parallelism, a single group
+  message could take seconds. Process deliveries in parallel
+  batches of 100, and use a separate queue for group fan-out to
+  avoid blocking 1:1 message delivery.
+```
+
+## Interview Deep-Dive Questions
+
+<Accordion title="Two users in a WhatsApp group send messages at nearly the same time from different continents. User A sees their message first, User B sees their own message first. Is this a bug? How does message ordering work in a distributed messaging system, and what guarantees can you actually provide?">
+
+**What the interviewer is really testing:** Do you understand the fundamental impossibility of total ordering in distributed systems, and can you articulate what ordering guarantees are sufficient for a chat application vs. what would require an unacceptable performance cost?
+
+**Strong answer:**
+
+- **This is not a bug -- it is a fundamental consequence of distributed systems.** Total ordering across all senders would require a single serialization point (like a single-leader database), which becomes a bottleneck and latency penalty at WhatsApp's scale (1.15M messages/sec). The CAP theorem-adjacent reality is that you cannot have both global total order and low-latency message delivery across continents.
+- **The guarantee WhatsApp provides is per-sender ordering within a conversation.** All messages from User A appear in the order A sent them. All messages from User B appear in the order B sent them. But the interleaving of A's and B's messages may differ across devices. This is causal consistency -- causally related messages (A sends, then B replies to A's message) are ordered correctly. Concurrent messages (A and B send independently at the same time) have no inherent order.
+- **Implementation uses client-assigned sequence numbers plus server timestamps.** Each client maintains a per-conversation sequence counter. Message from User A gets `sender_seq=47` (A's 47th message in this conversation). The server assigns a TIMEUUID (Cassandra) as the global message ID. Messages are stored ordered by TIMEUUID but the client uses sender sequence numbers to detect gaps and reorder within a sender's stream.
+- **The 500ms buffering window handles network reordering.** When displaying messages, the client holds incoming messages in a buffer for a short window before rendering. If message `sender_seq=47` arrives before `sender_seq=46` (due to different network paths), the buffer waits for 46 to arrive or for the window to expire. This eliminates most visible reordering artifacts.
+- **For groups, "happened-before" relationships via vector clocks would be ideal but impractical.** A vector clock with 500 entries (one per group member) on every message is too much metadata overhead. WhatsApp uses a simpler approach: Lamport-style timestamps where the server assigns a monotonically increasing timestamp per group. This provides a total order within the group but at the cost of routing all group messages through a partition leader for that group.
+
+**Red flag answer:** "Use a global timestamp and sort by it" without acknowledging clock skew across data centers, or "just use a single database" without recognizing the throughput bottleneck. Also a red flag: claiming you can provide total ordering cheaply.
+
+**Follow-up questions:**
+1. How do you handle the case where a user replies to a specific message (quoted reply) but that original message has not yet arrived on another group member's device due to network delay?
+2. If WhatsApp moved from per-group ordering (routed through a partition leader) to causal ordering (no central leader), what would change architecturally and what user-visible differences would occur?
+</Accordion>
+
+<Accordion title="Walk me through the Signal Protocol key exchange that happens when Alice messages Bob for the first time on WhatsApp. What are the pre-keys, why are there one-time pre-keys, and what happens if the server is compromised?">
+
+**What the interviewer is really testing:** Do you understand the cryptographic protocol at a level deeper than "E2E encryption means the server cannot read messages" -- specifically the X3DH key agreement and why it is designed the way it is?
+
+**Strong answer:**
+
+- **The protocol is X3DH (Extended Triple Diffie-Hellman), which solves the "asynchronous key exchange" problem.** Unlike standard Diffie-Hellman, which requires both parties to be online simultaneously, X3DH allows Alice to initiate a secure session with Bob while Bob is offline. This is essential for messaging -- you cannot require both parties to be online to start a conversation.
+- **Bob pre-publishes three types of keys to the server.** (1) Identity Key (IK) -- a long-term key pair that represents Bob's cryptographic identity, generated once and never changed. (2) Signed Pre-Key (SPK) -- a medium-term key pair, signed by Bob's IK to prove authenticity, rotated periodically (e.g., weekly). (3) One-Time Pre-Keys (OPK) -- a batch of single-use key pairs uploaded in bulk (e.g., 100 at a time). Each OPK is used for exactly one initial session and then deleted from the server.
+- **When Alice wants to message Bob, she fetches Bob's public keys and performs the triple DH.** She generates an ephemeral key pair and computes: `shared_secret = KDF(DH(Alice_IK, Bob_SPK) || DH(Alice_ephemeral, Bob_IK) || DH(Alice_ephemeral, Bob_SPK) || DH(Alice_ephemeral, Bob_OPK))`. The three (or four, with OPK) DH computations provide different security properties: forward secrecy (from the ephemeral key), mutual authentication (from the identity keys), and deniability.
+- **One-Time Pre-Keys provide forward secrecy for the initial message.** Without OPKs, if Bob's Signed Pre-Key is later compromised, an attacker who recorded the initial key exchange traffic could derive the shared secret and decrypt the first message. The OPK, being single-use and immediately deleted from the server, ensures that even SPK compromise does not reveal past sessions. When Bob runs out of OPKs (because many people messaged him while he was offline), the protocol falls back to using only SPK, which has slightly weaker forward secrecy for those initial messages.
+- **If the server is compromised, it still cannot read messages.** The server never sees private keys -- it only stores and distributes public keys. A compromised server could: (a) serve fake public keys (MITM attack), which is why WhatsApp has a "security code" verification feature that lets users out-of-band verify each other's identity keys, (b) withhold or delay messages (denial of service), (c) collect metadata (who messages whom, when, and how often). The inability to read content is the core E2E guarantee, but metadata leakage is a real and significant privacy concern.
+- **After the initial key exchange, the Double Ratchet takes over.** Each message uses a new symmetric key derived from a ratcheting process. This means compromising a single message key does not reveal past or future messages. The ratchet advances with every message exchange, providing continuous forward secrecy.
+
+**Red flag answer:** "The server stores the encryption keys and they are encrypted" -- this confuses E2E encryption with encryption at rest. Also a red flag: not knowing the difference between Identity Keys, Signed Pre-Keys, and One-Time Pre-Keys, or why there are three types.
+
+**Follow-up questions:**
+1. WhatsApp recently added multi-device support where your messages appear on your phone, tablet, and web client simultaneously. How does E2E encryption work when there are 3-4 devices per user, each needing its own keys?
+2. A government demands that WhatsApp add a "ghost participant" to specific conversations for lawful interception. What technical mechanisms would this require, and what does it break in the Signal Protocol?
+</Accordion>
+
+<Accordion title="A user sends a photo in a 500-member group chat. Walk me through the entire flow from the sender's camera roll to every group member's screen, including how media storage interacts with E2E encryption.">
+
+**What the interviewer is really testing:** Can you trace a complex data flow across multiple subsystems (client encryption, media upload, CDN, group fan-out, decryption) and identify the bottlenecks and design choices at each stage?
+
+**Strong answer:**
+
+- **Step 1: Client-side processing before upload.** The sender's app compresses the image (WhatsApp typically reduces photos to ~100KB-200KB from multi-MB originals), generates a thumbnail (for the chat preview), and encrypts both the full image and thumbnail with a random AES-256 key. This encryption key is generated per-media-item, not derived from the conversation key. The encrypted blob is what gets uploaded -- the server never sees the unencrypted image.
+- **Step 2: Upload to object storage via a pre-signed URL.** The client requests an upload URL from the media service, receives a pre-signed S3 (or equivalent) URL, and uploads the encrypted blob directly to object storage. This keeps large binary data off the messaging pipeline -- the gateway servers never handle media bytes, only routing metadata. The media service returns a media URL (CDN-backed) and a SHA-256 hash of the encrypted blob.
+- **Step 3: The message contains a pointer, not the media.** The actual message sent through the messaging pipeline is small: `{ "type": "image", "media_url": "https://media.whatsapp.net/...", "media_key": "<AES key, encrypted per-recipient>", "file_hash": "<SHA-256>", "thumbnail": "<encrypted thumbnail bytes>" }`. The media key is encrypted for each recipient using their session key from the Double Ratchet.
+- **Step 4: Group fan-out is for the message metadata, not the media.** The group fan-out service delivers this small message to all 499 members. This is the same fan-out path as a text message -- batches of 100, parallel delivery. The media blob is uploaded once and stored once. 499 members all download from the same CDN URL. This is a critical optimization: without it, a 200KB image in a 500-member group would require 100MB of upload bandwidth from the sender.
+- **Step 5: Each recipient downloads and decrypts independently.** When a recipient's app receives the message, it downloads the encrypted blob from the CDN URL, verifies the SHA-256 hash (to detect tampering or corruption), decrypts using the media key from the message, and displays the image. The CDN serves the same encrypted blob to everyone -- it cannot decrypt the content.
+- **The thumbnail enables lazy loading.** The encrypted thumbnail (typically 5-10KB) is included inline in the message. The client decrypts and displays the thumbnail immediately while the full image downloads in the background. This is why you see blurry image previews in WhatsApp before the full image loads.
+
+**Red flag answer:** "Upload the image to the server and the server sends it to everyone" -- this ignores E2E encryption entirely. Also a red flag: suggesting the media is sent through the message pipeline (this would overwhelm the gateway servers with binary data).
+
+**Follow-up questions:**
+1. WhatsApp has a "view once" feature for photos that auto-deletes after the recipient views it once. Given that the media is stored on S3/CDN and the decryption key is on the client, how would you implement this, and what are the limitations?
+2. Media files on WhatsApp CDN have expiration dates (URLs stop working after ~30 days). Why is this, and how does the client handle a user scrolling back to view a month-old photo?
+</Accordion>
+
+<Accordion title="WhatsApp shows 'online' and 'last seen at 3:42 PM' for your contacts. At 2 billion users, how do you design the presence system, and what are the privacy and scalability constraints that make this surprisingly hard?">
+
+**What the interviewer is really testing:** Can you identify that presence is a high-frequency, fan-out-heavy feature where the naive design explodes at scale, and can you reason about the privacy layer on top?
+
+**Strong answer:**
+
+- **The naive approach is a disaster at scale.** If each user has 100 contacts and comes online, you notify 100 people. With 500M DAU cycling between online/offline multiple times per day, that is billions of presence notifications per day. If you additionally send "last seen" timestamps every time someone interacts with the app, the notification volume becomes astronomical.
+- **Presence is a pull-on-demand system, not a push-everywhere system.** WhatsApp does not eagerly push presence updates to all contacts. Instead, when you open a chat with someone, your client subscribes to that person's presence. The server only sends presence updates for users you are actively viewing. This reduces fan-out from "all contacts" to "people whose chat windows are currently open" -- typically 1-3 people at any moment.
+- **The Redis sorted set approach for online status.** `ZADD online_users {timestamp} {user_id}` on every heartbeat (every 30 seconds). To check if someone is online: `ZSCORE online_users {user_id}`, then compare the timestamp to current time. If the score is older than 60 seconds, the user is offline, and the score itself becomes their "last seen" timestamp. This is O(1) per check and the entire online user set (~60M concurrent) fits in ~500MB of Redis memory.
+- **Privacy controls add architectural complexity.** Users can set "last seen" visibility to "Everyone," "My Contacts," "My Contacts Except...," or "Nobody." This means every presence query requires a permission check: "Is the requesting user allowed to see this person's status?" This check involves reading the target's privacy setting and, if set to "My Contacts," verifying that the requester is in the target's contact list. Without caching, this is two lookups per presence request. With caching, you need cache invalidation when someone changes their privacy setting or modifies their contacts.
+- **The "last seen" feature creates a subtle privacy leak even when disabled.** Researchers have shown that by monitoring when a user's "last seen" changes, you can infer their sleep patterns, daily routines, and when they are active even if they hide the timestamp. WhatsApp mitigated this by making the "Nobody" setting also hide your online indicator, not just the timestamp. This is a product decision driven by privacy analysis, not just engineering.
+- **Typing indicators are the most ephemeral presence signal.** They use a fire-and-forget UDP-style delivery with a 5-second TTL in Redis. If the notification is lost, the worst case is that the recipient does not see "typing..." for one occurrence. No retry, no persistence -- this is the right trade-off for a cosmetic feature.
+
+**Red flag answer:** "Push online status to all contacts when a user comes online" -- this is the fan-out bomb. Also a red flag: not discussing privacy controls or treating presence as a simple boolean without considering "last seen" timestamps and their privacy implications.
+
+**Follow-up questions:**
+1. If a user changes their privacy setting from "Everyone" to "Nobody," how quickly should this take effect -- is eventual consistency acceptable, and what does the cache invalidation look like?
+2. WhatsApp Web shows presence information too. How does the multi-device architecture complicate presence -- if a user's phone is online but their web client is idle, what status should contacts see?
+</Accordion>
+
+<Accordion title="WhatsApp stores 100 billion messages per day in Cassandra. A user opens a chat and scrolls up to load older messages. Walk me through the data model, the query pattern, and why Cassandra is chosen over alternatives.">
+
+**What the interviewer is really testing:** Can you design a Cassandra data model from the access pattern backward (not the relational way), and do you understand the performance characteristics of partition-scoped range queries vs. cross-partition queries?
+
+**Strong answer:**
+
+- **The primary access pattern drives the partition key.** The dominant query is "get the last N messages in conversation X, ordered by time." This means `conversation_id` is the partition key and `message_id` (a TIMEUUID) is the clustering key with `DESC` ordering. All messages in a single conversation live on the same partition, making this query a single-partition scan -- the fastest operation Cassandra can perform.
+- **Cassandra's write path is ideal for messaging workloads.** Writes are append-only to a commit log and memtable -- no read-before-write, no locking. At 1.15M writes/sec, a PostgreSQL cluster would need aggressive sharding and would still struggle with hot partitions (popular group chats). Cassandra's leaderless replication means any node can accept a write, distributing the load naturally.
+- **The partition size limit is the design constraint.** A single Cassandra partition should stay under ~100MB for optimal performance. A very active group chat with years of history could exceed this. The mitigation is time-bucketed partitions: instead of `PRIMARY KEY (conversation_id, message_id)`, use `PRIMARY KEY ((conversation_id, time_bucket), message_id)` where `time_bucket` is a monthly or weekly bucket. Loading recent messages hits the current bucket; scrolling far back hits older buckets (separate partitions, potentially on different nodes).
+- **The `user_messages` table serves the inbox view.** When a user opens the app, they see a list of conversations sorted by last message time. This requires a different access pattern: "get all conversations for user X, ordered by last activity." A separate `conversations` table with `PRIMARY KEY (user_id, last_message_at)` supports this. This is Cassandra's standard denormalization pattern -- store data redundantly in the shape your queries need.
+- **Cassandra's trade-off is no cross-partition joins or aggregations.** You cannot run "search all messages containing keyword X across all conversations" because that is a full-cluster scan. Server-side search is impossible (doubly so with E2E encryption). Client-side search works on the local message cache. For analytics (e.g., "how many messages were sent globally today"), use a separate analytics pipeline (Kafka to Spark to a data warehouse).
+
+**Red flag answer:** "Use PostgreSQL with a messages table and a foreign key to conversations" -- at 1.15M writes/sec, this will not scale without extreme sharding complexity. Also a red flag: designing the Cassandra model like a relational database (normalizing data instead of denormalizing for access patterns).
+
+**Follow-up questions:**
+1. A celebrity group chat has 500 members who each send 100 messages per day. That is 50,000 messages per day in a single partition. After a year, the partition is massive. How do you handle this, and what happens to read performance as the partition grows?
+2. WhatsApp recently added "disappearing messages" (auto-delete after 7 days). How would you implement this in Cassandra -- TTLs, compaction, or a separate deletion service?
+</Accordion>
+
+<Accordion title="You receive a report that messages in a specific group chat are arriving out of order on some devices but not others. The group has 200 members across 15 countries. How do you debug this?">
+
+**What the interviewer is really testing:** Production debugging of a distributed systems ordering issue -- can you reason about the multiple layers where reordering can occur (network, server, client) and systematically narrow down the cause?
+
+**Strong answer:**
+
+- **Step 1: Define what "out of order" means precisely.** Are messages from the same sender appearing out of order (a serious bug -- this violates per-sender ordering)? Or are messages from different senders interleaved differently on different devices (expected behavior in a distributed system)? Get the exact message IDs, their server-side timestamps, and the order they appear on the reporting device vs. a non-affected device.
+- **Step 2: Check server-side message ordering.** Query Cassandra for the group's messages ordered by TIMEUUID. If messages from the same sender are stored in the wrong order, the problem is upstream of Cassandra -- likely in the gateway or message router. If they are stored correctly but displayed incorrectly, the problem is client-side.
+- **Step 3: Investigate clock skew between gateway servers.** TIMEUUIDs are generated on the gateway server that receives the message. If Gateway A's clock is 3 seconds ahead of Gateway B's clock, two messages sent at the "same time" (one via each gateway) will have TIMEUUIDs that do not reflect actual send order. NTP synchronization issues across data centers in different countries could cause this. Check the NTP drift on affected gateways.
+- **Step 4: Check the Kafka partition ordering.** If group messages are published to Kafka and different senders' messages land on different partitions (e.g., partitioned by sender ID), Kafka only guarantees ordering within a partition. The consumer might process partition 0 (sender A's messages) faster than partition 1 (sender B's messages), causing interleaving differences. Fix: use group_id as the Kafka partition key so all messages for one group are in one partition, guaranteeing total order at the Kafka level.
+- **Step 5: Client-side network conditions.** A device in a country with poor connectivity might receive messages out of order due to TCP retransmissions or WebSocket frame reordering after a reconnect. The client-side buffering window (500ms) should handle this, but if the network delay exceeds the buffer window, messages slip through out of order. Check if affected devices correlate with specific ISPs or regions with high latency.
+- **Step 6: The fan-out service might be introducing reordering.** If the fan-out service delivers to members in parallel batches, and the batch processing is not ordered, later messages might reach some members before earlier messages. The fan-out service should ensure that for each recipient, messages are queued in TIMEUUID order, even if delivery across recipients happens in parallel.
+
+**Red flag answer:** "Messages are just stored by timestamp so they should be in order" -- this ignores distributed clock skew, Kafka partition ordering, network reordering, and client-side buffering. Also a red flag: not distinguishing between same-sender reordering (a bug) and cross-sender interleaving (expected behavior).
+
+**Follow-up questions:**
+1. You determine the root cause is NTP clock drift between data centers. What is the maximum acceptable clock skew for a messaging application, and how would you design the system to tolerate clock skew up to that limit?
+2. Some messaging apps (like Slack) show a "new messages" divider when you scroll down, implying a total ordering that all clients agree on. How would you implement this in a distributed system, and what is the cost?
+</Accordion>
+
+<Accordion title="WhatsApp processes 2 petabytes of media per day (images, videos, voice notes). How do you design the media storage and delivery system, and how does E2E encryption change the typical CDN caching model?">
+
+**What the interviewer is really testing:** Can you design a media pipeline at extreme scale and reason about how encryption breaks the standard CDN optimization playbook (deduplication, transcoding, content-aware caching)?
+
+**Strong answer:**
+
+- **Each media file is encrypted with a unique random key on the sender's device.** This means the server and CDN only ever handle encrypted blobs. Two users sending the exact same photo produce completely different encrypted blobs (different random keys). This fundamentally breaks content-addressable deduplication -- a standard CDN optimization that is impossible here.
+- **Upload path: pre-signed URL directly to object storage.** The client gets a pre-signed upload URL from the media service, uploads the encrypted blob directly to S3 (or equivalent), and receives back a media URL and content hash. The media URL is a CDN-fronted path. This upload path bypasses the messaging gateway servers entirely -- you never want multi-megabyte binary data flowing through your WebSocket connections.
+- **Storage tiering by access pattern.** Fresh media (last 30 days) is accessed frequently and stays on fast storage (S3 Standard or SSD-backed). Older media moves to cheaper tiers (S3 Infrequent Access, then Glacier) based on access patterns. At 2 PB/day, you accumulate ~60 PB/month. Without tiering, storage costs alone would be tens of millions of dollars per month.
+- **CDN caching is less effective than for a service like Netflix.** On Netflix, the same movie is served to millions of users (excellent cache hit ratio). On WhatsApp, each encrypted media file is typically accessed by 1-2 people (1:1 chats) or up to 500 (group chats). The CDN hit rate for WhatsApp media is much lower. The CDN still helps with geographic proximity (serving from a nearby edge reduces latency), but the caching benefit is limited to the short window between upload and download by recipients.
+- **Media expiration and garbage collection.** WhatsApp media URLs expire after approximately 30 days. After expiration, the encrypted blob is deleted from hot storage (it may remain in the recipient's local device storage). This controls storage growth and is also a privacy feature. A background garbage collection job identifies expired media, verifies no pending downloads, and deletes the blob. At 2 PB/day ingest, the deletion pipeline processes the same volume 30 days later.
+- **Voice notes and video messages have additional constraints.** Voice notes are small (~50-200KB) but extremely latency-sensitive (users expect near-instant playback). Video messages can be large (10-50MB). The client compresses and transcodes video before encryption, not the server -- because the server cannot see the unencrypted content. This means transcoding happens on the sender's mobile device, which has limited CPU. WhatsApp caps video message quality accordingly.
+
+**Red flag answer:** "Use a CDN like Netflix does" without recognizing that E2E encryption eliminates content-level deduplication and severely limits CDN cache hit rates. Also a red flag: suggesting server-side media transcoding when the server cannot decrypt the content.
+
+**Follow-up questions:**
+1. A user backs up their WhatsApp chat to Google Drive/iCloud. The backup includes media files. How does the encryption model change for backups, and what happens if the user loses their phone and restores from backup on a new device?
+2. WhatsApp recently increased the file sharing limit to 2GB. How does this affect the media pipeline architecture -- what changes when the average upload size increases by 100x for some messages?
+</Accordion>
+
+<Accordion title="WhatsApp needs to support 60 million concurrent WebSocket connections. Each connection consumes ~10KB of memory. How do you architect the gateway layer, handle server failures gracefully, and manage the reconnection thundering herd?">
+
+**What the interviewer is really testing:** Can you reason about stateful connection management at extreme scale, including failure domains, sticky sessions, and the reconnection stampede problem?
+
+**Strong answer:**
+
+- **The math: 60M connections at 10KB each = 600GB of connection state.** If each gateway server has 64GB RAM and allocates 50GB for connections (rest for OS, GC, buffers), each server handles ~2M connections (50GB / 25KB effective per connection with overhead). You need 30 gateway servers minimum, doubled for redundancy = 60 servers. WhatsApp famously achieved 2M+ connections per server using Erlang's lightweight process model.
+- **Connection routing uses consistent hashing on user ID.** `gateway = hash(user_id) % num_gateways` ensures a user reconnects to the same gateway (preserving in-memory state like subscription lists). But consistent hashing means a server failure redistributes its connections to its hash-ring neighbors, not uniformly across all servers. Size the ring so each server can absorb a neighbor's load without OOM.
+- **The reconnection thundering herd is the scariest failure mode.** If a gateway server with 2M connections dies, all 2M clients detect the disconnection (WebSocket close/timeout) and attempt to reconnect simultaneously. 2M TLS handshakes hitting the load balancer at once will overwhelm it. Mitigation: client-side reconnection with exponential backoff plus jitter. Each client waits `min(base * 2^attempt + random_jitter, max_delay)` where jitter spreads reconnections over a 30-60 second window instead of a single spike.
+- **Connection state must be externalized, not solely in-memory.** If a gateway dies, the session store (Redis) still knows which user was connected to which gateway. The replacement gateway can query Redis to restore subscriptions. Messages for the disconnected users are queued in Kafka (or a per-user Redis list) during the reconnection window and drained once the user reconnects.
+- **Health checking and graceful drain for planned maintenance.** Before taking a gateway offline for deployment, initiate a graceful drain: stop accepting new connections, send a "reconnect to a different server" message to existing connections (with a random delay to stagger), and wait for all connections to close. This avoids the thundering herd entirely for planned operations.
+- **Regional deployment reduces blast radius.** Deploy gateways in multiple regions. A failure in the US East gateway cluster does not affect users connected to the EU cluster. Cross-region message routing uses Kafka (inter-region replication). This limits the thundering herd to the affected region's user base, not the global user base.
+
+**Red flag answer:** "Just add more servers behind a load balancer" without discussing connection stickiness, stateful failover, or the thundering herd problem. Also a red flag: treating WebSocket connections as stateless like HTTP requests.
+
+**Follow-up questions:**
+1. You need to deploy a new version of the gateway service to all 60 servers. How do you roll it out without disconnecting 60 million users simultaneously, and what is your rollback strategy if the new version has a bug?
+2. A mobile carrier in India has a transparent proxy that aggressively terminates idle TCP connections after 30 seconds. How does this affect your WebSocket heartbeat strategy, and what client-side workarounds exist?
 </Accordion>

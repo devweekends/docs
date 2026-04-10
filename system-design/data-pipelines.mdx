@@ -5,7 +5,7 @@ icon: "pipe"
 ---
 
 <Warning>
-**Senior Level**: Data pipeline design is common in senior interviews, especially at data-intensive companies. Expect questions about batch vs streaming, exactly-once processing, and handling late data.
+**Senior Level**: Data pipeline design is common in senior interviews, especially at data-intensive companies (LinkedIn, Netflix, Uber, Stripe). Expect questions about batch vs streaming, exactly-once processing, and handling late data. The key insight interviewers look for: the choice between batch and stream is not binary. Most production systems use both (the "Lambda" pattern) or unify them (the "Kappa" pattern). Knowing when each is appropriate -- and being able to articulate the trade-offs -- is what separates strong senior candidates.
 </Warning>
 
 ## Batch vs Stream Processing
@@ -306,6 +306,10 @@ class StreamProcessor:
 ```
 
 ### Watermarks for Late Data
+
+Late data is the single most underestimated problem in stream processing. In a batch world, you process a complete dataset -- no data is "late" because you wait for all of it. In a streaming world, events arrive out of order due to network delays, client clock skew, mobile devices going offline then reconnecting, and retry logic in upstream producers. A robust pipeline must decide: how long do I wait for stragglers before closing a window and emitting results?
+
+Watermarks are the mechanism for making this decision systematically. They are essentially the pipeline's best guess at "what time is it in the event world?"
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
@@ -1320,3 +1324,83 @@ async def process_with_backpressure(stream, max_concurrent=100):
         asyncio.create_task(process_one(event))
 ```
 </Accordion>
+
+## Interview Deep-Dive
+
+<AccordionGroup>
+<Accordion title="You are building a real-time fraud detection pipeline for a payment processor handling 50,000 transactions per second. Walk me through the architecture and explain why you cannot use batch processing here.">
+**Strong Answer:**
+
+Fraud detection has a hard latency constraint: you must return an approve/deny decision before the payment gateway times out, typically within 100-500ms. Batch processing runs on bounded datasets with latency measured in minutes to hours -- by the time a batch job detects a fraudulent transaction, the money is already gone.
+
+**Architecture**:
+- **Ingestion**: Kafka topic with transactions partitioned by `merchant_id` (keeps related transactions together for pattern detection). At 50K TPS with ~1KB per transaction event, that is 50 MB/sec = 432 TB/day of raw event data.
+- **Stream processor**: Apache Flink with event-time windowing. Each transaction triggers three parallel checks:
+  1. **Rule engine** (sub-10ms): Hard-coded rules like "decline if amount exceeds 3x the user's average transaction in the last 30 days." This requires a pre-computed user profile in Redis (average transaction amount, transaction count, last transaction time). Redis lookup: ~1ms.
+  2. **Velocity check** (sub-20ms): Count transactions per card in sliding windows (1 minute, 1 hour, 24 hours). Flink maintains this state in-memory with RocksDB state backend. If a card has 10+ transactions in 1 minute, flag it.
+  3. **ML model scoring** (sub-50ms): Feature vector (transaction amount, merchant category, time of day, device fingerprint, geo-distance from last transaction) fed into a pre-trained model served via a low-latency inference service (TensorFlow Serving or ONNX Runtime). The model returns a fraud probability score.
+- **Decision aggregation**: Combine all three scores. If any hard rule triggers, decline. If ML score exceeds threshold (0.8), decline. If velocity check + ML score is borderline, route to human review queue.
+- **Total pipeline latency budget**: Kafka consume (5ms) + parallel checks (50ms worst case) + decision logic (2ms) + Kafka produce for downstream (5ms) = ~62ms end-to-end. Well within the 500ms gateway timeout.
+
+**Back-of-envelope for infrastructure**: Flink needs to maintain windowed state for velocity checks. 100M active cards * 3 windows * ~200 bytes per window = 60 GB of state. Fits in a 10-node Flink cluster with 8 GB state per node. Kafka: 50K TPS with 7 days retention = 50K * 86,400 * 7 * 1KB = 30 TB. A 30-broker Kafka cluster with 1 TB each.
+
+**Follow-up: Your ML model is retrained weekly on batch data, but fraud patterns shift within hours. How do you close this gap?**
+
+Use a lambda-style approach for the model. The weekly batch-trained model is the "base model" that captures long-term patterns. Layer an "online model" on top that retrains incrementally on confirmed fraud/not-fraud labels as they arrive (typically 24-48 hours after the transaction, when chargebacks come in). Flink can do online learning with frameworks like Apache Flink ML. The online model adjusts feature weights based on recent patterns. Combined score = 0.7 * base_model + 0.3 * online_model. This gives you the stability of batch training with the adaptiveness of online learning.
+</Accordion>
+
+<Accordion title="Your company has both a Lambda architecture (batch + speed layer) and is considering migrating to Kappa architecture (stream-only). The batch layer runs a nightly Spark job that takes 4 hours to reprocess all data. What are the trade-offs, and what would you recommend?">
+**Strong Answer:**
+
+The core trade-off is operational complexity vs. reprocessing capability.
+
+**Lambda architecture's pain**: You are maintaining two codepaths that must produce the same results -- one in Spark (batch) and one in Flink or Kafka Streams (speed). Every business logic change requires updating both, testing both, and verifying they agree. In my experience, the batch and speed layers inevitably diverge, and debugging discrepancies is the single biggest time sink for the data engineering team.
+
+**Kappa architecture's promise**: One codebase, one processing engine (Flink), one source of truth (Kafka log). When you need to reprocess, replay the Kafka topic from the beginning through an updated version of your Flink job.
+
+**The critical question: can you replay fast enough?**
+- Your nightly Spark batch takes 4 hours to process a full day of data. Assume 1 day of data = 10 TB.
+- In Kappa, reprocessing means replaying Kafka. Flink can typically process faster than real-time when reading from Kafka (no external I/O latency). If real-time throughput is 50 MB/sec, replay throughput might be 500 MB/sec (10x, limited by state checkpointing and sink writes). 10 TB / 500 MB/sec = 20,000 seconds = ~5.5 hours. Comparable to the 4-hour batch.
+- But what if you need to reprocess 30 days of data (a bug was found in the business logic 30 days ago)? That is 300 TB. Replay: 300 TB / 500 MB/sec = 600,000 seconds = ~7 days. With Lambda, you run the corrected Spark job against the data lake in 4 hours (it processes 30 days in parallel, not sequentially).
+
+**My recommendation**: Migrate to Kappa if your reprocessing window is typically under 7 days and your data volume is manageable. Keep the data lake (S3/HDFS) as a backup -- not a processing layer, just storage. If you need to reprocess more than 7 days, spin up a temporary Spark job against the data lake as an escape hatch. This gives you the simplicity of Kappa for 95% of cases with a safety net for the rare full-history reprocessing.
+
+**Follow-up: You move to Kappa. Your Flink job has a bug that corrupted 3 days of output data in your downstream analytics database. How do you recover?**
+
+This is the Kappa architecture's Achilles heel, and why you keep the raw event log. Step 1: fix the bug and deploy the corrected Flink job. Step 2: reset the Flink consumer offset to 3 days ago and replay into a PARALLEL output (a new table or a staging database), not the production output. Step 3: validate the replayed output against known-good reference data. Step 4: atomically swap the production table to point to the corrected output (rename tables or update a view). The key: never replay directly into production until you have validated the output. Kafka's retention policy must be set to keep at least 7-14 days of raw events to make this recovery possible. At 50 MB/sec * 86,400 sec * 14 days = ~60 TB of Kafka retention -- expensive but essential for disaster recovery.
+</Accordion>
+
+<Accordion title="Estimate the infrastructure cost of a data pipeline that ingests 1 billion events per day, stores raw events for 1 year, and produces real-time aggregations every 5 minutes.">
+**Strong Answer:**
+
+**Ingestion layer (Kafka)**:
+- 1B events/day = 11,574 events/sec average, ~35K peak.
+- Average event size: 500 bytes. Throughput: 11,574 * 500 = 5.8 MB/sec average, 17.4 MB/sec peak.
+- Kafka retention: 7 days for hot replay. 7 * 86,400 * 11,574 * 500 bytes = 3.5 TB.
+- Kafka cluster: 3 brokers with replication factor 3. Each broker stores 3.5 TB / 3 * 3 (replication) = 3.5 TB. Use i3.xlarge instances (1 TB NVMe). Need 4 i3.xlarge per broker = 12 instances total. At ~$0.31/hr: $2,700/month.
+
+**Stream processing (Flink)**:
+- 5-minute tumbling windows for aggregations. State size: depends on aggregation dimensions. If aggregating by 1M unique keys with 200 bytes of state each = 200 MB of state. Modest -- a 3-node Flink cluster handles this easily. 3 m5.2xlarge at ~$0.38/hr: $820/month.
+
+**Long-term storage (S3)**:
+- 1B events * 500 bytes = 500 GB/day raw. Compressed with Parquet: ~100 GB/day.
+- 1 year: 100 GB * 365 = 36.5 TB.
+- S3 Standard: $0.023/GB/month. For 36.5 TB: $839/month.
+- After 90 days, move to S3 Glacier Instant Retrieval: $0.004/GB/month. Average cost drops to roughly $400/month.
+
+**Aggregation output (time-series database)**:
+- 5-minute aggregations for 1M keys = 288 aggregation points per key per day. 1M * 288 * 100 bytes = 28.8 GB/day. 1 year = 10.5 TB.
+- TimescaleDB on a db.r6g.4xlarge: ~$2,500/month. With compression (10x on time-series data): 1 TB actual storage.
+
+**Data transfer**:
+- Kafka to Flink: same VPC, free.
+- Flink to S3: $0.00/GB within same region.
+- API reads from TimescaleDB: negligible.
+
+**Total monthly cost**: Kafka ($2,700) + Flink ($820) + S3 ($400) + TimescaleDB ($2,500) + monitoring/overhead ($500) = ~$6,920/month or ~$83,000/year.
+
+**Follow-up: The business wants to cut costs by 50%. Where do you start?**
+
+The biggest cost is Kafka at $2,700/month, driven by the 7-day retention with replication. Reduce retention to 3 days (you have S3 for replay beyond that): saves ~$1,000. Switch from i3.xlarge to graviton-based instances for 20% savings on Kafka and Flink: saves ~$700. Use spot instances for Flink (stateless processing can tolerate interruptions with checkpointing): saves ~$400. Move from TimescaleDB managed to self-hosted on reserved instances: saves ~$800. Total savings: ~$2,900, bringing the cost to ~$4,000/month -- a 42% reduction. To hit 50%, also evaluate whether 5-minute aggregation granularity is truly needed. If 15-minute windows are acceptable, Flink state and TimescaleDB storage drop by 3x, saving another ~$500.
+</Accordion>
+</AccordionGroup>

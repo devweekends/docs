@@ -644,25 +644,247 @@ class NotificationService:
 
 <Accordion title="How do you handle the celebrity problem?">
 Use hybrid approach: fan-out on write for regular users, fan-out on read for celebrities (>10K followers). Celebrity tweets are fetched at read time and merged with the pre-computed timeline.
+
+**Why 10K is the threshold**: Below 10K followers, fan-out on write is fast (writing 10K Redis entries takes ~50ms). Above 10K, write latency becomes noticeable and wastes writes for inactive followers. Twitter reportedly uses a similar threshold. The exact number is tunable -- monitor the P99 fan-out latency and adjust.
+
+**The math behind this**: If a celebrity with 50M followers tweets, fan-out on write means 50M Redis ZADD operations. At 100K writes/second, that takes 500 seconds -- by which time the tweet is old news. Fan-out on read for that celebrity means each of their followers fetches one extra tweet at read time, adding ~1ms of latency.
 </Accordion>
 
 <Accordion title="How do you ensure timeline freshness?">
-1. Pre-compute timelines via fan-out on write
-2. Short TTL on cache (5 minutes)
-3. Use WebSocket for real-time updates
-4. Periodic refresh on client side
+1. Pre-compute timelines via fan-out on write -- this is the main mechanism for low latency
+2. Short TTL on cache (5 minutes) to bound staleness
+3. Use WebSocket or Server-Sent Events for real-time updates to active sessions (only push to users with the app open)
+4. Periodic client-side refresh (pull) as a fallback for users who lose their WebSocket connection
+5. For celebrity tweets merged at read time, cache the merged result for 30-60 seconds to avoid recomputing on every scroll
+
+**Trade-off**: Pushing real-time updates via WebSocket to 200M DAU is expensive -- each connection consumes ~10KB of server memory. Twitter uses a selective push: only push to users who are actively viewing their timeline.
 </Accordion>
 
 <Accordion title="How do you handle tweet deletions?">
-1. Mark tweet as deleted in DB (soft delete)
-2. Async job to remove from all timeline caches
-3. Client-side filtering as backup
-4. Accept eventual consistency (deleted tweets may briefly appear)
+1. Mark tweet as deleted in DB (soft delete) -- never hard delete, you need audit trails
+2. Async job to remove from all timeline caches -- this is a reverse fan-out that can take minutes for popular users
+3. Client-side filtering as backup -- check deletion status when rendering, hiding deleted tweets immediately
+4. Accept eventual consistency -- deleted tweets may briefly appear in some users' timelines
+
+**Key nuance**: For legal/compliance deletions (court orders, GDPR right-to-erasure), you need a faster path. Use a "blocked tweet IDs" set in Redis that the timeline service checks before returning results. This adds ~1ms latency but ensures legally required deletions take effect within seconds.
 </Accordion>
 
 <Accordion title="How do you rank the timeline?">
-1. Chronological (simple, predictable)
-2. Algorithmic ranking (engagement prediction)
-3. Hybrid: recent tweets chronologically, older by relevance
-4. Store ranking score in timeline cache
+1. Chronological is the simplest and what users often say they prefer
+2. Algorithmic ranking uses engagement prediction (will this user engage with this tweet?) based on features like: author relationship strength, content type, recency, engagement velocity
+3. Hybrid: show the most recent tweets chronologically at the top, then switch to relevance-ranked for older tweets
+4. Store a pre-computed ranking score alongside the tweet ID in the timeline cache
+
+**What interviewers want to hear**: The ranking model runs at read time using pre-computed features. Training happens offline on billions of engagement signals. A/B testing is essential -- Twitter famously received backlash when switching to algorithmic timelines, so they offered both options. Mention this trade-off between engagement metrics (algorithmic wins) and user satisfaction (chronological feels more fair).
 </Accordion>
+
+### Key Trade-offs
+
+| Decision | Option A | Option B | Recommendation |
+|----------|----------|----------|----------------|
+| Fan-out strategy | Write (push) | Read (pull) | **Hybrid.** Fan-out on write for users with fewer than ~10K followers (covers 99%+ of accounts). Fan-out on read for celebrities. The math: at 200M DAU with a 50:1 read-to-write ratio, pre-computing timelines converts 7M DB queries/sec into 35K Redis lookups/sec. But fanning out to 50M celebrity followers takes 500 seconds at 100K writes/sec -- unacceptable. The hybrid gives you O(1) reads for 99% of the timeline and adds only 5-20ms of merge latency for celebrity tweets. |
+| Tweet storage | SQL (PostgreSQL) | NoSQL (Cassandra) | **Cassandra** for tweets, PostgreSQL for users. Tweets are append-heavy (20M/day), rarely updated, and read by partition key (user_id + time range). This is Cassandra's sweet spot. User data needs ACID transactions (follow/unfollow, profile updates), which PostgreSQL handles natively. The trade-off: you lose JOIN capability, but you never need to JOIN tweets with user data in the hot path -- denormalize the author name into the tweet record. |
+| Timeline cache structure | List (LPUSH/LRANGE) | Sorted Set (ZADD/ZRANGE) | **Sorted Set** in Redis. The score is the tweet timestamp (or ranking score for algorithmic timelines). This gives you O(log N) inserts, O(log N + M) range queries, and natural deduplication. Lists are simpler but require O(N) deduplication and do not support score-based ranking. At 200M cached timelines x 800 entries x 8 bytes per entry = ~1.28 TB of Redis memory -- expensive but feasible with a cluster. |
+| Real-time updates | WebSocket push | Client polling | **Selective WebSocket push** for active sessions, client polling as fallback. Maintaining 200M persistent connections is expensive (~10KB per connection = 2TB of memory). Twitter's approach: push updates only to users with the app open (typically 5-10% of DAU), poll for everyone else on a 30-60 second interval. This reduces connection count by 90% while keeping active users feeling real-time. |
+| Search index | In-house | Elasticsearch | **Elasticsearch** for the first iteration -- it handles full-text search, real-time indexing, and relevance scoring out of the box. At Twitter's scale (20M tweets/day), you eventually build custom infrastructure, but ES handles up to ~100K index operations/sec per cluster. The trade-off: ES clusters are operationally expensive and require careful shard management, but the alternative (building a custom inverted index) is a multi-year engineering investment. |
+
+### Common Candidate Mistakes
+
+```
+Mistake 1: Only discussing one fan-out strategy
+  Candidates who only propose fan-out on write get stuck when
+  asked "what about a user with 50M followers?" Those who only
+  propose fan-out on read get stuck when asked "how do you serve
+  35K timeline reads per second?" The hybrid approach is the
+  expected answer -- know why each piece exists.
+
+Mistake 2: Ignoring the read:write ratio
+  Twitter's read:write ratio is roughly 50:1 to 100:1. This
+  means you should heavily optimize the read path (pre-computed
+  caches, CDN for media) and accept more complexity on writes.
+  Candidates who design a write-optimized system miss the point.
+
+Mistake 3: Not considering cache memory requirements
+  200M DAU x 800 tweet IDs per timeline x 8 bytes = 1.28 TB of
+  Redis memory just for timeline caches. This is achievable with
+  a Redis cluster but expensive. Discuss TTL-based eviction for
+  inactive users and only caching timelines for users who have
+  been active in the last 7 days.
+
+Mistake 4: Using a single Kafka topic for fan-out
+  A single fan-out topic with 200M+ messages per tweet creates a
+  hot partition. Shard fan-out work by follower ID range, with
+  multiple consumer groups processing in parallel. Each consumer
+  batch-writes to Redis using pipeline mode for efficiency.
+```
+
+## Interview Deep-Dive Questions
+
+### Q1: Fan-out Trade-offs at Scale
+
+**Question:** Walk me through the fan-out on write versus fan-out on read trade-off. You have 200M DAU and a 50:1 read-to-write ratio. Which do you pick and why? Be specific about the numbers.
+
+**Strong Answer:**
+
+- The read-to-write ratio is the deciding factor. At 50:1, every optimization dollar should go toward the read path. Fan-out on write pre-computes timelines so reads become a single O(1) Redis `ZREVRANGE` -- at 35K peak QPS that means 35K simple cache lookups instead of 35K x 200 = 7M DB queries per second.
+- Fan-out on write costs us more storage and write amplification. When a user with 5K followers tweets, that is 5K `ZADD` operations -- roughly 5ms with Redis pipelining. Totally acceptable for regular users.
+- The breaking point is celebrities. A user with 50M followers triggers 50M writes. At 100K pipelined writes/sec, that takes ~500 seconds -- the tweet is stale before delivery finishes. This is why you need the hybrid: push for regular users (under ~10K followers), pull for celebrities at read time.
+- Memory math: 200M DAU x 800 tweet IDs x 8 bytes = ~1.28 TB of Redis. That is around 80 r6g.2xlarge instances on AWS at roughly $25K/month. Expensive but manageable for a platform at this scale.
+- The key trade-off most people miss: fan-out on write also wastes writes for inactive users. If only 40% of users check their timeline daily, 60% of those writes are thrown away when the cache TTLs out. You can mitigate this by only maintaining timeline caches for users active in the last 7 days, and falling back to fan-out on read for dormant accounts.
+
+**Red flag answer:** "I would just use fan-out on write for everyone." This ignores the celebrity problem entirely and shows the candidate has not thought about write amplification at scale. Equally bad: "I would use fan-out on read for everyone" -- this ignores the 50:1 ratio and guarantees unacceptable read latency.
+
+**Follow-ups:**
+1. How do you handle the transition when a user crosses the 10K follower threshold mid-day? Do their old tweets stay pushed, or do you backfill?
+2. A tweet from a 9,999-follower account goes viral and they gain 50K followers in an hour. How does your system handle this race condition?
+3. What metrics would you monitor to dynamically adjust the celebrity threshold instead of using a hard-coded 10K cutoff?
+
+---
+
+### Q2: Timeline Ranking -- Chronological vs. Algorithmic
+
+**Question:** Your PM wants to switch from chronological to algorithmic timeline ranking. How would you design the ranking system, and what are the risks?
+
+**Strong Answer:**
+
+- The ranking model runs at read time on pre-computed features, not raw data. You never want ML inference blocking the hot path with feature computation. Pre-compute features like author-reader interaction strength (how often does this user like/reply to this author), tweet engagement velocity (likes per minute in the first 10 minutes), content type affinity (does this user engage more with images or text), and recency decay.
+- Architecture: a lightweight scoring service sits between the timeline cache and the API response. It takes the top ~200 candidates from the cache, scores them using a gradient-boosted tree or small neural net (inference under 10ms), and returns the top 50. The model is trained offline on billions of `(user, tweet, engagement)` tuples using something like XGBoost or a two-tower embedding model.
+- The risk is engagement trap: algorithmic feeds optimize for engagement (clicks, likes, retweets) which can amplify outrage content because anger drives engagement. Twitter saw exactly this backlash -- users accused the algorithm of promoting inflammatory content. The mitigation is multi-objective optimization: score = `0.6 * engagement_prediction + 0.3 * satisfaction_prediction + 0.1 * diversity_bonus`.
+- Always offer a chronological fallback. Twitter learned this the hard way and added "Latest Tweets" as a toggle. Store the user's preference and short-circuit the ranker when chronological is selected.
+- A/B testing is non-negotiable before any rollout. Measure not just engagement rate but also session length, unfollow rate, and "time well spent" surveys. Engagement can go up while user satisfaction goes down -- those metrics can diverge.
+
+**Red flag answer:** "Just sort by a relevance score using machine learning." This is hand-waving. A strong candidate names specific features, discusses the inference latency budget, and acknowledges the engagement-vs-satisfaction tension. Bonus red flag: not mentioning A/B testing at all.
+
+**Follow-ups:**
+1. How do you handle the cold-start problem for a new user who has no engagement history to train features on?
+2. Your ranking model has a bug that accidentally suppresses all tweets containing links for 3 hours. How do you detect and recover from this?
+3. How would you design the ranking pipeline to be explainable -- i.e., "why am I seeing this tweet?"
+
+---
+
+### Q3: The Celebrity Problem in Depth
+
+**Question:** Elon Musk has 180M followers and tweets 30 times a day. Walk me through exactly what happens in your system when he posts a tweet, end to end. Where are the bottlenecks?
+
+**Strong Answer:**
+
+- Since 180M followers far exceeds the celebrity threshold, this tweet does NOT trigger fan-out on write. The tweet is saved to Cassandra (partitioned by `user_id`, clustered by `tweet_id` DESC), the tweet object is cached in Redis (`tweet:`{`tweet_id`}), and it is published to Kafka for search indexing and trending topic tracking. Total write-path latency: ~20ms. No follower-specific work happens at write time.
+- The cost shifts to read time. When any of his 180M followers opens their timeline, the timeline service fetches their pre-computed cache (regular user tweets) AND pulls Elon's latest tweets from the celebrity tweet cache. This adds one extra Redis lookup per celebrity the user follows -- typically 5-20 celebrities, so 5-20ms of extra latency.
+- The bottleneck is the celebrity tweet cache. If 50M of Elon's followers are online and request their timeline within a 5-minute window, that celebrity cache key gets hit 50M / 300 = ~167K times per second. You need read replicas on that Redis key, or a local in-process cache (like Caffeine/Guava) with a 5-10 second TTL on each timeline service instance to absorb the read amplification.
+- Another bottleneck: the merge step. Each user's timeline service must merge their pre-computed timeline with celebrity tweets and re-sort. If a user follows 20 celebrities, that is merging ~200 candidate tweets and sorting. This is fast (sub-millisecond in memory) but at 35K QPS it adds up to CPU pressure on the timeline service fleet.
+- Engagement counters (likes, retweets) on viral celebrity tweets are a hidden bottleneck. A tweet getting 500K likes per minute means 8,333 counter increments per second on a single row. You need a distributed counter pattern -- shard the counter across N Redis keys (`likes:`{`tweet_id`}`:shard_0` through `shard_15`) and sum on read.
+
+**Red flag answer:** "We just fan out to all 180M followers asynchronously." This shows the candidate did not internalize why the hybrid approach exists. At 100K writes/sec, fanning out 180M entries takes 30 minutes -- and Elon tweets 30 times a day, meaning the system would never catch up.
+
+**Follow-ups:**
+1. What happens when a celebrity deletes a tweet? How is the reverse fan-out different from the write path?
+2. How do you handle a celebrity tweeting during a major live event (Super Bowl) when read QPS spikes 10x?
+3. If a celebrity's account gets hacked and posts spam to 180M followers, how does your system limit the blast radius?
+
+---
+
+### Q4: Trending Topics -- Accuracy, Gaming, and Real-Time
+
+**Question:** Design the trending topics feature. How do you compute trends in real-time, and how do you prevent manipulation?
+
+**Strong Answer:**
+
+- The naive approach is counting hashtag frequency, but that surfaces perpetually popular topics (like `#love` or `#music`) rather than genuinely trending ones. The key insight is measuring the *rate of change* -- a topic is trending when its mention velocity exceeds its historical baseline. Think of it as a z-score: `(current_rate - historical_mean) / standard_deviation`. A hashtag that normally gets 100 mentions/hour but suddenly gets 10,000 mentions/hour is more "trending" than one that always gets 50,000.
+- Architecture: tweets flow into Kafka, a stream processor (Flink or Kafka Streams) extracts hashtags and computes windowed counts -- 1-minute tumbling windows aggregated into 5-minute sliding windows. These counts feed into Redis sorted sets keyed by location (`trending:US:current`, `trending:global:current`). A background job computes the velocity score every minute and updates the sorted set scores.
+- Gaming prevention is the hard part. Bot networks coordinate to push hashtags. Defenses: (1) weight contributions by account age and trust score -- a 6-year-old verified account's hashtag counts for more than a 2-day-old account with no followers, (2) detect coordinated behavior -- if 1,000 accounts all tweet the same hashtag within 30 seconds and those accounts share creation date patterns or IP ranges, discount them, (3) rate-limit hashtag contributions per account -- one account cannot increment a hashtag more than 3 times per hour, (4) human review queue for topics that spike unnaturally fast.
+- Localization matters. Trends in Tokyo and trends in New York are different. Partition by country and city using the user's profile location or IP geolocation. Maintain separate sorted sets per region and a global rollup.
+- The ZUNIONSTORE approach in the code above works for small scale but becomes a bottleneck at Twitter scale. At 20M tweets/day with an average of 1.5 hashtags each, that is 30M hashtag events per day flowing through the pipeline. The stream processor must partition by hashtag to avoid hot keys for viral tags.
+
+**Red flag answer:** "Just count hashtags and pick the top 10." This misses the velocity-over-baseline insight entirely and would surface the same generic hashtags every day. Also a red flag: no mention of gaming/manipulation prevention -- this is a top-3 concern for any trending feature in production.
+
+**Follow-ups:**
+1. How would you handle a breaking news event where the trending topic is not a hashtag but a person's name or a phrase? How do you extract trends from unstructured text?
+2. Your trending algorithm surfaces a politically sensitive topic that is genuinely trending but your trust-and-safety team wants removed. How do you design the system to support editorial overrides without compromising the engineering?
+3. How do you handle the "echo chamber" effect where trending topics in a user's network differ wildly from globally trending topics?
+
+---
+
+### Q5: Search Architecture at Twitter Scale
+
+**Question:** A user searches for "election results" on Twitter. Walk me through the request lifecycle from keystroke to rendered results. How do you handle relevance, recency, and scale?
+
+**Strong Answer:**
+
+- The query hits the API gateway, which routes to the Search Service. The Search Service sends the query to an Elasticsearch cluster. But this is not a simple `match` query -- Twitter search is fundamentally different from web search because *recency dominates relevance*. A tweet from 2 minutes ago about election results matters more than a highly-liked tweet from 3 months ago.
+- Index design: tweets are indexed into time-partitioned Elasticsearch indices -- one index per day (or per hour during high-volume events). The search query fans out to the last N indices (e.g., last 7 days by default, last 24 hours for "Latest" tab). This partitioning means old indices can be moved to cheaper storage or fewer replicas.
+- Relevance scoring combines: (1) text relevance (BM25 score from Elasticsearch), (2) recency decay (exponential decay function -- a tweet loses 50% relevance score every 6 hours), (3) author authority (verified status, follower count as a log-scaled signal), (4) engagement signals (likes and retweets boosted, but with diminishing returns to avoid viral-only results).
+- Typeahead/autocomplete is a separate system. As the user types, the client queries a prefix tree (trie) or a dedicated autocomplete index that suggests trending queries, usernames, and hashtags. This must respond in under 50ms, so it uses an in-memory data structure, not Elasticsearch.
+- At scale, the Elasticsearch cluster is enormous -- potentially hundreds of nodes. The key optimization is routing: use a custom routing key (like `user_id % shard_count`) for user-specific queries, but for global keyword search, you must scatter-gather across all shards. To keep latency under 200ms, use aggressive timeouts (100ms per shard) and return partial results if some shards are slow.
+- Abuse vector: search is a spam magnet. Spammers stuff trending keywords into tweets to appear in search results. Counter this with a search-quality layer that demotes tweets from low-trust accounts, applies duplicate content detection (near-duplicate hashing like SimHash), and boosts tweets from accounts the searcher follows or engages with.
+
+**Red flag answer:** "Just put tweets in Elasticsearch and query them." This ignores time-partitioned indexing, the recency-vs-relevance tension, typeahead as a separate system, and abuse prevention. Any answer that treats Twitter search like Google web search misses the fundamental difference: tweets are ephemeral, web pages are not.
+
+**Follow-ups:**
+1. How do you handle a search query that matches 50 million tweets? You cannot score all of them. What is your early-termination strategy?
+2. The Elasticsearch cluster has a hot shard for today's index during a major event. How do you rebalance in real time?
+3. How would you implement "search within a conversation thread" versus global search? Are they the same system or different?
+
+---
+
+### Q6: Abuse Detection and Content Moderation at Scale
+
+**Question:** Design the abuse detection and content moderation pipeline for Twitter. A user posts a tweet -- how do you decide in real time whether it violates platform policies?
+
+**Strong Answer:**
+
+- Content moderation must run in the tweet creation hot path, but you cannot block tweet publishing on slow ML models. The solution is a two-tier system: a fast synchronous tier (under 50ms) that catches obvious violations before the tweet is visible, and a slow asynchronous tier (minutes to hours) that does deeper analysis.
+- Tier 1 (synchronous, pre-publish): a lightweight classifier runs against the tweet text. This is typically a distilled BERT model or a fast regex/keyword matcher for known harmful content (slurs, known CSAM hashes using PhotoDNA, known spam URLs from a blocklist). If the confidence score exceeds 0.95, the tweet is blocked immediately and the user sees an error. If it scores between 0.7-0.95, the tweet is published but flagged for urgent human review. Under 0.7, it passes through.
+- Tier 2 (asynchronous, post-publish): a Kafka consumer picks up every published tweet and runs heavier models -- image classification (nudity detection, violence detection via CNNs), coordinated inauthentic behavior detection (graph analysis of retweet/reply patterns), misinformation matching (embedding similarity against a known-claims database). Violations trigger automatic removal or visibility reduction ("soft intervention" where the tweet stays up but is de-ranked from search and recommendations).
+- The hardest part is not the ML -- it is the policy layer. Content rules change constantly (new regulations, new types of abuse, cultural context). The system needs a rules engine that is decoupled from the ML models. Policy team writes rules like "if `hate_speech_score > 0.8` AND `region = EU` then `action = remove`" and these rules are hot-reloaded without redeploying the service.
+- False positive management is critical. At 20M tweets/day, even a 0.1% false positive rate means 20K legitimate tweets wrongly blocked per day. You need an appeals pipeline: blocked users can contest, which routes to human review with the ML model's explanation attached. Track false positive rate as a top-line metric alongside catch rate.
+- Rate limiting and behavioral signals complement content analysis: a new account posting 100 tweets/hour with trending hashtags is almost certainly a bot, regardless of content. Combine content signals with behavioral signals (posting frequency, account age, follower/following ratio, device fingerprint) in a composite risk score.
+
+**Red flag answer:** "Use a machine learning model to classify tweets." This is vague to the point of being meaningless. No mention of the two-tier sync/async architecture, no mention of false positive rates, no mention of the policy layer being separate from the ML layer, no mention of human-in-the-loop review. Also a red flag: any answer that suggests blocking all flagged content without an appeals process.
+
+**Follow-ups:**
+1. A state actor is running a disinformation campaign using AI-generated text that passes your content classifiers. How do you adapt?
+2. Your abuse detection model has a bias -- it flags African American Vernacular English (AAVE) as toxic at 2x the rate of other dialects. How do you detect and fix this?
+3. During a mass-shooting event, your system needs to simultaneously suppress graphic content AND allow news reporting. How do you handle this tension in real time?
+
+---
+
+### Q7: Timeline Cache Consistency and Failure Modes
+
+**Question:** The Redis cluster holding your timeline caches loses a node. What happens to the 10 million users whose timelines were on that node? How does the system recover?
+
+**Strong Answer:**
+
+- First, Redis cluster setup matters. Each shard should have at least one replica (ideally two for critical data). When a primary node dies, Redis Sentinel or Redis Cluster's built-in failover promotes the replica to primary within 10-30 seconds. During those seconds, writes to that shard fail -- fan-out messages for those users accumulate in Kafka (which is durable) and are retried once the new primary is up.
+- Timeline reads during failover return a cache miss. The timeline service must have a fallback path: on cache miss, fall back to fan-out on read for that user -- fetch their followee list, query Cassandra for recent tweets from each followee, merge and sort, then serve the result AND repopulate the cache. This is slower (200-500ms vs 10ms) but keeps the system available.
+- The critical design principle: the timeline cache is a *cache*, not a source of truth. The source of truth is the tweet table in Cassandra and the follow graph. Any cache entry can be reconstructed from these two sources. This means losing the entire Redis cluster is survivable (painful, but survivable) -- it just means temporary latency increase while caches are rebuilt.
+- Cache warming strategy after recovery: do NOT try to rebuild all 10M timelines at once -- that would overload Cassandra with a thundering herd. Instead, rebuild lazily (on next user request) and proactively only for "hot" users (users who have been active in the last hour, based on a separate active-users set). Spread proactive rebuilds over 5-10 minutes using a priority queue.
+- Kafka is the key to durability here. Fan-out messages are not fire-and-forget -- they are committed to Kafka with a retention period (e.g., 24 hours). If a Redis node dies and comes back, the fan-out consumer can replay messages from the last known offset to rebuild the cache. This is why consumer offset management in Kafka is critical -- store offsets in Kafka itself (not in the Redis that just died).
+
+**Red flag answer:** "Redis has replication so it is fine." This hand-waves past the actual failure sequence, the fallback read path, the thundering herd problem during recovery, and the role of Kafka as a durability layer. Also a red flag: any answer that treats the timeline cache as the source of truth.
+
+**Follow-ups:**
+1. What if it is not a single node but an entire availability zone that goes down, taking 33% of your Redis cluster? How does your architecture handle AZ failure?
+2. How do you detect "silent corruption" where a Redis node is up but returning stale data because replication lag exceeded the TTL?
+3. You discover that 5% of timeline caches have a subtle data inconsistency -- some tweets appear in timelines of users who do not follow the author. How do you audit and repair at scale?
+
+---
+
+### Q8: Designing Twitter Direct Messages -- Different Constraints Entirely
+
+**Question:** Now design the Direct Messages (DM) feature. Why can you NOT reuse the timeline architecture for DMs? What changes fundamentally?
+
+**Strong Answer:**
+
+- The timeline and DMs look superficially similar (a list of messages sorted by time) but have completely different consistency and privacy requirements. Timelines tolerate eventual consistency -- if a tweet appears 5 seconds late, nobody notices. DMs require strong ordering and at-least-once delivery -- if a message is lost or arrives out of order, users notice immediately and trust erodes.
+- Data model shift: timelines are a single user reading a merged feed from many authors. DMs are a conversation between exactly 2 (or N in group chats) participants. The partition key changes from `user_id` to `conversation_id`, and you need a per-user conversation list sorted by last-message timestamp (an inbox).
+- Storage choice changes: Cassandra is great for timelines (high write throughput, eventual consistency) but DMs need stronger consistency guarantees. You would use a partition-aware store like CockroachDB or DynamoDB with strong consistency reads, or Cassandra with `LOCAL_QUORUM` reads/writes and careful conflict resolution.
+- No fan-out needed: a DM goes to 1 recipient (or a small group), not thousands of followers. The write path is simple: write to the messages table, update both users' inbox sorted sets, send a push notification. The complexity shifts to real-time delivery -- you need WebSocket connections to push messages instantly, with a message queue (like RabbitMQ or Redis Streams) per-user for buffering when the WebSocket is disconnected.
+- End-to-end encryption (E2EE) changes everything architecturally. With E2EE, the server cannot read message content, which means: no server-side search over DM content, no server-side spam/abuse detection on DM text (you have to rely on metadata and user reports), and key management becomes a major subsystem (device-based keys, key rotation, multi-device sync via the Signal Protocol or similar).
+- Read receipts and typing indicators are real-time presence signals that do not exist in the timeline world. These require a lightweight presence service (heartbeats every 5-10 seconds per active connection) that tracks who is online and in which conversation. At 50M concurrent connections, this presence service alone needs careful engineering -- fan-out of "user is typing" to the other conversation participant must be sub-100ms.
+
+**Red flag answer:** "It is basically the same as the timeline, just between two users." This completely misses the consistency, encryption, real-time delivery, and presence requirements that make DMs a fundamentally different system. Also a red flag: not mentioning E2EE at all -- post-2023, any messaging system design that ignores encryption will raise eyebrows.
+
+**Follow-ups:**
+1. How do you handle message ordering in a group DM when two participants send messages at the same millisecond from different data centers?
+2. A user has 50,000 DM conversations. How do you efficiently render their inbox sorted by most-recent-message without scanning all 50K conversations?
+3. Law enforcement serves a legal request for a user's DM history, but you have E2EE enabled. What is your technical and architectural response?

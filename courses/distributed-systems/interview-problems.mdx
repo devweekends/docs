@@ -9,6 +9,8 @@ icon: "comments"
 
 Staff+ distributed systems interviews are among the most challenging in the industry. This module provides comprehensive practice problems with detailed solutions, covering the exact topics asked at Google, Meta, Amazon, and other top companies.
 
+Think of these problems the way a pilot thinks about flight simulators: the scenarios are designed to trigger the exact failure modes and trade-off decisions you will face in a real interview. Working through them builds the muscle memory so that under pressure, the right architectural instincts surface automatically.
+
 <Info>
 **Problem Count**: 15+ detailed problems  
 **Difficulty**: Staff/Principal level  
@@ -103,10 +105,15 @@ Design a rate limiting system that:
 **Redis Lua Script (Atomic Operation)**:
 
 ```lua
--- KEYS[1] = rate limit key
--- ARGV[1] = window size in seconds
--- ARGV[2] = max requests allowed
--- ARGV[3] = current timestamp
+-- KEYS[1] = rate limit key (e.g., "rate_limit:user_123")
+-- ARGV[1] = window size in seconds (e.g., 60 for per-minute limiting)
+-- ARGV[2] = max requests allowed (e.g., 100)
+-- ARGV[3] = current timestamp in seconds (with fractional precision)
+--
+-- Why a Lua script? Redis executes Lua atomically -- no other command
+-- can interleave between our "read count" and "add entry" steps.
+-- Without this, two servers could both read count=99 and both allow
+-- their request, exceeding the limit.
 
 local key = KEYS[1]
 local window = tonumber(ARGV[1])
@@ -114,21 +121,32 @@ local limit = tonumber(ARGV[2])
 local now = tonumber(ARGV[3])
 local window_start = now - window
 
--- Remove old entries
+-- Step 1: Evict stale entries outside the sliding window.
+-- The sorted set score IS the timestamp, so this range removal
+-- efficiently prunes everything older than our window boundary.
 redis.call('ZREMRANGEBYSCORE', key, 0, window_start)
 
--- Count current entries
+-- Step 2: Count how many requests remain in the current window.
 local count = redis.call('ZCARD', key)
 
 if count < limit then
-    -- Add current request
+    -- Step 3a: Under the limit -- record this request.
+    -- We append math.random() to the member value to guarantee uniqueness
+    -- (two requests in the same microsecond would otherwise collide).
     redis.call('ZADD', key, now, now .. '-' .. math.random())
+    -- Set TTL so Redis auto-cleans keys for inactive users,
+    -- preventing memory from growing unbounded.
     redis.call('EXPIRE', key, window)
     return 1  -- Allowed
 else
+    -- Step 3b: Over the limit -- reject without recording.
     return 0  -- Denied
 end
 ```
+
+<Warning>
+**Distributed pitfall**: Clock skew between your API servers means the `now` timestamp passed to this script may differ by milliseconds across servers. For a 60-second window this is negligible, but for sub-second windows (e.g., 10 requests per 100ms), use Redis server time via `redis.call('TIME')` instead of client-supplied timestamps.
+</Warning>
 
 **Follow-up Questions**:
 
@@ -220,6 +238,15 @@ Design a distributed lock service similar to Zookeeper or etcd that:
 
 ```python
 class DistributedLock:
+    """
+    A lease-based distributed lock backed by a consensus service (etcd, ZooKeeper).
+    
+    Think of this like a hotel room key card: you get the card (lease) for a
+    fixed duration. If you don't renew at the front desk before checkout time,
+    the room is given to the next guest -- even if you're still in the shower.
+    The fence token is like a monotonically increasing guest number printed on
+    the card that the minibar checks before serving you.
+    """
     def __init__(self, lock_service, resource_key):
         self.lock_service = lock_service
         self.resource_key = resource_key
@@ -230,32 +257,48 @@ class DistributedLock:
         """
         Acquire the lock with retries.
         Returns True if acquired, False if timeout.
+        
+        Important: The caller MUST use the fence_token when writing to
+        downstream storage. Without it, a stale lock holder (paused by GC
+        or network delay) can corrupt data after its lease silently expires.
         """
         deadline = time.time() + timeout_seconds
         
         while time.time() < deadline:
-            # Try to create lock in consensus layer
+            # Try to create lock in consensus layer.
+            # The consensus layer (Raft/Paxos) ensures only one client
+            # sees success for a given key at any point in time.
             result = await self.lock_service.try_acquire(
                 key=self.resource_key,
                 owner=self.client_id,
-                ttl_seconds=30  # Lease duration
+                ttl_seconds=30  # Lease duration -- choose based on your
+                                # longest expected critical section + margin
             )
             
             if result.success:
                 self.lease_id = result.lease_id
                 self.fence_token = result.fence_token
                 
-                # Start background lease renewal
+                # Start background lease renewal so the lock doesn't
+                # expire while we're still doing work. Renew at 1/3 of TTL
+                # to leave margin for transient network hiccups.
                 self._start_renewal_loop()
                 return True
             
-            # Lock held by someone else, wait and retry
+            # Lock held by someone else -- back off before retrying.
+            # A fixed sleep here is fine for low contention. For high
+            # contention, consider exponential backoff or a watch/notify
+            # mechanism (etcd Watch, ZooKeeper getData with watcher).
             await asyncio.sleep(0.1)
         
         return False
     
     async def release(self):
-        """Release the lock"""
+        """
+        Release the lock explicitly. Always do this in a finally block.
+        If the process crashes before release, the TTL ensures the lock
+        is eventually freed -- that's the whole point of lease-based locking.
+        """
         if self.lease_id:
             await self.lock_service.release(
                 key=self.resource_key,
@@ -264,14 +307,21 @@ class DistributedLock:
             self._stop_renewal_loop()
     
     def _start_renewal_loop(self):
-        """Renew lease periodically to prevent expiry"""
+        """
+        Renew lease periodically to prevent expiry while the lock holder
+        is still active. The renewal interval (10s) is roughly TTL/3,
+        giving us two retry opportunities before the 30s lease expires.
+        """
         async def renew():
             while self.lease_id:
                 try:
                     await self.lock_service.renew_lease(self.lease_id)
                     await asyncio.sleep(10)  # Renew every 10s (TTL is 30s)
                 except Exception:
-                    # Lost connection, lease will expire
+                    # Lost connection to lock service -- lease will expire.
+                    # The fence token ensures stale writes are rejected
+                    # even if we continue operating under the false belief
+                    # that we still hold the lock.
                     break
         
         asyncio.create_task(renew())
@@ -287,8 +337,9 @@ class DistributedLock:
    - Raft consensus with quorum reads/writes
    
 3. **Redlock controversy**: Why is Redis Redlock problematic?
-   - Martin Kleppmann's analysis: Clock assumptions too strong
-   - Fencing tokens still needed for safety
+   - Martin Kleppmann's analysis: Clock assumptions too strong -- Redlock assumes bounded clock drift across independent Redis nodes, but NTP jumps and VM clock corrections can violate this
+   - Antirez's rebuttal: argues real-world clocks are "good enough" with proper monitoring
+   - **The bottom line**: If you need the lock for **correctness** (not just performance), fencing tokens are non-negotiable regardless of the locking mechanism. If you need the lock only for **efficiency** (avoiding duplicate work), Redlock is acceptable
 
 ---
 
@@ -357,25 +408,36 @@ Design a payment processing system that:
 
 **Exactly-Once Processing**:
 
+Think of this like a post office with registered mail: each letter (payment) gets a unique tracking number (idempotency key). If the sender asks "did my letter arrive?", the post office can check the tracking number and say "yes, here's the confirmation" -- without delivering the letter a second time.
+
 ```python
 class PaymentProcessor:
     async def process_payment(
         self,
         idempotency_key: str,
-        amount: int,
-        currency: str,
+        amount: int,         # Always in smallest currency unit (cents) to avoid
+        currency: str,       # floating-point rounding issues in financial systems
         card_token: str
     ) -> PaymentResult:
         """
         Process payment with exactly-once guarantee.
+        
+        The idempotency_key is CLIENT-generated (typically a UUID). This is
+        critical -- if the server generated it, the client couldn't safely
+        retry without risking a duplicate charge, because the first request
+        might have succeeded but the response was lost in transit.
         """
         
-        # Step 1: Check idempotency store
+        # Step 1: Check idempotency store (Redis or DB with TTL).
+        # This is our "deduplication gate" -- the single most important
+        # line in the entire payment flow.
         existing = await self.idempotency_store.get(idempotency_key)
         if existing:
             if existing.status == "completed":
-                return existing.result  # Return cached result
+                return existing.result  # Return cached result -- safe replay
             elif existing.status == "in_progress":
+                # Another server is processing this exact request right now.
+                # Return 409 so the client retries after a delay.
                 raise ConflictError("Payment in progress")
         
         # Step 2: Create payment record (source of truth)
@@ -643,6 +705,8 @@ Design a system that generates globally unique IDs with:
 
 **Implementation**:
 
+The elegance of Snowflake is that each node is a self-contained ID factory -- like giving each post office its own stamp machine with a unique prefix. No two machines ever produce the same stamp, and you can read the timestamp and origin directly from the ID itself.
+
 ```python
 import time
 import threading
@@ -653,8 +717,12 @@ class SnowflakeGenerator:
         Initialize Snowflake ID generator.
         
         Args:
-            node_id: Unique identifier for this generator (0-1023)
-            epoch: Custom epoch (Twitter's is 2010-11-04)
+            node_id: Unique identifier for this generator (0-1023).
+                     Must be assigned once and never reused concurrently.
+            epoch: Custom epoch in milliseconds (Twitter's is 2010-11-04).
+                   Using a custom epoch gives you more years before the
+                   41-bit timestamp field overflows -- starting from Unix
+                   epoch 1970 wastes ~40 years of range.
         """
         if not 0 <= node_id < 1024:
             raise ValueError("Node ID must be between 0 and 1023")
@@ -669,7 +737,12 @@ class SnowflakeGenerator:
         return int(time.time() * 1000)
     
     def generate(self) -> int:
-        """Generate a unique Snowflake ID"""
+        """
+        Generate a unique Snowflake ID. Thread-safe via mutex.
+        
+        In high-throughput systems, this lock can become a bottleneck.
+        Alternatives: per-thread generators, or lock-free CAS loops.
+        """
         with self._lock:
             timestamp = self._current_time_millis()
             
@@ -858,11 +931,12 @@ Design a message queue like Kafka that:
   </Accordion>
   
   <Accordion title="Common Mistakes to Avoid" icon="triangle-exclamation">
-    - Starting to code before understanding the problem
-    - Not asking clarifying questions
-    - Ignoring scale constraints
-    - Over-engineering simple problems
-    - Forgetting failure modes
-    - Not discussing trade-offs
+    - Starting to code before understanding the problem -- spend at least 3-5 minutes on requirements
+    - Not asking clarifying questions -- interviewers deliberately leave gaps to see if you probe
+    - Ignoring scale constraints -- "works for 100 users" and "works for 100 million users" are fundamentally different systems
+    - Over-engineering simple problems -- if the interviewer says "single region, moderate scale," do not design a globally distributed system
+    - Forgetting failure modes -- always ask yourself: "What happens when this component goes down?"
+    - Not discussing trade-offs -- saying "I would use Kafka" without explaining why (vs. SQS, RabbitMQ, etc.) signals shallow understanding
+    - Treating consistency as binary -- many candidates say "eventually consistent" without specifying what guarantees their users actually need (read-your-writes, monotonic reads, etc.)
   </Accordion>
 </AccordionGroup>

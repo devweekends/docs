@@ -673,4 +673,56 @@ sudo opensnoop-bpfcc -p $(pidof myapp)
 
 ---
 
+## Interview Deep-Dive
+
+<AccordionGroup>
+  <Accordion title="You need to profile a production Go service that is experiencing periodic latency spikes, but you cannot attach a debugger or restart the process. Walk through your complete investigation methodology using only kernel tracing tools." icon="message">
+    **Strong Answer:**
+
+    - Step 1: Characterize the problem. Use `perf stat -p <pid> -- sleep 30` to get high-level counters: CPU cycles, instructions, cache misses, context switches. If IPC (instructions per cycle) drops during spikes, it suggests cache misses or memory stalls. If context switches spike, something is preempting the process.
+    - Step 2: CPU profiling. `perf record -F 99 -g -p <pid> -- sleep 30` captures on-CPU stack samples at 99Hz. Generate a flame graph: `perf script | stackcollapse-perf.pl | flamegraph.pl > cpu.svg`. Look for wide boxes that indicate hot functions. For Go, frame pointers are enabled by default since Go 1.21, so `perf` can unwind Go stacks correctly.
+    - Step 3: Off-CPU analysis. If the CPU flame graph does not explain the latency, the process is spending time blocked. `sudo offcputime-bpfcc -p <pid> -f 30 > off.stacks` and `flamegraph.pl --color=io off.stacks > offcpu.svg` shows where the process is sleeping. Common Go-specific causes: garbage collection (look for `runtime.gcBgMarkWorker` in the off-CPU graph), channel blocking, or mutex contention.
+    - Step 4: Targeted tracing. If GC is suspected, `sudo bpftrace -e 'uprobe:/path/to/binary:runtime.gcStart { @gc_start[tid] = nsecs; } uretprobe:/path/to/binary:runtime.gcStart /@gc_start[tid]/ { @gc_duration = hist(nsecs - @gc_start[tid]); delete(@gc_start[tid]); }'` measures GC pause duration directly.
+    - Step 5: Syscall analysis. `sudo perf trace --duration 10 -p <pid>` shows syscalls taking longer than 10ms. Sort by duration to find the slowest operations. Correlate timestamps with the latency spike times from application metrics.
+
+    **Follow-up:** What is the overhead of each tool you mentioned, and how would you justify using them on a production system serving real traffic?
+
+    **Follow-up Answer:**
+
+    - `perf stat`: near zero overhead -- it just reads hardware PMU counters. `perf record` at 99Hz: approximately 1-3% CPU overhead for stack sampling, proportional to the sampling rate. 99Hz is specifically chosen because it avoids aliasing with common periodic events (which tend to be round numbers). `offcputime-bpfcc`: 1-5% overhead because it hooks `sched_switch` tracepoints which fire on every context switch. `bpftrace` with targeted uprobe: varies, but a single uprobe on an infrequent function (GC runs seconds apart) adds negligible overhead. `perf trace`: 5-20% overhead because it traces every syscall. I would start with the lowest-overhead tools (perf stat, perf record) and only escalate to higher-overhead tools (offcputime, perf trace) if the lighter tools do not provide the answer. I would always time-bound tracing sessions (30 seconds to 5 minutes) and monitor the process's latency during tracing to ensure I am not worsening the problem I am investigating.
+  </Accordion>
+
+  <Accordion title="Explain the difference between on-CPU and off-CPU profiling. When would an on-CPU flame graph completely miss the performance problem?" icon="message">
+    **Strong Answer:**
+
+    - On-CPU profiling (e.g., `perf record`) samples the call stack at regular intervals while the thread is executing on a CPU. It tells you where the process spends its compute time. If a function is CPU-bound (tight loops, computation), it dominates the flame graph.
+    - Off-CPU profiling tracks the time a thread spends not running: blocked on I/O, waiting on a lock, sleeping on a futex, or descheduled by the scheduler. It records the stack trace at the point where the thread went to sleep and measures how long it slept.
+    - An on-CPU flame graph completely misses the performance problem when latency is caused by blocking. For example: a web service has 50ms request latency but spends only 2ms of CPU time per request. The remaining 48ms is off-CPU time -- waiting for database query responses (network I/O), waiting for disk reads, or waiting for a mutex held by another thread. The on-CPU flame graph shows 2ms of processing and reveals nothing about the 48ms of waiting.
+    - The canonical diagnostic approach is to generate both flame graphs. If the on-CPU graph explains the latency (CPU time approximately equals wall time), optimize the hot functions. If there is a gap between CPU time and wall time, the off-CPU graph reveals what the process is waiting on. The off-CPU stacks typically show blocking syscalls (`futex`, `epoll_wait`, `read`, `io_submit`) and the application-level function that initiated the blocking call.
+
+    **Follow-up:** How would you create a combined "wall clock" flame graph that shows both on-CPU and off-CPU time in a single visualization?
+
+    **Follow-up Answer:**
+
+    - A wall clock flame graph requires capturing both on-CPU samples and off-CPU events, then merging them weighted by time. One approach: record on-CPU with `perf record -F 99 -g` and off-CPU with `offcputime-bpfcc -f`. Convert both to folded stack format, then concatenate them with appropriate scaling (on-CPU samples represent 1/99th of a second each, off-CPU entries represent actual microseconds). Feed the combined folded stacks to `flamegraph.pl --color=chain` which uses different colors for on-CPU (warm colors) and off-CPU (cool colors). This gives a single flame graph where the width represents wall clock time: wide warm boxes are CPU-bound functions, wide cool boxes are blocking functions. Brendan Gregg calls this a "hot/cold flame graph" and it is the gold standard for understanding end-to-end request latency.
+  </Accordion>
+
+  <Accordion title="A colleague says 'strace is good enough for production debugging.' Explain why this is dangerous and describe the kernel mechanisms that make strace so slow compared to eBPF-based tracing." icon="message">
+    **Strong Answer:**
+
+    - strace uses the ptrace system call, which works by making the traced process stop at every syscall entry and exit. The mechanism: the tracer calls `ptrace(PTRACE_SYSCALL, pid)`, the kernel sets a flag in the tracee's `task_struct`, and on every syscall entry/exit, the kernel stops the tracee, sends SIGTRAP to the tracer, the tracer reads the syscall information via `ptrace(PTRACE_GETREGS)`, decides to continue, and calls `ptrace(PTRACE_SYSCALL)` again.
+    - This means every single syscall involves: stopping the tracee, scheduling the tracer, reading registers, deciding to continue, scheduling the tracee back. That is at least 2 context switches per syscall (tracer wakes, tracee wakes) plus signal delivery overhead. Each context switch costs 2-10 microseconds, so strace adds 10-20 microseconds per syscall. For a process making 10,000 syscalls per second, that is 100-200 milliseconds of overhead per second, easily causing 2-10x slowdown.
+    - eBPF-based tracing (bpftrace, perf trace) attaches a BPF program directly to the syscall tracepoint. The BPF program runs in kernel context on the same CPU as the traced process, with no context switches, no signal delivery, and no user-space tracer involvement. The BPF program executes in 50-200 nanoseconds per syscall -- 100x less overhead than ptrace.
+    - In production, strace can turn a healthy service into an unresponsive one. I have seen production incidents caused by attaching strace to a busy process. For production debugging, always use `perf trace` (5-20% overhead) or bpftrace with tracepoints (1-5% overhead).
+
+    **Follow-up:** Are there any scenarios where strace is still the right tool despite its overhead?
+
+    **Follow-up Answer:**
+
+    - Yes, strace is still valuable for: debugging startup failures (the process is not yet running, so overhead does not matter), analyzing one-shot commands (like why `curl` fails to connect), reproducing bugs in development environments, and when eBPF is not available (old kernels, restricted environments without CAP_BPF). strace's output format is also more human-readable than raw perf trace output, showing decoded flag names, file paths, and error strings. For quick local debugging where you can afford the overhead, strace's simplicity is valuable. The rule: strace for development, eBPF for production.
+  </Accordion>
+</AccordionGroup>
+
+---
+
 Next: [Kernel Debugging →](/courses/linux-internals/kernel-debugging)

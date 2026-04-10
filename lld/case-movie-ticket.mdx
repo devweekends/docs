@@ -797,3 +797,132 @@ classDiagram
     3. **Accessibility** - prioritize accessible seats for users who need them
   </Accordion>
 </AccordionGroup>
+
+---
+
+## Interview Deep-Dive Questions
+
+<AccordionGroup>
+  <Accordion title="Q1: Two users select the same seat at the same instant. Walk me through exactly what happens in the ShowSeatManager, and where the concurrency guarantee comes from.">
+    **Strong answer:**
+    - The `ShowSeatManager.hold_seats()` method acquires `self._lock` (a `threading.Lock`) at the very top of the method. Threading.Lock is a mutex -- only one thread can hold it at a time. So even if two requests arrive at the same nanosecond, one thread acquires the lock first and the other blocks.
+    - Thread A acquires the lock, checks that seat "A5" is AVAILABLE, marks it as HELD, creates a `SeatHold` with Thread A's user_id, and releases the lock. Thread B then acquires the lock, checks seat "A5", finds it is now HELD (not AVAILABLE), and the method returns False. Thread B's user sees "Seats not available."
+    - The critical design decision is that the check-and-set is atomic because both happen inside the same lock acquisition. If you checked availability outside the lock and then set inside the lock (a common mistake), you would have a TOCTOU (time-of-check-to-time-of-use) race condition.
+    - The method also holds seats atomically as a batch: if a user selects seats A5, A6, A7 and A6 is already taken, none of the three are held. This is important for user experience -- you do not want to partially hold seats, leaving the user with A5 and A7 but not the middle seat. The check loop runs first for all seats, and only if all pass does the hold loop execute.
+    - At scale (think: Avengers opening night with 100K concurrent users), an in-process mutex is insufficient because you have multiple server instances. You would replace the `threading.Lock` with a distributed lock (Redis `SETNX` with TTL, or a Redlock implementation). The logic stays the same but the lock coordination happens across processes.
+
+    **Red flag answer:** "We just check if the seat is available before booking it." This misses the atomicity requirement entirely -- checking and setting must be a single indivisible operation. Without mentioning locking, mutex, or atomic compare-and-swap, the candidate does not understand concurrency.
+
+    **Follow-ups:**
+    1. The in-memory Lock works for a single process. If BookMyShow runs on 50 server instances behind a load balancer, how do you prevent two instances from holding the same seat?
+    2. The current design locks the entire `ShowSeatManager` for one show. If a blockbuster has 10 shows running across 5 screens, what is the lock contention profile, and could you use more granular locking?
+  </Accordion>
+
+  <Accordion title="Q2: The seat hold expires after 10 minutes (HOLD_DURATION_SECONDS = 600). How is expiration actually enforced, and what are the edge cases?">
+    **Strong answer:**
+    - Expiration is enforced lazily, not proactively. The `_cleanup_expired_holds()` method is called at the start of `hold_seats()` and `get_seat_map()`. This means expired holds are only cleaned up when someone else tries to interact with the seat manager. If no one calls these methods, expired holds sit there indefinitely.
+    - Edge case 1: A user holds seats at 10:00 AM, the hold expires at 10:10 AM, but no other user looks at this show until 10:30 AM. For 20 minutes, the seats appear as HELD on the backend even though the hold is logically expired. This is not functionally wrong (the next `hold_seats` call will clean it up), but it means the seat map shown to users could display stale "held" seats, reducing perceived availability.
+    - Edge case 2: A user holds seats, starts payment at 10:09 AM, and the payment gateway takes 90 seconds to respond. By the time `confirm_seats()` is called at 10:10:30, the hold has expired. The `confirm_seats` method correctly checks `time.time() > hold.expires_at` and returns False. But now the user has been charged, and the seats were released. You need to handle this by refunding the payment -- the `BookingService` does not currently handle the case where `confirm_seats` returns False after a successful payment.
+    - A production system would use an active expiration mechanism: a background thread or scheduled task that runs every 30-60 seconds, scans for expired holds, and releases them. This keeps the seat map accurate in real-time. Alternatively, with Redis, you can use key TTL so expiration is handled by the data store itself without any application-level cleanup.
+    - Edge case 3: Clock skew. If `time.time()` is used and the server's clock jumps forward (NTP correction), holds could expire prematurely. Using monotonic clocks (`time.monotonic()`) prevents this.
+
+    **Red flag answer:** "The hold has a 10-minute timeout, so it automatically releases after 10 minutes." The word "automatically" hides the fact that nothing proactively enforces the expiration -- it is purely lazy cleanup. This distinction is critical for system correctness.
+
+    **Follow-ups:**
+    1. The payment succeeds but `confirm_seats()` returns False because the hold expired 2 seconds ago. The user is charged but has no tickets. How does your system detect and resolve this?
+    2. How would you implement active hold expiration using Redis TTL, and what happens if Redis itself is temporarily unreachable?
+  </Accordion>
+
+  <Accordion title="Q3: Walk me through the complete booking flow from seat selection to ticket confirmation, identifying every point where the process can fail.">
+    **Strong answer:**
+    - Step 1: User calls `BookingService.start_booking()`. This calls `show.seat_manager.hold_seats()`. Failure point: seats already held or booked by another user. Response: raise `SeatsNotAvailableError`.
+    - Step 2: A `Booking` object is created in PENDING status and saved to the repository. Failure point: database write failure. Response: release the just-held seats and return an error. The current code does not handle this -- if `booking_repo.save()` fails, the seats remain held with no associated booking, creating orphaned holds that only expire by timeout.
+    - Step 3: User calls `BookingService.complete_booking()` with payment details. Failure point: booking not found or not in PENDING status. Response: raise appropriate error.
+    - Step 4: `payment_service.process()` is called. Failure point: payment gateway timeout, card declined, insufficient funds, fraud detection block. Response: on failure, `booking.cancel()` is called, which releases seats. But what about a timeout? If the payment service hangs for 60 seconds and then succeeds, but the client has already timed out and the user retried with a new booking, you could end up with a double charge.
+    - Step 5: On payment success, `booking.confirm(payment)` is called, which calls `show.seat_manager.confirm_seats()`. Failure point: the hold expired between payment initiation and confirmation (the 10-minute window elapsed during payment processing). Response: the current code would get a False from `confirm_seats`, but `booking.confirm()` does not check this return value -- it proceeds to notify observers. This is a bug: the booking is marked CONFIRMED but the seats are not actually confirmed.
+    - Step 6: Observers are notified (email, SMS). Failure point: notification service down. Response: this should be asynchronous and non-blocking -- a failed email should never cause a booking failure. The current synchronous observer notification could throw and leave the booking in a half-confirmed state.
+    - The missing piece is idempotency. If `complete_booking` is called twice for the same booking (user double-clicked, network retry), the second call should be a no-op, not a double charge. The current code checks `booking.status != BookingStatus.PENDING` which provides this guard.
+
+    **Red flag answer:** "The user selects seats, pays, and gets a ticket." Listing the happy path without identifying failure points shows no production mindset. Interviewers are specifically testing whether you think about what goes wrong, not what goes right.
+
+    **Follow-ups:**
+    1. How would you implement an idempotency key to prevent the payment gateway from charging the user twice on a network retry?
+    2. The `booking.confirm()` method calls `seat_manager.confirm_seats()` and then notifies observers synchronously. If the email service throws an exception, what is the booking status? How would you fix this?
+  </Accordion>
+
+  <Accordion title="Q4: The pricing uses a Decorator-style Strategy composition: PeakHourPricing(WeekendPricing(StandardPricing())). What are the benefits and dangers of this approach?">
+    **Strong answer:**
+    - The composition is using the Decorator pattern layered on top of Strategy. Each pricing strategy wraps another, adding its multiplier on top. This means you can mix and match pricing rules freely: weekend + peak hour = 1.25 x 1.20 = 1.50x base price. Adding a new rule (e.g., holiday pricing, new-release surcharge) is just wrapping another layer -- no existing code changes.
+    - Benefit 1: Open/Closed Principle at its best. You literally never touch existing pricing classes to add new rules.
+    - Benefit 2: Order-independence within multiplication. Since all strategies are multipliers, `PeakHour(Weekend(Standard))` and `Weekend(PeakHour(Standard))` produce the same result. This is a happy accident of the current implementation, not a guarantee of the pattern.
+    - Danger 1: Order does matter if strategies are not purely multiplicative. If one strategy adds a flat fee (+$2 convenience charge) and another applies a percentage (x1.25), the order matters: `(base + 2) * 1.25` is not the same as `(base * 1.25) + 2`. The current code does not document or enforce ordering, which is a time bomb for the next developer.
+    - Danger 2: Debugging opacity. If a customer complains that their ticket was $37.50 instead of the expected $25, tracing through 3-4 nested strategy layers to figure out which multipliers were applied is painful. You need logging at each layer, or a `PricingBreakdown` object that each strategy appends to, showing the audit trail.
+    - Danger 3: Multiplicative compounding can produce absurd prices. Weekend (1.25x) + peak hour (1.20x) + new release (1.30x) + holiday (1.25x) = 2.44x base price. A $10 regular seat becomes $24.40. There should be a price cap or a sanity check in the outermost layer.
+
+    **Red flag answer:** "Strategy pattern lets you swap algorithms at runtime." This is the textbook definition but misses the specific Decorator composition being used here and all of the real-world pitfalls. It is a "read the GoF book" answer, not an "I have built this" answer.
+
+    **Follow-ups:**
+    1. How would you add a `PricingBreakdown` that returns not just the final price but a human-readable explanation like "Base: $10 + Weekend: +$2.50 + Peak: +$3.00 = $15.50"?
+    2. A product manager says "Tuesday is discount day -- all tickets are flat $5, regardless of seat type or time." How does this interact with the decorator chain, and where does it short-circuit?
+  </Accordion>
+
+  <Accordion title="Q5: The ShowSeatManager uses an in-memory dictionary for seat status. How would you redesign this for a system handling 50,000 concurrent users for a blockbuster release?">
+    **Strong answer:**
+    - An in-memory dictionary on a single server instance cannot handle 50K concurrent users. The fundamental bottleneck is that `threading.Lock` serializes all seat operations on a single core. Even if each operation takes 1ms, you can only process 1,000 operations per second.
+    - Step 1: Move seat state to Redis. Each seat's status becomes a Redis key (e.g., `show:123:seat:A5` -> `"available"` or `"held:user456:expires:1680000000"`). Redis is single-threaded but processes 100K+ operations per second. Use `SETNX` (set-if-not-exists) for the hold operation -- this is an atomic compare-and-swap that replaces the in-memory lock.
+    - Step 2: Use Redis key TTL for hold expiration instead of lazy cleanup. Set `EXPIRE show:123:seat:A5 600` when holding. Redis automatically deletes the key after 600 seconds, and the seat implicitly becomes available (absence of key = available).
+    - Step 3: For the seat map display (showing all 200+ seats to the user), do not query Redis one key at a time. Use Redis hash maps: `HGETALL show:123:seats` returns the entire seat map in one round trip. Update individual seats with `HSET`.
+    - Step 4: For the initial stampede (tickets go on sale at 10:00 AM sharp), even Redis can become a bottleneck. Pre-shard the seats: seats A1-A20 are managed by Redis shard 1, B1-B20 by shard 2, etc. Users selecting seats in different rows hit different shards, distributing load.
+    - Step 5: Virtual waiting room. Before users even reach the seat selection page, place them in a queue (e.g., using Cloudflare Waiting Room or a custom implementation). Only admit N users per second to the seat selection flow, preventing the thundering herd from overwhelming the backend.
+
+    **Red flag answer:** "Just add more servers." Horizontal scaling without explaining how shared seat state is coordinated across servers is hand-waving. You cannot just add servers when they all fight over the same seat lock.
+
+    **Follow-ups:**
+    1. Two Redis commands -- `SETNX` to hold and `EXPIRE` to set TTL -- are not atomic together. What happens if the process crashes between them? How does Redis `SET key value NX EX 600` solve this?
+    2. With seat state in Redis and 50K users refreshing the seat map every 2 seconds, you are looking at 25K reads/second on the seat map. How would you reduce this load?
+  </Accordion>
+
+  <Accordion title="Q6: The booking can be in states: PENDING, CONFIRMED, CANCELLED, EXPIRED. What happens if a user tries to cancel a CONFIRMED booking 5 minutes before the show starts?">
+    **Strong answer:**
+    - The current `ConfirmedState.cancel()` unconditionally allows cancellation and initiates a refund. It does not check how close the show is. In reality, cancellation policies are time-dependent: full refund if cancelled 24+ hours before the show, 50% refund for 2-24 hours, no refund within 2 hours. This is a business rule that the State pattern alone does not capture.
+    - You would introduce a `CancellationPolicy` (Strategy pattern) that the `ConfirmedState.cancel()` method consults before proceeding. The policy takes the booking and current time and returns a `CancellationResult` with `allowed: bool`, `refund_percentage: Decimal`, and `reason: str`. The state delegates the decision to the policy rather than hardcoding it.
+    - The current code has another issue: `ConfirmedState.cancel()` includes the comment "Note: Seats remain booked (refund policy may vary)" -- meaning cancelled-but-confirmed seats are not released back to the pool. This is correct for some scenarios (e.g., the show is about to start and reselling is impossible) but wrong for early cancellations where the seats could be resold. The cancellation policy should also determine whether seats are released.
+    - In production systems like BookMyShow, cancellation within a few hours of the show is typically blocked entirely because the theater has already committed resources (staff, food prep, etc.). Some platforms offer a "ticket transfer" option as an alternative to cancellation -- the user cannot get their money back, but they can transfer the booking to another user. This requires a new `TransferState` or a `transfer()` method on `ConfirmedState`.
+
+    **Red flag answer:** "The cancel method initiates a refund." This ignores time-based policies, partial refunds, and seat release logic. It suggests the candidate has never dealt with real-world cancellation flows.
+
+    **Follow-ups:**
+    1. How would you model a tiered cancellation policy (full refund > 24h, 50% refund > 2h, no refund < 2h) using the Strategy pattern, and where does it integrate into the State pattern?
+    2. If a cancelled booking's seats are released and immediately booked by another user, but the original user's refund fails, what is the correct system behavior?
+  </Accordion>
+
+  <Accordion title="Q7: How would you schedule shows to prevent overlaps on the same screen, accounting for cleaning time between shows?">
+    **Strong answer:**
+    - The current `Show` class has `start_time` and `end_time` (calculated as `start_time + movie.duration_minutes`). But it does not account for trailers (typically 15-20 minutes before the movie), interval breaks (common in Indian cinema for 3-hour films), or cleaning/turnover time (10-15 minutes after the show for the crew to clean).
+    - You would model the full time block as: `block_start = start_time - trailer_duration` and `block_end = end_time + interval_duration + cleaning_duration`. The overlap check becomes: for the same screen, no two shows can have overlapping blocks. This is an interval scheduling validation: `show_a.block_end <= show_b.block_start OR show_b.block_end <= show_a.block_start`.
+    - The scheduling service would have an `add_show()` method that first queries all existing shows for that screen on that date, checks for block overlaps, and rejects if there is a conflict. To make this efficient, store shows sorted by start_time per screen and use binary search to find potential conflicts.
+    - A subtler issue: what if an admin needs to change a movie's runtime (director's cut, censored version)? This retroactively changes `end_time` for all future shows of that movie and could create overlaps with shows that were scheduled after. The system needs a cascade validation: when a movie's duration changes, re-validate all future shows and flag conflicts.
+    - At scale, scheduling optimization becomes interesting. Given a set of movies with different durations and demand levels, and a set of screens, how do you maximize revenue? This is a variant of the job scheduling problem. Theaters use specialized software for this, but the core algorithm is: assign high-demand movies to peak time slots on larger screens, and fill gaps with shorter or lower-demand movies.
+
+    **Red flag answer:** "Just check if start times overlap." This misses trailer time, cleaning time, interval breaks, and the concept of a full time block. It also does not address how to efficiently validate against all existing shows for a screen.
+
+    **Follow-ups:**
+    1. An admin accidentally schedules two shows with a 5-minute overlap. Instead of rejecting, the system should show a warning and allow override. How would you implement soft vs. hard scheduling constraints?
+    2. How would you build an "auto-schedule" feature that, given a list of movies and their expected demand, fills a screen's daily schedule optimally?
+  </Accordion>
+
+  <Accordion title="Q8: The Observer pattern is used for notifications (email, SMS, analytics). What happens if the email service is down during booking confirmation?">
+    **Strong answer:**
+    - In the current implementation, observers are notified synchronously inside `booking.confirm()`. The loop `for observer in self._observers: observer.on_booking_confirmed(self)` runs inline. If `EmailNotificationObserver.on_booking_confirmed()` throws an exception (email service timeout, connection refused), the exception propagates up and potentially leaves the booking in an inconsistent state -- the seats are confirmed in the seat manager, but the booking might not be saved to the repository depending on exception handling.
+    - The fix is to make observer notifications asynchronous and non-blocking. The booking confirmation should complete (state change + seat confirmation + repository save) before any notifications fire. Notifications should be dispatched to a message queue (e.g., RabbitMQ, SQS, or even an in-process background thread pool) and processed independently.
+    - Each notification should be retried with exponential backoff. If the email service is down for 5 minutes, the email should be queued and sent when the service recovers. The user should not lose their booking because the notification system is degraded.
+    - An important architectural principle here: separate the critical path (booking, payment, seat confirmation) from the non-critical path (notifications, analytics). The critical path must be synchronous, consistent, and never fail due to non-critical dependencies. The non-critical path can be eventual, retried, and gracefully degraded.
+    - The analytics observer introduces another concern: if analytics tracking fails, you lose data but the user is not affected. However, if analytics is synchronous and slow (e.g., 500ms round trip to the analytics service), it adds latency to every booking confirmation. This is a hidden performance tax that only shows up under load testing.
+
+    **Red flag answer:** "We wrap the observer calls in try/except so errors are swallowed." This prevents crashes but silently loses notifications -- the user never gets their confirmation email and has no idea their booking succeeded. It is a fix that creates a worse problem than it solves.
+
+    **Follow-ups:**
+    1. You move notifications to a message queue. The booking is confirmed, but the email message is lost due to a queue failure. The user never receives confirmation. How do you design a self-healing mechanism to detect and re-send missed notifications?
+    2. The `AnalyticsObserver` adds 200ms of latency to every booking. How would you prove this is the culprit and what architectural change eliminates it?
+  </Accordion>
+</AccordionGroup>

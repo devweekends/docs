@@ -256,7 +256,7 @@ When a process finishes:
 A zombie process:
 
 - Has released almost all resources (no memory, no open files).
-- Still occupies a PID and a small PCB entry.
+- Still occupies a PID and a small PCB entry -- roughly 800 bytes for the minimal `task_struct` stub. On a system with a 32,768 PID limit, a zombie leak can exhaust the PID space long before it exhausts memory.
 - Shows as `Z` in tools:
 
 ```bash
@@ -385,8 +385,10 @@ A process transitions through various states during its lifetime:
 
 <Note>
 **TASK_INTERRUPTIBLE vs TASK_UNINTERRUPTIBLE**: 
-- Interruptible: Process can be woken by signals (common case)
-- Uninterruptible: Must complete I/O first (shows as 'D' in `ps` — often disk I/O)
+- Interruptible: Process can be woken by signals (common case). If you `kill` a sleeping process and it wakes up, it was interruptible.
+- Uninterruptible: Must complete I/O first (shows as 'D' in `ps` -- often NFS or disk I/O). You cannot kill a process in D state; it must wait for the hardware to respond. If you see many D-state processes, suspect a storage or network filesystem hang.
+
+**Practical tip**: `TASK_KILLABLE` (added in Linux 2.6.25) is a hybrid -- uninterruptible for normal signals but responds to `SIGKILL`. Modern kernel code increasingly uses this instead of `TASK_UNINTERRUPTIBLE` to avoid unkillable processes during NFS timeouts.
 </Note>
 
 ---
@@ -1511,6 +1513,76 @@ This gives you a real measurement of fork overhead on your system.
     Always reap children. Orphans adopted by init.
   </Card>
 </CardGroup>
+
+---
+
+---
+
+## Interview Deep-Dive
+
+<AccordionGroup>
+  <Accordion title="Explain Copy-on-Write in fork(). A colleague claims that fork() is 'basically free' because of COW. Under what conditions does this claim break down?">
+    **Strong Answer:**
+
+    Copy-on-Write makes fork() extremely cheap in the common case. Instead of copying the entire address space, the kernel marks all pages in both parent and child as read-only and sets a COW flag. When either process writes to a page, the MMU triggers a page fault, the kernel allocates a new physical page, copies the content, updates the page table, and allows the write to proceed. For the fork-then-exec pattern (used by shells and process supervisors), almost no pages are ever copied because exec() replaces the entire address space.
+
+    However, the claim breaks down in several important production scenarios:
+
+    - **Large resident working set with immediate writes**: If a process with 10GB RSS forks, and both parent and child immediately begin writing to their data (e.g., a database checkpoint process), every page gets faulted and copied. You temporarily need 20GB of physical RAM, and the page fault storm can stall the process for seconds. This is exactly the problem Redis faced with background persistence (BGSAVE): the fork was "free" until client writes triggered a cascade of COW faults, causing latency spikes proportional to the write rate.
+    - **Page table copying is not free**: Even though COW avoids copying data pages, the kernel must copy the entire page table structure (all PML4/PDPT/PD/PT entries). For a process with 100GB of virtual mappings, this means copying millions of page table entries, which can take tens of milliseconds and requires holding the mmap_lock.
+    - **TLB flush cost**: After fork, the kernel must invalidate TLB entries in the parent (because pages changed from read-write to read-only). On multi-core systems, this requires TLB shootdown IPIs to all cores running the parent's threads.
+    - **Huge pages make COW expensive**: A COW fault on a 2MB HugePage requires allocating and copying 2MB atomically, which is 512x more expensive than a 4KB COW fault. Some workloads disable THP specifically because of COW amplification during fork.
+
+    The practical wisdom: fork() is cheap for small processes or the fork+exec pattern. For large-memory processes that continue writing after fork, use `posix_spawn()` (which avoids the full fork) or `vfork()` (which shares the address space until exec, but is dangerous because the child must not modify any data).
+
+    **Follow-up: How does vfork() differ from fork(), and why is it considered dangerous?**
+
+    vfork() creates a child that shares the parent's address space entirely -- no COW, no page table copy. The parent is suspended until the child calls exec() or _exit(). This makes it extremely fast for the fork+exec pattern (no page table duplication at all). The danger is that the child runs in the parent's address space: if the child modifies variables, calls functions that alter stack frames, or returns from the function that called vfork(), it corrupts the parent's state. The child must only call exec() or _exit() -- nothing else is safe. In practice, posix_spawn() wraps the safe parts of vfork+exec and is the recommended approach for modern code.
+  </Accordion>
+
+  <Accordion title="What exactly happens during a context switch between two processes? Quantify the direct and indirect costs.">
+    **Strong Answer:**
+
+    A context switch is the OS replacing the currently running process with a different one on the same CPU. The cost has two components: the direct cost (what the kernel does) and the indirect cost (what happens to the hardware state).
+
+    Direct costs (the kernel work):
+    - **Save register state**: Push all general-purpose registers, FPU/SSE/AVX state (which can be 512+ bytes for AVX-512), and control registers to the outgoing process's `task_struct`. On x86-64, this includes RAX-R15, RFLAGS, FS/GS base, and the XSAVE area for extended state.
+    - **Switch page tables**: Write the new process's PGD (Page Global Directory) base address to the CR3 register. On systems with KPTI, this is two CR3 writes (one for user-space tables, one for kernel tables).
+    - **Switch kernel stack**: Load the new process's kernel stack pointer from its `task_struct`.
+    - **Restore register state**: Pop the incoming process's saved registers.
+    - **Total direct cost**: Approximately 1-5 microseconds on modern hardware, depending on how much extended state (AVX-512, etc.) needs saving/restoring.
+
+    Indirect costs (far more expensive):
+    - **TLB flush**: Changing CR3 invalidates TLB entries (unless PCIDs are used). The new process starts with a cold TLB, and every memory access for the next 100-1000 instructions triggers a TLB miss (each costing a 4-level page table walk, roughly 20-50ns). On a process with a large working set, the TLB warm-up penalty can be 50-100 microseconds.
+    - **Cache pollution**: The new process's code and data are not in L1/L2 cache. The first access to each cache line is a miss (L2 miss costs 10-20ns, L3 miss costs 50-100ns). If the working sets are large and non-overlapping, the effective penalty is hundreds of microseconds.
+    - **Branch predictor pollution**: Modern CPUs maintain per-address branch prediction tables. A context switch invalidates these predictions for the outgoing process, leading to mispredictions (10-20 cycle penalty each) until the predictor relearns.
+
+    In my experience, the indirect costs dominate by 10-100x. The direct cost is a few microseconds; the indirect cost (TLB, cache, branch predictor warm-up) can be 50-200 microseconds of degraded performance. This is why minimizing context switches is critical for latency-sensitive services. Thread pools sized to the number of cores, pinned with CPU affinity, eliminate most unnecessary switches.
+
+    **Follow-up: How do PCIDs (Process Context Identifiers) mitigate the TLB flush cost?**
+
+    PCIDs (called ASIDs on ARM) tag each TLB entry with a process identifier. When the CPU switches CR3, it does not flush the TLB -- entries from the old process remain but are only matched when the PCID matches. The new process gets its own PCID, and its TLB entries coexist with the old ones. The TLB has limited capacity (typically 1024-2048 entries), so very frequent switches between many processes will still cause evictions. But for the common case of switching between 2-4 hot processes, PCIDs eliminate the TLB warm-up penalty almost entirely. Linux enabled PCID support in kernel 4.14 alongside KPTI, which was critical because KPTI doubles the number of CR3 switches (one for user tables, one for kernel tables). Without PCIDs, KPTI's overhead would have been 30%+ instead of the actual 5-10%.
+  </Accordion>
+
+  <Accordion title="Explain zombie and orphan processes. In a containerized environment, what happens if PID 1 inside the container does not reap zombies?">
+    **Strong Answer:**
+
+    - **Zombie process**: A process that has terminated but whose parent has not called `wait()` to collect its exit status. The process's memory, file descriptors, and execution state are all gone -- but its entry in the process table (PID, exit code, resource usage statistics) remains. The kernel keeps this because the parent might want the exit status later. Zombies consume almost no resources (just a `task_struct` slot), but the PID is occupied and cannot be reused.
+    - **Orphan process**: A process whose parent has exited before it. The kernel "reparents" the orphan to PID 1 (init/systemd). The new parent is responsible for reaping it when it eventually exits.
+
+    In a containerized environment, the container's PID 1 is whatever process the Dockerfile specifies as the entrypoint -- often the application itself (e.g., a Node.js server). If that application forks child processes (or libraries it uses do, such as health check subprocesses), and it does not call `wait()`, those children become zombies when they exit.
+
+    Why this is a real problem:
+    - **PID exhaustion**: The kernel has a maximum number of PIDs (default 32768, configurable via `/proc/sys/kernel/pid_max`). In a container with a PID namespace, the limit applies locally. A long-running service that leaks zombies will eventually exhaust all PIDs, and new `fork()` calls will fail with EAGAIN. I have seen this in production with a Python web server that spawned subprocesses for PDF generation without properly waiting for them -- after 3 days of runtime, the container could not fork any new processes.
+    - **The fix**: Use a proper init process inside containers. `tini` (Docker's `--init` flag) or `dumb-init` runs as PID 1 and reaps zombies by calling `wait()` in a loop. Alternatively, the application can install a `SIGCHLD` handler with `signal(SIGCHLD, SIG_IGN)` which tells the kernel to auto-reap children (no zombies created), or use `waitpid(-1, NULL, WNOHANG)` in a loop.
+
+    The subtlety: in a PID namespace, the container's PID 1 also receives reparented orphans from any process in the namespace, not just its direct children. So even if your application never calls fork(), if a library it loads spawns helper processes that then orphan their children, your PID 1 inherits them. Without a reaping loop, they become zombies.
+
+    **Follow-up: What happens if PID 1 inside a container crashes? How does this differ from PID 1 crashing on a bare-metal system?**
+
+    On bare metal, if PID 1 (init/systemd) crashes, the kernel panics -- the system is considered unrecoverable because no process can reap orphans or manage the process hierarchy. In a container with a PID namespace, if PID 1 exits, the kernel sends SIGKILL to every other process in that namespace and the container terminates. The container runtime (containerd, crio) detects this and can restart the container according to its restart policy. This is actually a feature: it provides clean termination semantics. If PID 1 dies, everything in the container dies immediately rather than lingering in an inconsistent state.
+  </Accordion>
+</AccordionGroup>
 
 ---
 

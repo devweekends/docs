@@ -28,12 +28,14 @@ GKE offers three release channels to balance stability and features:
 Choosing between Autopilot and Standard is a choice between **Operational Simplicity** and **Total Control**.
 
 ### 2.1 GKE Autopilot (The SRE's Dream)
-In Autopilot mode, Google manages the **entire** cluster infrastructure, including node provisioning, scaling, and security hardening.
+In Autopilot mode, Google manages the **entire** cluster infrastructure, including node provisioning, scaling, and security hardening. Think of it as "Kubernetes without the Kubernetes operations." AWS's closest equivalent is EKS with Fargate (serverless pods), while Azure offers AKS with Virtual Nodes.
 
-- **The "Pod-Only" Contract**: You define your pods; Google ensures they have a place to run.
-- **Security by Default**: Enforces the **GKE Hardening Guide** (e.g., no privileged containers, mandatory `NET_RAW` removal).
-- **Billing**: You are billed **per-pod** (CPU, RAM, and ephemeral storage requested). You pay for what you use, not the idle space on nodes.
+- **The "Pod-Only" Contract**: You define your pods; Google ensures they have a place to run. You never see, manage, or SSH into the underlying nodes.
+- **Security by Default**: Enforces the **GKE Hardening Guide** (e.g., no privileged containers, mandatory `NET_RAW` removal). This means you cannot bypass security for convenience, which is a feature, not a limitation.
+- **Billing**: You are billed **per-pod** (CPU, RAM, and ephemeral storage requested). You pay for what you use, not the idle space on nodes. Minimum request is 250m CPU and 512MiB RAM per pod.
 - **Ideal For**: Teams that want to focus on code rather than Kubernetes cluster maintenance.
+
+**Cost Comparison:** In GKE Standard, if your pods use 60% of node resources on average, you are wasting 40% of your node spend. In Autopilot, Google handles bin-packing, so you pay only for requested pod resources. For many workloads, Autopilot is 15-30% cheaper than poorly optimized Standard clusters. However, for teams that are expert at bin-packing, Standard can be cheaper because Autopilot adds a per-pod management premium.
 
 ### 2.2 GKE Standard (The Architect's Choice)
 In Standard mode, you manage the node pools (GCE Managed Instance Groups).
@@ -82,6 +84,10 @@ For global applications, MCI uses a single Global External HTTP(S) Load Balancer
 ### 4.1 Workload Identity (The Principal Standard)
 *Already covered in Section 4.1, but here is the architectural why:*
 Without Workload Identity, you would use JSON keys stored as K8s Secrets. These are "static" and "unmanaged." Workload Identity provides short-lived tokens, eliminating the risk of key theft.
+
+Think of Workload Identity like a hotel key card system. Instead of giving every guest (pod) a permanent master key (JSON key file) that could be copied and used anywhere, you give them a temporary key card (short-lived token) that only works for their room (specific GCP resources) and expires automatically. AWS has an equivalent feature called "IAM Roles for Service Accounts" (IRSA) for EKS, and Azure uses "Workload Identity" for AKS as well.
+
+**Common Mistake:** Many teams migrating to GKE create a single service account JSON key, store it as a Kubernetes Secret, and share it across all pods. This works but is a ticking time bomb. If that key leaks (via a log, a debug dump, or a compromised pod), every workload using it is compromised. Workload Identity eliminates this risk entirely -- there is no key file to steal.
 
 ### 4.2 Binary Authorization
 Binary Authorization is a deploy-time security control that ensures only trusted container images are deployed on GKE.
@@ -160,42 +166,47 @@ Create a file named `main.tf`:
 ```hcl
 resource "google_container_cluster" "primary" {
   name     = "prod-cluster"
-  location = "us-central1"
+  location = "us-central1"   # Regional cluster = 3 control planes across 3 zones = 99.95% SLA
 
-  # Enabling VPC-Native Networking
+  # Why VPC-Native: Alias IPs give pods real VPC IPs, enabling direct routing via Andromeda SDN.
+  # Without this, you get Kubenet (overlay network) which adds encapsulation overhead and breaks
+  # features like VPC Service Controls, Private Google Access from pods, and Network Policies.
   networking_mode = "VPC_NATIVE"
   ip_allocation_policy {
-    cluster_secondary_range_name  = "pods"
-    services_secondary_range_name = "services"
+    cluster_secondary_range_name  = "pods"      # Pre-create this range in your subnet
+    services_secondary_range_name = "services"  # Separate range keeps pod and service IPs isolated
   }
 
-  # Enabling Workload Identity
+  # Why Workload Identity: Eliminates JSON key files for pod-to-GCP authentication.
+  # Without this, teams fall back to mounting SA keys as K8s Secrets -- a major security risk.
   workload_identity_config {
     workload_pool = "${var.project_id}.svc.id.goog"
   }
 
-  # Use a managed node pool
+  # Why remove default pool: The default pool uses the overprivileged default compute SA.
+  # We create a custom pool below with specific machine types and a dedicated SA.
   remove_default_node_pool = true
-  initial_node_count       = 1
+  initial_node_count       = 1    # Required even though we remove it (Terraform quirk)
 }
 
 resource "google_container_node_pool" "primary_nodes" {
   name       = "app-pool"
   location   = "us-central1"
   cluster    = google_container_cluster.primary.name
-  node_count = 3
+  node_count = 3   # 1 per zone for HA; use autoscaling in production (min 1, max 5 per zone)
 
   node_config {
-    preemptible  = false
-    machine_type = "e2-standard-4"
+    preemptible  = false          # Use true for dev/test to save ~70%
+    machine_type = "e2-standard-4"  # 4 vCPU, 16GB RAM -- good starting point for most workloads
 
-    # Workload Identity Metadata Server
+    # Why GKE_METADATA: Enables the Workload Identity metadata server on each node.
+    # Without this, pods cannot exchange K8s tokens for GCP tokens.
     workload_metadata_config {
       mode = "GKE_METADATA"
     }
 
     labels = {
-      env = "production"
+      env = "production"   # Used for node affinity and cost allocation
     }
   }
 }
@@ -209,15 +220,22 @@ gcloud container clusters get-credentials prod-cluster --region us-central1
 
 Create a Kubernetes Service Account and bind it to a GCP Service Account:
 ```bash
-# 1. Create GCP Service Account
+# 1. Create a dedicated GCP Service Account for this workload
+# Why: Each microservice should have its own SA with minimal permissions.
+# Common Mistake: Using the default compute SA -- it has Editor access to the entire project.
 gcloud iam service-accounts create gke-sa --display-name="GKE App SA"
 
-# 2. Allow KSA to act as GSA
+# 2. Bind the Kubernetes SA to the GCP SA via Workload Identity
+# Why: This tells GCP "when a pod running as K8s SA 'my-app-sa' in the 'default' namespace
+# requests a GCP token, give it the permissions of 'gke-sa'."
+# The [default/my-app-sa] format is [namespace/ksa-name].
 gcloud iam service-accounts add-iam-policy-binding gke-sa@$PROJECT_ID.iam.gserviceaccount.com \
     --role="roles/iam.workloadIdentityUser" \
     --member="serviceAccount:$PROJECT_ID.svc.id.goog[default/my-app-sa]"
 
-# 3. Create Kubernetes SA and annotate
+# 3. Create the K8s SA and annotate it with the GCP SA email
+# Why the annotation: This is how the GKE metadata server knows which GCP SA to impersonate.
+# Without it, the pod falls back to the node's SA (which you should also restrict).
 kubectl create serviceaccount my-app-sa
 kubectl annotate serviceaccount my-app-sa \
     iam.gke.io/gcp-service-account=gke-sa@$PROJECT_ID.iam.gserviceaccount.com

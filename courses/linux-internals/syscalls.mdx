@@ -873,6 +873,55 @@ cat /usr/include/asm/unistd_32.h
 
 ---
 
-Next: [Kernel Data Structures →](/courses/linux-internals/data-structures)
+## Interview Deep-Dive
 
+<AccordionGroup>
+  <Accordion title="You are profiling a high-throughput service and discover it makes 500,000 gettimeofday() calls per second. Explain why this is not actually a performance problem on modern Linux, and describe the kernel mechanism that makes it fast." icon="message">
+    **Strong Answer:**
+
+    - On modern Linux, `gettimeofday()` and `clock_gettime()` do not actually enter the kernel. They are served by the vDSO (virtual Dynamic Shared Object), which is a small shared library that the kernel maps into every process's address space during `execve()`. The vDSO contains code that reads time data from a shared memory page that the kernel updates on each timer tick (typically every 1-4ms).
+    - The mechanism works as follows: the kernel maintains a `vsyscall_gtod_data` structure in a page mapped read-only into user space. This structure contains the current time, the clocksource coefficients (TSC multiplier and shift), and the last update timestamp. The vDSO code reads the TSC register directly (via `rdtsc` or `rdtscp`), applies the coefficients to compute the current time, and returns -- all without any privilege transition.
+    - A regular syscall costs 200-500 CPU cycles (mode switch, register save/restore, Spectre mitigations). A vDSO call costs 10-20 cycles (just a function call and a few multiplications). At 500,000 calls per second, the difference is roughly 0.1% CPU for vDSO versus 5-10% CPU for real syscalls. This is why you rarely see `gettimeofday` as a performance bottleneck in strace output, and also why strace itself cannot see vDSO calls (they never enter the kernel).
+
+    **Follow-up:** Under what circumstances would clock_gettime() actually fall back to a real syscall instead of using vDSO?
+
+    **Follow-up Answer:**
+
+    - The vDSO only works when the kernel can provide sufficient information for user-space time computation. It falls back to a real syscall when: the clocksource is not TSC-based (for example, HPET or ACPI PM timer, which require MMIO reads that need kernel privileges), when `CLOCK_PROCESS_CPUTIME_ID` or `CLOCK_THREAD_CPUTIME_ID` are requested (these require reading per-task scheduling data), or when the clock is `CLOCK_TAI` on some kernel versions. You can verify which calls use vDSO by checking whether they appear in strace output -- if they do not appear, they are being handled by vDSO.
+  </Accordion>
+
+  <Accordion title="A container escape vulnerability has been reported that exploits a race condition in a specific syscall. Explain how seccomp-BPF would protect against this, and discuss the limitations of seccomp as a security boundary." icon="message">
+    **Strong Answer:**
+
+    - Seccomp-BPF filters run before the syscall handler executes. When a container runtime (like runc) starts a container, it installs a BPF filter program via `prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, ...)`. This filter receives the syscall number and arguments as input and returns an action (ALLOW, KILL, ERRNO, TRACE, LOG). If the vulnerable syscall is blocked by the filter, the exploit never reaches the buggy kernel code -- the filter returns EPERM or kills the process before the syscall handler is even invoked.
+    - Docker's default seccomp profile blocks approximately 44 of the 300+ syscalls, including dangerous ones like `kexec_load`, `mount`, `ptrace`, `init_module`, `delete_module`, and `clock_settime`. This reduces the kernel's attack surface significantly.
+    - However, seccomp has important limitations. First, it can only filter on syscall number and the first six arguments. It cannot dereference pointers, so it cannot inspect the contents of buffers or filenames passed to syscalls. Second, the filter is set once and cannot be relaxed (only tightened), following the principle of least privilege. Third, seccomp cannot protect against kernel vulnerabilities in allowed syscalls -- if the exploit is in `read()` or `write()`, which must be allowed for the container to function, seccomp cannot help. Finally, seccomp does not protect against hardware-level attacks like Spectre that bypass the syscall interface entirely.
+
+    **Follow-up:** How does the seccomp overhead scale with filter complexity, and how would you design a filter for a production service?
+
+    **Follow-up Answer:**
+
+    - Each seccomp filter is a BPF program that runs linearly: the kernel evaluates instructions sequentially for every syscall. A simple allowlist of 20 syscalls might take 20-50 nanoseconds per syscall. A complex filter with argument checking on dozens of syscalls could take 100-200 nanoseconds. Since syscalls already cost 200-500 nanoseconds minimum, a well-designed filter adds less than 25% overhead. For production, I would start with Docker's default profile, then use `strace -c` to identify which syscalls the service actually uses, and build a tight allowlist. I would put the most frequently called syscalls (read, write, futex, epoll_wait) first in the filter to minimize average evaluation time, and set the default action to SCMP_ACT_ERRNO rather than SCMP_ACT_KILL to avoid silent process deaths during development.
+  </Accordion>
+
+  <Accordion title="Trace the complete journey of a write(fd, buf, 4096) call from the moment user-space code executes it to the point where data reaches the storage device. Include every privilege transition and major kernel function." icon="message">
+    **Strong Answer:**
+
+    - In user space, `write()` is a libc wrapper that sets up registers per the x86-64 ABI: `rax=1` (SYS_write), `rdi=fd`, `rsi=buf`, `rdx=4096`, then executes the `syscall` instruction.
+    - The CPU saves RIP and RFLAGS into RCX and R11, loads the kernel entry point from MSR_LSTAR, switches to ring 0, and jumps to `entry_SYSCALL_64` in assembly. This code swaps to the kernel stack via `swapgs`, saves all user registers onto the kernel stack as a `pt_regs` structure, then calls `do_syscall_64()`.
+    - `do_syscall_64()` looks up `sys_call_table[1]` (write), which dispatches to `ksys_write()`. This function calls `fdget_pos()` to convert the integer fd to a `struct file *` pointer and acquire the file position lock. It then calls `vfs_write()`, which checks permissions and calls `file->f_op->write_iter()` -- the filesystem-specific write function.
+    - For ext4 buffered writes, `ext4_file_write_iter()` calls `generic_perform_write()`, which finds or creates pages in the page cache (`address_space`), copies the 4096 bytes from user space into the page cache page via `copy_from_user()`, and marks the page dirty. The write call returns to user space at this point -- the data is in page cache but not on disk.
+    - Later, the `writeback` kernel thread (or the `pdflush` equivalent) wakes up and calls `ext4_writepages()`, which allocates disk blocks, creates `bio` structures describing the I/O, and submits them to the block layer via `submit_bio()`. The block layer's scheduler (mq-deadline, kyber, or none) may reorder or merge the request, then dispatches it to the device driver, which programs DMA to transfer the page cache data directly to the storage device. The device raises an interrupt on completion, and the `bio` end_io callback marks the page clean.
+
+    **Follow-up:** At which point is the data guaranteed to survive a power failure, and how does fsync() change the flow?
+
+    **Follow-up Answer:**
+
+    - After the buffered write returns, data is only in volatile page cache -- a power failure loses it. Calling `fsync(fd)` after the write forces the kernel to flush all dirty pages for that file to disk and wait for the device to confirm they are on persistent storage. Specifically, `fsync()` calls `vfs_fsync()`, which invokes `file->f_op->fsync()` (ext4_sync_file), which flushes dirty data pages, writes the inode metadata, and issues a cache flush command to the drive (SYNCHRONIZE CACHE for SCSI/SAS, FUA bit for NVMe). Only after the drive confirms the flush is `fsync()` allowed to return. Note that even fsync does not guarantee safety against drive firmware bugs that falsely acknowledge writes, which is why enterprise drives with power-loss-protected write caches exist.
+  </Accordion>
+</AccordionGroup>
+
+---
+
+Next: [Kernel Data Structures →](/courses/linux-internals/data-structures)
 

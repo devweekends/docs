@@ -584,21 +584,23 @@ CREATE TABLE location_history (
 
 | Decision | Choice | Reasoning |
 |----------|--------|-----------|
-| **Location Store** | Redis + Geo commands | Fast writes, efficient geo queries |
-| **Matching** | Score-based + batch | Balance speed and optimality |
-| **Real-time** | WebSockets | Bidirectional, low latency |
-| **Trip DB** | PostgreSQL | ACID for payments, consistency |
-| **Analytics** | Kafka + TimescaleDB | Time-series location data |
-| **Maps** | External API | Don't reinvent Google Maps |
+| **Location Store** | Redis + Geo commands | Fast writes (500K/sec), efficient geo queries (GEOSEARCH is O(N+logM)). The entire active driver set for a city fits in memory (~10MB for 100K drivers). Sharding by city keeps each Redis instance focused and reduces cross-shard queries to zero for local rides. |
+| **Matching** | Score-based + batch | Individual matching (greedy, one-at-a-time) is simpler but produces suboptimal global assignments. Uber's batch matching runs every 2 seconds, collecting all pending requests and available drivers, then solves a bipartite matching problem (similar to the Hungarian algorithm). This improves match quality by ~10-15% at the cost of a 2-second delay. |
+| **Real-time** | WebSockets | Bidirectional, low latency, connection-oriented. HTTP polling would require 500K requests every 4 seconds (125K/sec) just for location updates, wasting bandwidth on headers. WebSocket upgrade eliminates that overhead. The trade-off: sticky sessions and connection state management add operational complexity. |
+| **Trip DB** | PostgreSQL | ACID guarantees are non-negotiable for trip records (linked to billing). A driver must never be double-booked, and fare calculations must be consistent. PostgreSQL with read replicas handles the write volume (~500 trips/sec at peak) comfortably. |
+| **Analytics** | Kafka + TimescaleDB | 2+ TB/day of location data is a time-series problem. TimescaleDB (PostgreSQL extension) provides automatic partitioning by time, efficient range queries for trip reconstruction, and SQL compatibility for analytics queries. Kafka acts as the buffer between the high-throughput location stream and the database. |
+| **Maps** | External API | Don't reinvent Google Maps -- but cache aggressively. Common routes (airport to downtown) should be cached. Uber spends hundreds of millions annually on mapping APIs; at their scale, they invested in their own mapping infrastructure, but for a system design interview, using an external API is the right initial choice. |
 
 ## Common Interview Questions
 
 <Accordion title="How do you ensure a driver isn't assigned to two rides?">
-1. Use distributed lock when assigning (Redis SETNX)
-2. Mark driver unavailable atomically before sending request
-3. Use database transaction with driver status check
-4. If request times out, release lock and mark available again
-5. Idempotency key for each matching attempt
+1. Use distributed lock when assigning (Redis SETNX with TTL) -- the TTL is critical; without it, a crash during assignment means the driver is locked forever
+2. Mark driver unavailable atomically **before** sending the ride request, not after acceptance. This prevents the race where two concurrent match attempts both see the driver as available
+3. Use a database transaction with an optimistic lock (version column) on the driver status: `UPDATE drivers SET status='assigned', version=version+1 WHERE id=? AND status='available' AND version=?`
+4. If the request times out or is rejected, release the lock and mark the driver available again. Use a background job to sweep stale locks (drivers marked as assigned but with no active trip for >60 seconds)
+5. Idempotency key for each matching attempt ensures that retries from network failures don't create ghost assignments
+
+**Key insight**: This is the exact same problem as inventory reservation in e-commerce. Treat driver availability as "inventory of one" and apply the same compare-and-swap pattern.
 </Accordion>
 
 <Accordion title="How do you handle driver going offline mid-ride?">
@@ -620,19 +622,204 @@ CREATE TABLE location_history (
 </Accordion>
 
 <Accordion title="How does ETA work?">
-1. Get route from Maps API (Google/Mapbox)
-2. Consider current traffic conditions
-3. Historical data for time-of-day patterns
-4. Adjust for driver behavior (driving style)
-5. Update ETA as driver moves
-6. Cache common routes
+1. Get route from Maps API (Google/Mapbox) for the road-network distance, not straight-line distance. A driver 1km away by straight line might be 5km by road due to one-way streets and highway exits
+2. Layer current traffic conditions on top of the base route. Traffic data comes from GPS probes from active drivers -- Uber has millions of real-time data points
+3. Historical patterns for time-of-day adjustments. The same route at 8 AM vs 2 PM can differ by 3x. Store historical trip time percentiles (P50, P90) by route segment, hour, and day-of-week
+4. ML model adjusts for factors the routing engine misses: intersection delays, parking lot navigation time, building access time for pickups at large venues (airports, stadiums)
+5. Update ETA continuously as the driver moves -- recalculate every 30 seconds, not just at the start
+6. Cache common routes aggressively. Airport-to-downtown routes are requested thousands of times per day with similar traffic patterns
+
+**What impresses interviewers**: Mention that ETA accuracy is a critical business metric. If your ETA says 3 minutes but the driver arrives in 8 minutes, rider trust erodes. Uber reportedly targets ETA accuracy within 15% of actual arrival time.
 </Accordion>
 
 <Accordion title="How do you prevent fraud?">
-1. GPS spoofing detection (impossible movements)
-2. Verify rider/driver at same location at pickup
-3. Monitor unusual patterns (circular routes)
-4. Photo verification at start
-5. ML model for anomaly detection
-6. Manual review queue for flagged rides
+1. GPS spoofing detection: flag physically impossible movements (e.g., driver "teleports" 10km in 1 second). Compare reported GPS against cell tower triangulation for cross-validation
+2. Verify rider/driver at same location at pickup -- compare driver GPS with rider GPS at trip start. Flag if they are >500m apart
+3. Monitor unusual patterns: circular routes (inflating distance), trips that start and end at the same location, consistently long routes between well-known short-distance pairs
+4. Photo verification: Uber's Real-Time ID Check takes a selfie and compares against the driver's profile photo using facial recognition
+5. ML model for anomaly detection trained on historical fraud patterns. Features include: trip distance vs straight-line ratio, fare vs comparable trips, driver-rider collusion patterns (same rider-driver pairs with unusually high fares)
+6. Manual review queue for flagged rides. Automated systems catch ~95% of fraud, but the remaining 5% requires human investigation. Queue prioritization by potential financial impact.
+
+**Scale context**: Uber processes 20M+ rides per day. Even a 0.1% fraud rate means 20K fraudulent rides daily, costing millions in lost revenue.
+</Accordion>
+
+### Key Trade-offs
+
+| Decision | Option A | Option B | Recommendation |
+|----------|----------|----------|----------------|
+| Geospatial index | Geohash + Redis | QuadTree (in-memory) | **Redis GEO (geohash-based)** for the pragmatic first choice. Redis GEOSEARCH is O(N+log M) and handles 2M drivers per city cluster without breaking a sweat. QuadTree gives finer control but is hard to distribute across machines -- a single-server QuadTree hits memory limits at global scale. For production at Uber scale, **S2 Cells or H3 hexagons** are superior: they handle poles, have uniform cell areas, and support multi-resolution covering. Uber built H3 specifically because geohash cell distortion near high latitudes caused matching inaccuracies in cities like Oslo and Helsinki. |
+| Connection protocol | HTTP polling | WebSocket / gRPC stream | **Persistent connections (WebSocket or gRPC streams)** for driver location updates. At 2M active drivers updating every 4 seconds, polling means 500K HTTP requests/sec with full header overhead per request. A persistent connection reduces per-message overhead to ~50 bytes. The savings: roughly 10x reduction in bandwidth and connection setup costs. Use WebSocket for the rider app (browser compatibility) and gRPC bidirectional streams for the driver app (native mobile, lower overhead, built-in protobuf serialization). |
+| Matching algorithm | Greedy (closest driver) | Batch (bipartite matching) | **Batch matching with a 2-second collection window.** Greedy matching (pick the closest available driver) is locally optimal but globally 10-15% worse in total wait time across concurrent requests. Batch matching collects requests over a short window and solves a minimum-cost bipartite assignment problem. The trade-off: 2 seconds of additional matching latency. This is acceptable because the driver still takes 3-8 minutes to arrive -- the 2-second delay is imperceptible. Fall back to greedy matching in low-demand situations where batching has no benefit. |
+| Surge pricing model | Static multiplier | Dynamic feedback loop | **Dynamic with temporal and spatial smoothing.** A naive static multiplier oscillates: high surge scares riders away, surge drops, riders return, surge spikes again. Temporal smoothing (EWMA with fast ramp-up, slow decay) prevents oscillation. Spatial smoothing across neighboring H3 cells prevents sharp price boundaries where a user walks 50 meters and saves 3x. The key insight: surge must decay slowly enough for drivers to physically reposition before prices drop, otherwise the supply-side rebalancing mechanism never works. |
+| Trip state management | Event-driven (choreography) | Orchestrator (saga) | **Orchestrator-based saga** for the trip lifecycle. The trip has exactly defined states (REQUESTED, ACCEPTED, ARRIVING, IN_PROGRESS, COMPLETED, PAID) with strict transition rules. Choreography (each service reacts to events independently) creates state divergence bugs -- the trip service says "completed" but the driver service says "on a trip" because an event was lost. An orchestrator provides a single source of truth for trip state with compensating actions on failure. The trade-off: the orchestrator is a single point of coordination, but trip volume (~500 TPS peak) is well within a single service's capacity. |
+
+### Common Candidate Mistakes
+
+```
+Mistake 1: Using straight-line distance for matching
+  Two points that are 500m apart in straight-line distance might
+  be 3km apart by road (separated by a river, highway, or one-way
+  streets). Always use road-network ETA for driver ranking, not
+  Haversine distance. This is a common gotcha that interviewers
+  specifically look for.
+
+Mistake 2: Polling for location updates
+  With 2M active drivers updating every 4 seconds, polling means
+  500K HTTP requests per second just for location. Use persistent
+  connections (WebSocket or gRPC streams) and push updates from
+  the driver. This reduces overhead by 10x compared to polling.
+
+Mistake 3: Single global matching service
+  A ride request in NYC should not query a matching service that
+  also handles Tokyo drivers. Shard the matching service by city
+  or region. Each shard operates independently with its own Redis
+  instance for driver locations. Cross-city rides (rare) can be
+  handled by a coordinator service.
+
+Mistake 4: Not discussing the cold start problem
+  When Uber launches in a new city, there are few drivers. The
+  matching algorithm needs to handle sparse supply gracefully --
+  wider search radii, longer wait times, and potentially
+  different surge pricing thresholds. Mention this to show you
+  think about operational realities, not just steady-state design.
+```
+
+## Interview Deep-Dive Questions
+
+<Accordion title="You're building the geospatial indexing layer for a ride-hailing service. You need to answer 'find the 10 nearest available drivers' 50,000 times per second. Walk me through your data structure choices, and explain why you'd pick one over the others.">
+
+**What the interviewer is really testing:** Do you understand the trade-offs between geospatial data structures (geohash, QuadTree, R-tree, S2 cells) at the implementation level, and can you reason about read vs. write patterns under Uber-scale load?
+
+**Strong answer:**
+
+- **Redis GEOADD/GEOSEARCH is the pragmatic starting point.** Redis GEO commands use a sorted set where each member's score is a 52-bit geohash-encoded interleaving of latitude and longitude. `GEOSEARCH BYRADIUS 3 km` translates to a sorted set range scan on geohash prefixes, which is O(N+log M) where N is results returned and M is total elements. At 2M active drivers per city cluster, this is fast enough for most workloads.
+- **Geohash has a well-known edge problem.** Two locations physically adjacent can have completely different geohash prefixes if they straddle a cell boundary. The fix is to always query the target cell plus its 8 neighboring cells. Redis handles this internally in GEOSEARCH, but if you roll your own geohash index, forgetting the neighbor query is a common bug that causes "nearby driver not found" incidents.
+- **QuadTree gives more control but is harder to distribute.** A QuadTree recursively divides the 2D plane into four quadrants, splitting cells when they exceed a threshold (e.g., 100 drivers per cell). Lookups are O(log N) and range queries are efficient. The downside: it is an in-memory tree structure, which means you either keep it on a single server (scaling limit) or shard it geographically and handle edge cases at shard boundaries.
+- **Google S2 cells (what Uber actually uses) are the production-grade answer.** S2 projects the Earth onto a cube, then uses a Hilbert curve to map 2D space to 1D cell IDs. This has better uniformity than geohash near the poles and provides multi-resolution covering (you can represent any geographic region as a set of S2 cells at varying levels). Uber's H3 hexagonal grid is a similar concept with the advantage that all cells at the same resolution have approximately equal area.
+- **Write-heavy workloads (500K location updates/sec) drive the choice toward Redis.** A QuadTree needs rebalancing on every write. Redis sorted set updates are O(log N) and naturally distributed via Redis Cluster. Shard by city so each Redis instance handles ~100K drivers. A 100K-member sorted set consumes ~15MB of RAM and handles hundreds of thousands of operations per second on a single core.
+
+**Red flag answer:** "I would use a SQL database with latitude/longitude columns and `ORDER BY distance`" -- this is an O(N) full table scan per query. Also a red flag: not mentioning the geohash boundary problem or the write throughput requirement.
+
+**Follow-up questions:**
+1. A driver is moving at 60 km/h and sending location updates every 4 seconds. That means they move ~67 meters between updates. How does this staleness affect your "nearest driver" accuracy, and what can you do about it?
+2. Uber expanded to boat rides (UberBOAT) and helicopter rides (Uber Copter). How would you adapt your geospatial index for vehicles that do not follow road networks?
+</Accordion>
+
+<Accordion title="Surge pricing is showing 3.5x in downtown during a Friday night concert. A rider sees the surge, waits 5 minutes, and the surge drops to 1.2x. How does the surge pricing system work internally, and what prevents it from oscillating wildly?">
+
+**What the interviewer is really testing:** Can you think about dynamic pricing as a control system with feedback loops, not just a static formula -- and can you identify the oscillation problem that naive implementations create?
+
+**Strong answer:**
+
+- **The core mechanism is supply/demand ratio per geographic cell.** Divide the city into hexagonal cells (Uber uses H3 cells at resolution ~8, roughly 0.7 km across). For each cell, compute `demand_ratio = active_ride_requests / available_drivers` over a rolling window (e.g., 2 minutes). Map this ratio to a surge multiplier using a step function or continuous curve with a cap (typically 5-8x).
+- **The oscillation problem is real and non-obvious.** Naive surge creates a feedback loop: high surge scares riders away (demand drops) and attracts drivers (supply increases), so the next computation shows low demand-to-supply ratio. Surge drops. Riders flood back in. Surge spikes again. This oscillation happens on a 2-5 minute cycle and creates a terrible user experience.
+- **Temporal smoothing is the primary defense.** Instead of snapping to the computed multiplier, apply exponential weighted moving average (EWMA). Surge increases quickly (respond to demand spikes in ~1 minute) but decreases slowly (decay over ~5 minutes). This asymmetric smoothing prevents the "oscillation trap" because surge lingers long enough for the supply increase to actually materialize before prices drop.
+- **Spatial smoothing prevents sharp boundaries.** Without spatial smoothing, a rider standing at a cell boundary could see 3.5x on one side and 1.0x by walking 50 meters. This looks unfair and creates gaming. Smooth surge values across neighboring cells using a spatial kernel (weighted average of the cell and its neighbors). This creates gradual surge gradients instead of sharp cliffs.
+- **Surge also serves as a market signal to drivers.** The driver app shows a heat map of surge areas. Drivers physically reposition toward high-surge zones. This is the supply-side mechanism that makes the market work. If surge drops too fast, drivers do not have time to arrive, and the system fails to rebalance.
+- **Price lock at request time prevents bait-and-switch.** When the rider confirms a surge ride, that multiplier is locked for that trip. Even if surge changes during the ride, the agreed price holds. This is both a UX decision and a legal requirement in many jurisdictions.
+
+**Red flag answer:** "Surge is just demand divided by supply" without discussing oscillation, smoothing, spatial boundaries, or the feedback loop dynamics. Also a red flag: not recognizing that surge is a two-sided market mechanism that affects both rider behavior and driver positioning.
+
+**Follow-up questions:**
+1. How would you A/B test a change to the surge algorithm -- what metrics would you track, and what are the ethical considerations of charging different prices to similar riders?
+2. Regulators in some cities have imposed surge caps (e.g., 2x max during emergencies). How does a hard cap affect the supply-demand rebalancing mechanism, and what alternative approaches exist?
+</Accordion>
+
+<Accordion title="A rider requests a ride and your system needs to match them with the best driver. The naive approach is 'pick the closest driver.' Why is that wrong, and how would you design the matching algorithm?">
+
+**What the interviewer is really testing:** Can you see past the obvious (distance) to the multi-objective optimization problem that matching actually is, and can you articulate the difference between greedy and batch matching?
+
+**Strong answer:**
+
+- **Closest driver by straight-line distance is wrong for two reasons.** First, straight-line (Haversine) distance ignores the road network. A driver 500 meters away across a river might be 3 km by road. You must use road-network ETA, not Euclidean distance. Second, even using ETA, "closest" is a locally greedy choice that can be globally suboptimal.
+- **The global suboptimality is the deeper insight.** Suppose Rider A and Rider B both request rides at the same time. Driver X is 2 min from A and 3 min from B. Driver Y is 4 min from A and 3 min from B. Greedy matching assigns X to A (closest). Now B gets Y at 3 min. Total wait: 5 min. But assigning X to B (3 min) and Y to A (4 min) gives a total wait of 7 min, which is worse. In this case greedy wins. But with 1000 riders and 1000 drivers, greedy matching produces total wait times 10-15% worse than optimal batch matching.
+- **Batch matching collects requests over a short window (2 seconds) and solves a bipartite matching problem.** Formulate it as a minimum-cost matching on a bipartite graph: riders on one side, drivers on the other, edge weights are match scores (ETA, driver rating, acceptance rate, idle time). Solve using the Hungarian algorithm or an approximation for large instances. Uber reportedly uses a variant of this approach.
+- **Match score is multi-dimensional, not just ETA.** `Score = w1 * (1/ETA) + w2 * driver_rating + w3 * acceptance_rate + w4 * idle_time + w5 * car_type_match`. The weights are tuned via ML on historical data. A driver with 4.95 rating who is 4 minutes away may score higher than a 4.6-rated driver who is 2 minutes away, because rider satisfaction (and hence retention) is higher with better-rated drivers.
+- **Fairness constraints prevent driver starvation.** Without the idle_time factor, a driver in a less popular area could go hours without a ride while nearby drivers in a busy zone get all the matches. The idle_time weight ensures that drivers who have been waiting longer get priority, which is critical for driver retention (an Uber driver who earns nothing for 2 hours will switch to Lyft).
+
+**Red flag answer:** "Just pick the closest driver" or describing a single-request matching algorithm without mentioning batch optimization, multi-factor scoring, or the fairness problem.
+
+**Follow-up questions:**
+1. How do you handle the matching latency trade-off: batch matching adds 2 seconds of delay before a rider gets matched. When is this delay acceptable, and when should you fall back to greedy matching?
+2. A VIP rider (high lifetime value) and a regular rider both request rides in the same area with only one available driver. How should the matching system handle this, and what are the ethical implications?
+</Accordion>
+
+<Accordion title="ETA says the driver will arrive in 4 minutes, but the rider waits 11 minutes. Walk me through how ETA calculation works and what could cause this magnitude of error.">
+
+**What the interviewer is really testing:** Do you understand ETA as a prediction problem with multiple data sources, not just a maps API call, and can you reason about the sources of prediction error in a real system?
+
+**Strong answer:**
+
+- **ETA is not a single maps API call -- it is a layered prediction.** Layer 1: routing engine computes the shortest path on the road graph (Dijkstra/A* on a graph where edges are road segments with travel-time weights). Layer 2: traffic overlay adjusts edge weights using real-time and historical traffic data. Layer 3: ML model applies corrections for factors the routing engine misses (building access time, parking lot navigation, one-way street traps).
+- **Real-time traffic data comes from the driver fleet itself.** Every active Uber driver reports GPS coordinates every 4 seconds. Aggregate these across thousands of drivers and you get real-time speed estimates for nearly every road segment in an active city. This is more granular than Google Maps traffic data because Uber has higher driver density on the exact roads riders use.
+- **An 11-minute actual vs. 4-minute estimate represents a 175% error.** Common causes include: (a) unexpected traffic incident that occurred after the ETA was computed (accident, road closure), (b) the driver took a wrong turn or missed an exit and had to reroute, (c) the pickup location is ambiguous (a large venue like an airport or stadium where the driver arrives at the building but spends 7 minutes navigating to the specific terminal/gate), (d) the driver accepted and then sat idle for several minutes before starting to drive (a behavior issue, not a routing issue).
+- **Pickup location ambiguity is the silent killer of ETA accuracy.** An address like "JFK Airport" could mean any of 6 terminals, each requiring different access roads. The ETA to "JFK" might be 4 minutes by road, but the actual pickup point is Terminal 4 Arrivals, which adds 7 minutes of airport-internal navigation. Uber addresses this with venue-specific pickup pins and geofenced pickup zones.
+- **ETA recalculation and communication matters as much as accuracy.** The system should recalculate ETA every 30 seconds as the driver moves and update the rider's app. If the initial estimate was 4 minutes but after 2 minutes the recalculated ETA is still 6 minutes, show the updated ETA. Riders tolerate inaccurate initial estimates better if the app proactively communicates the delay.
+- **Uber tracks ETA accuracy as a top-level business metric.** They reportedly target P50 error under 1 minute and P90 error under 3 minutes. Systematic overestimation (always arriving earlier than predicted) is actually preferred over underestimation because it creates positive surprises.
+
+**Red flag answer:** "Just call the Google Maps directions API" without discussing real-time traffic, pickup location specificity, recalculation, or the driver behavior component. Also a red flag: not distinguishing between routing accuracy and pickup logistics accuracy.
+
+**Follow-up questions:**
+1. How would you build an ML model that predicts ETA more accurately than the routing engine alone -- what features would you use, and how would you handle training data where the ground truth (actual arrival time) is affected by driver behavior?
+2. Uber needs ETA estimates before a driver is even assigned (the "estimated arrival" shown to the rider at request time). How do you compute this when you do not yet know which driver will be matched?
+</Accordion>
+
+<Accordion title="A rider completes a trip, but the app shows them as still in-progress and the driver cannot accept new rides. This is a trip consistency bug. How would you design the trip lifecycle to prevent this, and how do you recover when it happens?">
+
+**What the interviewer is really testing:** Can you design a state machine with proper transitions, identify failure modes in distributed state, and build self-healing mechanisms?
+
+**Strong answer:**
+
+- **The trip lifecycle is a state machine with exactly defined transitions.** `REQUESTED -> ACCEPTED -> ARRIVING -> IN_PROGRESS -> COMPLETED -> PAID`. Each transition has preconditions (e.g., `IN_PROGRESS -> COMPLETED` requires the driver to tap "End Trip" and the GPS to be near the destination). Illegal transitions (e.g., `REQUESTED -> COMPLETED`) are rejected at the service layer.
+- **The bug described is a state divergence between the trip service and the driver service.** The trip may have transitioned to `COMPLETED` in the trip database, but the event that marks the driver as `available` in the driver service was lost (network failure, Kafka consumer lag, bug in the event handler). Now the trip DB says "done" but the driver service says "on a trip."
+- **Event sourcing with a separate projection solves the root cause.** Instead of updating the trip DB and the driver status in separate operations (which can partially fail), emit a single `TripCompleted` event to Kafka. Both the trip service and the driver service consume this event and update their own state. If the driver service misses the event, Kafka retains it and the consumer can replay.
+- **Compensation/reconciliation jobs are the safety net.** Run a background job every 60 seconds that queries all trips in `IN_PROGRESS` state and checks: (a) has the driver sent a location update in the last 5 minutes? (b) is the current driver location near the destination? (c) has the trip been `IN_PROGRESS` for longer than 3x the estimated duration? If any of these heuristics trigger, flag the trip for automatic completion or manual review.
+- **Driver-side timeout is a client-side safeguard.** The driver app should implement a local timeout: if the trip has been in `IN_PROGRESS` for longer than 2x the estimated duration, prompt the driver to end the trip. This handles the case where the server-side state is correct but the completion event was never delivered to the driver app (WebSocket drop).
+- **Idempotent state transitions prevent double-processing.** Each state transition carries a version number. `UPDATE trips SET status='COMPLETED', version=version+1 WHERE id=? AND status='IN_PROGRESS' AND version=?`. If two "complete" requests arrive (retry scenario), the second one fails because the version has already changed. This prevents charging the rider twice.
+
+**Red flag answer:** "Just use a database transaction" without acknowledging that the trip service and driver service are separate microservices that cannot share a transaction. Also a red flag: no mention of reconciliation or self-healing mechanisms.
+
+**Follow-up questions:**
+1. How do you handle the case where the rider's app crashes during the trip, the driver completes the trip, but the rider never sees the fare or receipt -- what is the recovery flow?
+2. In a microservice architecture, the trip service, driver service, and payment service all need to agree that a trip is complete. How would you coordinate this without a two-phase commit?
+</Accordion>
+
+<Accordion title="Uber needs to handle 500,000 driver location updates per second. Each update is small (50 bytes) but the throughput is enormous. How do you architect the ingestion pipeline, and what can you afford to lose?">
+
+**What the interviewer is really testing:** Can you design a high-throughput, write-heavy pipeline and make deliberate trade-offs about durability vs. latency for different data paths?
+
+**Strong answer:**
+
+- **Split the data into two paths with different durability requirements.** The "hot path" updates the real-time location store (Redis) for driver matching -- this needs sub-second latency but can tolerate occasional data loss (a missed location update is invisible because the next one arrives 4 seconds later). The "cold path" persists to long-term storage (TimescaleDB/Cassandra) for trip reconstruction, analytics, and billing -- this needs durability but can tolerate seconds of delay.
+- **Hot path: UDP or gRPC streaming into a location service that writes to Redis.** The driver app sends location updates via a persistent gRPC stream (or WebSocket). The location service receives the update and writes to Redis using `GEOADD` (O(log N)). No disk I/O, no message queue -- just in-memory writes. If a Redis node crashes, you lose the latest positions for drivers on that shard, but they are refreshed within 4 seconds when the next update arrives. Acceptable.
+- **Cold path: Kafka as the buffer.** The location service also publishes each update to a Kafka topic partitioned by driver ID. A consumer writes batches to TimescaleDB (or Cassandra) every second. Kafka provides durability (replicated across brokers) and absorbs traffic spikes. If the database consumer falls behind, Kafka buffers the backlog. This decoupling is essential -- you never want database write latency to affect the real-time location update path.
+- **Client-side throttling reduces unnecessary load.** If the driver is parked (no movement), reduce update frequency from every 4 seconds to every 30 seconds. The client detects this by comparing consecutive GPS readings. At Uber's scale, ~30% of "active" drivers are actually stationary at any given time. Smart throttling cuts total update volume by ~25%.
+- **Batching on the server side improves throughput.** Instead of writing each update individually to Redis, buffer 100ms of updates on the location service and write them in a batch using Redis pipelining. This increases throughput by 5-10x because it amortizes the network round-trip cost. At 500K updates/sec, that is 50K updates per 100ms batch -- feasible on a single Redis pipeline.
+- **Stale data detection and eviction.** If a driver's last update is older than 60 seconds, they are likely offline (app crashed, phone died). A background job scans the Redis sorted set and removes stale entries. Without this, "ghost drivers" appear in nearby-driver queries but never accept rides.
+
+**Red flag answer:** "Store every update in PostgreSQL" (would require ~500K inserts/sec, far beyond a single PostgreSQL cluster's capacity). Also a red flag: treating all location data with the same durability requirement instead of recognizing the hot/cold path split.
+
+**Follow-up questions:**
+1. A Redis node holding location data for an entire city crashes and the replica takes 10 seconds to promote. During those 10 seconds, all matching queries for that city fail. How do you mitigate this?
+2. How would you use the historical location data (cold path) to improve ETA predictions -- what specific features would you extract?
+</Accordion>
+
+<Accordion title="You're on-call and receive an alert: 'Surge pricing stuck at 4.8x in the entire metro area for the last 45 minutes, even though driver supply has normalized.' What is your debugging approach?">
+
+**What the interviewer is really testing:** On-call production debugging under pressure -- can you systematically narrow down the root cause across multiple services (pricing, location, supply/demand calculation) without panicking?
+
+**Strong answer:**
+
+- **Step 1: Verify the alert is real, not a monitoring artifact.** Check the pricing service's API directly -- query the current surge for several cells across the metro area. If the API returns normal values but the alert says 4.8x, the issue is in the monitoring pipeline, not the pricing system. If the API also shows 4.8x, proceed.
+- **Step 2: Check the inputs to the surge formula.** The surge multiplier depends on demand (active ride requests) and supply (available drivers). Query both metrics independently. If demand appears normal and supply appears normal, but surge is high, the bug is in the computation. If supply reads as zero (even though drivers are online), the bug is in how the pricing service reads supply data.
+- **Most likely root cause: stale supply data.** The pricing service reads "available drivers per cell" from a cache or real-time feed. If the feed from the location/driver service is stuck (Kafka consumer lag, Redis connection failure), the pricing service sees outdated data from 45 minutes ago when supply was genuinely low. The formula is working correctly on stale inputs.
+- **Step 3: Check Kafka consumer lag for the pricing service's supply feed.** If the lag is millions of messages, the pricing service is consuming data from 45 minutes ago. Immediate mitigation: restart the consumer group with offset reset to latest (you accept losing some data but get current state). Root cause: investigate why the consumer fell behind (slow processing, consumer group rebalance storm, upstream partition increase).
+- **Step 4: If supply data is fresh but still shows low values, check the driver service.** Are drivers actually being marked as available? If a bug in the trip completion flow is failing to release drivers (see the trip consistency question), the system genuinely believes supply is low. Check the driver status distribution: if an abnormal percentage of drivers are in `ON_TRIP` status with no corresponding active trip, that is the bug.
+- **Immediate mitigation while debugging: apply a manual surge override.** The pricing service should have an admin endpoint to set a maximum surge cap per region. Set the cap to 1.0x for the affected metro area. This stops the bleeding (riders are not overcharged) while you fix the root cause. Remove the override once the system is healthy.
+
+**Red flag answer:** "Restart the pricing service" as the first action without understanding the root cause -- the service is likely functioning correctly on bad inputs. Also a red flag: not considering the data dependency chain (pricing depends on supply data, which depends on driver status, which depends on trip lifecycle).
+
+**Follow-up questions:**
+1. How would you design the pricing service to be resilient against stale supply data -- what circuit breaker or fallback behavior should exist when supply data is older than a threshold?
+2. After fixing this incident, what systemic changes would you propose to prevent the same class of failure (stale data causing incorrect business-critical computations)?
 </Accordion>

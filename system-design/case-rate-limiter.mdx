@@ -553,6 +553,173 @@ return count
 5. Consider adaptive rate limiting based on system load
 </Accordion>
 
+## Key Trade-offs
+
+| Decision | Option A | Option B | Recommendation |
+|----------|----------|----------|----------------|
+| Algorithm choice | Token Bucket | Sliding Window Counter | **Sliding Window Counter for most API gateways.** It uses O(1) memory per user (two counters per window), gives accuracy within ~1% of the true count, and maps cleanly to Redis. Token Bucket is better when you want to allow controlled bursts (mobile clients batch-sending after idle periods), but requires per-user bucket state that gets complicated at 1M+ users. Sliding Window Log (storing every request timestamp) is the most accurate but costs O(N) memory per user -- at 100K RPS, that blows up Redis. The trade-off: Sliding Window Counter approximates near window boundaries, but the error is under 1% and never over-limits. |
+| Counter location | Centralized (Redis) | Local (per-server in-memory) | **Centralized Redis as the primary, local as L1 fallback.** A per-server counter with limit/N per server sounds simple but fails badly: load balancers do not distribute traffic evenly per user, so one server might see 80% of a user's requests. Centralized Redis gives globally accurate counts with 0.5-2ms overhead. The trade-off: Redis is a SPOF for rate limiting. Add a local in-memory token bucket as fallback (with conservative limits) so that if Redis goes down, you degrade to approximate limiting rather than no limiting or total blocking. |
+| Failure mode | Fail-open (allow all) | Fail-closed (reject all) | **Per-endpoint configuration.** Fail-open for data-fetching endpoints (search, browse) -- a rate limiter outage should not become a total service outage. Fail-closed for security-critical endpoints (login, password reset, payment) -- an attacker could DDoS your Redis to disable rate limiting, then brute-force credentials. In practice, ~5-10% of endpoints should fail closed and the rest fail open. The trade-off: fail-open during an outage means some users may temporarily exceed their limits, but a local fallback limiter bounds the damage. |
+| Rate limit scope | Per-user only | Multi-dimensional (user + IP + endpoint) | **Multi-dimensional** for production APIs. Rate limit by user ID (authenticated), by IP (unauthenticated), and by endpoint (different limits for read vs write). A single user sending from 10K different IPs defeats per-IP limiting, and a single IP behind a NAT serving 10K users defeats per-user limiting. Use a Lua script that checks all dimensions atomically in a single Redis round-trip. The trade-off: multi-dimensional limiting requires 3-5 Redis keys per request instead of 1, increasing storage and compute by 3-5x. At 100K RPS, that is 300-500K Redis operations/sec -- well within a Redis Cluster's capacity. |
+| Response to throttled requests | Hard reject (429) | Queue and retry | **Hard reject with informative headers** for most APIs. Return HTTP 429 with `X-RateLimit-Limit`, `X-RateLimit-Remaining`, `X-RateLimit-Reset`, and `Retry-After` headers so clients can self-throttle. Queuing excess requests sounds polite but creates unbounded memory usage and unpredictable latency -- a burst of 10K requests above the limit would queue for minutes. Exception: for idempotent batch operations (data imports), a server-side queue with backpressure is reasonable. The trade-off: hard reject means legitimate requests are dropped during traffic spikes, but good clients will respect the Retry-After header and back off gracefully. |
+
+## Common Candidate Mistakes
+
+```
+Mistake 1: Implementing rate limiting per server instead of globally
+  If you have 10 API servers and set a limit of 100 requests/minute
+  per server, a user can actually make 1000 requests/minute by
+  spreading across servers. You need a centralized counter (Redis)
+  that all servers share.
+
+Mistake 2: Using INCR + EXPIRE as separate commands
+  There is a race condition: if the process crashes between INCR
+  and EXPIRE, the key persists forever and the user is permanently
+  rate-limited. Use a Lua script for atomicity, or use INCR with
+  EXPIRE only when the INCR result is 1 (first request in the
+  window).
+
+Mistake 3: Failing closed on Redis outage
+  If Redis goes down and you reject ALL requests, you have turned
+  a rate limiter outage into a total service outage. Fail open
+  (allow requests) for most endpoints. Exception: fail closed for
+  authentication endpoints to prevent brute-force attacks during
+  the outage.
+
+Mistake 4: Not considering the burst vs sustained rate distinction
+  A limit of "100 requests per minute" does not mean "steady rate
+  of 1.67 per second." A user could send 100 requests in the first
+  second and be blocked for 59 seconds. If you need smooth traffic
+  shaping, use the leaky bucket algorithm. If you want to allow
+  bursts, use token bucket. This distinction matters and
+  interviewers expect you to articulate it.
+
+Mistake 5: Ignoring response headers
+  A well-designed rate limiter returns X-RateLimit-Limit,
+  X-RateLimit-Remaining, X-RateLimit-Reset, and Retry-After
+  headers. Without these, clients have no way to self-throttle
+  and will keep hammering your API until they get a success.
+  Good API design reduces the need for rate limiting in the
+  first place.
+```
+
+## Interview Deep-Dive Questions
+
+### Q1: You're designing a distributed rate limiter for an API gateway handling 100K RPS across 20 servers. Walk me through your algorithm choice and why.
+
+**Strong Answer:**
+- The way I think about this is: what matters most here -- memory efficiency, accuracy, or burst tolerance? For most API gateways, the **sliding window counter** is the sweet spot. It uses O(1) memory per user (just two counters per window), gives accuracy within about 1% of the true count, and is simple to implement in Redis.
+- Here is why I would not pick the other algorithms for this use case. **Token bucket** is great if you want to allow controlled bursts (like allowing a mobile client to batch-send 10 requests at once after being idle), but it requires tracking per-user bucket state that gets complicated at 1M+ users. **Sliding window log** stores every single request timestamp in a sorted set -- at 100K RPS, that is millions of ZADD operations per second and O(N) memory per user, which blows up Redis memory.
+- For the distributed aspect, every server must hit a **centralized Redis** for the check-and-increment. The critical implementation detail is making this atomic -- you use a Lua script that does ZREMRANGEBYSCORE, ZCARD, and ZADD in a single evaluation. Without atomicity, two servers can read "99 requests" simultaneously, both allow, and you end up at 101.
+- At 100K RPS, Redis latency matters. I would use Redis Cluster with hash tags to ensure a user's rate limit key always lands on the same shard (`rate:{user123}` uses `{user123}` as the hash slot). Expected overhead: 0.5-2ms per rate limit check, well within the <10ms budget.
+
+**Red flag answer:** "I'd use a token bucket on each server and sync them periodically." This reveals the candidate does not understand the fundamental distributed problem -- local counters with periodic sync will always under-count during the sync gap, allowing users to exceed limits by a factor of N (number of servers).
+
+**Follow-ups:**
+1. What happens to your sliding window counter accuracy when a user sends all their requests in the last 5 seconds of the previous window and the first 5 seconds of the current window? How bad is the approximation?
+2. Your Redis Cluster has a network partition -- shard 1 is unreachable from half your API servers. What happens to rate limiting for users whose keys live on shard 1, and what is your failover strategy?
+
+---
+
+### Q2: Explain the difference between fail-open and fail-closed for a rate limiter. When would you choose each, and what are the consequences of getting it wrong?
+
+**Strong Answer:**
+- **Fail-open** means: if the rate limiter is down (Redis unavailable, network timeout), allow all requests through. **Fail-closed** means: if the rate limiter is down, reject all requests. The choice is fundamentally a question of which failure mode is more dangerous for your business.
+- For most API endpoints (data fetches, search, content), **fail-open is correct**. The reasoning: a rate limiter outage is temporary, but rejecting 100% of legitimate traffic turns a partial outage into a total outage. If Redis goes down for 60 seconds, you might let through some excess traffic, but your service stays up.
+- For security-critical endpoints, **fail-closed is correct**. Authentication endpoints (login, password reset) must fail closed because an attacker could intentionally DDoS your Redis to disable rate limiting, then brute-force credentials. Same for payment endpoints -- letting through unlimited payment retries during an outage can cause duplicate charges.
+- The practical implementation is a per-route configuration: `rate_limit_config("/api/auth/login", fail_mode="closed")` vs `rate_limit_config("/api/search", fail_mode="open")`. In my experience, about 5-10% of endpoints should fail closed, and the rest fail open.
+- What most people miss: you also need a **local fallback rate limiter** for the fail-open case. Not a full distributed limiter, but a per-server in-memory token bucket with a conservative limit (say, 1/N of the global limit where N is server count). This prevents a complete free-for-all during Redis outages.
+
+**Red flag answer:** "Always fail open for availability" -- this shows the candidate has not thought about security implications. Or "always fail closed for safety" -- this shows they have not thought about availability implications. The correct answer is always "it depends on the endpoint," and a strong candidate will immediately bifurcate the answer.
+
+**Follow-ups:**
+1. You chose fail-open for your main API, and Redis goes down for 10 minutes during a traffic spike. A single user sends 50,000 requests in that window. What downstream damage could that cause, and how do you mitigate it without fail-closed?
+2. How would you implement the local fallback rate limiter so it is roughly fair across servers without any coordination?
+
+---
+
+### Q3: Your Lua script does ZREMRANGEBYSCORE, ZCARD, and ZADD atomically. A junior engineer says "why not just use INCR with EXPIRE -- it is simpler." Walk me through the race condition they are missing and how Lua scripts solve it.
+
+**Strong Answer:**
+- The INCR + EXPIRE approach has a subtle but critical race condition. The pattern is: `INCR key` (returns count), then if count equals 1, `EXPIRE key 60`. The problem: if the process crashes or the network drops **between** the INCR and the EXPIRE, the key now has no TTL. It lives forever. That user is permanently rate-limited until someone manually deletes the key.
+- Even worse, there is a second race condition with separate GET + INCR. If two requests from the same user arrive at the same millisecond, both do GET (returns 99), both check 99 < 100, both do INCR, and the count ends up at 101. You have allowed an over-limit request.
+- **Lua scripts solve both problems** because Redis executes the entire script atomically -- no other command can interleave. The script checks the count AND increments in one indivisible operation. It is like a database transaction but with zero overhead because Redis is single-threaded and executes Lua in the same thread.
+- One important nuance: Lua scripts block the entire Redis instance while executing. A poorly written script (say, one that iterates over thousands of keys) can stall all Redis operations. For rate limiting, this is fine because the script is O(log N) for sorted set operations, completing in microseconds. But it is a footgun if someone adds "helpful" features to the script.
+- The alternative to Lua is Redis transactions (MULTI/EXEC with WATCH), but WATCH-based optimistic locking requires retry loops and is more complex to get right. For rate limiting, Lua is the standard approach.
+
+**Red flag answer:** "Just use INCR, it is atomic." INCR alone is atomic, yes, but the multi-step check-count-then-increment flow is not. Candidates who miss this do not understand the difference between a single atomic operation and a sequence of operations that needs to be atomic as a group.
+
+**Follow-ups:**
+1. Your Lua script takes 200 microseconds to execute. At 50K rate-limit checks per second on a single Redis instance, what percentage of Redis capacity does the rate limiter consume? When should you start worrying?
+2. Redis 7 introduced Functions as a Lua alternative. What are the tradeoffs compared to EVALSHA-based Lua scripts for rate limiting?
+
+---
+
+### Q4: A product manager asks you to support "100 requests per minute AND 1000 requests per hour AND 10,000 requests per day" for the same user. How do you implement multi-window rate limiting without making 3 separate Redis round-trips per request?
+
+**Strong Answer:**
+- The naive approach is three separate rate limit checks (one per window), which triples your Redis latency. At scale, that 0.5ms check becomes 1.5ms, which matters when you are processing 100K+ RPS.
+- The efficient approach is a **single Lua script that checks all three windows atomically**. The script takes three key-limit pairs, increments all three counters, checks all three limits, and returns the result in one round-trip. If any limit is exceeded, none of the counters are incremented (or you roll back). This gives you atomicity across windows AND single round-trip latency.
+- An alternative is **Redis pipelining** -- send all three INCR commands in a single pipeline. This is one network round-trip but technically three operations. The trade-off: pipelining is simpler but not atomic. If the minute limit passes but the hour limit fails, you have already incremented the minute counter. For most use cases, this small inaccuracy is acceptable.
+- The key design decision is **which window should be the "primary" response to the client**. When the user is within their minute limit but has hit their daily limit, you should return the daily reset time in the `Retry-After` header, not the minute reset time. Getting this wrong means clients retry every 60 seconds and keep getting rejected for hours.
+- In the implementation, I would use Redis hash tags to colocate all three keys on the same shard: `rate:{user123}:minute`, `rate:{user123}:hour`, `rate:{user123}:day`. The `{user123}` ensures same-slot placement in Redis Cluster, which is required for multi-key Lua scripts.
+
+**Red flag answer:** "Just make three separate calls, Redis is fast enough." At small scale, sure. But this shows the candidate does not think about compounding latency at scale. Three 0.5ms calls at 100K RPS means 300K Redis operations per second just for rate limiting -- that is a significant fraction of Redis throughput.
+
+**Follow-ups:**
+1. Your multi-window Lua script works, but now the product manager wants to add a per-endpoint limit on top of the per-user limits. How does your data model and key structure change?
+2. A user has 999/1000 hourly requests remaining but only 1/100 minute requests remaining. What should the `X-RateLimit-Remaining` header show, and what should `Retry-After` be?
+
+---
+
+### Q5: Your rate limiter uses Redis, but you discover 5% of requests experience >50ms latency spikes due to Redis. How do you diagnose and fix this without removing the centralized counter?
+
+**Strong Answer:**
+- First, I would **diagnose the source of the spikes**. The top causes of Redis latency spikes are: (1) slow commands like KEYS or large ZRANGEBYSCORE, (2) Redis persistence (RDB snapshots or AOF rewrite causing fork latency), (3) network latency between app servers and Redis, (4) memory pressure causing swap, (5) noisy neighbors if using cloud-hosted Redis.
+- For a rate limiter specifically, I would check: Are the sorted sets growing too large? If you are using the sliding window log algorithm with high-traffic users, a single sorted set could have thousands of entries, making ZRANGEBYSCORE slow. The fix: switch to sliding window counter (O(1) per check).
+- **Practical fixes in priority order**: (1) Switch from RDB snapshots to AOF-only if persistence is needed, or disable persistence entirely for rate limit data (it is ephemeral). Fork during snapshot causes 50-200ms pauses. (2) Use `redis-cli --latency-history` to profile. (3) Deploy Redis on dedicated instances, not shared with other workloads. (4) Add a **local L1 cache** with a short TTL (100ms) -- if the same user sends 10 requests in 100ms, only the first hits Redis and the rest use the cached result. This reduces Redis load by 50-80% for bursty traffic.
+- The nuclear option: **split rate limiting into a two-tier architecture**. L1 is an in-memory approximate limiter (token bucket per server, allows up to `limit / num_servers` per window). L2 is Redis for exact counts, checked asynchronously or on a sampling basis. This sacrifices some accuracy for latency guarantees.
+
+**Red flag answer:** "Add more Redis replicas." Read replicas do not help because rate limiting requires writes (INCR). The candidate is confusing read-scaling with write-scaling. Or "just increase the timeout" -- masking latency is not fixing it.
+
+**Follow-ups:**
+1. You implement the local L1 cache, but now your rate limits are slightly less accurate. How would you quantify the accuracy loss and decide if it is acceptable?
+2. Your Redis cluster is in us-east-1, but 30% of your API traffic comes from eu-west-1 (cross-region latency ~80ms). How do you handle rate limiting for European users without deploying a separate Redis cluster?
+
+---
+
+### Q6: An attacker is using a botnet with 10,000 different IP addresses to bypass your per-IP rate limiter. Each IP stays under the limit individually, but collectively they are overwhelming your service. How do you detect and mitigate this?
+
+**Strong Answer:**
+- This is a **distributed denial-of-service (DDoS) scenario** that per-IP rate limiting fundamentally cannot handle. The attacker stays under the per-IP limit (say, 100 req/min per IP), but 10,000 IPs times 100 req/min equals 1M req/min total.
+- **Layer 1 - Global rate limiting**: In addition to per-IP limits, implement a global throughput limit per endpoint. If `/api/search` normally gets 50K req/min and suddenly spikes to 1M, apply backpressure regardless of individual IP behavior.
+- **Layer 2 - Behavioral fingerprinting**: Botnets often share patterns even with unique IPs. Look for: identical User-Agent strings, similar request timing patterns, same API call sequences, requests from the same ASN (autonomous system number) or /24 subnet. Aggregate rate limits by these dimensions: "no more than 10,000 req/min from ASN 12345."
+- **Layer 3 - Adaptive rate limiting**: Use a sliding window to track request patterns and automatically tighten limits when anomalies are detected. If the 95th percentile response time starts climbing, progressively reduce the global rate limit until the system stabilizes.
+- **Layer 4 - Challenge-based mitigation**: For suspicious traffic, insert challenges: CAPTCHAs, JavaScript challenges (bots cannot execute JS), or proof-of-work puzzles. This is what Cloudflare does -- legitimate users solve the challenge once and get a cookie; bots cannot scale this.
+- In practice, most companies do not build this themselves. They use Cloudflare, AWS WAF, or Akamai for L3/L7 DDoS protection and focus their custom rate limiter on business logic (per-user, per-tier, per-API-key limits).
+
+**Red flag answer:** "Just block all the IPs." With 10,000 IPs, you are playing whack-a-mole. The attacker rotates IPs faster than you can block them. Or "lower the per-IP rate limit" -- this punishes legitimate users behind NATs (offices, universities) who legitimately share IPs.
+
+**Follow-ups:**
+1. Your global rate limit triggers during a legitimate viral event (your service was featured on a popular news site). How do you distinguish a real traffic spike from an attack without blocking real users?
+2. The attacker adapts and starts randomizing User-Agent strings and request patterns. What is your next line of defense?
+
+---
+
+### Q7: Compare implementing rate limiting at the API Gateway layer versus as a sidecar proxy (like Envoy) versus as application middleware. What are the operational trade-offs of each?
+
+**Strong Answer:**
+- **API Gateway (Kong, AWS API Gateway, Apigee)**: Rate limiting runs before the request reaches your services. Pros: single enforcement point, language-agnostic, can reject requests before consuming any backend resources. Cons: the gateway becomes a single point of failure and a scaling bottleneck. If the gateway goes down, everything goes down. Also, the gateway typically cannot access application-level context (user tier, subscription status) without an additional lookup.
+- **Sidecar proxy (Envoy, Istio)**: Each service instance has its own proxy that enforces rate limits. Pros: decentralized (no single point of failure), can apply service-specific limits, integrates with service mesh for observability. Cons: every pod now runs an extra process consuming CPU and memory. Configuration is distributed across many proxies, making global rate limit changes harder. Envoy supports global rate limiting via an external rate limit service (typically backed by Redis), which reintroduces the centralized dependency.
+- **Application middleware (Express middleware, Django middleware)**: Rate limiting code runs inside your application. Pros: full access to request context (user identity, subscription tier, request payload), easiest to customize per-endpoint logic. Cons: every service team must implement and maintain it, inconsistent enforcement across services, and the request has already consumed connection and parsing resources before being rejected.
+- **My recommendation**: API Gateway for coarse-grained limits (per-IP, per-API-key), application middleware for fine-grained limits (per-user-tier, per-endpoint business rules). The gateway handles the 90% case and protects against abuse; the application handles the 10% that requires business logic.
+
+**Red flag answer:** "Always put it in the API Gateway because it is the single entry point." This ignores internal service-to-service traffic, which also needs rate limiting but does not go through the external gateway. A complete answer addresses both north-south and east-west traffic.
+
+**Follow-ups:**
+1. You have 50 microservices and service A calls service B at a rate that overwhelms B during peak hours. Service B is not exposed externally. How do you rate-limit this internal traffic?
+2. Your API Gateway is AWS API Gateway (managed), and you discover its built-in rate limiting only supports fixed-window counters. How do you add sliding-window accuracy without replacing the gateway?
+
 ## Quick Reference Card
 
 ```
@@ -577,6 +744,16 @@ return count
 │  • ZADD set score    - sorted set (sliding log)                │
 │  • ZREMRANGEBYSCORE  - clean old entries                       │
 │  • ZCARD set         - count entries                           │
+│                                                                 │
+│  Interview power moves:                                        │
+│  • "Should we fail open or closed? It depends on the          │
+│     endpoint -- auth endpoints fail closed, data endpoints     │
+│     fail open."                                                │
+│  • "The sliding window counter gives us O(1) memory per user  │
+│     with accuracy within ~1% of the exact count."              │
+│  • "We should layer limits: IP-based for unauthenticated,     │
+│     API key for authenticated, and account-level for cross-key │
+│     limits."                                                   │
 │                                                                 │
 └─────────────────────────────────────────────────────────────────┘
 ```

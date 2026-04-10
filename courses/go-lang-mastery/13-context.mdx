@@ -9,6 +9,8 @@ icon: "clock"
 
 The `context` package is essential for production Go. It provides a standardized way to carry deadlines, cancellation signals, and request-scoped values across API boundaries and between goroutines.
 
+Think of context as a "request passport" that travels with every function call in a request's lifecycle. When a user cancels their browser request, that cancellation ripples through your HTTP handler, down to your database query, and out to any external API calls -- all because each layer checks the same context. Without context, you would need to manually wire cancellation signals through every function, which is error-prone and messy.
+
 ## Why Context?
 
 In real-world applications, you need to:
@@ -620,3 +622,46 @@ func (s *OrderService) Handler(w http.ResponseWriter, r *http.Request) {
 | `context.WithValue()` | Attach request-scoped data |
 | `context.WithCancelCause()` | Cancellation with reason (Go 1.20+) |
 | `context.AfterFunc()` | Schedule cleanup (Go 1.21+) |
+
+---
+
+## Interview Deep-Dive
+
+<AccordionGroup>
+  <Accordion title="Why should you never store a context.Context in a struct field? What problems does this cause, and what is the correct pattern?">
+    **Strong Answer:**
+    - Context represents the lifetime and cancellation scope of a single request or operation. Storing it in a struct field decouples the context from the call chain, creating two problems. First, lifecycle ambiguity: the context might be cancelled (because the original request finished) while the struct is still alive and being used for a different request. Second, stale contexts: if the struct is reused across requests (like a service singleton), the stored context from the first request would be used for all subsequent requests, which is both logically wrong and can cause premature cancellation.
+    - The correct pattern is to pass context as the first parameter of every function that needs it: `func (s *Service) CreateOrder(ctx context.Context, order *Order) error`. The context flows through the call chain, and each function can derive child contexts (with timeout, with values) as needed. When the request ends, the context is cancelled, and all derived contexts are cancelled too.
+    - The one exception is when a struct represents a single operation with a defined lifetime, like an `http.Request` which carries its own context via `r.Context()`. But even there, the context is accessed via a method, not used directly as a field. The `net/http` package set this precedent intentionally.
+    - In practice, if you find yourself wanting to store a context, it usually means your struct's lifetime does not match the context's lifetime. Restructure so the context is passed through function parameters instead.
+
+    **Follow-up: What happens if you forget to call the cancel function returned by `context.WithTimeout`?**
+
+    The timer goroutine that manages the timeout continues running until the parent context is cancelled or the program exits. This is a goroutine and memory leak. Each uncancelled timeout context keeps its timer goroutine alive, accumulating over time. In a high-throughput HTTP server handling 10,000 requests per second, forgetting `defer cancel()` would leak 10,000 goroutines per second, each waiting for their timeout to expire. Even after the timeout fires, the context's resources are not fully freed until cancel is called. This is why `go vet` warns about uncancelled contexts and why the idiomatic pattern is always `ctx, cancel := context.WithTimeout(parentCtx, duration); defer cancel()` -- the defer ensures cancel runs even on early return or panic.
+  </Accordion>
+
+  <Accordion title="Design a middleware that adds a request ID to the context and makes it available to all downstream handlers and services. Explain your key design decisions.">
+    **Strong Answer:**
+    - The middleware extracts or generates a request ID, attaches it to the context using `context.WithValue`, and passes the enriched context downstream. Key design decisions:
+    - First, use an unexported struct type as the context key, not a string. String keys risk collision: two packages using `context.WithValue(ctx, "requestID", ...)` would overwrite each other. An unexported struct type like `type requestIDKey struct{}` is globally unique because it belongs to your package and cannot be referenced from outside.
+    - Second, provide exported accessor functions: `func WithRequestID(ctx context.Context, id string) context.Context` and `func RequestID(ctx context.Context) string`. These encapsulate the key type and provide a clean API. The getter should return a sensible default (empty string or "unknown") if the value is not present, rather than panicking.
+    - Third, check for an existing request ID in the incoming request headers (like `X-Request-ID` or `X-Trace-ID`). If present, use it -- this enables distributed tracing across services. If absent, generate a new UUID. This way the same request ID follows a request through your entire microservice chain.
+    - Fourth, add the request ID to the structured logger in the same middleware, so every log line in the request's lifecycle includes it. This makes correlating logs across a request trivial: grep for the request ID and you see the full story.
+
+    **Follow-up: Context values are often criticized. What are the legitimate use cases versus the anti-patterns?**
+
+    Legitimate uses: request-scoped metadata that crosses API boundaries without being part of the function signature -- request IDs, trace IDs, authentication claims, and deadline information. These are truly cross-cutting concerns that every function in the chain might need but that should not pollute business logic signatures. Anti-patterns: using context values to pass optional function parameters (use functional options or config structs instead), storing mutable state in context (context values should be immutable), passing dependencies through context (use constructor injection). The rule of thumb: context values should be data that originates from the request and is consumed by infrastructure (logging, tracing, auth), not data that is part of the business logic. If removing the context value would change the function's behavior (not just its logging), it probably should be a regular parameter.
+  </Accordion>
+
+  <Accordion title="A function creates a child context with a 5-second timeout, but the parent context has a 2-second timeout. What happens, and why?">
+    **Strong Answer:**
+    - The child context inherits the parent's deadline. Since the parent expires in 2 seconds, the child will also be cancelled at 2 seconds, even though you requested 5 seconds. `context.WithTimeout` creates a context that expires at the earlier of: the parent's deadline or now + the specified duration. It never extends the parent's deadline.
+    - This is by design. A child context can only narrow the constraints (shorter timeout, additional values), never widen them. If the parent says "this request must complete in 2 seconds," no child can override that to say "actually, I need 5 seconds." This ensures that cancellation always propagates downward and timeout guarantees are always honored.
+    - You can check the effective deadline with `ctx.Deadline()`. The function returns the actual deadline and a boolean indicating whether one exists. A well-designed function that needs a minimum amount of time should check the remaining time before starting expensive work: `if deadline, ok := ctx.Deadline(); ok && time.Until(deadline) < minRequired { return ErrInsufficientTime }`.
+    - In production, this behavior sometimes surprises developers who set generous timeouts on database queries but forget that the HTTP handler's context has a tighter timeout. The database query context is derived from the request context, so the handler's timeout wins. The fix is to set appropriate timeouts at each level, understanding that the tightest timeout in the chain always dominates.
+
+    **Follow-up: When would you use `context.Background()` instead of passing the parent context, and is this ever acceptable in production?**
+
+    Use `context.Background()` for operations that must complete regardless of the original request's lifecycle. The classic example: a payment was successfully charged but the database save failed. You need to issue a refund, and that refund must happen even if the HTTP request was cancelled. Using `context.Background()` (or `context.WithTimeout(context.Background(), 30*time.Second)`) ensures the refund is not cancelled when the request context expires. Other legitimate uses: background cleanup goroutines, periodic tasks (health checks, metrics flushing), and shutdown operations. The key principle: use the request context for work that is part of the request, use `context.Background()` for work that must survive the request. If you find yourself using `context.Background()` in a handler's main logic path, that is a code smell -- it means you are bypassing the request's cancellation semantics.
+  </Accordion>
+</AccordionGroup>

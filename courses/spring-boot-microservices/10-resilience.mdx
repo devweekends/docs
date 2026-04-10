@@ -116,3 +116,68 @@ It creates separate thread pools for different calls. If the "Image Processing" 
 - **Retry:** Try again for temporary glitches.
 - **Rate Limiter:** Control traffic flow.
 - **Bulkhead:** Isolate failures.
+
+---
+
+## Interview Deep-Dive
+
+<AccordionGroup>
+  <Accordion title="Explain the circuit breaker state machine in detail. How does the sliding window work, and what is the difference between count-based and time-based sliding windows in Resilience4j?">
+    **Strong Answer:**
+
+    - The circuit breaker has three states: CLOSED (normal, requests pass through), OPEN (tripped, requests fail immediately with fallback), and HALF_OPEN (testing, a limited number of requests are allowed through to probe whether the downstream service has recovered).
+    - In CLOSED state, every call's outcome (success or failure) is recorded in a sliding window. When the failure rate in the window exceeds the threshold (e.g., 50%), the circuit transitions to OPEN.
+    - Count-based sliding window (`slidingWindowType: COUNT_BASED`): a fixed-size ring buffer (e.g., last 10 calls). After 10 calls, if 5+ failed, the circuit opens. Advantage: simple, deterministic. Disadvantage: if traffic is low (1 call per minute), it takes 10 minutes to fill the window, so the circuit reacts slowly. Also, 2 failures out of 3 calls (66%) will not trip it if the window is 10 because only 3 of 10 slots are filled -- Resilience4j requires `minimumNumberOfCalls` to be met first.
+    - Time-based sliding window (`slidingWindowType: TIME_BASED`): aggregates calls within a time period (e.g., last 60 seconds). It uses partial aggregations per second for efficiency. Advantage: reacts based on real failure rate over time, regardless of traffic volume. Disadvantage: during traffic spikes, many calls are aggregated, and a short burst of errors (caused by a deploy, not a real outage) can trip the circuit prematurely.
+    - In OPEN state, all calls are rejected immediately (no network call to the downstream service). After `waitDurationInOpenState` (e.g., 5 seconds), it transitions to HALF_OPEN.
+    - In HALF_OPEN, `permittedNumberOfCallsInHalfOpenState` (default: 10) calls are allowed through. If the failure rate is below the threshold, the circuit closes. Otherwise, it reopens. This is the "probe" phase.
+
+    **Follow-up: How do you design a good fallback method? What makes a fallback "good" vs. "harmful"?**
+
+    A good fallback returns degraded but useful data. Examples: return cached data (last known product price), return a default value (show "temporarily unavailable" instead of crashing the page), return a subset of results (show products without reviews if the Review Service is down). A harmful fallback hides a real problem. Example: the fallback for a payment service returns `PaymentResult.SUCCESS` -- now you are shipping products without charging customers. Every fallback should be explicitly designed with the product team. Ask: "If this service is down, what is the least harmful thing we can show the user?" Also, fallbacks should be monitored. If the fallback is firing 1000 times per minute, that is an alert -- the circuit is open and staying open. Log every fallback invocation with the exception that triggered it.
+  </Accordion>
+
+  <Accordion title="You have a retry configured with 3 attempts and a circuit breaker on the same method. What is the interaction between them? Does order matter?">
+    **Strong Answer:**
+
+    - The order matters critically, and Resilience4j applies decorators in a specific sequence. The default order (outermost to innermost) is: Bulkhead -> TimeLimiter -> RateLimiter -> CircuitBreaker -> Retry -> the actual method call.
+    - With this default order, Retry is INSIDE CircuitBreaker. This means: when the circuit is CLOSED, each call attempt triggers the method. If it fails, Retry retries up to 3 times. The circuit breaker sees each retry as a separate call. So one user request with 3 retries counts as 3 calls against the circuit breaker's sliding window. If `slidingWindowSize` is 10 and one user's request exhausts 3 attempts, that is 30% of the window filled by one request.
+    - If you reverse the order (CircuitBreaker inside Retry), the retry wraps the circuit breaker. When the circuit is OPEN, the first call hits the circuit breaker, gets rejected immediately, and the retry... retries against an open circuit. This is pointless -- you retry 3 times and all 3 fail instantly without ever reaching the downstream service.
+    - The correct pattern for most use cases: Retry inside CircuitBreaker (the default). This way, retries try to reach the actual service, and the circuit breaker aggregates all attempts. But you must account for the amplification: if `maxAttempts=3` and `slidingWindowSize=10`, it only takes 4 user requests (12 call attempts, all failing) to trip a 50% failure threshold.
+    - Important: configure retry to only retry on specific exceptions (e.g., `ConnectException`, `TimeoutException`), not on all exceptions. Retrying a 400 Bad Request is pointless and wastes resources.
+
+    **Follow-up: How do you prevent retries from overwhelming a recovering downstream service?**
+
+    Use exponential backoff with jitter. Instead of retrying immediately (which creates a thundering herd when the service comes back up), wait 100ms, then 200ms, then 400ms with random jitter (+/- 50ms). This spreads retry attempts over time and prevents all callers from hammering the recovering service simultaneously. In Resilience4j: `waitDuration: 500ms` with `IntervalFunction.ofExponentialRandomBackoff()`. Also, combine retries with the circuit breaker's half-open state -- when the circuit is in HALF_OPEN, only `permittedNumberOfCallsInHalfOpenState` requests probe the downstream service. This naturally limits the recovery load.
+  </Accordion>
+
+  <Accordion title="Explain the Bulkhead pattern. What is the difference between thread pool isolation and semaphore isolation, and when would you use each?">
+    **Strong Answer:**
+
+    - The Bulkhead pattern isolates resources so that a failure in one dependency does not exhaust resources shared with other dependencies. Named after ship compartments: if one compartment floods, the bulkhead walls prevent the flood from spreading to the entire ship.
+    - Thread pool isolation: each dependency gets its own thread pool. Calls to the Inventory Service run on a pool of 10 threads. Calls to the Payment Service run on a separate pool of 10 threads. If Inventory is slow and all 10 threads are blocked, the Payment pool is unaffected. Advantage: true isolation, slow calls do not consume the caller's threads (the request thread submits work to the pool and waits or gets a Future). Disadvantage: overhead of thread context switching, limited by system thread capacity, and the calling thread still blocks waiting for the pool's result (unless you use async).
+    - Semaphore isolation: uses a semaphore (counter) to limit concurrent calls. No separate thread pool -- the call runs on the caller's thread. If the semaphore count is 10 and 10 calls are in progress, the 11th call is rejected immediately. Advantage: zero thread overhead, lower latency. Disadvantage: a slow call blocks the caller's thread directly. If those are Tomcat request threads, you are still at risk of thread exhaustion.
+    - Use thread pool isolation when: calls are slow or have high variance in latency (third-party APIs, batch processing). The separate pool prevents slow calls from consuming request threads.
+    - Use semaphore isolation when: calls are fast and predictable (in-memory cache lookups, local service calls). The overhead of a separate thread pool is not worth the isolation benefit for sub-millisecond calls.
+    - Resilience4j defaults to semaphore isolation. Hystrix (now deprecated) defaulted to thread pool isolation. This is one of the key philosophical differences between the two libraries.
+
+    **Follow-up: How does the Bulkhead interact with the circuit breaker? If the bulkhead rejects a request, does it count as a failure for the circuit breaker?**
+
+    Yes, by default a `BulkheadFullException` (request rejected because the bulkhead is at capacity) propagates to the circuit breaker and counts as a failure. This can cause a cascading effect: the bulkhead fills up due to a slow downstream service, the rejections trip the circuit breaker, and now even when the bulkhead has capacity, the circuit is open and rejecting everything. To handle this, configure the circuit breaker to ignore `BulkheadFullException`: `resilience4j.circuitbreaker.instances.myService.ignoreExceptions=io.github.resilience4j.bulkhead.BulkheadFullException`. This way, the circuit breaker only opens based on actual downstream failures, not local resource exhaustion.
+  </Accordion>
+
+  <Accordion title="A cascading failure just took down three of your microservices. Walk me through how you would have prevented it and how you would investigate after the fact.">
+    **Strong Answer:**
+
+    - Cascading failure anatomy: Service A calls Service B synchronously. Service B calls Service C. Service C's database is overloaded and responds slowly (30-second queries instead of 50ms). Service B's thread pool fills up waiting for C. Service A's thread pool fills up waiting for B. All three services become unresponsive. Meanwhile, health checks fail, the orchestrator restarts pods, the restarting pods create connection storms against the database, and the situation worsens.
+    - Prevention layer 1 -- Timeouts: Every outbound call must have a timeout. No exceptions. If the default is "infinity" (which it is for many HTTP clients), you are one slow dependency away from disaster. Set aggressive timeouts: 2-5 seconds for service-to-service calls, 500ms for cache lookups.
+    - Prevention layer 2 -- Circuit breakers: When Service B detects that 50% of calls to Service C are failing (or timing out), the circuit opens. Service B returns a fallback instantly instead of waiting. Service A never even knows C is struggling.
+    - Prevention layer 3 -- Bulkheads: Service B uses separate thread pools for calling Service C and Service D. Even if the C pool is exhausted, calls to D still work. Service B is degraded, not dead.
+    - Prevention layer 4 -- Async where possible: If Service A's call to Service B is for a side effect (send notification), make it async via a message queue. Service A publishes an event and moves on. Service B's problems never block A.
+    - Post-incident investigation: use distributed tracing (Zipkin/Jaeger). Find the trace ID for a failed request. The trace shows the full call chain with latency at each hop. You will see Service C's span took 30 seconds, which caused B's span to timeout, which caused A's span to fail. Then check C's metrics in Grafana: database connection pool utilization spiked to 100%, query latency P99 went from 50ms to 30s. Root cause: a missing index on a new query deployed to Service C 20 minutes before the incident.
+
+    **Follow-up: How do you set appropriate timeout values? What is the relationship between timeout, retry, and circuit breaker durations?**
+
+    Start with P99 latency measurements. If Service C normally responds in 50ms and its P99 is 200ms, set the timeout at 500ms-1s (2-5x P99). This catches genuine slowness without false-positiving on normal variance. For retries: `maxAttempts * (timeout + backoffDelay)` must be less than the caller's timeout. If A's timeout for B is 3 seconds, and B retries C with 500ms timeout and 200ms backoff, then B can do `3 retries * (500ms + 200ms) = 2.1s`, leaving 900ms for B's own processing. For the circuit breaker: `waitDurationInOpenState` should be long enough for the downstream service to recover (30-60 seconds for most services), but short enough that the circuit tests recovery promptly. These values should be tuned based on production metrics, not guessed.
+  </Accordion>
+</AccordionGroup>

@@ -28,6 +28,8 @@ Understanding PostgreSQL's architecture is essential for debugging production is
 
 PostgreSQL uses a **multi-process architecture** where each client connection gets its own backend process.
 
+**Real-world analogy**: Think of a restaurant. The Postmaster is the host who greets every guest at the door and assigns them a dedicated waiter (backend process). Each waiter handles one table exclusively -- if a waiter drops a tray, the other tables keep eating. The kitchen staff (auxiliary processes) work behind the scenes: one person washes dishes (Background Writer), another restocks the pantry (Checkpointer), a third writes down every order in the logbook before the kitchen starts cooking (WAL Writer). This isolation-by-process design is why PostgreSQL can survive a crash in one connection without bringing down the whole server.
+
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
 │                    POSTGRESQL PROCESS MODEL                                  │
@@ -139,25 +141,38 @@ PostgreSQL uses a **multi-process architecture** where each client connection ge
 ```sql
 -- For a 32GB server
 
--- Shared memory (all backends share)
-shared_buffers = 8GB                  -- 25% of RAM
-effective_cache_size = 24GB           -- RAM available for caching (hint to planner)
-wal_buffers = 64MB                    -- Auto-tuned based on shared_buffers
+-- Shared memory (all backends share this single pool)
+shared_buffers = 8GB                  -- 25% of RAM: the "hot data cache" all backends read from.
+                                      -- Why 25%? The OS file cache handles the rest. Going higher
+                                      -- (e.g., 50%) starves the OS cache and often hurts performance.
+effective_cache_size = 24GB           -- NOT an allocation -- just a hint to the planner about how much
+                                      -- total RAM (shared_buffers + OS cache) is available for caching.
+                                      -- Setting this too low makes the planner avoid index scans.
+wal_buffers = 64MB                    -- Auto-tuned based on shared_buffers. Buffer for WAL records
+                                      -- before they're flushed to disk. Rarely needs manual tuning.
 
--- Per-backend memory
-work_mem = 256MB                      -- Per sort/hash, be careful!
-maintenance_work_mem = 1GB            -- VACUUM, CREATE INDEX
-temp_buffers = 32MB                   -- Temp tables
+-- Per-backend memory (MULTIPLIED by every connection!)
+work_mem = 256MB                      -- Memory for each sort/hash operation within a single query.
+                                      -- A complex query with 4 sorts uses 4 x 256MB = 1GB per backend.
+maintenance_work_mem = 1GB            -- Used by VACUUM, CREATE INDEX, ALTER TABLE ADD FK.
+                                      -- Can be set higher than work_mem because these run less often.
+temp_buffers = 32MB                   -- Cache for temporary tables. Only allocated when temp tables
+                                      -- are actually used, so the cost is low in practice.
 
--- Danger: work_mem × connections × operations!
--- 100 connections × 4 sorts × 256MB = 100GB overflow!
+-- PITFALL: work_mem is per-operation, not per-connection!
+-- 100 connections x 4 sorts x 256MB = 100GB -- far more than your 32GB server has.
+-- In production, start with work_mem = 16-64MB and increase only for specific
+-- sessions running large analytical queries:
+--   SET LOCAL work_mem = '512MB';  -- Only affects this transaction
 ```
 
 ---
 
 ## 9.3 Buffer Pool Management
 
-The buffer pool is the heart of PostgreSQL's I/O system.
+The buffer pool is the heart of PostgreSQL's I/O system. It sits between your queries and the disk, caching frequently-accessed 8KB pages in RAM so the database avoids slow disk reads.
+
+**Real-world analogy**: The buffer pool is like the counter at a busy pharmacy. The pharmacist (backend process) doesn't walk to the warehouse (disk) for every prescription. Instead, the most requested medicines sit on the counter (buffer pool). When a medicine is requested, the pharmacist checks the counter first. If it's there (a "buffer hit"), they hand it over instantly. If not (a "buffer miss"), they fetch it from the warehouse and place it on the counter for next time -- bumping a less-popular item off the limited counter space.
 
 ### Buffer Architecture
 
@@ -533,3 +548,48 @@ src/backend/
 <Card title="Module 10: Replication & HA" icon="arrow-right" href="/courses/database-engineering/replication">
   Build highly available PostgreSQL systems
 </Card>
+
+---
+
+## Interview Deep-Dive (Conversational)
+
+<AccordionGroup>
+  <Accordion title="You said shared_buffers should be 25% of RAM. What happens if you set it to 75%? And why is not 'more cache = better' true here?">
+    **Strong Answer:**
+
+    - Setting shared_buffers to 75% of RAM will likely degrade performance rather than improve it, because PostgreSQL relies on a double-buffering architecture. When PostgreSQL reads a page from disk, that page exists in both the OS page cache AND in shared_buffers. The OS page cache acts as a second-level cache that is managed by the kernel's LRU algorithm, which is often more sophisticated than PostgreSQL's clock-sweep.
+    - At 75% of RAM for shared_buffers, the OS has very little memory left for its own page cache, for work_mem allocations, for maintenance_work_mem during VACUUM/CREATE INDEX, and for the per-backend private memory (5-10MB each). The system starts swapping, or the OS reclaims pages aggressively, and performance collapses.
+    - The 25% guideline exists because the remaining 75% is used by: OS page cache (~50% of RAM effectively), work_mem for sorts and hash operations across all backends, maintenance_work_mem for autovacuum workers, and per-backend overhead. The effective_cache_size parameter (typically 75% of RAM) tells the planner about the total cache available (shared_buffers + OS cache) without actually allocating that memory.
+    - Exception: very large dedicated database servers (256GB+ RAM) may benefit from slightly higher shared_buffers (30-40%) because the absolute amount left for the OS cache is still very large. But always benchmark -- the Pareto optimal is remarkably consistent at 25%.
+
+    **Follow-up: How would you diagnose whether shared_buffers is too small for your workload?**
+
+    Check the buffer cache hit ratio: `SELECT sum(blks_hit) / nullif(sum(blks_hit) + sum(blks_read), 0) FROM pg_stat_database`. Below 99% on a well-tuned OLTP system indicates the working set does not fit in cache. Also install pg_buffercache extension and check which relations consume the most buffer space -- if critical tables are being evicted, shared_buffers may be undersized for your working set.
+  </Accordion>
+
+  <Accordion title="Explain the autovacuum subsystem. Why does it exist, what happens when it falls behind, and how do you tune it for a high-write workload?">
+    **Strong Answer:**
+
+    - Autovacuum exists because PostgreSQL's MVCC creates dead tuples on every UPDATE and DELETE. Without cleanup, tables grow without bound, indexes bloat, and eventually the 32-bit transaction ID wraps around, forcing the database to shut down. Autovacuum is not optional -- it is a core component of PostgreSQL's correctness guarantee.
+    - When it falls behind: the symptoms cascade. Dead tuples accumulate, causing table bloat (sequential scans read more pages), index bloat (index lookups traverse more pages), and eventually the `autovacuum_freeze_max_age` threshold triggers an aggressive "anti-wraparound" vacuum that cannot be cancelled, causing I/O storms. At its worst, the database refuses new transactions with `WARNING: database must be vacuumed within X transactions`.
+    - Tuning for high-write workloads: (1) Increase `autovacuum_max_workers` from 3 to 5-6. (2) Reduce `autovacuum_vacuum_scale_factor` to 0.01 on high-churn tables (vacuum after 1% of rows are dead instead of 20%). (3) Increase `autovacuum_vacuum_cost_limit` from 200 to 1000-2000 to let vacuum do more work before sleeping. (4) Reduce `autovacuum_naptime` from 1min to 15s for faster reaction. (5) Set per-table settings on the busiest tables: `ALTER TABLE events SET (autovacuum_vacuum_scale_factor = 0.005, autovacuum_vacuum_cost_limit = 2000)`.
+    - Monitor: watch `n_dead_tup` and `last_autovacuum` in pg_stat_user_tables. Alert when n_dead_tup exceeds n_live_tup on any table, or when last_autovacuum is more than 1 hour ago on a high-write table.
+
+    **Follow-up: What is the relationship between VACUUM and the visibility map?**
+
+    The visibility map tracks which heap pages contain only tuples visible to all current and future transactions (all-visible pages). VACUUM sets bits in the visibility map after cleaning a page. The visibility map enables two optimizations: (1) Index-Only Scans can skip heap fetches for all-visible pages, reading data directly from the index. (2) Future VACUUM runs can skip all-visible pages entirely, dramatically reducing vacuum I/O on tables where most data is cold. This is why frequent vacuum is not just about dead tuple cleanup -- it is also about maintaining the visibility map for index-only scan performance.
+  </Accordion>
+
+  <Accordion title="The checkpointer process just triggered a 'checkpoint too frequent' warning. What is happening and what do you do?">
+    **Strong Answer:**
+
+    - This warning means checkpoints are being triggered by WAL volume (max_wal_size) rather than the configured interval (checkpoint_timeout). The database is generating WAL faster than the checkpoint interval can accommodate, so the system forces early checkpoints to prevent running out of WAL space.
+    - Impact: each checkpoint flushes ALL dirty buffers to disk. Frequent checkpoints mean frequent full I/O flushes, causing latency spikes. They also mean full_page_writes (which happen after each checkpoint) trigger more often, inflating WAL volume further in a vicious cycle.
+    - Fix: increase `max_wal_size` to accommodate the WAL volume generated within one checkpoint_timeout interval. Calculate: check `pg_stat_bgwriter.checkpoints_req` (checkpoints triggered by WAL size) vs `checkpoints_timed` (triggered by timeout). If `checkpoints_req` dominates, double max_wal_size and re-evaluate. A typical production setting for write-heavy workloads is max_wal_size = 4GB-16GB with checkpoint_timeout = 15min.
+    - Also ensure `checkpoint_completion_target = 0.9` so checkpoint I/O is spread over 90% of the interval rather than hitting all at once. And verify that your storage can handle the checkpoint write burst -- if underlying disk I/O is the bottleneck, no amount of tuning will help.
+
+    **Follow-up: What is the tradeoff of setting max_wal_size very high, like 64GB?**
+
+    Recovery time increases. After a crash, PostgreSQL must replay all WAL since the last completed checkpoint. With max_wal_size = 64GB and checkpoint_timeout = 15min, the worst case is replaying 15 minutes of WAL, which could take several minutes. With max_wal_size = 1GB, recovery might take 30 seconds. You are trading write performance (fewer, larger checkpoints) against recovery time (more WAL to replay after crash). The right balance depends on your RTO requirements.
+  </Accordion>
+</AccordionGroup>

@@ -17,6 +17,10 @@ In distributed systems, multiple nodes must agree on:
 
 Without consensus, you get split-brain, data inconsistency, or unavailability.
 
+The real-world analogy: imagine three friends trying to decide on a restaurant over group text, but messages arrive out of order and some get dropped. Alice texts "Let's go to Sushi Place," Bob texts "Let's go to Pizza Place," and Carol's phone dies. When Carol's phone comes back, which restaurant did they agree on? This is the consensus problem -- and it gets dramatically harder when you add the constraint that the friends must *never* show up at different restaurants (safety) while also not waiting forever to decide (liveness).
+
+Understanding consensus at depth is what separates senior from staff-level engineers. Most candidates can say "Raft uses leader election" -- far fewer can explain *why* the leader's log must be at least as up-to-date as any voter's log, or what happens when a leader is elected but has uncommitted entries from a prior term.
+
 ```
 ┌─────────────────────────────────────────────────────────────────┐
 │                    THE CONSENSUS PROBLEM                        │
@@ -47,17 +51,20 @@ Without consensus, you get split-brain, data inconsistency, or unavailability.
 
 > "In an asynchronous network, it's impossible to guarantee consensus if even one node can fail."
 
+This is one of the most important theoretical results in distributed computing, proven by Fischer, Lynch, and Paterson in 1985. It does not mean consensus is impossible in practice -- it means there is no algorithm that *always* terminates in all scenarios. Real systems work around this by using timeouts (which technically assume partial synchrony -- you assume messages arrive *eventually* within some bound, even if you do not know the exact bound).
+
 This means we must make trade-offs:
-- **Paxos/Raft**: Sacrifice liveness for safety (may get stuck, but never wrong)
-- **Eventual Consistency**: Sacrifice strong consistency for availability
+- **Paxos/Raft**: Sacrifice liveness for safety (may get stuck during a partition, but never produce incorrect results -- the system pauses rather than diverges)
+- **Eventual Consistency**: Sacrifice strong consistency for availability (every node responds immediately, but responses may be stale or conflicting, converging over time)
 
 ## Raft Consensus Algorithm
 
-Raft is designed to be understandable (unlike Paxos). It's used in:
-- etcd (Kubernetes)
-- CockroachDB
-- TiKV
-- Consul
+Raft was created by Diego Ongaro and John Ousterhout at Stanford specifically because Paxos was too hard for most engineers to understand and implement correctly. Their 2014 paper explicitly optimized for understandability as a primary design goal -- and it worked. Raft is now the consensus algorithm that powers much of modern infrastructure:
+
+- **etcd** (the coordination layer for Kubernetes -- every K8s cluster runs Raft under the hood)
+- **CockroachDB** (distributed SQL database using Raft for range-level replication)
+- **TiKV** (the storage layer for TiDB, handling millions of Raft groups)
+- **Consul** (HashiCorp's service mesh and service discovery platform)
 
 ### Raft Basics
 
@@ -799,3 +806,73 @@ class FencedLeaderElection(RedisLeaderElection):
 
 **Q: When would you NOT use consensus?**
 > When eventual consistency is acceptable (social feeds, analytics), or when you can tolerate some data loss. Consensus has latency and availability costs.
+
+## Interview Deep-Dive
+
+<AccordionGroup>
+<Accordion title="You are running a 5-node Raft cluster for your metadata store. During a rolling deployment, 2 nodes are briefly down simultaneously. A client reports that writes are failing. Walk me through exactly what is happening and what you would do differently.">
+**Strong Answer:**
+
+A 5-node Raft cluster requires a majority of 3 nodes (N/2 + 1 = 3) to commit any write. With 2 nodes down, you have exactly 3 nodes remaining -- this should still work. But the devil is in the details.
+
+- **If one of the 2 down nodes is the leader**: The remaining 3 nodes will trigger an election after the election timeout (150-300ms). During the election, no writes are accepted. If the rolling deployment bounces nodes quickly (say, 10 seconds each), and the new leader is one of the nodes about to be restarted, you could get a cascade: elect a leader, immediately restart that leader, elect again, restart again. The cluster spends most of its time in election mode, and clients see write failures.
+- **The fix: deployment ordering matters**. Never deploy the current leader first. Check who the leader is (`etcdctl endpoint status`), deploy followers first, wait for each to rejoin and catch up, then finally deploy the leader. The leadership transfer happens once, cleanly.
+- **The deeper mistake**: Taking 2 nodes down simultaneously in a 5-node cluster is operating at the absolute minimum quorum. One more failure and the cluster is unavailable. The right approach for rolling deployments: take down 1 node, wait for it to rejoin and confirm its log is caught up (`match_index` equals leader's `last_log_index`), then proceed to the next. This ensures you are never below N-1 healthy nodes.
+
+**Back-of-envelope for unavailability window**: If each node restart takes 30 seconds and you have 5 nodes, a serial rolling deployment takes 5 * 30 = 150 seconds. During each 30-second window, the cluster operates at 4/5 nodes (safe). With 2 simultaneous, you cut the deployment to 75 seconds but risk availability. The 75-second savings is not worth the risk.
+
+**Follow-up: Your Raft cluster is in steady state, but you notice that write latency is 50ms when it should be 2ms. All 5 nodes are healthy. What do you investigate?**
+
+This is almost always a slow follower. Raft commits are gated by the second-fastest quorum response (for a 5-node cluster, that is the 3rd fastest). If one follower has a slow disk (SSD degradation, noisy neighbor in cloud), it does not matter -- the leader only waits for 2 followers. But if 2 followers are slow, the leader must wait for the slowest of those 2. Check: `raft_apply_latency` metrics per node, disk I/O latency (`iowait`), and network RTT between nodes. Another common cause: the leader's WAL write is slow (it must fsync its own log before sending AppendEntries). If the leader is on a degraded disk, every write is slow. Solution: transfer leadership to a healthy node using `raft.LeaderTransfer()` -- takes effect in one election round, zero downtime.
+</Accordion>
+
+<Accordion title="Your company is evaluating whether to use Raft consensus (via etcd) or a simpler Redis-based leader election with TTL leases for a distributed task scheduler. The scheduler runs 10,000 tasks/day. Make the case for each approach.">
+**Strong Answer:**
+
+This is fundamentally a question about how catastrophic a split-brain scenario would be.
+
+**Redis-based leader election (TTL lease)**:
+- **How it works**: SET with NX and EX (set-if-not-exists with TTL). Leader renews the lease at 1/3 of the TTL interval. If it misses a renewal, another node acquires leadership.
+- **The failure mode**: If the leader has a long GC pause, a network blip, or a slow Redis response, its lease expires, a new leader is elected, but the old leader does not know it has been deposed. For a brief window (until the old leader's next renewal attempt fails), both think they are leader. Two task schedulers might assign the same task to two workers.
+- **Mitigation**: Fencing tokens. Each lease acquisition increments a counter. Workers reject task assignments from leaders with an older fencing token. This prevents duplicate execution but adds complexity.
+- **Cost**: One Redis instance, ~$50/month. Latency: ~1ms for lease operations.
+
+**Raft-based consensus (etcd)**:
+- **How it works**: True distributed consensus. The leader is authoritative because a majority of nodes agree. Split-brain is impossible by construction -- the minority partition cannot elect a leader.
+- **The failure mode**: During a network partition, the minority side is completely unavailable (no reads, no writes). If your scheduler is on the minority side, it stops scheduling tasks entirely until the partition heals. This is safe but has availability cost.
+- **Cost**: Minimum 3 etcd nodes, ~$300-500/month. Latency: ~2-5ms for consensus operations.
+
+**My recommendation for 10,000 tasks/day**: Redis with fencing tokens. Here is why: 10,000 tasks/day = ~7 tasks/minute. The probability of a split-brain during the exact moment a task is being assigned is extremely low. And even if it happens, a duplicate task execution for a scheduler (which should be idempotent anyway) is a minor inconvenience, not a data corruption event. The operational simplicity of Redis (one instance, no cluster management) wins over Raft for this use case.
+
+**I would choose Raft if**: The scheduler manages financial transactions, database migrations, or any operation where duplicate execution causes data corruption. The safety guarantee of "never two leaders" is worth the operational cost of running an etcd cluster.
+
+**Follow-up: Six months later, the scheduler now manages 1M tasks/day and some tasks trigger bank transfers. Does your recommendation change?**
+
+Absolutely. At 1M tasks/day (~12 tasks/second) with financial implications, the Redis approach's split-brain window is no longer an acceptable risk. A fencing token protects against duplicate execution, but the complexity of ensuring every downstream system correctly validates fencing tokens across a growing number of worker types becomes a maintenance burden. Switch to etcd. The $500/month cost is negligible compared to the risk of a single duplicate bank transfer. More importantly, at 12 tasks/second, you probably need multiple scheduler instances for availability anyway -- and etcd's leader election trivially handles "which scheduler instance is active" with zero application-level fencing logic.
+</Accordion>
+
+<Accordion title="Estimate the network overhead of running Raft consensus in a 5-node cluster that processes 10,000 writes per second. How much bandwidth does Raft itself consume?">
+**Strong Answer:**
+
+Let me trace the network traffic for each Raft operation.
+
+**Per write operation**:
+1. Client sends write to leader: 1 message (~200 bytes for a typical key-value write).
+2. Leader sends AppendEntries to 4 followers: 4 messages, each containing the log entry (~200 bytes payload + ~50 bytes RPC overhead = ~250 bytes each). Total: 1,000 bytes outbound from leader.
+3. Followers send AppendEntries response: 4 messages, each ~50 bytes. Total: 200 bytes inbound to leader.
+4. Leader commits and responds to client: 1 message (~100 bytes).
+
+**Total per write**: ~1,500 bytes of network traffic. At 10,000 writes/sec: 15 MB/sec = 120 Mbps. This is well within the capacity of even a 1 Gbps network link, and trivial on a 10 Gbps datacenter network.
+
+**Heartbeats (no writes in-flight)**:
+- Leader sends empty AppendEntries to 4 followers every 50-100ms (configurable). Each heartbeat is ~50 bytes. At 4 followers * 10 heartbeats/sec = 40 messages/sec = 2 KB/sec. Negligible.
+
+**The real bandwidth concern**: Log replication when a follower falls behind. If a follower was down for 10 minutes during which 6 million writes accumulated (10K/sec * 600sec), and each entry is 200 bytes, the catch-up transfer is 1.2 GB. At 1 Gbps, that takes ~10 seconds. During catch-up, the follower is not counted toward the quorum for new commits, so you are effectively running with 4 nodes (still above majority for a 5-node cluster).
+
+**When bandwidth becomes a problem**: When your write payloads are large. If each write is 10KB instead of 200 bytes, the per-write traffic jumps to 50KB * 4 followers = 200KB. At 10K writes/sec: 2 GB/sec = 16 Gbps. Now you need 10 Gbps links and careful NIC tuning. This is why systems like CockroachDB (which uses Raft per range) use a separate data path for large values -- the Raft log contains only a reference, and the actual data is transferred out-of-band.
+
+**Follow-up: You need to add a 6th node to your cluster for additional read capacity. What happens during the membership change, and why is it dangerous?**
+
+Adding a node is a cluster membership change, and it is one of the trickiest operations in Raft. The danger is the "joint consensus" problem: during the transition from 5 to 6 nodes, there is a window where the old configuration (majority = 3) and the new configuration (majority = 4) could each independently elect a leader, violating the single-leader guarantee. Raft solves this with a two-phase configuration change. First, the leader commits a "joint" configuration entry (old + new) to the log. During this phase, commits require a majority from BOTH the old and new configurations. Once that is committed, the leader commits the final "new" configuration. The etcd implementation handles this automatically with `member add`, but you should monitor the cluster during the transition and avoid doing other risky operations (like deploying) simultaneously.
+</Accordion>
+</AccordionGroup>

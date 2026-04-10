@@ -961,26 +961,36 @@ module.exports = { InventoryService };
 
 ```
 1. Product Pages:
-   • CDN for static assets
-   • Edge caching for product details
-   • Pre-computed related products
-   • Lazy load reviews
+   • CDN for static assets (images, CSS, JS) -- at 500M page views/day,
+     the CDN serves ~95% of asset requests, reducing origin load by 20x
+   • Edge caching for product details with 5-min TTL -- product data
+     changes infrequently, yielding 99%+ cache hit rate
+   • Pre-computed related products (nightly batch job) -- computing
+     "also bought" in real-time requires scanning millions of orders
+   • Lazy load reviews below the fold -- keeps product page load <500ms
 
 2. Search:
-   • Search results caching (1 min TTL)
-   • Popular searches pre-computed
-   • Autocomplete from trie structure
-   • Facet counts cached
+   • Search results caching (1 min TTL) -- identical searches return
+     cached results. 30% hit rate eliminates 360 ES queries/sec
+   • Popular searches pre-computed hourly -- top 10K terms are ~60% of
+     traffic. Serve from Redis at sub-1ms instead of 50-200ms from ES
+   • Autocomplete from trie in Redis -- must respond in <50ms to feel
+     instant. Top 100K terms fit in <100MB
+   • Facet counts cached per query for 5 minutes
 
 3. Cart:
-   • Session-local cart (Redis)
-   • Merge on login
-   • Background price updates
+   • Session-local cart (Redis) with 7-day TTL for anonymous users
+   • Merge anonymous cart into persistent cart on login (keep higher qty
+     on conflicts)
+   • Background price updates -- refresh prices lazily on cart view,
+     not in real-time
 
 4. Checkout:
-   • Inventory pre-check before payment
-   • Async order confirmation email
-   • Background fraud detection
+   • Inventory pre-check before payment -- never charge for out-of-stock
+   • Async order confirmation email via notification service (keeps
+     checkout latency under 1 second)
+   • Background fraud detection in parallel with payment (synchronous
+     review only for high-risk orders)
 ```
 
 ## Interview Tips
@@ -988,9 +998,287 @@ module.exports = { InventoryService };
 <Tip>
 **Key Discussion Points:**
 
-1. **Inventory consistency**: How to prevent overselling?
-2. **Search relevance**: How to rank products?
-3. **Checkout reliability**: What if payment fails?
-4. **Flash sales**: How to handle 100x traffic spike?
-5. **Multi-region**: How to expand globally?
+1. **Inventory consistency**: How to prevent overselling? Discuss the reservation pattern with TTL-based locks. Mention that Amazon reportedly oversells less than 0.1% of orders -- even that fraction at their scale means thousands of customer service tickets daily.
+2. **Search relevance**: How to rank products? Mention that search drives 30-40% of e-commerce revenue. Discuss combining text relevance with business signals (conversion rate, margin, sponsored placement). Explain why Elasticsearch re-indexing lag matters -- a product going out of stock should be de-ranked within seconds, not minutes.
+3. **Checkout reliability**: What if payment fails mid-saga? Walk through compensating transactions. A common mistake is not distinguishing between a payment that *failed* (safe to retry) and a payment with an *unknown* outcome (must query the processor before retrying, or you risk double-charging).
+4. **Flash sales**: How to handle 100x traffic spike? Pre-compute everything possible. Use a virtual queue (waiting room) to throttle checkout. Pre-warm caches and CDN. A real example: Amazon Prime Day peaks at over 100K orders per minute -- they pre-provision capacity weeks in advance and use circuit breakers to shed non-critical features.
+5. **Multi-region**: How to expand globally? Discuss data residency requirements (GDPR means EU user data stays in EU). Product catalogs can be replicated globally with eventual consistency, but orders and payments need regional strong consistency with cross-region reconciliation.
 </Tip>
+
+### Key Trade-offs
+
+| Decision | Option A | Option B | Recommendation |
+|----------|----------|----------|----------------|
+| Inventory reservation timing | Reserve on add-to-cart | Reserve at checkout | **Reserve at checkout initiation only.** 95% of shopping carts are abandoned. If you reserve inventory on add-to-cart, 95% of your stock is locked by users who never buy. At Amazon's scale (500M page views/day, 5% add-to-cart rate), that would lock 25M item reservations per day, most of which expire. Reserve at checkout with a short TTL (5-10 minutes), and use atomic compare-and-swap (`UPDATE inventory SET stock = stock - 1 WHERE sku = ? AND stock > 0`) to prevent overselling. The trade-off: a user might see "in stock" but fail at checkout. Amazon accepts this -- their oversell rate is reportedly under 0.1%. |
+| Checkout pattern | Synchronous (2PC) | Saga (async compensating) | **Saga pattern with orchestrator.** Checkout spans inventory, payment, shipping, promotions, and notification services. Two-phase commit (2PC) across 5+ services is operationally fragile -- if any participant is slow, all are blocked. The Saga pattern executes each step locally with a defined compensating action on failure (e.g., payment succeeded but inventory failed = refund). The trade-off: eventual consistency means a user might see "order confirmed" and then receive a cancellation email. Mitigate with UX design -- show "order processing" with a ~30-second delay before "confirmed." |
+| Search architecture | Single Elasticsearch cluster | Two-stage recall + ranking | **Two-stage: Elasticsearch for recall, LTR model for ranking.** Pure text-relevance search is wrong for e-commerce -- a product with 50% fewer text signals but 3x higher conversion rate should outrank the "more relevant" result. Stage 1: ES retrieves ~500 candidates via BM25 with field boosting. Stage 2: a learned-to-rank model re-scores using conversion rate, click-through rate, seller rating, price competitiveness, stock level, and margin. The trade-off: the LTR model adds 10-20ms latency but lifts revenue by 5-15% (search drives 30-40% of e-commerce revenue). |
+| Product catalog DB | Single relational DB | Polyglot persistence | **Polyglot persistence.** PostgreSQL for structured product data and orders (ACID). Elasticsearch for search (inverted index). Redis for hot product cache and cart sessions. S3 + CDN for product images. The access patterns are wildly different: catalog reads are 1000x more frequent than order writes, search needs inverted indexes not relational joins, cart data is ephemeral while orders are permanent. The trade-off: operational complexity of managing 4+ data stores. But a single database creates bottlenecks everywhere -- the search indexing pipeline alone would saturate a monolithic DB. |
+| Flash sale handling | Over-provision servers | Virtual queue (waiting room) | **Virtual queue with pre-computed everything.** During a flash sale, traffic spikes 100x. Over-provisioning servers for peak-of-peak is wasteful (you pay for 100x capacity 99.99% of the time). A virtual queue (waiting room) throttles users into the checkout funnel at a controlled rate. Pre-warm caches and CDN. Shed non-critical features (recommendations, reviews) via circuit breakers to protect the checkout path. The trade-off: users wait in a queue, which creates friction. But the alternative (site crash during the sale) is worse. Amazon Prime Day uses this approach -- reportedly peaking at over 100K orders per minute with pre-provisioned capacity. |
+
+### Common Candidate Mistakes
+
+```
+Mistake 1: Treating inventory as a simple decrement
+  Why it is wrong: Under concurrent load, two buyers can read
+  "1 remaining" and both succeed. You need atomic operations
+  (compare-and-swap or database transactions with row-level locks).
+
+Mistake 2: Ignoring the cart-to-checkout gap
+  Shopping carts are NOT inventory reservations. If you reserve on
+  "add to cart," you lock inventory for users who never buy (95%+
+  of carts are abandoned). Reserve only at checkout initiation.
+
+Mistake 3: Single database for everything
+  An e-commerce platform has wildly different access patterns:
+  - Catalog reads are 1000x more frequent than order writes
+  - Search needs inverted indexes, not relational joins
+  - Cart data is ephemeral; orders are permanent
+  Using one database for all of these creates bottlenecks everywhere.
+
+Mistake 4: Synchronous checkout pipeline
+  If your checkout calls inventory, payment, shipping, and
+  notification services synchronously, any single failure blocks
+  the entire purchase. Use the Saga pattern with async
+  compensating transactions and an event-driven architecture.
+```
+
+## Interview Deep-Dive Questions
+
+<AccordionGroup>
+  <Accordion title="Q1: How do you prevent overselling during concurrent purchases, and why is a simple stock decrement not enough?" icon="warehouse">
+    **What the interviewer is really testing:** Whether you understand race conditions in inventory systems and can reason about atomicity under concurrent writes.
+
+    **Strong Answer:**
+    - A naive `SELECT stock; if stock > 0 then UPDATE stock = stock - 1` has a classic TOCTOU (time-of-check-to-time-of-use) race. Two threads can both read `stock = 1`, both pass the check, and both decrement -- selling one item twice.
+    - The fix is to make the check-and-decrement atomic. In SQL that means `UPDATE inventory SET stock = stock - 1 WHERE sku = ? AND stock >= ?` and inspecting `rows_affected`. If zero rows were affected, the item is out of stock. This uses the database's row-level lock to serialize concurrent updates.
+    - For multi-warehouse setups, you need a reservation pattern: separate `available`, `reserved`, and `sold` counters. At checkout initiation you atomically increment `reserved` (with a TTL), and on payment confirmation you atomically convert reserved to sold while decrementing available.
+    - At extreme scale (flash sales), even row-level database locks become a bottleneck because every buyer contends on the same row. Solutions include: (a) sharding inventory across virtual buckets (split 1000 units into 10 buckets of 100), (b) using Redis `DECR` with Lua scripts for sub-millisecond atomic decrements, or (c) a pre-allocated token/queue system where you hand out purchase tokens before hitting the database at all.
+    - **Example:** During Amazon Prime Day, a single popular item might get 50K concurrent add-to-cart requests per second. A single PostgreSQL row cannot handle that contention. Amazon uses a distributed counter system where inventory is pre-sharded and reconciled asynchronously.
+
+    **Red flag answer:** "Just use a transaction" without explaining what isolation level or locking mechanism prevents the race, or suggesting you lock inventory at add-to-cart time (which locks stock for the 95% of users who abandon their cart).
+
+    **Follow-ups:**
+    1. What happens if the reservation TTL expires right as the customer clicks "Pay"? How do you handle that race between TTL expiry and payment confirmation?
+    2. If you shard inventory into virtual buckets and one bucket runs out while others still have stock, how do you rebalance without overselling?
+  </Accordion>
+
+  <Accordion title="Q2: 95% of shopping carts are abandoned. How does this fact influence your system design, and what strategies would you use to recover lost revenue?" icon="cart-arrow-down">
+    **What the interviewer is really testing:** Whether you design for the common case (abandonment) rather than the happy path (purchase), and whether you think about the business impact of technical decisions.
+
+    **Strong Answer:**
+    - Cart abandonment directly shapes the inventory strategy: you must NOT reserve inventory at add-to-cart time. If you reserve on add-to-cart, 95% of your inventory would be locked by people who never buy. Reserve only at checkout initiation, with a short TTL (5-10 minutes).
+    - Carts should be stored in Redis for speed, keyed by session ID for anonymous users and user ID for logged-in users. On login, merge the session cart with the user's persisted cart, preferring the most recently added items when there are conflicts.
+    - For cart recovery: capture the user's email early (even before checkout) if possible. Trigger an abandonment email flow: first email 1 hour after abandonment, second at 24 hours, third at 72 hours. The first email typically has a 40%+ open rate. Optionally include a discount code in the second or third email.
+    - On the technical side, publish a `cart.abandoned` event to Kafka when a cart has been inactive for N minutes. A downstream analytics service processes this for the email flow and also feeds into personalization (show the user their abandoned items as recommendations on their next visit).
+    - Price and stock changes must be reflected in the cart. If a user returns 3 days later, the cart should show updated prices and flag any out-of-stock items rather than letting them discover this at checkout.
+    - **Example:** Shopify reports that stores using a 3-email abandonment sequence recover 5-10% of abandoned carts. At Amazon's scale, even 1% recovery of abandoned carts represents billions in annual revenue.
+
+    **Red flag answer:** Only discussing the technical storage of carts without addressing the business recovery strategy, or suggesting you reserve inventory when items are added to the cart.
+
+    **Follow-ups:**
+    1. How would you handle the merge conflict when a logged-in user has a saved cart with item A at quantity 2, but their anonymous session cart also has item A at quantity 3?
+    2. Cart abandonment emails need to show product images, prices, and stock status at send-time, not at abandonment-time. How does your system ensure the email content is fresh?
+  </Accordion>
+
+  <Accordion title="Q3: How would you design the search ranking system for an e-commerce platform, and what signals go beyond simple text relevance?" icon="ranking-star">
+    **What the interviewer is really testing:** Whether you understand that e-commerce search is a revenue optimization problem, not just an information retrieval problem.
+
+    **Strong Answer:**
+    - E-commerce search is fundamentally different from web search. The goal is not "find the most relevant document" but "show the product the user is most likely to buy." This means the ranking function blends text relevance with business signals.
+    - The ranking pipeline has two stages: (1) **Recall** -- Elasticsearch retrieves candidates using BM25 text matching with field boosting (title^3, brand^2, description^1). (2) **Ranking** -- a learned-to-rank (LTR) model re-scores candidates using features like: click-through rate, conversion rate, return rate, seller rating, price competitiveness, stock level, margin, and sponsored bid amount.
+    - Real-time signals matter enormously: if a product just went out of stock, it should be demoted within seconds, not minutes. This requires a near-real-time indexing pipeline (Kafka to Elasticsearch). Similarly, if a product is getting a spike in returns, its ranking should drop.
+    - Personalization adds another layer: a user who frequently buys premium brands should see premium results higher. A user who is price-sensitive (history of sorting by price-low) should see deals first.
+    - Beware of feedback loops: if you rank by click-through rate, items at position 1 always get more clicks, reinforcing their position. You need to use position-debiased click models or periodically inject exploration (show lower-ranked items in top positions and measure actual interest).
+    - **Example:** Amazon's A9 search algorithm is known to heavily weight conversion rate and sales velocity. A product with 50% fewer text-relevance signals but 3x higher conversion rate will often outrank the "more relevant" result. This is why search drives 30-40% of e-commerce revenue -- it is the primary monetization surface.
+
+    **Red flag answer:** Describing only Elasticsearch text matching without mentioning business signals, or not understanding why conversion rate matters more than text relevance in e-commerce.
+
+    **Follow-ups:**
+    1. How do you handle the cold-start problem for a brand-new product with no click or conversion data? It would never rank well in a conversion-weighted model.
+    2. Sponsored products need to be blended into organic results. How do you balance ad revenue against user experience degradation from showing less-relevant promoted items?
+  </Accordion>
+
+  <Accordion title="Q4: Walk me through your checkout flow design. What happens if the payment succeeds but inventory confirmation fails?" icon="cash-register">
+    **What the interviewer is really testing:** Whether you understand the Saga pattern, compensating transactions, and can reason about partial failure in distributed systems.
+
+    **Strong Answer:**
+    - Checkout is a distributed transaction across multiple services (inventory, payment, shipping, promotions, notifications) that cannot use a single ACID transaction. The Saga pattern orchestrates this as a sequence of local transactions, each with a defined compensating action on failure.
+    - The checkout saga proceeds: (1) Create order in PENDING state, (2) Reserve inventory (compensate: release), (3) Validate address and calculate shipping, (4) Apply promotions/coupons, (5) Process payment (compensate: refund), (6) Confirm inventory (convert reserved to sold), (7) Send confirmation.
+    - The specific scenario asked -- payment succeeds but inventory confirmation fails -- is one of the trickiest cases. The inventory might fail because (a) the reservation TTL expired between payment and confirmation, or (b) the inventory service is temporarily down. The correct response depends on the failure mode:
+      - If the reservation expired: attempt to re-reserve. If stock is still available, proceed. If not, you must issue a payment refund and notify the customer. This is a terrible user experience but it is the only correct action.
+      - If the inventory service is down: retry with exponential backoff. The payment is already captured, so you hold the order in a PAYMENT_CONFIRMED state and use an async reconciliation process to eventually confirm inventory. Do NOT refund preemptively -- the inventory service being down does not mean the item is unavailable.
+    - The orchestrator must be idempotent and crash-safe: store the saga state in a database so it can resume after a crash. Each step should be idempotent so retries are safe.
+    - **Example:** Uber uses a saga orchestrator for ride payments. If the charge succeeds but the ride-completion event fails, they have a reconciliation system that runs every few minutes to match charges against ride states and either confirm or refund.
+
+    **Red flag answer:** Saying "use a two-phase commit across all services" (does not work in microservices at scale), or not distinguishing between transient failures (retry) and permanent failures (compensate).
+
+    **Follow-ups:**
+    1. Would you use an orchestration-based saga (central coordinator) or a choreography-based saga (event-driven, each service reacts to events)? What are the trade-offs?
+    2. How do you prevent the customer from seeing an "order confirmed" page and then receiving a "sorry, we had to cancel your order" email 5 minutes later? Is there a UX design that mitigates this?
+  </Accordion>
+
+  <Accordion title="Q5: Design the system to handle a flash sale where 100,000 users try to buy 500 units of a single product simultaneously." icon="bolt">
+    **What the interviewer is really testing:** Whether you can design for extreme write contention on a single hot resource and think about both fairness and system stability.
+
+    **Strong Answer:**
+    - Flash sales are the worst-case scenario for e-commerce: extreme read AND write traffic concentrated on a single product, with a tiny inventory pool. A naive design collapses because 100K users all contend on the same inventory row.
+    - **Layer 1 -- Traffic management:** Put a virtual waiting room (queue) in front of the checkout. When users click "Buy," they enter a queue and get a position. Only let users through at a rate the backend can handle (e.g., 500/second). This converts a 100K-request thundering herd into a manageable stream. Shopify and Ticketmaster both use this pattern.
+    - **Layer 2 -- Pre-allocated purchase tokens:** Before the sale starts, pre-generate 500 tokens (one per unit) and load them into a Redis list. When a user reaches the front of the queue, `LPOP` a token. This is O(1) and contention-free because Redis is single-threaded. If `LPOP` returns nil, the item is sold out. The token is then used to complete checkout within a time window (e.g., 10 minutes).
+    - **Layer 3 -- Decouple the hot path:** Serve the product page from CDN/cache (read path) entirely separately from the purchase path. Do not let 100K product page views hit the same service that processes purchases. Pre-warm the CDN with the flash sale product page before the sale starts.
+    - **Layer 4 -- Graceful degradation:** Disable non-essential features during the sale: turn off recommendations, reviews, "customers also bought" widgets. Use circuit breakers to shed load from non-critical services. Pre-provision capacity based on expected traffic (Amazon does this weeks in advance for Prime Day).
+    - **Layer 5 -- Fairness:** The queuing system should be FIFO to prevent bots from gaining an advantage through retry storms. Implement rate limiting per user/IP and CAPTCHA to deter automated purchasing.
+    - **Example:** Xiaomi flash sales in India regularly see 200K+ users trying to buy a few thousand phones. They use a token-based queue system where users register interest before the sale, and at sale time, tokens are distributed via a lottery-weighted queue rather than pure FIFO.
+
+    **Red flag answer:** Suggesting "just scale horizontally" without addressing the single-row contention problem, or proposing optimistic locking on the inventory row (which would cause 99,500 failed transactions).
+
+    **Follow-ups:**
+    1. How do you handle the case where a user gets a purchase token but abandons checkout? You have a 10-minute window, but 500 tokens are issued and only 400 people complete payment. How and when do you release the remaining 100 tokens?
+    2. How would you prevent bot networks from acquiring a disproportionate number of tokens? What signals would you use to distinguish bots from real users under extreme time pressure?
+  </Accordion>
+
+  <Accordion title="Q6: How would you design the product page to load in under 500ms globally, given that a product page aggregates data from 5+ services?" icon="gauge-high">
+    **What the interviewer is really testing:** Whether you understand latency budgets, parallel data fetching, caching hierarchies, and the difference between critical-path and lazy-loaded data.
+
+    **Strong Answer:**
+    - A product page aggregates: product details, pricing, inventory status, images, reviews, seller info, related products, and ads. Fetching all of these serially from microservices would take 2-3 seconds. The key is to separate critical-path data from non-critical data.
+    - **Critical path (must be in initial render, < 200ms):** Product name, price, primary image, availability status. These should be served from a pre-composed cache (Redis or CDN). The backend composes this "product card" on write (when product data changes) rather than on read. This turns a fan-out of 5 service calls into a single cache read.
+    - **Secondary data (can be loaded asynchronously, < 500ms):** Reviews summary (average rating, count), seller info, shipping estimate. Fetch these in parallel from an API gateway that fans out to services concurrently.
+    - **Lazy-loaded data (loaded after initial render):** Full review text, Q&A, related products, recommendations, ads. These are loaded via client-side JavaScript after the page renders. The user does not see them immediately, so they do not affect perceived load time.
+    - CDN strategy: cache the full rendered product page at edge locations. Use short TTLs (30-60 seconds) to handle price/stock changes. For cache invalidation, publish product-change events and use CDN purge APIs to invalidate stale pages.
+    - For images: serve from a separate image CDN, use progressive JPEG/WebP for fast perceived load, and lazy-load below-the-fold images.
+    - **Example:** Amazon's product page makes over 300 service calls behind the scenes, but the initial HTML render contains only the critical data. Everything else streams in progressively. Their internal rule is that any service call on the critical render path must respond within 50ms.
+
+    **Red flag answer:** Describing a single API call that joins all data from all services synchronously, or not distinguishing between critical-path and lazy-loaded data.
+
+    **Follow-ups:**
+    1. If the inventory service is slow (taking 2 seconds to respond), would you show the page without stock status or block the render? How do you communicate "checking availability..." to the user?
+    2. How do you handle cache invalidation when a product's price changes? You have thousands of CDN edge nodes -- do you push-invalidate or let the TTL expire?
+  </Accordion>
+
+  <Accordion title="Q7: How would you handle multi-region deployment for an e-commerce platform serving users in the US, EU, and Asia?" icon="globe">
+    **What the interviewer is really testing:** Whether you understand data residency, consistency trade-offs across regions, and how to partition data that has different consistency requirements.
+
+    **Strong Answer:**
+    - Different data types have different cross-region requirements. Product catalog data is read-heavy and tolerates eventual consistency -- replicate it globally with a multi-leader setup or CRDTs, accepting seconds of lag. Inventory requires strong consistency within a region because overselling is unacceptable. Orders and payments need strong consistency within the region where the transaction occurs.
+    - **Data residency constraints (GDPR, PDPA):** EU user personal data must stay in the EU region. This means user profiles, order history, and payment tokens for EU users live in the EU data center. You cannot just replicate everything everywhere. This requires routing logic at the API gateway: determine the user's data region from their account, and route requests to the correct regional backend.
+    - **Inventory partitioning:** Inventory is naturally partitioned by warehouse location. A US user buying from a US warehouse only needs US inventory consistency. Cross-region inventory queries (e.g., "ship from EU to US") can tolerate slightly stale reads because the actual reservation will do a strongly-consistent check at transaction time.
+    - **Checkout regional affinity:** The entire checkout saga should execute within a single region to avoid cross-region latency in the critical path. If a US user is buying from a US seller, all checkout steps happen in US-East. Cross-region orders (US buyer, EU seller) require careful orchestration, with inventory reserved in the seller's region and payment processed in the buyer's region.
+    - **Failure isolation:** Regions must be independently deployable and independently operational. An outage in EU should not affect US users. This means avoiding cross-region synchronous calls on the critical path.
+    - **Example:** Shopify runs a multi-region architecture where merchant data is pinned to a region, but the storefront CDN is global. When GDPR went into effect, they had to ensure that EU merchant and customer data never left the EU region, which required re-architecting their replication topology.
+
+    **Red flag answer:** Saying "replicate everything to all regions" without considering GDPR or the strong-consistency requirements for orders and payments, or not thinking about cross-region latency in the checkout path.
+
+    **Follow-ups:**
+    1. A popular product is sold by a US seller but 40% of buyers are in the EU. The product page is cached globally, but inventory checks go to the US. How do you keep the EU product page's stock status fresh without adding 150ms of cross-region latency to every page view?
+    2. How do you handle a scenario where the EU region goes down but EU users still want to browse (even if they cannot buy)? What can you serve from the US region's replica?
+  </Accordion>
+</AccordionGroup>
+
+---
+
+## Conversational Interview Walkthrough
+
+The following simulates a realistic back-and-forth interview dialogue. Each exchange includes the interviewer's question, a strong candidate response, an immediate follow-up, and the follow-up answer -- the way a real 45-minute system design conversation unfolds.
+
+<AccordionGroup>
+  <Accordion title="Walk me through how you would design the checkout flow for an e-commerce platform handling 100K orders per minute during a flash sale." icon="cash-register">
+    **Interviewer:** "Let's focus on the checkout experience. During our biggest flash sales, we see 100K orders per minute. Walk me through how you would design this so that no orders are lost, no customers are double-charged, and the system does not fall over."
+
+    **Strong Candidate Response:**
+    - The checkout flow is the most critical path in any e-commerce system because it directly touches revenue. I would design it as a multi-step saga rather than a single monolithic transaction, because the steps involve different services with different consistency requirements.
+    - The flow has five stages: cart validation, inventory reservation, payment authorization, order creation, and fulfillment initiation. Each step is idempotent and each has a compensating action for rollback.
+    - For the flash sale scenario specifically, I would front-load the hardest bottleneck: inventory. Before the sale starts, I would partition the available inventory into "buckets" distributed across multiple Redis nodes. Instead of a single atomic counter for "500 units available," I would pre-split into 10 buckets of 50 each. Each checkout request is routed to a random bucket, reducing contention by 10x. When a bucket is exhausted, the request tries the next bucket. This is how Shopify handles flash sales for high-demand drops.
+    - Payment authorization happens asynchronously after inventory reservation. The user sees "order placed" once inventory is reserved and the payment auth is submitted. If the payment auth fails, a compensating transaction releases the reserved inventory. This means the user gets a fast response (sub-second) even though payment processing takes 1-3 seconds.
+    - For exactly-once order creation, every checkout request carries a client-generated idempotency key (UUID). If the user's browser retries (network timeout, double-click), the second request with the same idempotency key returns the result of the first request without creating a duplicate order.
+    - I would use a message queue (Kafka) between the order service and downstream services (fulfillment, email confirmation, analytics). This decouples the critical path from non-critical work and provides durability -- if the email service is down, the order is still placed.
+
+    **Interviewer Follow-up:** "Good. Now tell me -- what happens when inventory runs out in 8 of your 10 Redis buckets, but there are still 20 units left in the remaining 2 buckets? You have thousands of concurrent requests all failing on the empty buckets before finding a live one. How do you handle this hot-bucket problem?"
+
+    **Follow-up Answer:**
+    - This is the "last few units" problem, and it is the hardest part of the flash sale. When most buckets are empty, all traffic funnels into the remaining buckets, recreating the very contention I was trying to avoid.
+    - The solution is a two-layer approach. First, maintain a lightweight "bucket availability bitmap" in a shared Redis key -- a bitfield where each bit represents whether a bucket has stock. Before checking a bucket, the client reads the bitmap (a single O(1) Redis read) and only tries buckets that are marked as available. When a bucket hits zero, the decrement operation also clears its bit in the bitmap. This eliminates wasted round-trips to empty buckets.
+    - Second, when the bitmap shows fewer than 3 buckets remaining, I would switch to a queue-based model. Instead of direct decrement, requests are placed in a FIFO queue, and a single consumer drains the queue and processes reservations sequentially. This trades throughput for fairness -- the last 100 units are distributed first-come-first-served, eliminating the race condition entirely.
+    - There is a UX component too. Once available inventory drops below a threshold (say 5%), the frontend should show "Almost gone -- your cart is not guaranteed" and switch the "Buy Now" button to "Join waitlist" once stock hits zero. This reduces server load from hopeless retry storms.
+  </Accordion>
+
+  <Accordion title="What would break first if your e-commerce platform suddenly got 10x its normal traffic?" icon="bolt">
+    **Interviewer:** "It is Black Friday. Your platform normally handles 5,000 requests per second, but today you are seeing 50,000. What breaks first, and how would you have prepared for this?"
+
+    **Strong Candidate Response:**
+    - In my experience, the thing that breaks first is almost never what you expect. People assume it is the database, but the actual failure sequence at 10x load typically goes: (1) connection pools exhaust first, then (2) downstream service timeouts cascade, then (3) database connections saturate, and finally (4) the database itself struggles.
+    - Connection pools are the silent killer. If your app servers have a connection pool of 50 database connections and you have 20 app servers, that is 1,000 database connections at normal load. At 10x traffic, the app servers spin up to 200 instances (if auto-scaling is configured), now requesting 10,000 database connections. PostgreSQL's default max_connections is 100. The database rejects new connections, and every app server starts throwing "connection refused" errors simultaneously. This is a cascading failure triggered by success (your auto-scaling worked, but it overwhelmed the database).
+    - My preparation strategy focuses on the bottlenecks in order. First, put a connection pooler (PgBouncer) in front of the database. PgBouncer holds 10,000 application connections but multiplexes them onto 200 actual database connections using transaction-mode pooling. This absorbs the connection surge.
+    - Second, circuit breakers on every downstream service call. If the recommendation service is slow (because it is also getting 10x traffic), the product page should render without recommendations rather than waiting 5 seconds and timing out. I use a circuit breaker that opens after 5 consecutive failures and serves a fallback (cached recommendations or "trending products") for 30 seconds before retrying.
+    - Third, request shedding at the load balancer. If the system is at capacity, it is better to reject 10% of requests with a fast 503 than to accept all of them and have everyone experience 30-second response times. Implement adaptive load shedding that monitors P99 latency -- when P99 exceeds 2 seconds, start rejecting the lowest-priority requests (anonymous browsing before logged-in users, search before checkout).
+
+    **Interviewer Follow-up:** "You mentioned circuit breakers for the recommendation service. But what about the inventory service? You cannot just serve a fallback for 'is this item in stock.' How do you handle the inventory service under 10x load?"
+
+    **Follow-up Answer:**
+    - You are right -- inventory is on the critical path and there is no safe fallback. Showing "in stock" when the item is actually sold out leads to overselling. Showing "out of stock" when it is available means lost sales. Both are unacceptable.
+    - My approach is to make the inventory service virtually unbreakable by keeping it extremely simple. The inventory service at peak should do exactly one thing: decrement a counter in Redis. No database queries, no joins, no complex logic. The Redis counter is the source of truth during the sale, and a background reconciliation process syncs it back to the database.
+    - For 10x resilience, I would pre-warm the inventory cache before Black Friday. Every SKU's stock count is loaded into Redis. Reads ("is it in stock?") are served from Redis with sub-millisecond latency -- this scales to millions of reads per second trivially. Writes (decrements during purchase) use Redis DECR, which is atomic and handles 100K+ operations per second per node.
+    - If Redis itself becomes the bottleneck (unlikely for a single operation, but possible at extreme scale), I would shard inventory by product category across Redis nodes. Electronics inventory on shard 1, clothing on shard 2, and so on. This distributes the write load.
+    - The one thing I would NOT do is hit the primary database for inventory checks during the sale. The database is the weakest link in the chain for this access pattern.
+  </Accordion>
+
+  <Accordion title="How would you handle a scenario where the payment succeeds but the order creation fails?" icon="triangle-exclamation">
+    **Interviewer:** "Here is a failure scenario. A customer's credit card has been charged, but the order service crashes before writing the order to the database. The customer sees 'order failed' on screen but the charge appears on their credit card statement. How do you prevent this, and how do you recover?"
+
+    **Strong Candidate Response:**
+    - This is the classic distributed transaction problem, and it is why payment systems are hard. The fundamental issue is that the payment gateway and the order database are two separate systems that cannot participate in a single ACID transaction.
+    - Prevention: I would never charge the card before the order is created. Instead, the flow is: (1) create the order in the database with status PENDING, (2) authorize (not capture) the payment, (3) if authorization succeeds, update the order to CONFIRMED, (4) capture the payment later (when the item ships). Authorization places a hold on the customer's credit limit but does not move money. If step 3 fails, I void the authorization -- the hold is released and the customer is never charged.
+    - But your scenario asks what happens if we are already past authorization and the order write fails. For this, I use the transactional outbox pattern. In a single database transaction: write the order row AND write a "payment authorized" event to an outbox table. If the transaction commits, both are written atomically. If it rolls back, neither is written and I void the authorization.
+    - Recovery for edge cases: even with the outbox pattern, there is a window where the authorization succeeds at the payment gateway but the database transaction has not committed yet and the app crashes. For this, I run a reconciliation job every 5 minutes that compares authorized payments (from the payment gateway's API) against order records. Any authorization without a matching order is automatically voided. Any order without a matching authorization is flagged for review.
+    - The customer-facing UX matters here. I would never show "order failed" until the system has confirmed the payment status. If the order service crashes mid-flow, the customer sees "processing your order..." and a background job resolves the state within 60 seconds, then sends the customer a confirmation email or a "payment was not charged" email.
+
+    **Interviewer Follow-up:** "That reconciliation job runs every 5 minutes. But what if the payment gateway is also having issues and the void request fails? Now you have an orphaned authorization that the reconciliation cannot clean up. How deep does the recovery go?"
+
+    **Follow-up Answer:**
+    - This is where you need multiple layers of defense. The first reconciliation attempt is the automated 5-minute job that voids orphaned authorizations via the payment gateway API. If the void fails (gateway timeout, 500 error), the job marks the authorization as "void_pending" and retries with exponential backoff -- 5 minutes, 15 minutes, 1 hour.
+    - If the payment gateway is having a prolonged outage (which happens -- Stripe had a 2-hour incident in 2023), the retries will accumulate. I set a maximum retry window of 24 hours. After 24 hours of failed void attempts, the system escalates to a human review queue in the finance team's dashboard.
+    - There is a natural safety net: payment authorizations expire. Visa and Mastercard authorizations typically expire after 7 days if not captured. So even in the worst case -- gateway outage, reconciliation failure, human review delayed -- the hold on the customer's credit limit is released automatically within a week.
+    - The key architectural principle is to design for the eventual consistency of money. No single component can guarantee atomicity across payment networks and your database. Instead, you build layers: the outbox pattern handles 99.9% of cases, the reconciliation job handles 99.99%, manual review handles the rest, and authorization expiry is the ultimate backstop.
+  </Accordion>
+
+  <Accordion title="How would you design the search system to handle 50 million products with sub-200ms latency?" icon="magnifying-glass">
+    **Interviewer:** "You have 50 million products in the catalog. A user types 'blue running shoes size 10' and expects results in under 200 milliseconds, with relevant results, correct stock status, and personalized ranking. Walk me through the search architecture."
+
+    **Strong Candidate Response:**
+    - I would use Elasticsearch as the core search engine, but the architecture around it is where the real design happens. Raw Elasticsearch is not enough for a production e-commerce search -- you need a pipeline with indexing, query understanding, ranking, and post-filtering.
+    - The indexing pipeline: products are indexed into Elasticsearch with a denormalized document structure. Each document contains: product title, description, category hierarchy, brand, attributes (size, color, material), price, average rating, stock status, and seller information. I would NOT store real-time inventory in Elasticsearch because stock changes every second and re-indexing that frequently is expensive. Instead, stock status in the index is a coarse flag ("in stock" vs "out of stock") updated every 5 minutes. The exact inventory count is checked at display time via a fast Redis lookup.
+    - Query understanding: the raw query "blue running shoes size 10" needs to be decomposed into structured attributes. An NLP layer extracts: color=blue, category=running shoes, size=10. This enables precise filtering rather than full-text matching. The NLP model is trained on historical search queries and click data.
+    - Ranking: Elasticsearch's default BM25 scoring is a starting point, but I would layer a learning-to-rank model on top. Features: text relevance score, sales velocity, conversion rate, customer review score, price competitiveness, stock availability, and personalization signals (this user's browsing history, purchase history, brand preferences). The learning-to-rank model is trained offline on click-through and purchase data, and the model weights are loaded into an Elasticsearch plugin.
+    - For sub-200ms latency at 50M documents: shard the Elasticsearch index across 20-30 nodes, with each shard holding 2-3 million documents. Queries are scattered to all shards in parallel and results are gathered. Use Elasticsearch's request cache for popular queries -- "running shoes" is searched thousands of times per hour, so caching the top 10K queries eliminates repeated computation.
+
+    **Interviewer Follow-up:** "A seller updates a product's title from 'Athletic Sneakers' to 'Blue Running Shoes Pro.' How long until this change is reflected in search results? And what happens if a customer searches during that window and the product does not show up for the new name?"
+
+    **Follow-up Answer:**
+    - Elasticsearch uses a near-real-time (NRT) indexing model. When a document is updated, it is written to an in-memory buffer and becomes searchable after the next "refresh" cycle. The default refresh interval is 1 second, so the updated title is searchable within 1-2 seconds. This is fast enough for most cases.
+    - However, there is a subtlety. The old document with the old title is marked as deleted, and the new document is created in a new segment. Until a segment merge happens, both the old and new versions exist. The search correctly returns only the new version because the old one is marked deleted, but if the indexing fails mid-update (node crash), you could end up with neither version.
+    - For the specific scenario you described -- customer searches for "blue running shoes" during the 1-2 second window -- the product simply does not match. This is acceptable because 1-2 seconds is negligible. If we needed faster indexing (say for flash sale products where every second matters), I could reduce the refresh interval to 200ms for specific index partitions, though this increases I/O load.
+    - The more dangerous issue is when the indexing pipeline itself is lagging. If Kafka (which feeds product updates to Elasticsearch) has consumer lag of 30 minutes, product changes take 30 minutes to become searchable. I monitor the pipeline lag as a critical metric and alert if it exceeds 5 minutes. For truly critical updates (price changes, stock-out), I use a "fast path" that directly calls the Elasticsearch Update API instead of going through the Kafka pipeline, providing sub-second visibility.
+  </Accordion>
+
+  <Accordion title="Your order processing system uses the Saga pattern. A saga step fails midway through. Walk me through the compensation logic." icon="rotate-left">
+    **Interviewer:** "You said you use the Saga pattern for order processing. Here is the scenario: the inventory has been reserved, the payment has been authorized, but the shipping service rejects the order because the item cannot be delivered to the customer's address (remote area, hazardous material, whatever). Walk me through exactly what happens next."
+
+    **Strong Candidate Response:**
+    - When the shipping service rejects the order, the saga orchestrator triggers compensating transactions in reverse order. Each compensating action undoes the effect of its corresponding forward action.
+    - Step 1: The saga orchestrator marks the order as CANCELLED with reason "shipping_rejected." This is important for audit trails and customer communication.
+    - Step 2: Release the payment authorization. The orchestrator calls the payment service with a void request using the original authorization ID. The payment service calls the payment gateway to void the hold. The customer's available credit is restored.
+    - Step 3: Release the inventory reservation. The orchestrator calls the inventory service with a release request using the reservation ID. The inventory counter is incremented back. The reserved units are available for other customers.
+    - Step 4: Notify the customer. The orchestrator publishes a "saga_compensated" event, which triggers an email: "We could not ship to your address. Your payment was not charged."
+    - Each compensating action is idempotent. If the saga orchestrator crashes after releasing the payment but before releasing the inventory, it restarts and re-executes all compensating actions from the beginning. The payment void is a no-op the second time (the payment service checks if the authorization is already voided), and the inventory release proceeds normally.
+    - The orchestrator maintains a saga log in the database: a record of which steps have been executed and which compensations have been applied. On recovery, it reads the log and resumes from where it left off. This log is the source of truth for saga state.
+
+    **Interviewer Follow-up:** "What if the payment void fails because the payment gateway is down? The saga cannot complete its compensation. Do you retry indefinitely? Do you leave the customer with a hold on their credit card?"
+
+    **Follow-up Answer:**
+    - The compensation must eventually succeed, so yes, I retry -- but with a structured approach, not indefinitely in a tight loop.
+    - I use a "compensation retry queue" backed by Kafka (or a database-backed job queue with exponential backoff). The failed void request is enqueued with metadata: saga ID, payment authorization ID, attempt count, and next retry timestamp. The retry schedule: 1 minute, 5 minutes, 15 minutes, 1 hour, 4 hours.
+    - After 6 failed attempts (roughly 5.5 hours), the compensation is escalated to a dead letter queue monitored by the finance operations team. The DLQ entry includes all context needed for manual resolution.
+    - Meanwhile, the customer-facing experience matters. I do not wait for the void to succeed before communicating with the customer. As soon as the saga enters the compensating state, the customer sees "Your order could not be completed. If you see a pending charge, it will be released automatically within 24-48 hours." This sets expectations even before the void succeeds.
+    - The safety net is authorization expiry. Even if every retry fails, the authorization expires within 7 days (for credit cards) or 3 days (for debit cards). The hold is released automatically by the card network. But relying on this as a primary strategy would be irresponsible -- it is the last resort.
+    - One architectural improvement: I would design the payment service to track "void_pending" authorizations and run its own internal reconciliation that retries voids independently of the saga orchestrator. This way, even if the saga orchestrator has a bug, the payment service self-heals.
+  </Accordion>
+</AccordionGroup>

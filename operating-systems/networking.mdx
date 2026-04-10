@@ -87,6 +87,8 @@ The Linux network stack follows the OSI model but implements it in a Linux-speci
 
 The `struct sk_buff` (socket buffer) is the heart of the Linux networking stack. It represents a network packet as it travels through the kernel.
 
+Think of an sk_buff like a shipping envelope with adjustable flaps. As a packet moves down the stack (application to wire), each layer adds a header by pulling the front flap forward. As it moves up (wire to application), each layer strips a header by pushing the flap back. The clever part: the actual data never moves in memory -- only the pointers change. This is what makes Linux networking fast even at millions of packets per second.
+
 ### 2.1 sk_buff Structure
 
 ```c
@@ -194,7 +196,7 @@ unsigned char *eth_hdr = skb_push(skb, ETH_HLEN);  // ETH_HLEN = 14
 
 ### 2.3 Zero-Copy Mechanisms
 
-**Problem**: Copying large packets is expensive (memory bandwidth limited).
+**Problem**: Copying large packets is expensive (memory bandwidth limited). On a 100 Gbps NIC, the CPU would spend all its time in `memcpy()` if every packet required a full copy. Zero-copy techniques are what make high-speed networking possible on commodity hardware.
 
 **Solution 1: skb_clone()** - Clone sk_buff structure, share data
 
@@ -363,7 +365,7 @@ Result: 100% CPU time in interrupt handling (interrupt storm)
 
 ### 3.2 NAPI: New API (Polling + Interrupts)
 
-**Solution**: Hybrid polling/interrupt model
+**Solution**: Hybrid polling/interrupt model. The analogy: imagine a doorbell that rings every time a letter arrives. If you get one letter per hour, the doorbell is helpful. If you get 1,000 letters per second, you would never leave the door. NAPI's approach: after the first ring, disable the doorbell and check the mailbox in batches until it is empty, then re-enable the doorbell.
 
 ```
 Receive Flow with NAPI:
@@ -477,9 +479,9 @@ static void net_rx_action(struct softirq_action *h) {
 
 ### 3.3 Receive Packet Steering (RPS/RFS)
 
-**Problem**: Single NIC queue → all packets processed on one CPU core
+**Problem**: Single NIC queue means all packets processed on one CPU core. On a 10 Gbps link pushing small packets, a single core can become 100% saturated while the other 31 cores sit idle.
 
-**Solution**: Distribute packet processing across multiple CPUs
+**Solution**: Distribute packet processing across multiple CPUs. There are three levels of this, each solving a different part of the problem:
 
 <CardGroup cols={2}>
   <Card title="RSS (Hardware)" icon="microchip">
@@ -2259,6 +2261,79 @@ setsockopt(fd, IPPROTO_TCP, TCP_CONGESTION, "bbr", 3);
 - Enable BBR for internet traffic
 - Increase conntrack table for high connection count
 - Use zero-copy for large data transfers
+
+---
+
+---
+
+## Interview Deep-Dive
+
+<AccordionGroup>
+  <Accordion title="A production service is dropping packets under high load. You suspect the kernel network stack is the bottleneck, not the application. Walk me through your debugging methodology from NIC to socket.">
+    **Strong Answer:**
+
+    The way I approach this is bottom-up, from hardware to application, checking for drops at each layer. Every layer in the network stack has its own counters, and the trick is finding where packets disappear.
+
+    - **NIC level**: Start with `ethtool -S eth0 | grep -i drop` and `ethtool -S eth0 | grep -i error`. Look for `rx_dropped`, `rx_missed_errors`, and `rx_fifo_errors`. If the NIC is dropping, the ring buffer is full -- packets arrive faster than the CPU drains them. Fix: increase ring buffer size with `ethtool -G eth0 rx 4096`, enable RSS (multiple hardware queues), or move to NAPI polling with a higher budget.
+    - **Softirq/NAPI level**: Check `/proc/net/softnet_stat`. Each line represents a CPU. Column 1 is total packets processed, column 2 is drops (backlog overflow), column 3 is time_squeeze (NAPI budget exhausted before all packets processed). If column 2 is non-zero, increase `net.core.netdev_max_backlog`. If column 3 is non-zero, increase `net.core.netdev_budget` or enable RPS to spread load across more CPUs.
+    - **Socket buffer level**: Check `ss -s` for socket memory statistics. If the TCP receive buffer is full because the application is not calling `recv()` fast enough, the kernel drops incoming segments. Check `netstat -s | grep "pruned"` for TCP pruning events. Fix: increase socket buffers (`net.core.rmem_max`, `net.ipv4.tcp_rmem`) or fix the slow application.
+    - **Conntrack table**: If using iptables/nftables, check `conntrack -C` for the current count and compare with `net.netfilter.nf_conntrack_max`. A full conntrack table silently drops new connections. This is a classic production issue for high-connection-count services (100K+ concurrent connections). Fix: increase the max or bypass conntrack for stateless services with `-j NOTRACK`.
+    - **Application level**: If none of the above show drops, the application is the bottleneck. Check with `ss -tlnp` if the listen backlog is overflowing (`Recv-Q` exceeding the backlog value). Increase `net.core.somaxconn` and the application's listen backlog.
+
+    In my experience, 80% of production packet drops are either conntrack table exhaustion or softirq budget starvation. Both are silent -- no error logs, no alerts unless you explicitly monitor those counters.
+
+    **Follow-up: How does XDP help in this scenario compared to iptables?**
+
+    XDP processes packets before sk_buff allocation, at the driver level. For dropping known-bad traffic (DDoS mitigation, IP blacklists), XDP can drop at 10-100x the rate of iptables because it avoids the entire network stack overhead -- no sk_buff allocation, no conntrack lookup, no routing decision. Facebook's Katran load balancer uses XDP to handle millions of packets per second per core. The trade-off is that XDP programs only see raw packet bytes (no parsed TCP state, no connection tracking), so they are limited to stateless or simple stateful decisions. For complex firewall rules that need connection state, you still need conntrack/netfilter.
+  </Accordion>
+
+  <Accordion title="Explain the difference between TCP BBR and CUBIC congestion control. When would you switch a production service from CUBIC to BBR, and what could go wrong?">
+    **Strong Answer:**
+
+    CUBIC and BBR take fundamentally different approaches to congestion control:
+
+    - **CUBIC (default on Linux)**: Loss-based. CUBIC increases the congestion window following a cubic function until it detects packet loss, then backs off. The key insight is that packet loss signals network congestion. CUBIC is aggressive at probing for bandwidth (the cubic growth curve approaches the previous maximum quickly after a loss event) and conservative after loss.
+    - **BBR (Bottleneck Bandwidth and RTT)**: Model-based. BBR continuously estimates two parameters: bottleneck bandwidth (max throughput the path can sustain) and minimum RTT. It then paces sending to match bottleneck bandwidth while keeping in-flight data to roughly bandwidth x RTT. BBR does not treat loss as a congestion signal -- it treats it as noise.
+
+    When to switch to BBR:
+    - **Bufferbloat networks**: On paths with large buffers (common in ISPs, cellular networks), CUBIC fills the buffers until loss occurs, adding hundreds of milliseconds of queuing delay. BBR avoids filling buffers by targeting the bottleneck rate, resulting in dramatically lower latency (often 10-50x reduction in queuing delay).
+    - **Lossy links (wireless, satellite)**: CUBIC interprets random packet loss (wireless interference) as congestion and backs off unnecessarily. BBR ignores occasional loss and maintains throughput.
+    - **Long-distance, high-BDP paths**: BBR converges to fair share faster than CUBIC on high bandwidth-delay product links.
+
+    What could go wrong:
+    - **Fairness with CUBIC flows**: BBR can be unfair when competing with CUBIC flows on the same bottleneck link. BBR tends to grab more bandwidth because it does not back off on loss. BBRv2 and BBRv3 address this somewhat, but fairness remains a concern in shared environments.
+    - **RTT measurement sensitivity**: BBR's performance depends on accurate minimum RTT estimation. If your service runs behind a load balancer that adds variable latency, BBR may over-estimate min_RTT and underperform.
+    - **Retransmission behavior**: BBR can sometimes cause higher retransmission rates than CUBIC because it probes aggressively and does not immediately reduce sending on loss. Monitor `netstat -s | grep retrans` after switching.
+
+    My recommendation: enable BBR for internet-facing services (CDNs, APIs serving mobile clients) where bufferbloat is the primary latency enemy. Keep CUBIC for data center east-west traffic where links are reliable and bufferbloat is not a factor. You can set it per-connection with `setsockopt(TCP_CONGESTION, "bbr")`, so you do not need a system-wide switch.
+
+    **Follow-up: How would you measure whether switching to BBR actually improved your service's performance?**
+
+    Before/after A/B test measuring three metrics: p50/p95/p99 TCP RTT (from `ss -ti` or TCP tracepoints), retransmission rate (`nstat TcpRetransSegs`), and application-level latency. Run both simultaneously on different server pools serving the same traffic. If BBR shows lower RTT and equal or lower retransmit rate, it is a win. If retransmits spike, investigate whether the path has a strict policer (some ISPs police by drop rate, which confuses BBR).
+  </Accordion>
+
+  <Accordion title="What is the sk_buff structure and why is it designed the way it is? What would happen if you needed to redesign it for modern 100Gbps NICs?">
+    **Strong Answer:**
+
+    The `sk_buff` (socket buffer) is the central data structure representing a network packet as it traverses the Linux kernel network stack. Every packet -- whether incoming or outgoing -- is wrapped in an sk_buff from the moment it enters the kernel until it leaves.
+
+    - **Key design elements**: An sk_buff contains a `head` pointer (start of allocated buffer), `data` pointer (start of current layer's header), `tail` pointer (end of data), and `end` pointer (end of allocated buffer). The space between `head` and `data` is "headroom" -- reserved for prepending headers as the packet moves down the stack (e.g., adding an IP header, then an Ethernet header). The space between `tail` and `end` is "tailroom" for appending data. This design means that adding or removing headers is a pointer adjustment, not a memory copy.
+    - **Metadata**: sk_buff also carries extensive metadata: timestamp, hash value (for RSS), mark (for iptables), VLAN tag, checksum offload status, GRO/GSO information, and pointers to the associated socket and network device. This metadata is what makes protocol processing efficient -- each layer annotates the sk_buff rather than parsing from scratch.
+    - **Cloning**: When a packet needs to go to multiple destinations (multicast, tapping), the kernel clones the sk_buff -- creating a new metadata structure that points to the same data buffer. This avoids copying the packet payload.
+
+    For redesigning at 100Gbps:
+    - **The problem**: At 100Gbps with 64-byte packets, you need to process 148 million packets per second. Allocating and freeing an sk_buff per packet is impossibly expensive -- each allocation involves slab allocator calls, cache-line bouncing, and metadata initialization.
+    - **Batch processing**: Modern approaches (GRO -- Generic Receive Offload) coalesce multiple packets into a single sk_buff before handing to upper layers, reducing per-packet overhead by 10-60x.
+    - **XDP's approach**: Bypass sk_buff entirely. XDP uses a minimal `xdp_md` structure that is just pointers into the DMA buffer. No allocation, no metadata bloat. This is why XDP can process packets at line rate on 100Gbps NICs.
+    - **AF_XDP**: Provides a zero-copy path from NIC DMA buffers directly to user-space ring buffers, completely bypassing the sk_buff-based stack. Used by high-frequency trading firms and DPDK-like workloads.
+
+    If I were redesigning from scratch, I would make sk_buff a thin wrapper with a fixed-size inline metadata area (avoiding pointer chasing), support batch allocation/deallocation natively (like the page allocator's bulk APIs), and make the XDP fast path the primary path rather than an afterthought.
+
+    **Follow-up: What is GRO and how does it reduce per-packet overhead?**
+
+    GRO (Generic Receive Offload) coalesces multiple incoming packets belonging to the same flow into a single large sk_buff before passing it up the stack. For example, if 10 TCP segments of 1500 bytes arrive for the same connection, GRO merges them into one 15000-byte sk_buff. The upper layers (TCP) then process one "packet" instead of ten. This reduces per-packet processing overhead (header parsing, socket lookup, lock acquisition) by an order of magnitude. The hardware equivalent is LRO (Large Receive Offload), which does the same thing in the NIC firmware. GRO is preferred because it is smarter about which packets can be safely coalesced (it respects TCP timestamps, ECN bits, etc.) while LRO can sometimes break things by coalescing packets that should not be merged.
+  </Accordion>
+</AccordionGroup>
 
 ---
 

@@ -105,6 +105,9 @@ unsigned long do_mmap(struct file *file, unsigned long addr,
 **W^X Policy** (Write XOR Execute):
 - A page can be writable OR executable, but never both
 - Prevents attacker from modifying code or executing data
+- The logic is straightforward: if you can write it, the attacker can inject code there, so it must not execute. If it executes, it must be immutable.
+
+**Practical tip**: JIT compilers (V8, JVM HotSpot) are the main exception -- they must generate code at runtime. They handle this by allocating pages as RW, writing machine code, then calling `mprotect()` to flip them to RX before execution. This W-then-X pattern is audited carefully in security-critical JITs like Firefox's Wasm compiler.
 
 **Check NX status**:
 
@@ -3088,6 +3091,79 @@ echo "50" > /sys/fs/cgroup/myapp/pids.max
 - KPTI + Retpolines + CPU features (hardware attack mitigation)
 
 **Performance vs Security**: Many mitigations have performance costs. Understand trade-offs and apply based on threat model.
+
+---
+
+---
+
+## Interview Deep-Dive
+
+<AccordionGroup>
+  <Accordion title="Explain how ASLR, stack canaries, and NX bits work together to defend against buffer overflow attacks. What is the attack sequence an adversary must defeat, and where does each mitigation intervene?">
+    **Strong Answer:**
+
+    These three mechanisms form a layered defense against the classic buffer overflow attack chain. To understand why you need all three, walk through what an attacker must accomplish to exploit a buffer overflow:
+
+    - **Step 1: Overwrite the return address** -- The attacker provides input that overflows a stack buffer and overwrites the saved return address (RIP) on the stack, redirecting execution to attacker-controlled code.
+      - **Stack canaries** intervene here. A random value (the "canary") is placed between local variables and the saved return address at function entry. Before the function returns, the compiler-inserted code checks if the canary was modified. If it was (because the overflow overwrote it on the way to the return address), the program aborts immediately. The attacker must either guess the canary (2^64 possibilities on 64-bit) or find a way to overwrite the return address without touching the canary (possible with format string bugs or non-contiguous overwrites, but much harder).
+
+    - **Step 2: Redirect execution to shellcode** -- If the attacker bypasses the canary, they redirect execution to injected code (shellcode) in the buffer itself.
+      - **NX (No-Execute) / DEP** intervenes here. The stack (and heap, and data sections) are marked non-executable at the page table level. The CPU enforces this in hardware: executing an instruction from an NX page triggers a page fault. The attacker's shellcode on the stack cannot execute. This forces the attacker to use Return-Oriented Programming (ROP) -- chaining existing code snippets ("gadgets") from the binary and libraries.
+
+    - **Step 3: Locate usable code gadgets** -- The attacker needs to find executable code at known addresses to build ROP chains.
+      - **ASLR** intervenes here. The kernel randomizes the base addresses of the stack, heap, shared libraries, and (with KASLR) the kernel itself at each process start. The attacker cannot hard-code addresses of gadgets because they change every run. On 64-bit systems, the entropy is typically 28-30 bits for library randomization, making brute force impractical.
+
+    Together, the attacker must: bypass the canary (hard without an information leak), cannot inject code (NX), and cannot find existing code to reuse (ASLR). Breaking one is insufficient -- you need to break at least two.
+
+    Where it still fails:
+    - **Information leaks**: A separate vulnerability that leaks memory addresses (e.g., a format string bug that prints stack values) can defeat both ASLR (reveals addresses) and canaries (reveals the canary value). This is why modern defenses add CFI (Control Flow Integrity) as a fourth layer -- even if the attacker knows addresses, they cannot redirect execution to arbitrary gadgets because the CPU verifies that indirect branches target valid function entries.
+
+    **Follow-up: What is KASLR and why was KPTI needed despite it?**
+
+    KASLR randomizes the kernel's base address in virtual memory at each boot. The idea is that even if an attacker has a kernel vulnerability, they cannot exploit it without knowing where kernel functions are located. KPTI (Kernel Page Table Isolation) was needed because the Meltdown vulnerability allowed user-space code to speculatively read kernel memory through the CPU's speculative execution, bypassing KASLR entirely -- the attacker could read kernel addresses at ~500KB/s and then use those addresses for their exploit. KPTI unmaps the kernel from user-space page tables entirely, so there is nothing for Meltdown to speculatively read. The cost is that every syscall now requires a CR3 switch between user and kernel page tables (5-30% overhead on older CPUs).
+  </Accordion>
+
+  <Accordion title="Compare seccomp-BPF and SELinux as security mechanisms. If you were hardening a container running an untrusted workload, which would you use and why?">
+    **Strong Answer:**
+
+    Seccomp-BPF and SELinux operate at completely different layers and are complementary, not interchangeable.
+
+    - **Seccomp-BPF (System Call Filter)**: Intercepts every syscall at the entry point and runs a BPF filter that decides allow/deny/kill based on the syscall number and (with some limitations) its arguments. It answers: "Can this process invoke this kernel API?" Seccomp cannot distinguish between files, network addresses, or process targets -- if you allow `open()`, the process can open any file. If you allow `connect()`, it can connect to any address.
+    - **SELinux (Mandatory Access Control)**: Assigns security labels to every process, file, socket, and kernel object. A policy defines which labels can perform which operations on which other labels. It answers: "Can this specific subject access this specific object in this specific way?" SELinux can say "process with label httpd_t can read files with label httpd_content_t but cannot write to files with label etc_t." This is far more granular than seccomp.
+
+    For hardening an untrusted container, I would use both:
+
+    - **Seccomp-BPF**: Block all syscalls the container does not need. A web server does not need `mount`, `reboot`, `kexec_load`, `ptrace`, `init_module`, or `io_uring_setup`. Docker ships a default seccomp profile that blocks about 60 dangerous syscalls. For untrusted workloads, I would create a custom profile that allowlists only the ~50 syscalls the application actually uses (determined by running `strace` during testing). This shrinks the kernel attack surface enormously -- most kernel CVEs are in obscure syscall handlers that a web server never touches.
+    - **SELinux (or AppArmor)**: Apply a policy that restricts what the container can access even with the allowed syscalls. The container process can call `open()`, but SELinux ensures it can only open files in its designated directory. It can call `connect()`, but SELinux restricts it to specific ports and network labels. This prevents a compromised container from reading `/etc/shadow`, connecting to the metadata service (a common cloud attack vector), or accessing the Docker socket.
+
+    The layers complement each other: seccomp removes dangerous kernel entry points, SELinux restricts what the remaining entry points can access. Neither alone is sufficient. Seccomp without SELinux means a process with `open()` allowed can read any file. SELinux without seccomp means a process can invoke dangerous syscalls (even if they fail due to policy, the syscall handler code still runs, potentially triggering kernel bugs).
+
+    **Follow-up: What is the performance overhead of running both seccomp-BPF and SELinux simultaneously?**
+
+    Seccomp-BPF adds 10-50 nanoseconds per syscall (running a small BPF program in the syscall entry path). SELinux adds 100-500 nanoseconds per security check (which happens on syscalls that access objects -- file open, socket connect, etc.). For a web server making 10K syscalls per second, the combined overhead is roughly 0.5-5 milliseconds per second -- negligible. For a storage-intensive application making 500K syscalls per second, the overhead is 25-250 milliseconds per second (2.5-25% of one core). The practical impact depends entirely on the syscall rate. For most workloads, the overhead is under 1% and invisible in application-level metrics. The security benefit far outweighs the cost.
+  </Accordion>
+
+  <Accordion title="Explain the Spectre vulnerability. How does it differ from Meltdown, and why is Spectre considered harder to mitigate fully?">
+    **Strong Answer:**
+
+    Both Spectre and Meltdown exploit speculative execution -- the CPU's optimization of executing instructions ahead of time before knowing whether they are needed. The critical difference is the trust boundary they violate.
+
+    - **Meltdown (CVE-2017-5754)**: Exploits the fact that on vulnerable Intel CPUs, speculative loads from kernel memory are not immediately stopped by the permission check. The CPU speculatively reads kernel data into a register, uses it to access a cache line (encoding the secret in a cache side channel), and then throws away the speculative result when the permission check fails. But the cache side channel remains -- the attacker can probe which cache line was accessed and recover the kernel data. Meltdown crosses the user/kernel boundary and allows reading arbitrary kernel memory.
+    - **Spectre (CVE-2017-5753 Variant 1, CVE-2017-5715 Variant 2)**: Exploits the CPU's branch prediction. In Variant 1 (bounds check bypass), the attacker trains the branch predictor to predict that a bounds check will pass, then triggers speculative execution past the check with an out-of-bounds index. The speculative load accesses secret data and encodes it in the cache. In Variant 2 (branch target injection), the attacker poisons the Branch Target Buffer (BTB) to redirect speculative execution of an indirect branch to attacker-chosen code ("gadgets") within the victim's address space.
+
+    Why Spectre is harder to mitigate:
+    - **Meltdown has a clean fix**: KPTI (Kernel Page Table Isolation) unmaps the kernel from user-space page tables. If the kernel memory is not even mapped during user-space execution, the speculative load has nothing to read. The fix is at the OS level and is complete (with a 5-30% performance cost).
+    - **Spectre crosses any trust boundary**: Spectre does not require reading kernel memory. It can leak data between processes, between VMs, between JavaScript contexts in a browser, between a sandbox and its host. Any code running on the same CPU can potentially be a Spectre victim or attacker.
+    - **Software mitigations are partial**: Retpolines (replacing indirect branches with a return trampoline that defeats BTB poisoning) mitigate Variant 2 but add overhead to every indirect call. Array bounds masking (inserting an AND instruction after bounds checks to zero out speculative out-of-bounds accesses) mitigates Variant 1 but requires compiler changes and careful code auditing. Neither is a complete fix.
+    - **New variants keep appearing**: Spectre is a class of vulnerabilities, not a single bug. Spectre-v3a, Spectre-RSB, Spectre-BHB, and MDS (Microarchitectural Data Sampling) are all variations on the same theme. Each requires its own mitigation.
+
+    The fundamental problem is that speculative execution is not a bug -- it is a deliberate performance feature that provides 10-100x speedup for branch-heavy code. Disabling speculation entirely would reduce modern CPUs to 1990s performance levels. The industry is converging on hardware fixes in newer CPUs (Intel Golden Cove, AMD Zen 4) that add speculation barriers in microcode, but older hardware remains vulnerable.
+
+    **Follow-up: How do cloud providers like AWS protect against cross-VM Spectre attacks on shared hardware?**
+
+    Multiple layers: hardware partitioning (Intel CAT/MBA to partition the L3 cache between VMs, reducing cache side-channel leakage), microcode updates (clearing branch predictor state on VM entry/exit), hypervisor patches (KVM flushes speculation buffers on VMEXIT), and core scheduling (ensuring untrusted VMs do not share SMT siblings, since Hyper-Threading shares the branch predictor and L1 cache between logical cores). AWS's Nitro system goes further by offloading virtualization to dedicated hardware, reducing the hypervisor attack surface. Despite all this, the most sensitive workloads (HSMs, cryptographic key storage) run on dedicated single-tenant hosts with no sharing.
+  </Accordion>
+</AccordionGroup>
 
 ---
 

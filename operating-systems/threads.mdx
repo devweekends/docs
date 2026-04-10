@@ -19,7 +19,7 @@ In modern operating systems, a **thread** is the fundamental unit of CPU utiliza
 
 ## 1. The Anatomy of a Thread
 
-A thread is often called a "Lightweight Process" (LWP), but this is slightly misleading. In Linux, threads and processes are both represented by the `task_struct`, but they differ in what they *share*.
+A thread is often called a "Lightweight Process" (LWP), but this is slightly misleading. The analogy that works better: if a process is an apartment (private address space, resources, keys), then threads are roommates sharing that apartment. They each have their own bedroom (stack, registers, TLS) but share the kitchen, living room, and front door (heap, code, file descriptors). In Linux, threads and processes are both represented by the `task_struct`, but they differ in what they *share*.
 
 ### The Thread Control Block (TCB)
 The TCB is the kernel data structure that stores everything unique to a thread. While the process has a Process Control Block (PCB), the TCB contains:
@@ -81,12 +81,14 @@ All user threads map to a single kernel thread.
 ### The M:N Model (Hybrid / Scheduler Activations)
 M user threads are multiplexed onto N kernel threads.
 
-- **Implementation**: Used by **Go (Goroutines)** and **Erlang**. The runtime manages a pool of kernel threads and schedules user tasks onto them.
+- **Implementation**: Used by **Go (Goroutines)** and **Erlang**. The runtime manages a pool of kernel threads and schedules user tasks onto them. Go's runtime, for example, maintains a set of OS threads ("M"), a set of goroutines ("G"), and a set of logical processors ("P"). The runtime scheduler assigns Gs to Ms via Ps, enabling work-stealing across cores.
 - **Pros**: 
     - Efficient switching + True parallelism.
-    - Low memory (Goroutine stacks start at ~2KB).
+    - Low memory (Goroutine stacks start at ~2KB, growing dynamically up to 1GB).
+    - Can support millions of concurrent goroutines on a single machine.
 - **Cons**: 
-    - **Scheduler Complexity**: The runtime must detect when a kernel thread is about to block and "hand off" the remaining user threads to a new kernel thread. This is known as **Scheduler Activations**.
+    - **Scheduler Complexity**: The runtime must detect when a kernel thread is about to block (e.g., on a syscall like `read()`) and "hand off" the remaining user threads to a new kernel thread. Go handles this by wrapping blocking syscalls and spawning replacement threads automatically. This is known as **Scheduler Activations**.
+    - **Debugging difficulty**: Stack traces and profiling tools see OS threads, not goroutines. You need runtime-aware tools (`go tool pprof`, Delve) to get the full picture.
 
 ---
 
@@ -124,21 +126,29 @@ load_context:
 ### The Return Address Trick
 Notice the `ret` at the end. When a thread is first created, the OS pushes the address of the thread's entry function onto its new stack. When the first context switch happens to that thread, the `ret` instruction pops that address and "returns" into the thread's starting code.
 
+This is one of the most elegant tricks in systems programming: "starting" a new thread is actually "returning" into it. The CPU does not know the difference between resuming a suspended thread and entering a new one -- it just follows the stack pointer and return address, which the OS has carefully prepared to look like the thread was always running.
+
+**Practical tip**: If you ever need to understand why a thread's first stack frame looks odd in GDB, this is why. The "return address" on the initial stack is the thread entry point, not the address of some caller.
+
 ---
 
 ## 4. Thread Local Storage (TLS) Internals
 
-TLS allows each thread to have its own copy of a global variable. This is vital for thread-safe libraries (e.g., `errno` in C).
+TLS allows each thread to have its own copy of a global variable. This is vital for thread-safe libraries (e.g., `errno` in C must be per-thread so that one thread's failed syscall does not clobber another thread's error code).
+
+Think of TLS like labeled cubbyholes at the entrance to a shared office. Every employee (thread) has their own cubbyhole at the same relative position, but the cubbyholes are in different physical locations. When a thread accesses `__thread int errno`, the compiler translates it into "look in MY cubbyhole at offset 0x10" -- no locking required because no two threads share a cubbyhole.
 
 ### How it works (x86-64)
 The CPU uses **segment registers** (`FS` or `GS`) to point to a thread-specific memory block. 
-1. The linker aggregates all `__thread` variables into a special ELF section (`.tdata` and `.tbss`).
-2. When a thread is created, the OS allocates a block of memory for these variables.
-3. The `FS` register is set to point to the base of this block.
-4. To access a TLS variable, the compiler generates code like `mov eax, fs:[0x10]`.
+1. The linker aggregates all `__thread` variables into a special ELF section (`.tdata` for initialized data and `.tbss` for zero-initialized data).
+2. When a thread is created, the OS allocates a fresh copy of this block and initializes it from the template.
+3. The `FS` register is set to point to the base of this block via `arch_prctl(ARCH_SET_FS, addr)`.
+4. To access a TLS variable, the compiler generates code like `mov eax, fs:[0x10]` -- a single instruction with no locks.
 
 ### The TCB Pointer
-In Linux, the TCB itself is usually stored at the end of the TLS block. This allows the thread to find its own metadata (like its TID) by just reading from the `FS` register.
+In Linux, the TCB itself is usually stored at the end of the TLS block. This allows the thread to find its own metadata (like its TID) by just reading from the `FS` register. This is why `gettid()` can be extremely fast when cached in TLS -- no syscall needed on the hot path.
+
+**Practical tip**: If you are debugging a multi-threaded program in GDB and need to identify which thread you are on, `info registers fs_base` gives you the TLS base address, which uniquely identifies the thread. This is also how runtimes like Go store the current goroutine pointer: in a platform-specific TLS slot.
 
 ---
 
@@ -186,14 +196,16 @@ When you call `pthread_join()`, the calling thread doesn't busy-wait. It uses a 
 Modern high-scale systems (like Nginx or Node.js) often avoid OS threads for high-concurrency tasks, opting for **Fibers** or **Coroutines**.
 
 ### Fibers (Cooperative Threads)
-Fibers are user-space execution contexts that use **cooperative multitasking**.
-- **Switching**: A fiber must explicitly "yield" control back to the scheduler.
-- **Benefit**: No race conditions within a single kernel thread (since only one fiber runs at a time).
-- **Drawback**: A single long-running fiber can "starve" all others.
+Fibers are user-space execution contexts that use **cooperative multitasking**. The analogy is a group project where each person works until they reach a natural stopping point, then passes the baton. Nobody gets interrupted mid-sentence.
+- **Switching**: A fiber must explicitly "yield" control back to the scheduler. The context switch is just a `swapcontext()` or equivalent -- saving and restoring registers entirely in user space, with zero kernel involvement. This makes switching 10-100x faster than a kernel thread context switch.
+- **Benefit**: No race conditions within a single kernel thread (since only one fiber runs at a time). You get concurrency without needing locks for shared state within the same thread.
+- **Drawback**: A single long-running or accidentally blocking fiber can "starve" all others. If a fiber calls a blocking syscall (e.g., `read()` on a slow socket), the entire kernel thread freezes, taking all its fibers with it.
 
 ### Coroutines (Stackless vs. Stackful)
-- **Stackful (Fibers)**: Have their own stack. Can yield from deep within nested function calls (e.g., Go).
-- **Stackless**: Transformed by the compiler into a State Machine. They "remember" where they were but don't have a real stack (e.g., Python `async/await`, C++20 Coroutines).
+- **Stackful (Fibers)**: Have their own stack. Can yield from deep within nested function calls (e.g., Go goroutines, Lua coroutines). The cost: each needs its own stack allocation, though Go mitigates this with dynamically-growing stacks starting at just 2 KB.
+- **Stackless**: Transformed by the compiler into a State Machine. They "remember" where they were (which `await` point) but do not have a real stack (e.g., Python `async/await`, C++20 Coroutines, Rust `async`). The benefit is zero per-coroutine stack allocation. The cost: you can only yield at explicit `await` points, not from arbitrary nested function calls.
+
+**Practical tip**: When choosing between concurrency models, ask: "How many concurrent tasks do I need?" For thousands, OS threads work fine. For tens of thousands, M:N models (Go, Tokio) are the sweet spot. For millions of concurrent connections (C10M problem), you likely need stackless coroutines or a raw event loop (epoll + state machines).
 
 ---
 

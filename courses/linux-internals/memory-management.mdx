@@ -699,4 +699,56 @@ cat /sys/kernel/mm/transparent_hugepage/enabled
 
 ---
 
+## Interview Deep-Dive
+
+<AccordionGroup>
+  <Accordion title="A production database container was OOM-killed, but the host machine had 50GB free. Explain why this happened and walk through how you would investigate and prevent it." icon="message">
+    **Strong Answer:**
+
+    - The container was killed by the cgroup OOM killer, not the system-wide OOM killer. Cgroups v2 memory controller enforces a per-cgroup `memory.max` limit that is independent of host-level free memory. When the container's `memory.current` exceeds `memory.max`, the kernel first attempts to reclaim pages from within that cgroup (file-backed pages, reclaimable slab). If reclaim fails to free enough, the cgroup OOM killer selects and kills a process within the cgroup.
+    - To investigate, I would first check the cgroup memory stats: `cat /sys/fs/cgroup/<path>/memory.stat` to see the breakdown of `anon` (heap, stack), `file` (page cache charged to this cgroup), `kernel` (slab, page tables, socket buffers), and `sock` (network buffers). A common surprise is that page cache from file reads is charged to the container's cgroup, so a database doing sequential scans can fill its memory limit with page cache before the application's heap is even close to the limit.
+    - I would also check `memory.events` for the `oom_kill` counter and correlate with `dmesg` for the detailed OOM output, which shows per-process RSS and the scoring breakdown.
+    - Prevention strategies: set `memory.high` below `memory.max` to create a throttling buffer where the kernel aggressively reclaims before hitting the hard limit. For databases, consider using `O_DIRECT` to bypass page cache, or tune `vm.swappiness` within the cgroup. Always set the JVM's `-Xmx` below the container's memory limit, leaving headroom for native allocations, page tables, and kernel memory charged to the cgroup.
+
+    **Follow-up:** How does the buddy allocator's fragmentation interact with cgroup memory limits?
+
+    **Follow-up Answer:**
+
+    - The buddy allocator operates on physical pages at the zone level, not per-cgroup. However, cgroup memory limits affect the availability of pages for allocation within a cgroup context. When a cgroup is near its `memory.max`, the kernel may need to reclaim pages before allocating new ones. If the cgroup's pages are heavily fragmented (many small free chunks but no contiguous blocks), allocations requesting higher-order pages (like transparent huge pages needing order-9 = 2MB) will fail even if the cgroup has reclaimable memory. The kernel will attempt compaction within the cgroup's pages, but this adds latency. This is why disabling transparent huge pages (`echo never > /sys/kernel/mm/transparent_hugepage/enabled`) is often recommended for latency-sensitive containerized workloads.
+  </Accordion>
+
+  <Accordion title="Explain the complete lifecycle of a page fault when a process accesses a heap allocation for the first time after malloc(). What kernel code paths are involved?" icon="message">
+    **Strong Answer:**
+
+    - When user space calls `malloc()`, glibc either services it from its internal free list or calls `mmap()` or `brk()` for new pages. The kernel's `mmap()` handler creates a `vm_area_struct` (VMA) describing the new mapping but does not allocate any physical pages. The page table entries for this range remain empty. This is lazy allocation -- the kernel defers physical allocation until the page is actually accessed.
+    - When the process first writes to the allocated address, the CPU walks the page table, finds no valid PTE, and raises a page fault exception (interrupt 14 on x86-64). The CPU pushes the error code and faulting address (CR2 register) onto the kernel stack.
+    - The kernel's `do_page_fault()` handler in `arch/x86/mm/fault.c` reads CR2 to get the faulting address, then calls `find_vma()` to locate the VMA containing that address. If no VMA exists, or the access violates VMA permissions, the kernel sends SIGSEGV.
+    - For a valid anonymous mapping, `handle_mm_fault()` walks the page table levels (PGD, P4D, PUD, PMD, PTE), allocating intermediate page table pages as needed. At the PTE level, it calls `do_anonymous_page()`, which allocates a physical page via `alloc_pages()` (the buddy allocator), zeroes it (for security), creates a PTE mapping the virtual address to the physical page, and inserts it into the page table.
+    - This is a minor fault: no disk I/O was needed, the cost is roughly 2-10 microseconds.
+
+    **Follow-up:** How does transparent huge page allocation change this flow?
+
+    **Follow-up Answer:**
+
+    - When THP is enabled and the faulting address falls within a suitably aligned VMA, the PMD-level handler (`do_huge_pmd_anonymous_page()`) attempts to allocate an order-9 compound page (2MB) instead of a regular 4KB page. If the buddy allocator has a free 2MB block, it maps the entire 2MB region with a single PMD entry, eliminating 511 page table entries and dramatically reducing TLB misses. If the 2MB allocation fails due to fragmentation, the kernel falls back to regular 4KB pages. The `khugepaged` kernel thread runs in the background, scanning for opportunities to collapse adjacent 4KB pages into 2MB huge pages, which involves migrating pages to achieve contiguity.
+  </Accordion>
+
+  <Accordion title="Your monitoring shows kswapd consuming 30% CPU on a server. What is happening, what are the implications, and how would you fix it?" icon="message">
+    **Strong Answer:**
+
+    - `kswapd` is the kernel's background memory reclaim daemon. It wakes up when free memory in a zone drops below the `low` watermark and reclaims pages until free memory reaches the `high` watermark. If kswapd is consuming 30% CPU, the system is under sustained memory pressure -- applications are allocating faster than kswapd can reclaim.
+    - The implications are severe: kswapd reclaim involves scanning LRU lists (active/inactive for both anonymous and file-backed pages), which is CPU-intensive. Worse, if kswapd cannot keep up, application threads enter direct reclaim during `alloc_pages()`, meaning they block in the allocator trying to free pages before they can proceed. This causes unpredictable latency spikes across all applications.
+    - To diagnose, I would check `/proc/meminfo` for the breakdown: if `Cached` is high, file pages are consuming memory and can be reclaimed. If `AnonPages` is high, the working set genuinely exceeds physical memory and swap is being used. I would check `/proc/vmstat` for `pgscan_kswapd` vs `pgscan_direct` -- a high ratio of direct reclaim to kswapd reclaim means kswapd is falling behind.
+    - Fixes depend on the cause: if excessive page cache, tune `vm.vfs_cache_pressure` higher to reclaim dentries and inodes more aggressively. If anonymous memory pressure, either add physical memory, reduce the workload, or add swap (swap prevents OOM but adds latency). If the problem is specific containers, tighten their `memory.high` limits so they self-throttle before causing system-wide pressure.
+
+    **Follow-up:** How does the multi-gen LRU (MGLRU) improve on the traditional two-list LRU for reclaim decisions?
+
+    **Follow-up Answer:**
+
+    - The traditional LRU uses two lists per page type (active and inactive) and makes binary decisions: a page is either recently used or not. This leads to poor decisions when the working set changes, because pages must cycle through both lists before being reclaimed. MGLRU (merged in kernel 6.1) introduces multiple generations of pages, tracking access recency with higher fidelity. It uses hardware-assisted page table scanning (checking accessed bits) to build a multi-generational age distribution, allowing the kernel to reclaim the truly coldest pages first. In practice, MGLRU reduces page fault rates and improves throughput under memory pressure, especially for workloads with large, dynamic working sets like databases.
+  </Accordion>
+</AccordionGroup>
+
+---
+
 Next: [Virtual Memory & Address Translation →](/courses/linux-internals/virtual-memory)

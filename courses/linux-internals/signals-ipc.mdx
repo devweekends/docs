@@ -870,3 +870,55 @@ ls /dev/shm/
 - [Namespaces →](/courses/linux-internals/namespaces) - IPC namespace isolation
 - [Process Subsystem →](/courses/linux-internals/process-subsystem) - How signals interact with scheduling
 - [Networking Stack →](/courses/linux-internals/networking-stack) - Sockets in depth
+
+---
+
+## Interview Deep-Dive
+
+<AccordionGroup>
+  <Accordion title="Docker sends SIGTERM to a container's PID 1 process during 'docker stop', waits 10 seconds, then sends SIGKILL. Explain the kernel-level signal delivery for each step, and why some containers do not shut down gracefully." icon="message">
+    **Strong Answer:**
+
+    - When Docker calls `kill(container_pid, SIGTERM)`, the kernel's `do_send_sig_info()` allocates a `sigqueue` structure, adds it to the target task's pending signal queue, sets the `TIF_SIGPENDING` flag on the task, and wakes the task if it is sleeping. The signal is delivered when the task returns to user space: `exit_to_user_mode_prepare()` calls `do_signal()`, which dequeues the signal and either invokes the registered handler or performs the default action (terminate for SIGTERM).
+    - The reason many containers do not shut down gracefully is that the application runs as PID 1 and does not register a SIGTERM handler. PID 1 in a PID namespace is special: the kernel does not deliver signals with default actions to PID 1 unless a handler is registered. This is because killing PID 1 would destroy the namespace, so the kernel protects it from accidental termination. If the application does not call `sigaction(SIGTERM, ...)`, SIGTERM is silently ignored.
+    - After the 10-second timeout, Docker sends SIGKILL. SIGKILL cannot be caught, blocked, or ignored -- not even by PID 1. The kernel's `get_signal()` function detects SIGKILL and calls `do_exit()` immediately, bypassing any handler. The process is terminated, all its resources are cleaned up, and all other processes in the PID namespace receive SIGKILL as well (because PID 1 exited).
+    - The fix is to either use an init system like `tini` (Docker's `--init` flag) that properly handles signals and forwards them to the application, or explicitly register a SIGTERM handler in the application code.
+
+    **Follow-up:** What happens if the application is in an uninterruptible sleep (D state) when SIGKILL arrives?
+
+    **Follow-up Answer:**
+
+    - If the process is in `TASK_UNINTERRUPTIBLE` state (typically waiting for disk I/O or a kernel lock), even SIGKILL cannot immediately terminate it. The kernel sets the `TIF_SIGPENDING` flag and the signal remains queued, but the process does not check for signals until it transitions out of the D state. This is why `kill -9` sometimes appears to have no effect on processes stuck in D state. The process can only be killed when the I/O completes or the lock is released, at which point the signal delivery happens. Newer kernels introduced `TASK_KILLABLE` (a variant of uninterruptible sleep that responds to SIGKILL) to reduce the frequency of this problem for common code paths.
+  </Accordion>
+
+  <Accordion title="You need to implement a zero-downtime restart for a network service. Describe how you would use Unix domain sockets to pass the listening socket's file descriptor from the old process to the new one, and explain the kernel mechanisms involved." icon="message">
+    **Strong Answer:**
+
+    - The strategy is: start the new process, pass the listening socket's fd to it via a Unix domain socket, have the new process start accepting connections, then gracefully drain and stop the old process.
+    - The fd-passing mechanism uses ancillary (control) messages on Unix domain sockets. The sender constructs a `msghdr` with a `cmsghdr` containing `SCM_RIGHTS` and the fd number. When `sendmsg()` processes this, the kernel does not just send the integer -- it looks up the sender's `struct file *` for that fd, increments its reference count, and serializes a reference in the control message.
+    - On the receiving side, `recvmsg()` creates a new fd in the receiver's file descriptor table pointing to the same `struct file`. The receiving process now has an independent fd number (possibly different from the sender's) that references the same underlying socket. Both processes can now `accept()` connections on the same listening socket.
+    - The kernel mechanism in `scm_send()` and `scm_recv()` in `net/core/scm.c` handles the fd translation: it calls `fget()` on the sender's fd to get the `struct file *`, stores it in the `scm_cookie`, and on the receiving side calls `receive_fd()` to install the file in the receiver's fd table with `__receive_fd()`.
+    - For zero-downtime: the new process calls `accept()` on the inherited socket. Both old and new processes can accept simultaneously during the transition window. The old process stops accepting, drains in-flight requests, and exits. The socket's listen backlog is shared, so no connections are dropped during the transition.
+
+    **Follow-up:** What happens to connections that were already accepted by the old process? How would you drain them gracefully?
+
+    **Follow-up Answer:**
+
+    - Already-accepted connections are individual sockets with their own file descriptors in the old process. These are not affected by passing the listening socket. The old process should stop accepting new connections (close or stop polling the listening fd), then continue processing in-flight requests on existing accepted sockets until they complete. It can set a deadline and, after the deadline, close remaining connections with a proper TCP FIN (graceful close). If the service uses HTTP, it should send `Connection: close` headers on in-flight responses. For long-lived connections (WebSockets, gRPC streams), the application protocol needs its own graceful shutdown mechanism -- the kernel-level fd passing only handles the listening socket.
+  </Accordion>
+
+  <Accordion title="Compare the performance characteristics of pipes, Unix domain sockets, and shared memory for IPC between two processes on the same host. When would you choose each?" icon="message">
+    **Strong Answer:**
+
+    - Pipes provide unidirectional byte stream communication with a kernel-managed circular buffer (default 64KB, adjustable via `F_SETPIPE_SZ`). Each `write()` and `read()` involves a syscall, data copy from user to kernel buffer (write side) and kernel buffer to user (read side) -- two copies per transfer. Latency is approximately 1 microsecond for small messages. I would use pipes for simple parent-child communication where data flows one direction, like shell pipelines.
+    - Unix domain sockets support bidirectional communication, both stream and datagram modes, and critically support fd passing. Performance is similar to pipes (two data copies, ~1 microsecond latency), but with the overhead of full socket buffer management. For SOCK_DGRAM, message boundaries are preserved. I would use Unix sockets for any IPC that needs bidirectional communication, fd passing, or integration with event loops (epoll). They are the default choice for general-purpose local IPC.
+    - Shared memory eliminates all data copying: both processes map the same physical pages into their address spaces via `mmap()` with `MAP_SHARED`. Data written by one process is immediately visible to the other (subject to cache coherency, which is handled by hardware on x86). Latency is approximately 100 nanoseconds. However, shared memory requires explicit synchronization (mutexes, semaphores, or lock-free algorithms) because the kernel provides no ordering guarantees. I would use shared memory only for high-throughput, latency-critical IPC (inter-process queues for trading systems, database buffer pools) where the application team can correctly implement the synchronization.
+    - The key decision factor is: how much data and how fast? For small, infrequent messages, Unix sockets are simplest and safest. For high-throughput bulk data transfer, shared memory avoids the copy overhead that dominates at high rates.
+
+    **Follow-up:** How does `eventfd` fit into this picture, and why is it commonly used with shared memory?
+
+    **Follow-up Answer:**
+
+    - `eventfd` is a lightweight notification mechanism: it provides a file descriptor that represents a counter. Writing increments the counter, reading returns and resets it. The overhead is minimal -- a single syscall to signal an event, and the fd is epoll-compatible. Shared memory alone has no built-in notification mechanism: a reader must either busy-poll (waste CPU) or use a separate signaling channel. `eventfd` fills this role perfectly: the writer updates shared memory, then writes to the eventfd to notify the reader. The reader blocks on `epoll_wait()` including the eventfd, wakes up on notification, and reads the shared memory. This combines shared memory's zero-copy data transfer with eventfd's efficient notification, giving the best of both worlds for high-performance IPC.
+  </Accordion>
+</AccordionGroup>

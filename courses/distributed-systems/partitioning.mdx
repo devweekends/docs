@@ -9,6 +9,8 @@ icon: "table-cells"
 
 When data outgrows a single machine, you need to partition (shard) it across multiple nodes. This module covers the strategies, trade-offs, and production patterns for effective data distribution.
 
+Think of partitioning like organizing a library: you could put all books on one giant shelf (single node), but eventually you run out of space and it takes too long to find anything. Instead, you split books across rooms -- fiction in Room A, non-fiction in Room B, reference in Room C. The challenge is choosing the split so that most visitors only need to visit one room, and no single room is overwhelmed while others sit empty.
+
 <Info>
 **Module Duration**: 10-14 hours  
 **Key Topics**: Hash Partitioning, Range Partitioning, Consistent Hashing, Rebalancing, Hot Spots  
@@ -327,9 +329,19 @@ class ConsistentHash:
     """
     Consistent hashing with virtual nodes.
     Used by: Cassandra, DynamoDB, Memcached (with ketama), load balancers
+    
+    The key insight: instead of hash(key) % N (which reshuffles everything
+    when N changes), we map both keys and nodes onto the same circular
+    space. Adding a node only "steals" keys from its immediate neighbors
+    on the ring, leaving all other assignments unchanged. Virtual nodes
+    smooth out the distribution -- without them, 3 physical nodes might
+    split the ring 60/30/10 instead of the desired 33/33/33.
     """
     
     def __init__(self, nodes: list = None, virtual_nodes: int = 150):
+        # 150 vnodes per physical node is a good default for clusters
+        # up to ~100 nodes. More vnodes = better balance but more memory
+        # for the ring data structure and slower lookups.
         self.virtual_nodes = virtual_nodes
         self.ring = {}  # position -> node
         self.sorted_positions = []  # sorted list of positions
@@ -710,16 +722,29 @@ When data is pinned to a region, **Cross-Region Operations** become extremely co
 class HotKeySharding:
     """
     Spread hot keys across multiple sub-partitions.
+    
+    Real-world analogy: When a celebrity tweets, millions of users request
+    that tweet simultaneously. If all requests hit one partition, it melts.
+    This is like a bakery that normally serves 50 customers/hour suddenly
+    facing 50,000. The solution: open 100 temporary counters (sub-shards),
+    each serving from their own copy of the menu.
+    
+    Instagram uses a similar approach for celebrity profiles, and Twitter
+    (now X) uses fan-out-on-write with sharded timelines.
     """
     
     def __init__(self, hot_keys: set, shard_count: int = 100):
-        self.hot_keys = hot_keys
+        self.hot_keys = hot_keys  # Typically maintained by a background
+                                   # job that monitors QPS per key
         self.shard_count = shard_count
     
     def get_partition_key(self, key: str) -> str:
         """
-        For hot keys, add a shard suffix.
-        For normal keys, use as-is.
+        For hot keys, add a random shard suffix to spread writes.
+        For normal keys, use as-is to keep single-partition lookups fast.
+        
+        Trade-off: writes become O(1) per shard, but reads now require
+        scatter-gather across all shards. Only shard keys you KNOW are hot.
         """
         if key in self.hot_keys:
             shard = hash(str(random.random())) % self.shard_count
@@ -1058,3 +1083,45 @@ You are designing a time-series platform that ingests telemetry, metrics, or log
     Handle cross-partition transactions with 2PC and Saga
   </Card>
 </CardGroup>
+
+---
+
+## Interview Deep-Dive
+
+<AccordionGroup>
+  <Accordion title="How do you choose a partition key for a system that needs to support both point lookups and range scans efficiently?">
+    **Strong Answer:**
+    - This is a fundamental tension in partitioning design. Hash partitioning gives you excellent point lookups (hash the key, go directly to one partition) and even data distribution, but destroys range scan ability because adjacent keys are scattered across partitions. Range partitioning preserves key order (enabling efficient range scans) but creates hot spots when access patterns cluster around certain key ranges.
+    - The solution is usually a compound partition key. For example, in a time-series system, partition by hash(device_id) and use timestamp as the clustering key within each partition. Point lookups by device_id go to one partition, and range scans for "device X, last 24 hours" are also single-partition because the timestamps are ordered within the partition.
+    - DynamoDB models this explicitly with its partition key (hash distributed) and sort key (range ordered within the partition). Cassandra uses a similar compound primary key model.
+    - The design rule: pick the partition key to match your most frequent query pattern, then use secondary indexes or materialized views for alternative access patterns.
+
+    **Follow-up: What if your most frequent query requires a range scan across a dimension that cannot be the sort key?**
+
+    Then you need a global secondary index (GSI) or a denormalized table. With a GSI (as in DynamoDB), the index is itself partitioned by the indexed attribute, so a range scan on that attribute becomes a single-partition read on the index. The cost: writes are slower because every data write triggers an asynchronous index update, and the index is eventually consistent with the base table. Alternatively, you can create a separate denormalized table optimized for the range scan query, maintained via change data capture (CDC) or an event stream. This is the CQRS pattern -- separate read models for separate query patterns. The trade-off is storage cost and the complexity of keeping multiple representations in sync.
+  </Accordion>
+
+  <Accordion title="A celebrity posts on your platform and generates a massive hot spot on one partition. How do you handle this in real time?">
+    **Strong Answer:**
+    - This is the "celebrity problem" or "thundering herd on a single key." The partition holding the celebrity's data receives 1000x normal traffic, exceeding its capacity while other partitions sit idle.
+    - Immediate mitigation: add a random suffix to the celebrity's partition key, splitting their data across N sub-partitions (e.g., "celebrity123:shard_0" through "celebrity123:shard_99"). Writes are distributed randomly across sub-shards. Reads require scatter-gather across all sub-shards, but this is parallelizable and much better than overloading a single partition.
+    - Detection must be automated. Monitor per-partition QPS and latency in real time. When a partition's QPS exceeds a threshold (e.g., 5x the average), automatically add it to a "hot key" list and enable sub-sharding for that key. This is a dynamic, not static, process -- celebrities come and go.
+    - Caching is the complementary strategy. For read-heavy hot spots, place the celebrity's data in a distributed cache (Redis Cluster, Memcached) with a short TTL. This absorbs the read storm without hitting the database. For write-heavy hot spots (likes, view counts), buffer writes in memory and flush to the database in batches (write coalescing).
+
+    **Follow-up: How do you handle the transition when a hot key is detected and you need to add sub-sharding without downtime?**
+
+    The transition must be atomic from the client's perspective. I would use a routing layer that maintains a mapping of hot keys to their sub-shard configuration. When a key is detected as hot: (1) The routing layer starts writing to sub-shards in addition to the original key (dual-write phase). (2) After a convergence period, all recent data is in sub-shards. (3) Switch reads to scatter-gather across sub-shards. (4) Stop writing to the original key. The critical detail is that during the transition, reads must check both the original key and the sub-shards to avoid missing data. A simpler approach, used by some systems: always use sub-sharding for all keys (with a low shard count like 4), so no dynamic transition is needed. The overhead of reading 4 sub-shards per key is minimal, and you are always prepared for hot keys.
+  </Accordion>
+
+  <Accordion title="Explain the trade-offs between local secondary indexes and global secondary indexes in a partitioned database.">
+    **Strong Answer:**
+    - A local secondary index is co-located with the data partition. Each partition maintains its own index over its local data only. Writes are fast because the index update is a local operation within the same partition. But reads by the indexed attribute require scatter-gather across all partitions because any partition might have matching data. Read latency equals the slowest partition.
+    - A global secondary index is separately partitioned by the indexed attribute. A query like "find all users in NYC" goes to a single index partition, making reads fast. But writes are slow because inserting a record might require updating an index partition on a different node, which is either a distributed transaction (expensive) or eventually consistent (the index lags behind the data).
+    - Cassandra uses local indexes (materialized views with scatter-gather). DynamoDB uses global indexes (GSIs that are eventually consistent). Elasticsearch uses global indexing with near-real-time consistency.
+    - The decision depends on read/write ratio. If the workload is write-heavy and reads by secondary key are rare, local indexes are better. If the workload is read-heavy with frequent secondary key lookups, global indexes are better despite the write overhead.
+
+    **Follow-up: In DynamoDB, what consistency issues can arise from the eventually consistent nature of GSIs?**
+
+    A write to the base table is immediately visible but the GSI update is asynchronous, typically within milliseconds but potentially delayed during high write throughput. This means a query on the GSI might not return a record that was just written to the base table. Worse, it can return stale attribute values if the record was recently updated. In practice, this means you cannot use a GSI query result as the source of truth for an immediate business decision. For example, if you use a GSI to check "is this username taken?" and the GSI lags, two users might simultaneously register the same username -- the GSI returns "not taken" for both. The mitigation: use the base table (with a strongly consistent read) for invariant checks, and use GSIs only for queries where eventual consistency is acceptable (search, analytics, listing pages).
+  </Accordion>
+</AccordionGroup>

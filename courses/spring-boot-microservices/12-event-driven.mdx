@@ -221,3 +221,65 @@ spring:
 
 Now, after 3 failed attempts, the message goes to `orders.order-service.dlq`.
 
+---
+
+## Interview Deep-Dive
+
+<AccordionGroup>
+  <Accordion title="Explain the Transactional Outbox pattern. Why can't you just put the database write and the Kafka publish in the same @Transactional method?">
+    **Strong Answer:**
+
+    - The fundamental problem is the "dual write": you need to update a database AND publish a message to a broker, and these are two separate systems with no shared transaction coordinator. If you put both in a `@Transactional` method, the database transaction commits, but the Kafka send might fail afterward (network blip, broker down). Now the order exists in the database but the event was never published. Downstream services never learn about the order. Reversing the order does not help: if you publish first and the database commit fails, the event says "order created" but no order exists.
+    - The Transactional Outbox solves this by writing the event to an `outbox` table in the SAME database transaction as the business data. Since it is a single database transaction, either both the order AND the outbox row are committed, or neither is. Atomicity is guaranteed by the database.
+    - A separate process (scheduler, CDC tool like Debezium) reads the outbox table and publishes events to Kafka. If the publisher crashes, the outbox rows remain and will be picked up on the next run. If the Kafka send fails, the publisher retries. This provides at-least-once delivery guarantee.
+    - The Debezium approach is superior to a scheduled poller. Debezium reads the database's transaction log (PostgreSQL WAL, MySQL binlog) and publishes changes to Kafka in near-real-time. This eliminates the polling delay and the load on the outbox table from repeated SELECTs. Debezium also guarantees ordering: events are published in the same order they were committed to the database.
+    - The trade-off: eventual consistency. There is a window (milliseconds with Debezium, seconds with a poller) between the database commit and the event being published. Downstream services see the event with a delay. For most business operations (send email, update inventory), this delay is acceptable. For operations requiring immediate consistency (check balance before transfer), the outbox pattern is not the right tool.
+
+    **Follow-up: What about using Kafka's transactional producer with the database transaction? Can't you coordinate them?**
+
+    You can use the XA (two-phase commit) protocol with a JTA transaction manager to coordinate a database transaction and a Kafka transaction atomically. Spring supports this via `JtaTransactionManager` with providers like Atomikos or Narayana. But in practice, XA transactions are fragile, slow, and operationally complex. They require both the database and the broker to support XA, they hold locks longer (the prepare phase locks resources across both systems), and if the transaction coordinator crashes between prepare and commit, you need manual recovery. At scale, the latency overhead of 2PC makes it impractical for high-throughput paths. The Transactional Outbox achieves equivalent guarantees (at-least-once, eventual consistency) with much simpler operational characteristics. I have only seen XA used in legacy enterprise environments where regulatory requirements mandate synchronous consistency between systems.
+  </Accordion>
+
+  <Accordion title="Compare Kafka and RabbitMQ for microservices event-driven architecture. When would you choose each, and what are the failure modes unique to each?">
+    **Strong Answer:**
+
+    - Kafka is a distributed log. Messages are appended to topic partitions, retained for a configurable period (days, weeks, forever), and consumers maintain their own offset. Multiple consumer groups can read the same topic independently. This means you can replay events from any point in time -- a producer published an event last week, and a new consumer can read it from the beginning.
+    - RabbitMQ is a traditional message broker. Messages are routed to queues via exchanges (direct, topic, fanout). Once a consumer acknowledges a message, it is deleted. No replay. RabbitMQ excels at complex routing patterns (send this message to queues matching `order.*.created`), priority queues, and request-reply patterns.
+    - Choose Kafka when: you need high throughput (millions of messages/second), event replay (new service needs historical events), event sourcing (the log IS the database), or long retention (compliance, analytics). Kafka's partition-based parallelism scales horizontally.
+    - Choose RabbitMQ when: you need complex routing (messages go to different queues based on content), low-latency delivery (RabbitMQ push model delivers faster than Kafka poll model for low-throughput scenarios), priority queues, or request-reply patterns (RPC over messaging).
+    - Kafka failure modes: consumer lag (consumers fall behind producers, causing stale data downstream). Partition rebalancing (when consumers join/leave, partitions are reassigned, causing temporary duplicates or pauses). Out-of-order processing within a partition if the producer retries without idempotency enabled.
+    - RabbitMQ failure modes: queue depth explosion (if consumers are down, messages pile up in memory, causing broker OOM). Message loss if queues are not durable and the broker restarts. Poison messages that repeatedly fail processing and block the queue (solved with DLQ, but must be explicitly configured).
+
+    **Follow-up: How do you handle message ordering in Kafka when you have multiple consumers in a consumer group?**
+
+    Kafka guarantees ordering within a single partition, not across partitions. If you have 3 partitions and 3 consumers, each consumer reads one partition in order. To ensure all events for a specific entity (e.g., Order 12345) are processed in order, set the message key to the entity ID (`order.getId()`). Kafka hashes the key to determine the partition, so all events for Order 12345 go to the same partition and are processed by the same consumer in order. The trade-off: if one entity is hot (millions of events for one order), it overloads one partition while others are idle. For most business entities, the distribution is even enough. If not, use a composite key (`customerId + orderId`) to spread load while maintaining per-order ordering.
+  </Accordion>
+
+  <Accordion title="What is a Dead Letter Queue (DLQ), and how do you design a strategy for handling messages that end up there?">
+    **Strong Answer:**
+
+    - A DLQ is a secondary queue where messages are routed after they fail processing a configured number of times. Instead of blocking the main queue (in RabbitMQ) or causing infinite consumer restarts (in Kafka), the poison message is moved aside for later inspection.
+    - The DLQ strategy has three phases: detection, diagnosis, and resolution. Detection: monitor the DLQ depth. If it grows, alert the team. A non-empty DLQ is not an emergency, but a growing one is. Diagnosis: build a dashboard or tool that displays DLQ messages with their payload, exception stacktrace, original timestamp, and number of retry attempts. Resolution: fix the root cause (deploy a code fix, correct bad data), then replay the messages from the DLQ back to the main queue.
+    - Replay mechanisms: (1) Manual -- an operator tool reads DLQ messages and re-publishes them to the original topic. (2) Automated -- a scheduled job periodically retries DLQ messages (dangerous if the root cause is not fixed, creates an infinite retry loop). (3) Selective -- replay only messages matching certain criteria (e.g., only messages after a specific timestamp when the bug was introduced).
+    - Design considerations: include metadata in the DLQ message -- the original topic/queue name, the exception class and message, the consumer that failed, and the attempt count. This is critical for diagnosis. Also, set a retention policy on the DLQ itself -- messages older than 30 days should be archived to cold storage or deleted, depending on compliance requirements.
+
+    **Follow-up: A consumer keeps throwing NullPointerException for a specific message format. It retries 3 times and goes to the DLQ. But the DLQ is growing at 1000 messages/hour. What do you do?**
+
+    This is not a poison-message scenario -- it is a systematic failure. 1000 messages/hour means a significant fraction of traffic hits the bug. Immediate action: deploy a hotfix to the consumer that handles the null case gracefully (log and skip, or use a default value). If you cannot deploy quickly, temporarily increase `max-attempts` to 1 (send to DLQ immediately without retries) to reduce consumer load. After the fix is deployed, replay all DLQ messages. For prevention: add schema validation at the producer side (messages must conform to an Avro/Protobuf schema registered in a Schema Registry). This catches malformed messages before they enter the topic, shifting the failure to the producer where the root cause is.
+  </Accordion>
+
+  <Accordion title="How would you ensure exactly-once processing in an event-driven microservices system? Is it even possible?">
+    **Strong Answer:**
+
+    - True exactly-once across distributed systems is impossible in the general case (this follows from the Two Generals problem and FLP impossibility). What you can achieve is effectively exactly-once through idempotent processing combined with at-least-once delivery.
+    - At-least-once delivery: Kafka guarantees this by default with `acks=all` and retries. The producer retries until the broker acknowledges. The consumer commits offsets only after successful processing. If the consumer crashes before committing, it re-reads and re-processes the message. This means duplicates are possible.
+    - Idempotent processing: design your consumer so that processing the same message twice produces the same result as processing it once. Strategies: (1) Idempotency key: each message carries a unique ID. The consumer checks a processed-messages table before processing. If the ID exists, skip. (2) Upsert instead of insert: `INSERT ... ON CONFLICT DO UPDATE` ensures the same event applied twice does not create duplicate rows. (3) Conditional updates: `UPDATE inventory SET quantity = quantity - 1 WHERE order_id != :orderId` prevents double-decrementing.
+    - Kafka's "exactly-once semantics" (EOS) with `enable.idempotence=true` and transactional producers provides exactly-once within Kafka: a produce-consume-produce chain within Kafka does not create duplicates. But the moment you write to an external system (database), you need the Transactional Outbox or idempotent consumer pattern.
+    - The practical approach: accept at-least-once delivery and make consumers idempotent. This is simpler, more resilient, and scales better than trying to achieve true exactly-once with distributed transactions.
+
+    **Follow-up: How do you implement an idempotency key in a Spring Boot consumer? What is the storage strategy?**
+
+    Store processed message IDs in the same database transaction as the business logic. When the consumer processes an `OrderCreatedEvent`, it (1) checks if `event_id` exists in the `processed_events` table, (2) if not, inserts the business data AND the event ID in one `@Transactional` method. If the consumer crashes and retries, the event ID is either already in the table (skip) or not (process). The `processed_events` table needs a TTL -- you do not need to keep IDs forever, just long enough to cover the maximum retry window (e.g., 7 days). Use a scheduled job or PostgreSQL's `pg_partman` to auto-expire old rows. Redis with TTL is faster for lookups but adds the dual-write problem again (database + Redis), so I prefer keeping the idempotency check in the same database transaction as the business write.
+  </Accordion>
+</AccordionGroup>
+

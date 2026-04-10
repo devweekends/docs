@@ -565,9 +565,265 @@ shard_id = hash(short_code) % num_shards
 
 | Aspect | Decision | Reason |
 |--------|----------|--------|
-| **Short code** | 7 chars, base62 | 3.5 trillion URLs, no special chars |
-| **ID generation** | Snowflake | Distributed, no coordination |
-| **Database** | Cassandra | High write throughput, easy scaling |
-| **Cache** | Redis cluster | Fast reads, 99% hit rate |
-| **Redirect** | 301 | Browser caching, SEO friendly |
-| **Analytics** | Kafka + ClickHouse | Async processing, OLAP queries |
+| **Short code** | 7 chars, base62 | 3.5 trillion URLs, no special chars. 62^7 = 3.5 trillion combinations means at 100M URLs/month, you have capacity for ~3,000 years. No need for 8+ characters. |
+| **ID generation** | Snowflake | Distributed, no coordination needed between servers. Each worker generates unique IDs independently using timestamp + machine ID + sequence number. The trade-off vs Redis INCR: Snowflake IDs are time-sortable but non-sequential, while Redis INCR is sequential but requires a centralized counter. |
+| **Database** | Cassandra | High write throughput, easy horizontal scaling. The URL mapping table has a simple access pattern (point lookups by short code) that is a perfect fit for a key-value or wide-column store. PostgreSQL works fine at smaller scale but requires manual sharding past ~1TB. |
+| **Cache** | Redis cluster | Fast reads, 99% hit rate achievable because URL access follows a power law -- 20% of URLs get 80% of traffic. At 100M hot URLs x 600 bytes = 60GB, which fits in a 3-node Redis cluster. |
+| **Redirect** | 301 | Browser caching, SEO friendly. The trade-off: 301 (permanent) redirects are cached by browsers, so repeat clicks don't hit your servers -- great for performance but means you lose analytics on those repeat visits. Use 302 (temporary) if analytics accuracy matters more than SEO and server load reduction. |
+| **Analytics** | Kafka + ClickHouse | Async processing decouples the hot redirect path from analytics writes. ClickHouse is purpose-built for OLAP queries (aggregations over billions of click events). The alternative -- writing analytics inline during redirects -- would add 5-10ms latency to every redirect and couple your availability to the analytics store. |
+
+### Key Trade-offs
+
+| Decision | Option A | Option B | Recommendation |
+|----------|----------|----------|----------------|
+| ID generation | Hash (MD5/SHA) | Counter (Snowflake/Redis INCR) | **Counter-based (Snowflake ID)** -- collision-free by construction. Hash-based approaches hit the birthday paradox: with 7 characters of hash output, collision probability reaches 50% at ~10M URLs. At 100M URLs/month, you are guaranteed collisions within weeks. Snowflake IDs are globally unique, time-sortable, and require no collision checks. The trade-off: Snowflake IDs are predictable (sequential), which is a minor information leak. If URL privacy matters, apply a bijective shuffle to the ID before base62 encoding. |
+| Redirect status code | 301 (Permanent) | 302 (Temporary) | **301 for most use cases** -- browsers cache the redirect, so repeat clicks never hit your servers. This dramatically reduces read load (which is 100x write load). The trade-off: cached 301s bypass your analytics pipeline, so repeat visits from the same browser are not counted. Use 302 if analytics accuracy is critical (e.g., ad click tracking where every click has monetary value). Bit.ly defaults to 301 and compensates for the analytics gap with JavaScript-based tracking on the destination page. |
+| Database | SQL (PostgreSQL) | NoSQL (Cassandra/DynamoDB) | **Cassandra or DynamoDB** for the URL mapping store. The access pattern is pure point lookups by short code -- no joins, no complex queries, no transactions needed. Cassandra handles the write volume (1,200/sec) and read volume (115K/sec) natively with horizontal scaling. PostgreSQL works fine up to ~1TB but requires manual sharding beyond that. The trade-off: you lose SQL query flexibility, but the URL shortener never needs it. Keep PostgreSQL for user account management if you have authenticated users. |
+| Caching layer | Redis (dedicated) | CDN edge cache | **Both in a tiered strategy.** Redis cluster caches the top ~20% of active URLs (Pareto principle: 20% of URLs get 80% of traffic). Expected hit rate: 90%+. CDN edge caching adds a global layer that absorbs geographic traffic spikes. The trade-off: CDN caching with 301 redirects means your URL-level analytics undercounts by the cache hit rate. If you serve 1M redirects/day and CDN hit rate is 40%, you only see 600K in your analytics pipeline. |
+| Analytics pipeline | Synchronous (inline) | Asynchronous (Kafka) | **Asynchronous via Kafka.** The redirect hot path must stay under 50ms p99. Writing analytics inline (country lookup, user-agent parsing, DB insert) adds 5-10ms and couples redirect availability to the analytics store. Fire a lightweight click event to Kafka, process it in Flink/Spark Streaming, and store aggregates in ClickHouse. The trade-off: analytics lag by 1-2 seconds, which is imperceptible on a dashboard. Inline counters in Redis (`INCR`) provide the real-time "click count" display. |
+
+### Common Candidate Mistakes
+
+```
+Mistake 1: Using MD5/SHA hash and hoping for no collisions
+  With 7 characters of a hash output, collision probability
+  reaches 50% at around 10 million URLs (birthday paradox).
+  At 100M URLs/month, you will hit collisions within the first
+  month. Counter-based approaches (Snowflake, Redis INCR)
+  guarantee uniqueness without collision checks.
+
+Mistake 2: Checking the database for duplicates on every write
+  Some candidates propose "generate hash, check DB, retry on
+  collision." At 1,200 writes/second, each collision check adds
+  a database round trip. Use a pre-generated key pool or a
+  counter-based approach that is collision-free by construction.
+
+Mistake 3: Not discussing the 301 vs 302 trade-off
+  This is a common follow-up question. Many candidates default
+  to 301 without understanding the analytics implication. Mention
+  both options and when each is appropriate -- it shows you think
+  about product requirements, not just engineering.
+
+Mistake 4: Over-engineering the database layer
+  URL shortening is fundamentally a key-value lookup. Candidates
+  who propose complex relational schemas with foreign keys and
+  joins are over-engineering. The core table has two columns:
+  short_code and original_url. Analytics is a separate concern
+  with a separate data store.
+
+Mistake 5: Ignoring abuse and security
+  Short URLs are used for phishing and malware distribution. A
+  production system needs URL scanning (check against Google
+  Safe Browsing API), rate limiting on URL creation, and a
+  reporting/takedown mechanism. Mentioning this in an interview
+  shows security awareness.
+```
+
+## Interview Deep-Dive Questions
+
+These are the questions a senior interviewer would ask after you present your URL shortener design.
+They test whether you actually understand the trade-offs or just memorized the diagram.
+
+---
+
+### Question 1: ID Generation at Scale
+
+**Q: You chose Snowflake IDs for short code generation. We just acquired a company and need to merge their 2 billion existing URLs into our system without downtime. Their IDs overlap with ours. Walk me through how you handle this migration without breaking existing short links.**
+
+**Strong Answer:**
+
+- The core problem is ID namespace collision. Two independent Snowflake generators will have produced overlapping IDs because they used different machine-ID assignments. You cannot simply re-ID the acquired URLs because existing short links are already bookmarked, printed on physical media, and indexed by search engines -- changing them is a non-starter.
+- **Dual-read approach**: Introduce a routing layer that checks both URL stores. For any incoming redirect request, first check the primary store. On a miss, check the acquired company's store. This gives you zero-downtime reads immediately.
+- **Namespace partitioning for new writes**: Reserve a bit prefix or range in the Snowflake ID space for legacy-acquired URLs. For example, if you are using 64-bit Snowflake IDs, dedicate bit 63 as a "source" flag -- `0` for organic URLs, `1` for acquired. This guarantees no future collisions without touching existing data.
+- **Background migration**: Lazily migrate acquired URLs into the primary store. On each redirect that hits the secondary store, write-through to the primary store. Combine this with a background batch job that migrates cold URLs. Track migration progress with a counter and alert when complete.
+- **The trade-off**: Dual-read adds ~2-5ms latency on cache misses during migration. You accept this temporary cost rather than risking a big-bang migration that could corrupt billions of mappings. In practice, since 99% of reads hit cache, the user-visible impact is negligible.
+- **Validation**: Before declaring migration complete, run a consistency checker that samples random short codes from both stores and verifies they resolve identically. Only then decommission the secondary store.
+
+**Red flag answer:** "We'd just re-hash all their URLs with our algorithm and update the database." This ignores the fact that existing short links are immutable external references. Anyone with a bookmark, QR code, or API integration pointing to the old short URL would get a 404.
+
+**Follow-ups:**
+1. What happens if two different original URLs from the two systems mapped to the same short code? How do you detect and resolve that conflict?
+2. The acquired company used base36 (lowercase + digits only) while you use base62. How does this affect your cache key strategy and routing logic?
+3. At 2 billion URLs, the background migration job will take days. How do you make it resumable and idempotent so a failure at hour 47 does not force a restart from scratch?
+
+---
+
+### Question 2: Hot Key Problem
+
+**Q: A celebrity tweets a short link and it gets 500,000 clicks per second for 10 minutes. Your Redis cluster has 3 nodes. What breaks, and how do you fix it -- both for this incident right now and architecturally for the future?**
+
+**Strong Answer:**
+
+- **What breaks immediately**: Redis shards keys by consistent hashing, so that one short code lives on exactly one node. At 500K reads/second on a single key, you are hammering one Redis node while the other two sit idle. A single Redis node tops out around 100K-200K ops/second for simple GET operations. The node's CPU saturates, latency spikes to 50ms+, and every other key on that shard also degrades. You get cascading timeouts across your API servers.
+- **Incident response (right now)**:
+  1. Push the hot URL to CDN edge cache immediately. CloudFlare or Fastly can absorb millions of requests/second at the edge. If you are using 301 redirects, browsers will cache it automatically, but new visitors still hit you. Force a CDN cache rule for this specific short code with a 5-minute TTL.
+  2. Replicate the hot key to all Redis nodes manually. Set `url:abc123` on all 3 nodes and have your application randomly pick which node to read from for this key. This is a manual, temporary measure.
+- **Architectural fix for the future**:
+  1. **Local in-process cache (L1)**: Each API server keeps a small LRU cache (e.g., Caffeine in Java, `lru-cache` in Node) holding the top ~10,000 hot keys with a 30-60 second TTL. This absorbs viral spikes before they hit Redis at all. At 50 API server instances, 500K QPS becomes 10K QPS per server, and the L1 cache absorbs 99% of that.
+  2. **Redis read replicas per shard**: Configure 2-3 read replicas for each Redis primary. Route reads to replicas using round-robin. This triples your read throughput per shard.
+  3. **Adaptive TTL**: Detect hot keys by tracking access counts in the L1 cache. When a key exceeds a threshold (e.g., 1,000 hits/second), automatically extend its L1 TTL and promote it to a "hot key" list that gets replicated across all Redis shards.
+- **The key insight**: This is fundamentally a single-shard hotspot problem. The fix is to spread reads across more physical locations (L1 cache, replicas, CDN), not to make a single node faster.
+
+**Red flag answer:** "We'd just add more Redis nodes." Adding nodes to a cluster does not help a hot key -- the key still hashes to one shard. This answer reveals the candidate does not understand how consistent hashing works in a sharded cache.
+
+**Follow-ups:**
+1. Your L1 in-process cache has a 60-second TTL, but the URL owner just deleted the link due to a legal takedown. How do you invalidate across 50 API server instances within seconds?
+2. How would you implement hot key detection automatically so you do not need a human to notice the spike and respond?
+3. The celebrity short link points to a page that itself is down (the destination returns 503). Should you still serve the redirect, or should you show an error page? What are the product and legal implications of each choice?
+
+---
+
+### Question 3: Analytics Pipeline Design
+
+**Q: Your product team wants real-time click analytics -- "show the click count updating live as users watch the dashboard." But your redirect path must stay under 50ms p99. Design the analytics pipeline and explain where you would sacrifice accuracy for speed.**
+
+**Strong Answer:**
+
+- **Decouple the hot path completely**: The redirect handler must never write synchronously to any analytics store. The redirect flow is: Redis lookup, return 301/302, done. Analytics is a side-effect, not a dependency.
+- **Event emission**: On each redirect, the API server emits a lightweight click event (short code, timestamp, IP, user-agent, referrer) to an in-memory buffer. A background thread flushes this buffer to Kafka every 100ms or every 500 events, whichever comes first. The redirect handler itself does zero I/O for analytics -- it just appends to a lock-free ring buffer. Cost: ~1 microsecond.
+- **Real-time counting layer**: A Flink or Kafka Streams job consumes the click topic and maintains windowed counters (1-second tumbling windows) in Redis. The dashboard polls or subscribes via WebSocket to these Redis counters. This gives "live" updates with ~1-2 second delay, which feels real-time to humans.
+- **Where accuracy is sacrificed**:
+  1. **At-least-once delivery**: Kafka producers retry on failure, so a click event could be counted twice during broker failover. You accept ~0.1% over-counting rather than adding the complexity of exactly-once semantics.
+  2. **Buffer loss on crash**: If an API server crashes, the in-memory buffer (up to 500 events) is lost. At 50 servers, a single server crash loses at most 500 events out of millions -- statistically negligible.
+  3. **Bot filtering is async**: Bot detection (checking user-agent against known crawlers, rate-limiting by IP) happens in the Flink pipeline, not in the redirect path. So the "live" counter briefly includes bot clicks until the pipeline filters them out, typically within 5-10 seconds.
+- **Batch reconciliation**: Every hour, a Spark job reads raw events from S3 (where Kafka also sinks), deduplicates them, applies stricter bot filtering, and writes corrected totals to ClickHouse. The dashboard shows real-time approximate counts with a subtle label ("~15,234 clicks") and switches to exact counts for anything older than 1 hour.
+- **Why not just increment a counter in Redis on each redirect?** At 1,200 redirects/second, Redis INCR is fast enough. But the problem scales badly: you also need per-country, per-referrer, and per-hour breakdowns. That turns one INCR into 5-10 INCRs per redirect, and Redis becomes a write bottleneck. The Kafka approach lets you fan out these aggregations in the stream processor without adding latency to the redirect.
+
+**Red flag answer:** "We'd just increment a counter in the database on each redirect." This couples redirect latency to database write latency, means a database outage takes down redirects, and does not scale to multi-dimensional analytics (by country, by referrer, by time window).
+
+**Follow-ups:**
+1. A customer complains that the dashboard showed 10,000 clicks but the hourly reconciled report shows 9,200. How do you explain the discrepancy and what would you change?
+2. Your Kafka cluster has a 2-hour outage. During that time, click events are buffered on the API servers. When Kafka comes back, you have 8 million events to replay. How do you prevent this burst from overwhelming your Flink pipeline and Redis counters?
+3. The product team now wants "unique visitors" as a metric, not just total clicks. How does this change your pipeline architecture, and what is the cost of doing this at 1 billion events/day?
+
+---
+
+### Question 4: Cache Invalidation and Consistency
+
+**Q: A user updates the destination URL for their short link. Your Redis cache has the old URL with a 24-hour TTL, and the CDN has it cached at 200 edge locations. How do you ensure users get the new destination, and what is the maximum staleness window you would accept?**
+
+**Strong Answer:**
+
+- **The fundamental tension**: Caching is what makes redirects fast (sub-10ms). Invalidation is what makes updates correct. You cannot have instant, global consistency without sacrificing the performance that caching provides. The goal is to minimize the staleness window to something the product can tolerate.
+- **Layer-by-layer invalidation**:
+  1. **Database**: Update immediately. This is the source of truth. Use a `version` or `updated_at` column so readers can detect staleness.
+  2. **Redis cache**: On URL update, immediately delete the cache key (`DEL url:abc123`). Do not try to update it -- delete and let the next read re-populate from the database. This avoids race conditions where a stale read re-caches the old value between your update and cache-set. Use Redis `DEL` + database write in a single application-level transaction (write DB first, then delete cache -- the "Cache-Aside" pattern).
+  3. **L1 in-process cache**: Publish an invalidation message to a Redis Pub/Sub channel or a Kafka topic. All API server instances subscribe and evict the key from their local LRU cache. Propagation time: 50-200ms across a typical cluster.
+  4. **CDN**: Issue a purge request via the CDN's API (e.g., CloudFlare's Purge by URL endpoint). Most CDNs complete purges across all edge locations within 2-5 seconds. Some edge cases with edge nodes in remote regions may take up to 30 seconds.
+- **Maximum staleness window**: For a URL update, 30 seconds is acceptable. Users who update a destination URL understand it is not instant -- email propagation and DNS changes have trained people to expect brief delays. Document this as "changes take up to 30 seconds to propagate globally."
+- **Edge case -- race condition**: If a user updates the URL and immediately clicks the short link to test it, they might hit a CDN edge that has not purged yet. Mitigation: add a `bypass-cache` query parameter (e.g., `short.ly/abc123?nocache=1`) that the dashboard's "test your link" button uses. This parameter triggers a `Cache-Control: no-cache` header that forces the CDN to go to origin.
+- **Why not shorter TTLs everywhere?** Reducing Redis TTL from 24 hours to 5 minutes means 288x more cache misses per day. At 400 QPS of reads, that is a significant increase in database load. The 24-hour TTL is the right default because URL updates are rare (less than 0.01% of URLs change per day), so you optimize for the 99.99% case and handle the 0.01% with explicit invalidation.
+
+**Red flag answer:** "Just set a short TTL on the cache, like 1 minute." This trades constant performance degradation (every URL re-fetched every minute) for a problem that affects 0.01% of URLs. It shows the candidate does not understand the cost of cache miss rates at scale.
+
+**Follow-ups:**
+1. What if the database write succeeds but the Redis DEL fails (network partition)? How do you prevent the stale cache entry from persisting for 24 hours?
+2. Your CDN provider has a rate limit of 1,000 purge requests per minute. A bulk operation updates 50,000 URLs at once. How do you handle this?
+3. A URL is updated from a legitimate site to a phishing site by a compromised account. Now the 30-second staleness window is a security issue, not just a UX issue. How does this change your approach?
+
+---
+
+### Question 5: Custom Domain Support
+
+**Q: Enterprise customers want to use their own domains (e.g., `links.nike.com/abc123` instead of `short.ly/abc123`). How do you architect multi-tenant custom domain support without making every redirect slower?**
+
+**Strong Answer:**
+
+- **DNS and TLS setup**: The customer creates a CNAME record pointing `links.nike.com` to a dedicated ingress endpoint, like `custom.short.ly`. You need to provision and manage TLS certificates for each custom domain. Use Let's Encrypt with automated ACME challenges -- specifically DNS-01 challenges for wildcard support or HTTP-01 for individual domains. Store certificates in a secret manager (AWS ACM, HashiCorp Vault) and load them dynamically at your TLS termination layer.
+- **TLS termination architecture**: Your load balancer or reverse proxy (e.g., Envoy, nginx) must perform SNI-based routing. When a request comes in for `links.nike.com`, the proxy looks up the correct TLS certificate and terminates the connection. At 1,000+ custom domains, you cannot statically configure nginx. Use a dynamic certificate store: Envoy's SDS (Secret Discovery Service) or nginx with `ssl_certificate_by_lua` that fetches certs from Redis/Vault at connection time. Certificate lookup adds ~1-2ms to the TLS handshake, not to every redirect.
+- **Domain-to-tenant mapping**: Add a `domains` table mapping custom domains to tenant IDs. On each redirect request, extract the `Host` header, look up the tenant, and then look up the short code within that tenant's namespace.
+  ```
+  domains table: domain -> tenant_id
+  urls table: (tenant_id, short_code) -> original_url
+  ```
+  This means the same short code `abc123` can map to different URLs under different domains. The cache key becomes `url:{tenant_id}:{short_code}` instead of `url:{short_code}`.
+- **Performance impact**: The domain-to-tenant lookup is an extra cache check, but custom domains are a small set (thousands, not billions). Cache the entire domain mapping table in the L1 in-process cache with a 5-minute refresh. This adds effectively zero latency. The short code lookup itself is unchanged.
+- **Operational complexity**: Each custom domain is a blast radius. If a customer's DNS is misconfigured, it only affects their domain. Certificate renewal failures are the biggest operational risk -- a single expired cert at 3 AM means a customer's links are broken with scary browser warnings. Implement certificate expiry monitoring with alerts at 30, 14, and 3 days before expiration. Auto-renew at 30 days. Page on-call at 3 days if auto-renewal has failed.
+- **Abuse vector**: A customer could point a custom domain to your service and then use it for phishing. You must verify domain ownership during setup (DNS TXT record verification, similar to how Google Search Console works) and scan destination URLs regardless of the customer's enterprise status.
+
+**Red flag answer:** "We'd just add a wildcard DNS entry and handle all subdomains." This conflates DNS configuration (which the customer controls) with your architecture. It also ignores the TLS certificate provisioning problem, which is the hardest part of custom domain support.
+
+**Follow-ups:**
+1. A customer's domain `links.bigcorp.com` gets 10x more traffic than all your other custom domains combined. How do you prevent their traffic from degrading performance for other tenants?
+2. Let's Encrypt certificates expire every 90 days. With 5,000 custom domains, you are renewing ~55 certificates per day. How do you make this renewal pipeline resilient to transient failures?
+3. The customer wants their custom domain short links to work in China, where Let's Encrypt is sometimes blocked. What alternative TLS strategy would you propose?
+
+---
+
+### Question 6: Abuse Prevention and Security
+
+**Q: Your URL shortener is being used to distribute phishing links at scale. Attackers create 10,000 short URLs per hour pointing to credential-harvesting pages. How do you design an abuse prevention system that stops this without blocking legitimate users who also create URLs in bulk (e.g., marketing platforms)?**
+
+**Strong Answer:**
+
+- **Layered defense -- you need multiple signals, not one rule**:
+  1. **Rate limiting (first line)**: Per-IP and per-account rate limits on URL creation. Anonymous users: 10 URLs/hour. Authenticated free users: 100 URLs/hour. Paid accounts: 10,000 URLs/hour. Use a token bucket algorithm in Redis with `INCR` + `EXPIRE`. This stops naive attackers but not distributed botnets.
+  2. **URL reputation scanning (second line)**: Before creating a short URL, check the destination against Google Safe Browsing API and PhishTank. These APIs respond in ~50-100ms and catch known malicious domains. This blocks about 60-70% of phishing URLs that use previously-flagged domains.
+  3. **Heuristic scoring (third line)**: For URLs that pass reputation checks, apply a risk score based on: domain age (newly registered domains in the last 7 days are high risk -- ~80% of phishing uses domains less than 30 days old), URL structure (excessive subdirectories, suspicious query parameters, lookalike domains like `g00gle.com`), destination page content (async crawl and check for login forms, brand logos without matching domain). If the risk score exceeds a threshold, queue the URL for human review and serve it with an interstitial warning page ("You are being redirected to...") instead of a direct 301.
+  4. **Post-creation monitoring (fourth line)**: Even URLs that pass initial checks can become malicious later (attacker creates a short link to a clean page, then changes the destination page). Run a periodic re-scan job that re-checks the top 10% most-clicked URLs every hour and a random sample of all URLs daily.
+- **Separating legitimate bulk users from attackers**: Marketing platforms create many URLs but they target well-known domains (mailchimp.com landing pages, shopify stores, etc.). Attackers target newly registered or compromised domains. The signals that differentiate them: destination domain age, destination domain reputation, creation pattern (legitimate users create URLs during business hours with consistent cadence; attackers create in bursts), and account history (account age, payment method on file, prior URLs created).
+- **Takedown pipeline**: Users can report abusive short links via a `short.ly/abc123+` report page. Reports feed into a queue. When a URL is confirmed malicious, disable the redirect and replace it with a warning page. Notify the destination domain's hosting provider via their abuse contact. Log the attacker's account for law enforcement referrals. Keep the short code reserved (never reassign it) to prevent the attacker from re-creating it.
+- **Legal requirement**: In the US, you must comply with DMCA takedown requests. In the EU, the Digital Services Act requires you to have a transparent content moderation process. Building the takedown pipeline is not optional -- it is a legal necessity for operating at scale.
+
+**Red flag answer:** "We'd just check URLs against a blocklist." Static blocklists are always stale -- attackers use fresh domains. This answer misses the layered approach and the dynamic nature of phishing infrastructure. It also ignores the harder problem of distinguishing legitimate bulk creation from malicious bulk creation.
+
+**Follow-ups:**
+1. An attacker uses your service to shorten legitimate-looking URLs (`google.com/...`) that use open redirect vulnerabilities to bounce to phishing sites. Your Safe Browsing check sees `google.com` and marks it safe. How do you detect this?
+2. A Fortune 500 customer complains that your abuse system is flagging their legitimate marketing URLs as suspicious because they use a newly registered campaign domain. How do you balance false positives against security?
+3. You discover that 15% of all short URLs created in the last month were malicious. The board wants a number: what is the cost to the business of this abuse (in reputation, infrastructure, legal exposure)? How would you quantify it?
+
+---
+
+### Question 7: 301 vs 302 Redirects and Their System-Wide Impact
+
+**Q: Your PM says "we need accurate click analytics for every single redirect, no exceptions." Your infrastructure team says "we need 301s for performance and SEO." These requirements directly conflict. How do you resolve this, and what is the actual quantitative impact of each choice?**
+
+**Strong Answer:**
+
+- **Why they conflict**: A 301 (Moved Permanently) tells the browser to cache the redirect. After the first click, the browser goes directly to the destination URL without ever contacting your servers. You get zero visibility into repeat clicks. A 302 (Found / Temporary) tells the browser to check with your server every time, giving you full analytics but adding a network round-trip to every click.
+- **Quantifying the impact**:
+  - With 301: On a popular link shared on social media, the first click from each unique browser hits your server. Subsequent clicks from the same browser bypass you entirely. In practice, about 40-60% of total clicks are repeat clicks from the same browser (varies by use case). So 301 means you see roughly half the true click volume in your analytics.
+  - With 302: Every click hits your server. At 400 QPS baseline, viral links push you to peak loads. Your infrastructure cost is 1.5-2x higher because you are handling clicks that 301 would have offloaded to browser caches.
+  - SEO impact: 301 passes "link juice" to the destination URL. For marketing teams that care about SEO, this is non-negotiable. 302 signals to search engines that the redirect is temporary, so the short URL itself accumulates PageRank instead of passing it through.
+- **The resolution -- make it configurable per link**:
+  - Default to 302 for links created through the API (these are typically marketing/analytics use cases where click accuracy matters).
+  - Offer a `redirect_type` parameter in the create API: `"permanent"` (301) or `"temporary"` (302).
+  - For enterprise customers who need both accurate analytics AND SEO pass-through, use a **307 with client-side tracking**: Return a 302 that serves a tiny HTML page with a JavaScript pixel that fires an analytics event, then immediately redirects via `window.location`. The pixel fires even on repeat visits. Downside: adds ~100ms to the redirect and requires JavaScript, so it fails for curl/bots.
+  - Alternative hybrid: Use 301 for SEO, but embed a 1x1 tracking pixel in the destination page via a partnership/SDK with the customer. This is how Bitly's enterprise product works -- they provide a JavaScript snippet the customer adds to their destination page.
+- **What most people miss**: The 301 vs 302 debate is a product decision disguised as a technical decision. Different customers have different priorities. The engineering answer is to support both and let the product requirements drive the default.
+
+**Red flag answer:** "Just use 302 for everything -- analytics is more important." This ignores the SEO impact, which is the primary reason marketing teams use URL shorteners in the first place. It also shows the candidate cannot hold two competing requirements in their head and find a creative resolution.
+
+**Follow-ups:**
+1. HTTP clients like `curl` and `wget` follow 301/302 automatically but do not execute JavaScript. For API consumers and bots, your JavaScript tracking pixel approach does not work. How do you track these clicks?
+2. A browser's 301 cache has no expiration -- it is cached "forever" (until the browser cache is cleared). If a user accidentally creates a 301 redirect to the wrong URL and realizes the mistake 5 minutes later, what can you do? What is truly irrecoverable here?
+3. Google's crawler is following your 302 redirects and indexing your short URLs instead of the destination URLs. Your SEO-focused customers are furious. What went wrong and how do you fix it?
+
+---
+
+### Question 8: Database Sharding and Rebalancing
+
+**Q: You sharded your Cassandra cluster by hashing the short code across 16 shards. Traffic has grown 10x, and 3 of your 16 shards are hot because the hash distribution was not perfectly uniform. You need to reshard to 64 shards without any downtime. Walk me through the migration.**
+
+**Strong Answer:**
+
+- **Why naive resharding breaks everything**: If you simply change `hash(short_code) % 16` to `hash(short_code) % 64`, every key's shard assignment changes. You cannot do an atomic cutover of billions of rows. During migration, some keys are on the old shard and some on the new -- reads must know where to look.
+- **Use consistent hashing to avoid this entirely (the real answer)**: If you had used consistent hashing from the start (as mentioned in the original design), adding nodes would only require moving ~1/N of the keys (where N is the new total). Adding 48 nodes to 16 means moving ~75% of keys, but incrementally -- each new node only takes a slice from its neighbors. Cassandra natively supports this via virtual nodes (`vnodes`). The migration plan:
+  1. **Add new nodes to the ring**: Cassandra's gossip protocol detects new nodes. Each new node is assigned token ranges on the consistent hash ring.
+  2. **Stream data**: Cassandra automatically streams the relevant key ranges from existing nodes to new nodes. This happens in the background while the cluster is serving reads and writes. Cassandra's anti-entropy repair mechanism handles any data that was written during the streaming process.
+  3. **Monitor progress**: Track streaming progress via `nodetool netstats`. At 100MB/s per node, streaming 500GB per node takes about 90 minutes. Plan for 2-4 hours for a 16-to-64 node expansion with safety margins.
+  4. **Decommission is the inverse**: If you need to remove the old nodes or rebalance, use `nodetool decommission` which streams data off a node before removing it.
+- **If you are stuck with modulo sharding (e.g., you used a custom application-level sharding layer)**:
+  1. **Double-write**: Start writing every new URL to both the old shard (`hash % 16`) and the new shard (`hash % 64`). This ensures no data is lost for new URLs.
+  2. **Background migration**: A batch job reads all existing URLs from the old shards and writes them to the correct new shard. Mark each migrated row with a flag.
+  3. **Dual-read with fallback**: Reads go to the new shard first. On a miss, fall back to the old shard. This handles the window where migration is in progress.
+  4. **Cutover**: Once migration is complete (verified by row counts and random sampling), stop the dual-read and route all traffic to the new shards. Keep the old shards in read-only mode for 7 days as a safety net before decommissioning.
+  5. **Total timeline**: For 6 billion URLs at ~1KB each, this is ~6TB of data. At 50,000 rows/second migration throughput, it takes about 33 hours. Plan for a 2-day migration window.
+- **Lesson**: This is why you use consistent hashing from day one. Modulo-based sharding creates a cliff -- every resharding is a major operation. Consistent hashing makes scaling a gradual process.
+
+**Red flag answer:** "Cassandra handles sharding automatically, so you just add nodes." While Cassandra does handle data distribution, this answer is dangerously oversimplified. It ignores the impact on read/write latency during rebalancing, the need to monitor streaming progress, the risk of hotspots during migration (new nodes are empty, so reads that hash to them cause cache misses and fallback to other nodes), and the capacity planning needed to ensure existing nodes can handle the additional streaming I/O on top of normal traffic.
+
+**Follow-ups:**
+1. During the migration, your existing 16 nodes are handling normal traffic AND streaming data to new nodes. The streaming I/O is saturating the disk on 3 of your hottest nodes, causing read latency to spike from 5ms to 200ms. How do you throttle the migration without making it take two weeks?
+2. You discover that Cassandra's virtual nodes (`vnodes`) with the default 256 tokens per node are causing significant overhead in your cluster's gossip protocol and repair operations. Would you use fewer vnodes or switch to a single-token-per-node strategy? What are the trade-offs?
+3. An engineer proposes skipping the migration entirely and just using a caching layer (Redis) in front of the hot shards to absorb the load imbalance. Critique this approach -- when is it a valid short-term fix and when does it just defer the real problem?

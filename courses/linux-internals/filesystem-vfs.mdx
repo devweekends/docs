@@ -737,4 +737,56 @@ kretprobe:path_lookupat /@start[tid]/ {
 
 ---
 
+## Interview Deep-Dive
+
+<AccordionGroup>
+  <Accordion title="Explain the relationship between file descriptors, struct file, and inodes. If two processes open the same file, what is shared and what is independent?" icon="message">
+    **Strong Answer:**
+
+    - Each `open()` call creates a new `struct file` instance, even if the same file is opened multiple times by the same or different processes. The `struct file` contains the file position (`f_pos`), access mode (`f_mode`), flags (`f_flags` like O_NONBLOCK), and a pointer to the inode. Each `struct file` has its own independent file position, so two processes reading the same file track their positions separately.
+    - The file descriptor is just an integer index into the process's file descriptor table (`task_struct->files->fd_array[]`). Different processes can use different fd numbers to refer to the same underlying `struct file` (for example, after `dup2()` or after passing an fd via Unix socket).
+    - The inode (`struct inode`) is shared: there is exactly one inode per file in the VFS inode cache, regardless of how many times the file is opened. The inode holds metadata (size, permissions, timestamps, block pointers) and the `address_space` for the page cache. This means the page cache is shared: if process A reads a file into cache, process B reading the same file will hit the cache.
+    - After `fork()`, the situation is special: the child inherits the parent's file descriptor table, and both parent and child fd entries point to the same `struct file` objects. This means they share file positions -- if the parent reads 100 bytes, the child's position also advances by 100. This is a common source of bugs in forked programs that do not close inherited fds.
+
+    **Follow-up:** What happens to these structures when the last fd referencing a file is closed but the file has been deleted (unlinked)?
+
+    **Follow-up Answer:**
+
+    - When `unlink()` is called on a file, the directory entry is removed and the inode's link count (`i_nlink`) is decremented. But if any process still has the file open (the inode's reference count `i_count` is non-zero), the inode and its data blocks are not freed. The file becomes "anonymous" -- it exists on disk, consuming space, but has no name in any directory. You can see these files via `/proc/<pid>/fd/` and they show as "(deleted)" in `ls -la /proc/<pid>/fd/`. Only when the last `struct file` referencing the inode is closed (via `close()` or process exit) does the kernel call `iput()` on the inode, and if `i_nlink == 0` and `i_count == 0`, the filesystem frees the blocks. This is why disk space is not reclaimed until you restart a process that has deleted files open -- a common operational issue.
+  </Accordion>
+
+  <Accordion title="The page cache is consuming 90% of memory on a production server. Is this a problem? How does the kernel decide what to cache and what to evict?" icon="message">
+    **Strong Answer:**
+
+    - A page cache using 90% of memory is normal and desirable. Linux uses all available free memory as page cache because unused memory is wasted memory. The page cache accelerates file reads from milliseconds (disk) to microseconds (memory). The key metric is not cache size but cache hit ratio. If the working set fits in cache and the hit ratio is 95%+, the system is performing optimally.
+    - It becomes a problem only when memory pressure causes the cache to evict pages that the application will need again soon, leading to major page faults (disk reads). The symptom is high `pgmajfault` counts in `/proc/vmstat` or high `kswapd` CPU usage.
+    - The kernel uses a two-list LRU (Least Recently Used) algorithm to decide what to cache. Each page is on either the active or inactive list, and the lists are split by type (anonymous vs file-backed). When a file page is first read, it goes on the inactive list. If accessed again while on the inactive list, it is promoted to the active list. When memory reclaim is needed, kswapd scans the inactive list from the tail, evicting pages that have not been recently accessed. Active list pages are periodically demoted to the inactive list if not recently accessed.
+    - The `vm.vfs_cache_pressure` sysctl tunes how aggressively the kernel reclaims dentry and inode caches relative to page cache. The `vm.swappiness` tunes the preference for reclaiming anonymous pages (swap out) versus file pages (drop from cache). For a database server, I would set `swappiness=10` to preserve anonymous memory (heap, buffer pool) and prefer dropping file cache.
+
+    **Follow-up:** How does `posix_fadvise()` allow applications to influence page cache behavior, and when would you use it?
+
+    **Follow-up Answer:**
+
+    - `posix_fadvise()` lets applications give hints to the kernel about their access patterns. `POSIX_FADV_SEQUENTIAL` tells the kernel to increase read-ahead (prefetch more pages ahead of the current read position). `POSIX_FADV_RANDOM` disables read-ahead, which is better for random-access patterns like database index lookups. `POSIX_FADV_WILLNEED` asks the kernel to prefetch the specified range into cache (asynchronous read-ahead). `POSIX_FADV_DONTNEED` tells the kernel that the specified range is no longer needed and can be evicted from cache. I would use `DONTNEED` after processing a large file in a streaming fashion (like log processing) to avoid polluting the cache with data that will never be re-read. I would use `WILLNEED` before a database knows it will need specific pages for an upcoming query.
+  </Accordion>
+
+  <Accordion title="Compare ext4 and XFS for a write-heavy workload with many small files. What are the internal architectural differences that affect performance?" icon="message">
+    **Strong Answer:**
+
+    - For write-heavy workloads with many small files, XFS generally outperforms ext4 due to fundamental architectural differences in allocation and journaling.
+    - ext4 uses a bitmap-based block allocator: it searches free space bitmaps for available blocks. For many small files, this creates contention on the bitmap locks and can lead to fragmentation as the allocator struggles to find contiguous free space among many small allocations. ext4's journaling (jbd2) writes metadata changes to a journal before committing them to their final locations, and the journal is a single sequential log shared by all operations.
+    - XFS uses B+ tree-based allocation groups. The filesystem is divided into independent allocation groups (AGs), each with its own B+ trees for free space, inodes, and extents. This parallelism means multiple threads can allocate blocks in different AGs simultaneously without contending on a single lock. XFS also uses delayed allocation aggressively: it defers block allocation until writeback time, which allows the allocator to make better decisions about contiguity.
+    - For journaling, XFS uses delayed logging: metadata changes are accumulated in memory and flushed in batches, reducing journal I/O. ext4's jbd2 commits more frequently by default (every 5 seconds).
+    - The practical impact: on a server creating millions of small files per day, XFS's allocation group parallelism and B+ tree-based free space tracking significantly reduce lock contention and provide more predictable latency. ext4 is better for simpler workloads and has wider tooling support (fsck is more mature).
+
+    **Follow-up:** How does the VFS abstraction layer allow both filesystems to coexist, and what is the performance cost of that abstraction?
+
+    **Follow-up Answer:**
+
+    - VFS defines a set of operation tables (`super_operations`, `inode_operations`, `file_operations`, `address_space_operations`) that each filesystem implements. When user space calls `write()`, VFS dispatches through `file->f_op->write_iter()` which is a function pointer set by the filesystem during `open()`. This is a single indirect function call overhead -- roughly 1-2 nanoseconds on modern CPUs. Given that the actual I/O work takes microseconds to milliseconds, the VFS abstraction cost is negligible (less than 0.01% of total I/O time). The real benefit is enormous: applications, system calls, and kernel subsystems (page cache, memory mapping) work identically regardless of the underlying filesystem. This is why you can switch from ext4 to XFS by simply reformatting and remounting without changing any application code.
+  </Accordion>
+</AccordionGroup>
+
+---
+
 Next: [I/O Subsystem →](/courses/linux-internals/io-subsystem)

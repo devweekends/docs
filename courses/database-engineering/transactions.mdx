@@ -146,7 +146,11 @@ When you execute an `UPDATE`, PostgreSQL performs a **Delete + Insert**:
 1.  The existing row version's `xmax` is set to the current transaction ID (marking it as "logically deleted").
 2.  A new row version is inserted with its `xmin` set to the current transaction ID.
 
-This results in "Dead Tuples"—old versions of rows that are no longer visible to any active transaction but still take up disk space.
+This results in "Dead Tuples" -- old versions of rows that are no longer visible to any active transaction but still take up disk space.
+
+**Real-world analogy:** Think of MVCC like a legal document system where you never erase anything. Instead of modifying a contract, you issue an amendment that supersedes the original. The original still exists in the filing cabinet (for audit or for anyone who started reading before the amendment was issued), but new readers are directed to the latest version. Periodically, a clerk (VACUUM) comes through and shreds the old versions that nobody could possibly need anymore.
+
+**Common pitfall:** This append-only design means that an `UPDATE` to a 1KB row creates a new 1KB row. If you run `UPDATE users SET last_login = NOW()` on 10 million rows, you have just written 10 million new tuples, doubling the table size temporarily until VACUUM cleans up. Always consider the write amplification cost of broad UPDATE statements.
 
 ### Transaction Isolation via Snapshots
 
@@ -266,9 +270,14 @@ ROLLBACK;  -- Automatic rollback due to constraint violation
 -- Transaction 1
 BEGIN;
 SET TRANSACTION ISOLATION LEVEL READ COMMITTED;
+
 SELECT balance FROM accounts WHERE id = 1;  -- Returns 1000
--- (Transaction 2 updates and commits here)
+-- (Transaction 2 updates balance to 1200 and COMMITs here)
 SELECT balance FROM accounts WHERE id = 1;  -- Returns 1200 (changed!)
+-- Same query, same transaction, different result.
+-- This is NOT a bug -- it is the defined behavior of READ COMMITTED.
+-- Each statement gets a NEW snapshot of the database.
+
 COMMIT;
 ```
 
@@ -281,6 +290,8 @@ COMMIT;
 - Most OLTP workloads
 - You don't need consistent reads across multiple queries
 - Maximum concurrency is important
+
+**Common pitfall:** Many developers assume that `BEGIN`/`COMMIT` gives them a frozen view of the database. It does not at READ COMMITTED. If you read a value, do some computation, then read it again, the value may have changed. If your logic depends on values staying stable across multiple queries, you need REPEATABLE READ.
 
 ### REPEATABLE READ
 
@@ -329,8 +340,11 @@ COMMIT;
 ```sql
 BEGIN;
 SET TRANSACTION ISOLATION LEVEL SERIALIZABLE;
--- Transactions behave as if run one after another
--- Any anomaly causes serialization failure
+-- Transactions behave as if run one after another.
+-- PostgreSQL does NOT actually run them serially (that would be slow).
+-- Instead, it uses SSI to detect when concurrent execution would produce
+-- a result different from some serial ordering, and aborts one transaction.
+-- Your application MUST be prepared to retry aborted transactions.
 COMMIT;
 ```
 
@@ -340,9 +354,11 @@ COMMIT;
 - Detects anomalies and aborts conflicting transactions
 
 **Use when**:
-- Financial calculations
+- Financial calculations where any anomaly is unacceptable
 - When correctness is more important than performance
 - Complex business logic with multiple dependencies
+
+**Practical tip:** SERIALIZABLE does not mean "slow." SSI adds modest overhead (tracking read and write dependencies) and only aborts transactions when it detects an actual anomaly. For many workloads, the abort rate is under 1%, making SERIALIZABLE a surprisingly practical default. The key requirement is that your application must implement retry logic for serialization failures -- without retry logic, SERIALIZABLE is worse than useless because it randomly fails transactions.
 
 ---
 
@@ -372,7 +388,12 @@ WHERE status = 'pending'
 ORDER BY created_at 
 LIMIT 1 
 FOR UPDATE SKIP LOCKED;
--- Perfect for job queues: take next available job
+-- Perfect for job queues: take next available job.
+-- Each worker grabs a different row without blocking.
+-- This pattern eliminates the need for external queue systems
+-- (like Redis or RabbitMQ) for simple task distribution.
+-- Combined with a status column update and COMMIT, this gives you
+-- exactly-once processing semantics within a single database.
 
 -- NOWAIT: Fail immediately if locked
 SELECT * FROM accounts WHERE id = 1 FOR UPDATE NOWAIT;
@@ -791,3 +812,62 @@ $$ LANGUAGE plpgsql;
 <Card title="Module 4: Indexing Deep Dive" icon="arrow-right" href="/courses/database-engineering/indexing">
   Master the art of database indexing for blazing-fast queries
 </Card>
+
+---
+
+## Interview Deep-Dive
+
+<AccordionGroup>
+  <Accordion title="Explain the difference between REPEATABLE READ in PostgreSQL and REPEATABLE READ in MySQL/InnoDB. Why does this distinction matter in production?">
+    **Strong Answer:**
+
+    - PostgreSQL's REPEATABLE READ uses true Snapshot Isolation (SI) via MVCC. When your transaction starts, you get a frozen snapshot of the database at that point in time. All reads within the transaction see this same snapshot. Crucially, PostgreSQL's SI also prevents phantom reads -- if another transaction inserts a new row that would match your query's WHERE clause, you will not see it. This is stronger than the SQL standard requires for REPEATABLE READ.
+    - MySQL/InnoDB's REPEATABLE READ also uses MVCC snapshots for SELECT statements, but it uses gap locking for write operations to prevent phantoms. The subtle difference is that InnoDB's approach can cause more lock contention because it physically locks ranges of index records, while PostgreSQL's approach detects conflicts at commit time and raises serialization errors.
+    - This matters in production because developers migrating from MySQL to PostgreSQL (or vice versa) often assume identical behavior. In PostgreSQL, concurrent updates to the same row under REPEATABLE READ will cause the second transaction to fail with `ERROR: could not serialize access due to concurrent update`. In MySQL, the second transaction would block until the first commits, then proceed. The PostgreSQL approach requires application-level retry logic but avoids long lock waits.
+
+    **Follow-up: When would you choose SERIALIZABLE over REPEATABLE READ in PostgreSQL, given that PostgreSQL's REPEATABLE READ already prevents phantoms?**
+
+    REPEATABLE READ prevents read phenomena but does not prevent write skew anomalies. Write skew occurs when two transactions read overlapping data, make decisions based on what they read, and write to different rows -- producing a result that could not have occurred in any serial execution. Classic example: two doctors checking if at least one doctor is on-call, and both taking themselves off-call simultaneously, leaving zero doctors on-call. SERIALIZABLE uses Serializable Snapshot Isolation (SSI) which detects these dependency cycles and aborts one transaction. I use SERIALIZABLE for any business logic where the correctness invariant spans multiple rows -- financial reconciliation, inventory allocation, scheduling constraints.
+  </Accordion>
+
+  <Accordion title="A production system is experiencing frequent deadlocks. Walk me through your diagnosis and resolution process.">
+    **Strong Answer:**
+
+    - Step 1: Enable deadlock logging. Set `log_lock_waits = on` and `deadlock_timeout = 1s` (the default). PostgreSQL logs the exact queries and lock types involved in every deadlock, including the circular dependency chain. Read the log -- it tells you exactly which transactions, which tables, which rows.
+    - Step 2: Identify the pattern. In my experience, 90% of application-level deadlocks fall into two categories: (a) two transactions updating the same rows in different order, and (b) a SELECT FOR UPDATE followed by an UPDATE that creates a gap between lock acquisition and lock escalation.
+    - Step 3: Fix the ordering. The universal solution is to ensure all transactions acquire locks in a consistent global order. If you are transferring money between accounts, always lock the lower account ID first: `SELECT * FROM accounts WHERE id IN (1, 2) ORDER BY id FOR UPDATE`. This eliminates the possibility of circular waits.
+    - Step 4: Shorten transactions. Deadlocks are more likely when transactions hold locks for longer. Move any non-database work (API calls, computation) outside the transaction. Use `SET LOCAL statement_timeout = '5s'` to prevent runaway transactions from holding locks indefinitely.
+    - Step 5: Consider advisory locks for application-level coordination. If the business logic inherently requires locking across multiple tables in unpredictable order, use `pg_advisory_xact_lock(hash_of_entity)` at the beginning of the transaction to serialize access to a logical entity.
+
+    **Follow-up: How does PostgreSQL's deadlock detection actually work internally?**
+
+    PostgreSQL runs a deadlock detector that wakes up every `deadlock_timeout` milliseconds (default 1 second). It builds a wait-for graph by examining all backends that are waiting for locks and the backends that hold the conflicting locks. If it finds a cycle in this graph, it picks a victim -- typically the transaction that has done the least work (measured by number of locks held) -- and terminates it with `ERROR: deadlock detected`. The detection is global across all backends and runs in the lock manager's shared memory. The key insight is that the deadlock_timeout also acts as a damper: short-lived lock waits resolve naturally without invoking the detector, reducing overhead.
+  </Accordion>
+
+  <Accordion title="You need to implement an exactly-once job processing system using PostgreSQL. How would you design it without external message brokers?">
+    **Strong Answer:**
+
+    - The pattern is SELECT FOR UPDATE SKIP LOCKED combined with idempotency keys. Create a jobs table with columns: id, payload, status (pending/processing/completed/failed), locked_at, attempts, idempotency_key.
+    - Workers run: `BEGIN; UPDATE jobs SET status = 'processing', locked_at = NOW() WHERE id = (SELECT id FROM jobs WHERE status = 'pending' AND (locked_at IS NULL OR locked_at < NOW() - INTERVAL '5 minutes') ORDER BY created_at LIMIT 1 FOR UPDATE SKIP LOCKED) RETURNING *;` This atomically claims a job. SKIP LOCKED means other workers do not block -- they grab the next available job instead.
+    - After processing, the worker either sets status to 'completed' and COMMITs, or on failure, sets status to 'failed' and increments attempts. The `locked_at` timeout handles the case where a worker crashes mid-processing -- after 5 minutes, the job becomes available for re-claim.
+    - For exactly-once semantics, use the idempotency_key: before processing, check if the output of this job already exists. This is crucial because "at-least-once delivery + idempotent processing = exactly-once semantics."
+    - A partial index `CREATE INDEX idx_jobs_pending ON jobs(created_at) WHERE status = 'pending'` ensures the worker query remains fast even with millions of completed jobs in the table.
+
+    **Follow-up: What are the limitations of this approach compared to a dedicated message broker like Kafka?**
+
+    The main limitations are: (1) Throughput ceiling -- at very high volumes (100K+ jobs/sec), the row-level locking and MVCC overhead on the jobs table becomes a bottleneck. Kafka's append-only log is designed for this scale. (2) No built-in fan-out -- if multiple consumers need to process the same event, you need to create separate job rows. Kafka's consumer groups handle this natively. (3) No log retention for replay -- once a job is completed and cleaned up, it is gone. Kafka retains events for replay. For systems under ~10K jobs/sec, PostgreSQL-as-queue eliminates an entire infrastructure dependency and its associated operational burden. Above that threshold, Kafka earns its complexity.
+  </Accordion>
+
+  <Accordion title="Explain the transaction ID wraparound problem in PostgreSQL. Why is it dangerous, and how do you prevent it?">
+    **Strong Answer:**
+
+    - PostgreSQL uses a 32-bit transaction ID (XID) counter, which means it can only represent about 4.2 billion transactions before wrapping around. MVCC visibility relies on comparing XIDs -- "is this row's xmin older or newer than my snapshot?" When the counter wraps, old XIDs that were "in the past" suddenly appear to be "in the future," making previously visible data invisible. If this goes unchecked, the database will proactively shut down to prevent data loss.
+    - The prevention mechanism is VACUUM's freeze operation. VACUUM scans tables and replaces old XIDs with a special FrozenTransactionId (2), which is defined as "always in the past" for visibility checks. Once frozen, a row's visibility is no longer dependent on XID comparison. The parameter `autovacuum_freeze_max_age` (default 200 million) forces an aggressive autovacuum when a table's oldest unfrozen XID approaches the danger zone.
+    - The danger scenario: a long-running transaction holds back the oldest active XID, preventing VACUUM from freezing rows in any table. If this goes on long enough (approaching 2 billion XIDs), PostgreSQL will refuse to start new transactions and log warnings about impending wraparound. The emergency fix is to kill the long-running transaction, then run VACUUM FREEZE on affected tables.
+    - Production prevention: monitor `age(datfrozenxid)` per database and `age(relfrozenxid)` per table. Alert when any value exceeds 500 million. Kill transactions older than 1 hour. Ensure autovacuum is not being blocked by long-running queries on replicas (hot_standby_feedback can contribute to this).
+
+    **Follow-up: How does the 64-bit XID work in PostgreSQL and when is it expected to fully replace the 32-bit system?**
+
+    PostgreSQL has been incrementally moving toward 64-bit XIDs. In recent versions, the on-disk format still uses 32-bit XIDs, but the internal epoch-based mechanism (the "epoch" counter combined with the 32-bit XID) effectively provides 64-bit resolution. There is ongoing work in the community to make the transition to native 64-bit XIDs on disk, which would eliminate the wraparound problem entirely. Until then, VACUUM FREEZE remains a non-negotiable operational requirement. The practical impact is that even with 64-bit XIDs, you would still need VACUUM for dead tuple cleanup -- it just removes the urgency of the freeze operation.
+  </Accordion>
+</AccordionGroup>

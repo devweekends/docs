@@ -774,4 +774,54 @@ int main(int argc, char **argv) {
 
 ---
 
+## Interview Deep-Dive
+
+<AccordionGroup>
+  <Accordion title="A security researcher claims they can escape a Docker container by exploiting the mount namespace. Walk through how mount namespace isolation works and identify the potential attack vectors." icon="message">
+    **Strong Answer:**
+
+    - Mount namespace isolation works by giving each container its own mount table, so mounts made inside the container are invisible to the host and vice versa. During container creation, runc calls `clone(CLONE_NEWNS)` to create a new mount namespace, then uses `pivot_root()` to change the container's root filesystem to the overlay mount. The old host root is unmounted with `MNT_DETACH`, so the container should not be able to see or access host filesystems.
+    - The attack vectors are primarily misconfiguration, not namespace bugs. First, bind mounts: if the container runtime mounts host directories into the container (Docker volumes like `-v /:/host`), the container has direct access to the host filesystem through that mount. Second, the `CAP_SYS_ADMIN` capability allows processes to call `mount()` inside the container, potentially remounting filesystems or mounting procfs/sysfs entries that leak host information. Third, device access: if `/dev` is not properly filtered, the container could `mknod` and access host block devices directly, bypassing the filesystem entirely.
+    - A properly configured container mitigates these: drop `CAP_SYS_ADMIN`, use `seccomp` to block the `mount` syscall, make the rootfs read-only, minimize bind mounts, and use a device whitelist. User namespaces add another layer by mapping container root to an unprivileged host UID, so even if mount is somehow called, the kernel rejects it because the user lacks real privileges.
+
+    **Follow-up:** How does `pivot_root` differ from `chroot`, and why do container runtimes use pivot_root?
+
+    **Follow-up Answer:**
+
+    - `chroot` simply changes the process's root directory reference (`task_struct->fs->root`) but does not change the mount namespace. The old root filesystem remains mounted and accessible via `/proc/1/root` or by opening file descriptors before the chroot. A privileged process can escape chroot by using `chdir("../..")` combined with another chroot. `pivot_root` is fundamentally different: it atomically swaps the mount namespace's root mount, making the old root a subdirectory that can then be fully unmounted. After unmounting the old root, there is no reference to the host filesystem in the mount namespace at all. This is why container runtimes use `pivot_root` followed by `umount2(old_root, MNT_DETACH)` -- it provides genuine isolation, while chroot is just a pathname illusion.
+  </Accordion>
+
+  <Accordion title="Explain how PID namespace nesting works. If a process in a nested PID namespace sends a signal using kill(), what PID does it use, and how does the kernel resolve it?" icon="message">
+    **Strong Answer:**
+
+    - PID namespaces form a hierarchy. A process can have a different PID in each level of the hierarchy. For example, the first process in a child PID namespace has PID 1 inside the namespace, but might have PID 5001 in the parent namespace. The kernel tracks all these PIDs simultaneously using a `pid` structure that contains an array of `upid` entries, one per namespace level.
+    - When a process in the child namespace calls `kill(2, SIGTERM)`, the kernel resolves PID 2 relative to the caller's PID namespace. It looks up PID 2 in the caller's namespace to find the target `task_struct`. If PID 2 exists in that namespace, the signal is delivered. The target process might be PID 5002 in the host namespace, but the caller never sees or uses that number.
+    - Crucially, processes in a child namespace cannot see or signal processes in the parent namespace (they simply do not have PID numbers for parent namespace processes). However, processes in the parent namespace can see and signal all processes in child namespaces using the host-level PIDs. This asymmetry is intentional: containers should be isolated from the host, but the host must retain full control.
+    - The kernel function `find_task_by_vpid()` performs the namespace-aware PID lookup, using the caller's PID namespace as the search context. `find_task_by_pid_ns()` allows specifying an explicit namespace, which is how the host sends signals to container processes.
+
+    **Follow-up:** What happens when PID 1 inside a container exits or crashes?
+
+    **Follow-up Answer:**
+
+    - When PID 1 in a PID namespace exits, the kernel sends SIGKILL to every remaining process in that namespace. This is because PID 1 is the init process for the namespace, responsible for reaping orphaned zombie processes. Without it, zombies would accumulate indefinitely. The kernel enforces this cleanup by iterating through all tasks whose PID namespace matches and sending them SIGKILL. This is why container runtimes use an init process (like `tini` or Docker's `--init` flag) that properly handles signals and reaps children. If the application runs as PID 1 directly and does not handle SIGCHLD, zombie processes accumulate. If it crashes, the entire container terminates. Running the application as PID 1 also means SIGTERM must be explicitly handled -- the kernel does not deliver unhandled signals to PID 1 (since killing init would destroy the namespace prematurely).
+  </Accordion>
+
+  <Accordion title="How do rootless containers work at the kernel level? Walk through the user namespace UID mapping and explain what security guarantees it provides versus privileged containers." icon="message">
+    **Strong Answer:**
+
+    - Rootless containers use user namespaces to map UID 0 inside the container to an unprivileged UID on the host. When the container runtime calls `clone(CLONE_NEWUSER)`, the kernel creates a new user namespace where the creator can define UID/GID mappings by writing to `/proc/<pid>/uid_map`. A typical mapping is `0 100000 65536`, meaning container UIDs 0-65535 map to host UIDs 100000-165535. The host UIDs come from the subordinate UID ranges defined in `/etc/subuid`.
+    - Inside the container, the process sees itself as root (UID 0) with full capabilities within its user namespace. It can create files owned by root, bind to privileged ports within its network namespace, and perform operations that normally require root. However, the kernel enforces that capabilities are scoped to the user namespace: `CAP_SYS_ADMIN` in the container's user namespace does not grant `CAP_SYS_ADMIN` in the host's user namespace. Any operation that touches a resource outside the container's namespaces (like accessing a host-owned file) uses the mapped host UID (100000), which is unprivileged.
+    - Security guarantees: if an attacker escapes the container, they land on the host as UID 100000, not root. They cannot read `/etc/shadow`, cannot load kernel modules, cannot mount host filesystems. This is a fundamental improvement over privileged containers where container root equals host root.
+    - Limitations: some operations genuinely require host root (binding to host ports below 1024 without network namespace, certain FUSE operations). Network namespace setup requires either `slirp4netns` (user-space network stack, slower) or root helper processes. Performance is slightly lower due to UID translation overhead.
+
+    **Follow-up:** Can a process inside a user namespace mount a filesystem, and if so, what are the restrictions?
+
+    **Follow-up Answer:**
+
+    - A process with `CAP_SYS_ADMIN` in its user namespace can perform certain mounts, but the kernel restricts which filesystem types are allowed. Only filesystems marked as `FS_USERNS_MOUNT` in the kernel are permitted: this includes tmpfs, procfs, sysfs, and overlay (with restrictions). Block device filesystems like ext4 or XFS cannot be mounted because they interact directly with hardware and could be used to exploit device-level vulnerabilities. Even for allowed filesystems, the kernel performs additional checks: procfs mounted in a user namespace only exposes information relevant to that namespace, and sysfs entries are restricted. These restrictions are implemented in `do_new_mount()` where the kernel checks `mount_too_revealing()` to prevent information leaks.
+  </Accordion>
+</AccordionGroup>
+
+---
+
 Next: [Cgroups v1 & v2 →](/courses/linux-internals/cgroups)

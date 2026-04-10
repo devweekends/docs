@@ -96,6 +96,54 @@ This is the most challenging project in the course. You'll need:
 
 ---
 
+## Interview Deep-Dive
+
+<AccordionGroup>
+  <Accordion title="What actually happens under the hood when Docker creates a container? Walk me through the kernel-level operations.">
+    **Strong Answer:**
+
+    - The container runtime (runc) makes a sequence of syscalls. First, it calls `clone()` or `unshare()` with namespace flags -- `CLONE_NEWPID`, `CLONE_NEWNS`, `CLONE_NEWNET`, `CLONE_NEWUTS`, `CLONE_NEWIPC`, and optionally `CLONE_NEWUSER`. Each flag creates a new namespace that gives the child process an isolated view of that particular resource. The process now sees itself as PID 1, has its own hostname, its own mount table, and its own network stack.
+    - Next, the runtime sets up cgroups by writing to files under `/sys/fs/cgroup`. For example, writing `50000 100000` to `cpu.max` gives the container 50% of one CPU core. Writing a byte count to `memory.max` sets the hard memory limit. The container's PID is written to `cgroup.procs` to place it under these limits.
+    - The filesystem is assembled using OverlayFS. The runtime mounts an overlay with the image layers as read-only lower directories, an empty upper directory for writes, and a work directory for atomic operations. Then it calls `pivot_root()` to atomically swap the container's root filesystem, which is more secure than `chroot()` because it fully detaches the old root.
+    - For networking, the runtime creates a veth pair -- two virtual interfaces connected like a pipe. One end goes into the container's network namespace (becomes `eth0`), the other stays in the host namespace and attaches to a bridge (like `docker0`). NAT rules via iptables MASQUERADE enable outbound connectivity, and DNAT rules handle port forwarding.
+    - Finally, the runtime calls `execve()` to replace itself with the container's entrypoint process. At this point, the container is running.
+
+    **Follow-up: You mentioned pivot_root is more secure than chroot. Why exactly?**
+
+    `chroot()` only changes the apparent root directory for pathname lookups, but the process retains references to the old root via open file descriptors and the `..` trick (if it has root privileges, it can `chroot(".")` then `chdir("..")` repeatedly to escape). `pivot_root()` is an atomic operation that moves the old root to a subdirectory of the new root, and the runtime immediately unmounts and removes that directory. After `pivot_root`, there is no accessible path back to the host filesystem. This is why every serious container runtime uses `pivot_root` rather than `chroot` -- the attack surface is meaningfully smaller. In fact, container escape CVEs have historically exploited situations where this was not done correctly, such as CVE-2019-5736 in runc where a malicious container could overwrite the host runc binary.
+  </Accordion>
+
+  <Accordion title="Containers are often described as 'lightweight virtual machines.' Why is that description misleading, and what are the real security implications?">
+    **Strong Answer:**
+
+    - The description is misleading because VMs provide hardware-level isolation through a hypervisor, while containers share the host kernel. A VM has its own kernel, its own device drivers, and communicates with hardware through a hypervisor that mediates all access. A container is just a process with restricted views of the host kernel's resources.
+    - The security implication is that containers share attack surface with the host kernel. A kernel exploit inside a container can potentially escape to the host because the container is running on the same kernel. With a VM, a kernel exploit only compromises the guest kernel -- the hypervisor is a separate, much smaller attack surface.
+    - Real-world example: the Dirty COW vulnerability (CVE-2016-5195) was a Linux kernel race condition that allowed privilege escalation. Inside a VM, this only affected the guest. Inside a container, it could be used to escape to the host because the container shared the vulnerable kernel.
+    - That said, containers have significantly improved their security posture over time. Seccomp profiles restrict which syscalls a container can make (Docker's default profile blocks ~44 syscalls). AppArmor and SELinux provide mandatory access control. User namespaces map container root to an unprivileged host user. These layers together provide defense in depth, but they are fundamentally different from the hardware isolation boundary of a hypervisor.
+    - The practical takeaway is that containers are appropriate for workload isolation within a trust boundary (your own microservices), but not for running mutually untrusted code (that is what gVisor and Kata Containers address, by adding a kernel-level boundary back into the picture).
+
+    **Follow-up: How do Kubernetes and cloud providers deal with this shared-kernel risk in multi-tenant environments?**
+
+    Most major cloud providers (AWS EKS Fargate, GCP GKE Autopilot) run each customer's pods inside a lightweight VM -- essentially combining the container developer experience with VM-level isolation. AWS Firecracker is a microVM that boots in ~125ms and provides a KVM-based isolation boundary around each container. Google's gVisor takes a different approach: it implements a user-space kernel (Sentry) that intercepts syscalls from the container, so the container never talks directly to the host kernel. The trade-off is performance -- gVisor adds syscall overhead, Firecracker adds boot time and memory overhead. In practice, this means that the "containers vs. VMs" framing is outdated; modern infrastructure uses both, layered together, with the choice depending on the threat model.
+  </Accordion>
+
+  <Accordion title="Explain the noisy neighbor problem in containerized environments and how cgroups address it. What can still go wrong?">
+    **Strong Answer:**
+
+    - The noisy neighbor problem occurs when one container on a shared host consumes disproportionate resources, degrading performance for other containers. Without limits, a single container running a fork bomb or a memory leak can starve every other workload on the machine.
+    - Cgroups address this by enforcing hard limits on CPU, memory, I/O bandwidth, and process count. The `cpu.max` file controls bandwidth allocation (e.g., 50000/100000 means 50% of one core). `memory.max` sets a hard ceiling -- if a process exceeds it, the kernel's OOM killer terminates it. `pids.max` prevents fork bombs by capping the number of processes.
+    - What can still go wrong: cgroups do not limit *everything*. Kernel resources that are not cgroup-aware remain shared. For example, the dentry cache (filesystem metadata) and inode cache are global kernel structures. A container doing millions of file operations can bloat these caches and cause memory pressure for the entire host. Similarly, cgroups v1 did not limit kernel memory by default, so a container could exhaust kernel stack pages.
+    - Another subtle issue is CPU throttling. CFS (Completely Fair Scheduler) bandwidth control with `cpu.max` can cause latency spikes even when the container is well below its quota. If a container uses its entire quota in the first 5ms of a 100ms period, it gets throttled for the remaining 95ms. This is why latency-sensitive applications (like API servers) sometimes see p99 latency spikes that correlate with cgroup throttling periods, not with actual load.
+    - In production, I would also set `memory.high` (the soft limit that triggers throttling before the hard kill) and use CPU pinning (`cpuset.cpus`) for latency-critical workloads to avoid cache line bouncing across cores.
+
+    **Follow-up: How would you debug a situation where a container is being OOM-killed but the application's memory usage looks normal in your monitoring?**
+
+    This is a classic gotcha. Application-level metrics (like Go's `runtime.MemStats` or JVM heap usage) only show user-space allocations. The kernel counts *all* memory charged to the cgroup, including page cache, tmpfs mounts, kernel stack pages, and slab allocations. A container writing heavily to an in-container tmpfs (like `/dev/shm`) will consume memory that shows up in `memory.current` but not in application metrics. The debugging steps: check `memory.stat` in the cgroup directory (it breaks down RSS, cache, kernel stack, etc.), compare `memory.current` against `memory.max`, and look at `memory.events` for `oom_kill` counters. Also check if the container is doing heavy filesystem I/O to overlay-mounted paths, because those pages get charged to the cgroup's page cache.
+  </Accordion>
+</AccordionGroup>
+
+---
+
 ## Implementation: Java
 
 <Note>
