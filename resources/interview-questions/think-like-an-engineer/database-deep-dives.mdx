@@ -1235,6 +1235,590 @@ This is why PostgreSQL UPDATEs are actually "INSERT new version + mark old versi
 
 ---
 
+# Interview Deep-Dive Questions
+
+These questions go beyond surface-level knowledge. Each one is designed to simulate a real senior-level interview chain -- an initial question followed by the kind of probing follow-ups an experienced interviewer uses to separate candidates who *know about* databases from candidates who have *operated* them in production.
+
+## How would you debug a PostgreSQL query that was fast yesterday but is slow today, with no schema or code changes?
+
+**Difficulty:** Senior
+
+**What the interviewer is really testing:** Systematic debugging methodology, understanding of statistics-driven query planning, and awareness that the database is a living system where performance changes without code changes.
+
+**Strong Answer:**
+
+The key insight is that query performance depends on the *plan*, and the plan depends on *statistics* -- not just the query text. No code change does not mean nothing changed.
+
+**Step 1: Compare query plans.** Run `EXPLAIN (ANALYZE, BUFFERS)` on the slow query now. If you have the old plan (from `pg_stat_statements` or auto_explain logs), compare them side by side. Look for a plan shape change -- did it switch from an Index Scan to a Sequential Scan? Did the join strategy change from Hash Join to Nested Loop?
+
+**Step 2: Check statistics freshness.** The most common cause is stale statistics after a data distribution change. Maybe a bulk import ran last night and doubled the table size, or a migration changed the data distribution (e.g., a status column went from 50% active to 95% active). The planner now estimates selectivity wrong.
+- Run `ANALYZE` on the involved tables and re-execute. If it fixes the problem, the root cause was stale statistics. Set more aggressive `autovacuum_analyze_scale_factor` on these tables.
+
+**Step 3: Check for bloat.** If a large UPDATE or DELETE ran overnight, millions of dead tuples now sit in the table. Sequential scans are slower because they read dead tuples. The visibility map may be invalidated, breaking index-only scans.
+- Check `pg_stat_user_tables` for `n_dead_tup`. If it is high, VACUUM has not kept up.
+
+**Step 4: Check for lock contention or resource pressure.** A new batch job may be running during business hours, consuming `shared_buffers` and pushing the query's working set out of the buffer cache. Check `BUFFERS` output in EXPLAIN -- if `shared read` (disk) is now much higher than `shared hit` (cache), the buffer pool is under pressure.
+
+**Step 5: Check `pg_stat_activity` for long-running transactions.** An idle-in-transaction session can hold back the visibility horizon, forcing PostgreSQL to examine more row versions.
+
+The meta-principle: in PostgreSQL, "nothing changed" almost never means nothing changed. Data volume changed, data distribution changed, vacuum state changed, or concurrent workload changed. The query planner is a function of statistics, and statistics are a function of data.
+
+#### Follow-up: What is correlation in PostgreSQL statistics and how can it cause a plan change?
+
+**Answer:**
+
+Correlation measures how closely the physical ordering of rows on disk matches the logical ordering of values in an index. It ranges from -1 to 1. A correlation of 1.0 means rows with sequential index values are stored on sequential disk pages (the table is physically sorted by that column). A correlation near 0 means the values are randomly scattered across pages.
+
+This matters because it determines whether an Index Scan is cheap or expensive. With high correlation, fetching 1,000 rows via an index reads a small number of sequential pages (the rows are physically adjacent). With low correlation, those 1,000 rows might be on 1,000 different pages -- 1,000 random I/O operations.
+
+After a bulk load or major table reorganization, correlation can change dramatically. The planner sees this in `pg_statistic` and may switch from an Index Scan (which was efficient when rows were physically ordered) to a Bitmap Index Scan or Sequential Scan (which handle random physical ordering better). This causes a "slow query with no code change" because the *data layout* changed.
+
+You can check correlation with:
+```sql
+SELECT tablename, attname, correlation
+FROM pg_stats
+WHERE tablename = 'your_table';
+```
+
+If correlation dropped and you need it back, `CLUSTER tablename USING index_name` physically reorders the table to match the index. But CLUSTER takes an exclusive lock on the table -- in production, use `pg_repack` instead for an online reorder.
+
+#### Follow-up: How would you set up proactive monitoring so this kind of regression does not page you at 3 AM?
+
+**Answer:**
+
+Three layers of defense:
+
+1. **Query performance baselines with `pg_stat_statements`.** Track `mean_exec_time` and `calls` for your top 50 queries. Alert when any query's mean execution time exceeds 3x its rolling 7-day average. This catches plan regressions within minutes.
+
+2. **auto_explain extension.** Configure `auto_explain.log_min_duration = '1s'` to automatically log the full EXPLAIN plan for any query exceeding 1 second. When a regression happens, you already have the bad plan in the logs -- no need to reproduce it.
+
+3. **Statistics freshness monitoring.** Track `last_autoanalyze` in `pg_stat_user_tables`. Alert if any high-traffic table has not been analyzed in over 24 hours, or if `n_dead_tup / n_live_tup` exceeds 10%. This catches the root cause (stale stats, vacuum falling behind) before it causes a plan regression.
+
+The principle is the same as any observability strategy: do not wait for symptoms (slow queries) -- monitor the leading indicators (stale statistics, dead tuple accumulation, plan changes).
+
+#### Going Deeper: You have auto_explain enabled and you can see that the planner's row estimate was off by 1000x. Statistics are fresh. What else could cause such a massive estimation error?
+
+**Answer:**
+
+Fresh statistics can still produce wildly wrong estimates in several scenarios:
+
+- **Correlated columns.** PostgreSQL assumes column values are independent. If you query `WHERE country = 'Japan' AND language = 'Japanese'`, PostgreSQL multiplies the selectivity of each predicate independently. It might estimate 2% of rows match `country = 'Japan'` and 1% match `language = 'Japanese'`, giving 0.02% combined. But in reality, 95% of Japan rows have Japanese -- the actual selectivity is close to 2%, not 0.02%. That is a 100x error. PostgreSQL 14+ has extended statistics (`CREATE STATISTICS ... (dependencies, ndistinct, mcv) ON country, language FROM users`) that model multi-column correlations.
+
+- **Parameterized queries with generic plans.** When using prepared statements, PostgreSQL starts with custom plans (per-parameter) but after 5 executions switches to a generic plan (parameter-agnostic). If the generic plan is optimal for typical values but terrible for an outlier value (e.g., `status = 'deleted'` matches 0.01% of rows but the generic plan is optimized for `status = 'active'` which matches 90%), you get a bad plan for the outlier. Setting `plan_cache_mode = force_custom_plan` forces per-parameter planning at the cost of planning overhead.
+
+- **Statistics target too low.** The default `default_statistics_target` is 100, meaning PostgreSQL samples 300 * 100 = 30,000 rows for histogram construction. For a table with 500M rows and a highly skewed distribution, 30,000 samples may miss important value frequencies. Increase the target: `ALTER TABLE t ALTER COLUMN c SET STATISTICS 1000`.
+
+---
+
+## Walk me through how you would design a DynamoDB table for a multi-tenant SaaS platform where each tenant can have vastly different data volumes.
+
+**Difficulty:** Staff-Level
+
+**What the interviewer is really testing:** Real-world DynamoDB modeling at scale, understanding of the noisy-neighbor problem, and the ability to design for both small and large tenants in the same table.
+
+**Strong Answer:**
+
+This is one of the hardest DynamoDB design problems because of the noisy-neighbor effect -- a single large tenant can consume a disproportionate share of partition throughput, causing throttling for other tenants.
+
+**Key design decisions:**
+
+**1. Partition key strategy.** Use `TENANT#<tenantId>` as the partition key prefix. For small tenants (under 10 GB of data), all their data lives under one partition key prefix and queries are simple `Query(PK = TENANT#small-co)`.
+
+For large tenants (hundreds of GBs, thousands of RPS), a single partition key creates a hot partition. Apply **write sharding**: `TENANT#big-co#SHARD-0` through `TENANT#big-co#SHARD-15`. The application hashes or round-robins writes across shards. Reads require scatter-gather across all shards. Store the shard count in a metadata item so the application knows how many shards to query.
+
+**2. Sort key design.** Use composite sort keys with entity type prefixes: `RESOURCE#<type>#<timestamp>#<id>`. This lets you query all resources of a type sorted by time, or get a specific resource by its full key.
+
+**3. Tenant tier metadata table.** Maintain a lightweight table (or a DynamoDB item) that stores each tenant's tier: small, medium, large. This drives the application logic for shard count and capacity allocation. When a tenant grows past a threshold, a migration job reshards their data.
+
+**4. Cost isolation.** On provisioned mode, you cannot isolate capacity per-tenant within a single table. Options:
+- Use on-demand mode so hot tenants pay per request and do not affect cold tenants' throughput.
+- For enterprise tenants with strict SLAs, provision a **separate table** (table-per-tenant for your top 5% tenants). This gives hard capacity isolation at the cost of operational complexity.
+- Use DynamoDB resource-based policies and AWS Organizations for billing isolation.
+
+**5. GSI design.** Design GSIs so that they do not create secondary hot partitions. A GSI with `PK = STATUS` puts all active items on one partition -- bad for multi-tenant. Instead use `PK = TENANT#<tenantId>#STATUS#active` so each tenant's active items land on their own GSI partition.
+
+The honest trade-off: single-table multi-tenant DynamoDB is operationally simpler but creates coupling between tenants. Table-per-tenant gives isolation but multiplies operational burden. Most SaaS platforms start with single-table and graduate their largest tenants to dedicated tables as they grow.
+
+#### Follow-up: A large tenant does a bulk import of 10 million records. How do you handle this without impacting other tenants?
+
+**Answer:**
+
+Bulk imports are dangerous in shared DynamoDB tables because they can spike write capacity and trigger throttling across all partitions.
+
+**Approach:**
+
+1. **Use `BatchWriteItem` with rate limiting.** Do not just fire-hose writes. Implement client-side rate limiting (e.g., 500 WCU/sec) with exponential backoff on `UnprocessedItems`. This keeps writes below the partition-level throughput ceiling.
+
+2. **Spread writes across shards.** If the tenant has 16 shards, distribute bulk writes evenly across all 16 partition keys. This gives 16x the per-partition throughput ceiling.
+
+3. **Temporarily scale up.** If using provisioned mode, increase WCU before the import and scale back down after. If using on-demand, DynamoDB auto-scales but has a warm-up period -- if the table has been seeing 1,000 WCU and you suddenly hit 50,000, you will be throttled until adaptive scaling kicks in (minutes). Pre-warm by gradually ramping up write traffic.
+
+4. **Consider an offline path.** For truly massive imports, write to S3 and use the DynamoDB Import from S3 feature (launched 2023). It provisions temporary capacity separate from the online table, avoiding any impact on live traffic. The data appears in the table once the import completes.
+
+5. **If isolation is critical, import into a staging table first.** Validate the data, then use DynamoDB Streams to replicate the items into the production table at a controlled rate.
+
+#### Follow-up: How would you implement per-tenant rate limiting at the DynamoDB level?
+
+**Answer:**
+
+DynamoDB itself does not have per-tenant rate limiting built in -- capacity is shared across the table. So you implement it at the application layer:
+
+**Option 1: Token bucket in Redis.** Before every DynamoDB operation, the application checks a per-tenant token bucket in Redis. Each tenant gets a bucket sized to their tier (free tier: 100 WCU, enterprise: 10,000 WCU). If the bucket is empty, the request is queued or rejected. This is the most common pattern -- fast, centralized, and independent of DynamoDB.
+
+**Option 2: API Gateway throttling per API key.** If tenants are identified by API keys, configure per-key rate limits in API Gateway or your load balancer. This limits the request rate before it reaches DynamoDB. Less granular (limits requests, not capacity units) but simpler.
+
+**Option 3: Application-level middleware.** Track consumed capacity per-tenant using DynamoDB's `ReturnConsumedCapacity` response field. Maintain running counters per tenant and throttle when a tenant exceeds their allocation.
+
+The key insight is that DynamoDB's capacity model is table-level, not tenant-level. Multi-tenancy rate limiting is always an application concern. This is a fundamental architectural limitation you accept when choosing a shared-table approach.
+
+---
+
+## Your company runs a critical MongoDB replica set. The primary just went down. Walk me through exactly what happens next and what could go wrong.
+
+**Difficulty:** Senior
+
+**What the interviewer is really testing:** Understanding of MongoDB's consensus mechanism, the realities of failover, and awareness that "automatic failover" is not as magical as it sounds.
+
+**Strong Answer:**
+
+When the primary becomes unreachable, here is the sequence:
+
+**1. Detection phase (seconds 0-10).** The remaining secondaries notice they have not received a heartbeat from the primary within the `electionTimeoutMillis` window (default: 10 seconds). This is not instant -- there is a built-in delay to avoid false positives from transient network blips.
+
+**2. Election phase (seconds 10-12).** An eligible secondary calls an election. MongoDB uses a Raft-like consensus protocol. To win, a candidate needs votes from a majority of the replica set members. With a 3-node set (1 down), the remaining 2 nodes form a majority and can elect a new primary. With a 2-node set plus an arbiter, the secondary plus arbiter form the majority.
+
+**3. The new primary accepts writes (seconds 12-15).** The winning secondary becomes the new primary and starts accepting writes. Total failover time: typically 10-15 seconds, though it can be longer under heavy load.
+
+**What could go wrong:**
+
+- **No majority.** If you have a 3-node set and 2 nodes go down, the remaining node cannot form a majority and will not become primary. The replica set is read-only until a majority of nodes recover. This is why the minimum production deployment is 3 nodes across at least 2 data centers (or 2 nodes + 1 arbiter).
+
+- **Writes lost during failover.** If the old primary accepted writes with `w: 1` (the default) and went down before replicating those writes to a secondary, those writes are gone. When the old primary comes back, it has writes that the new primary does not have -- these become **rollback** writes and are placed in a rollback directory. This is why `w: "majority"` matters for critical data.
+
+- **Driver connection handling.** Client drivers need to discover the new primary. Smart drivers (using the replica set connection string) handle this automatically -- they detect the topology change and redirect writes. But there is a brief window where the application throws connection errors. If your application does not retry writes, user requests fail during failover. If it does retry writes, they must be idempotent or you risk duplicate operations.
+
+- **Election ties and priority.** If two secondaries have the same optime (are equally up-to-date), priority settings determine who wins. If priority is misconfigured, a secondary in a remote data center might become primary, increasing latency for all write operations. Set `priority: 0` on nodes that should never become primary (analytics replicas, cross-region replicas used only for reads).
+
+#### Follow-up: After failover, the old primary comes back online with writes that the new primary does not have. What happens to those writes?
+
+**Answer:**
+
+Those writes enter a **rollback**. The old primary detects that its oplog has diverged from the current primary's oplog. It identifies the point of divergence and undoes all operations after that point, saving the rolled-back data to a special `rollback/` directory in the data directory.
+
+The rollback data is stored as BSON files that you can inspect and manually re-apply if needed. But in practice, most teams treat rollbacks as data loss -- the data was never acknowledged as durable (since `w: 1` only guaranteed the primary, which failed).
+
+The maximum rollback size is 300 MB by default. If more than 300 MB of data needs to be rolled back, MongoDB refuses to roll back automatically and the node shuts down, requiring manual intervention.
+
+This is the strongest argument for `w: "majority"` on any write you cannot afford to lose. With majority write concern, a write is not acknowledged until it is on at least 2 of 3 nodes. If the primary dies, the surviving majority already has the data -- no rollback needed.
+
+#### Follow-up: How would you design your application to handle the 10-15 second failover window gracefully?
+
+**Answer:**
+
+Three strategies layered together:
+
+**1. Retries with backoff.** Configure your MongoDB driver with `retryWrites: true` (default since MongoDB 4.2 drivers). The driver automatically retries certain write operations once on a new primary. For reads, use `retryReads: true`. These handle transient errors during failover transparently.
+
+**2. Circuit breaker at the application layer.** If the database is unreachable for more than a few seconds, trip a circuit breaker that returns degraded responses (cached data, a "try again shortly" message) instead of queuing up requests that will all timeout. Without this, you get a thundering herd of retries the moment the new primary is available.
+
+**3. Write idempotency.** Since retries may re-execute a write that actually succeeded (the primary crashed after persisting but before acknowledging), every write operation must be idempotent. Use unique identifiers in your writes (`updateOne` with `upsert: true` and a unique constraint) rather than operations that are not idempotent like `$inc` without a transaction.
+
+The honest truth: 10-15 seconds of write unavailability is the cost of automatic failover. If your business cannot tolerate this, you need to look at architectures that decouple the write path from the database -- buffer writes in a message queue (SQS, Kafka) and drain them to MongoDB asynchronously.
+
+---
+
+## Explain the Redis single-threaded model. How can it be fast when it only uses one core?
+
+**Difficulty:** Intermediate
+
+**What the interviewer is really testing:** Understanding of event-driven architecture, I/O multiplexing, and the difference between CPU-bound and I/O-bound workloads.
+
+**Strong Answer:**
+
+The way I think about this is: Redis is fast *because* it is single-threaded, not *despite* it.
+
+Redis uses an **event loop** with I/O multiplexing (`epoll` on Linux, `kqueue` on macOS). A single thread monitors all client connections simultaneously. When data arrives on any connection, the event loop processes the command, performs the in-memory operation, and queues the response -- all without context switches.
+
+Why this works:
+
+1. **All data is in memory.** The bottleneck for most databases is disk I/O. Redis eliminates this entirely. An in-memory hash lookup takes ~100 nanoseconds. At that speed, a single core can process hundreds of thousands of operations per second because the CPU never waits for anything.
+
+2. **No context switching overhead.** A multi-threaded design with locks would spend more time on lock acquisition, cache invalidation, and context switching than on actual data operations. For sub-microsecond operations, the coordination cost of multithreading exceeds the operation cost itself.
+
+3. **No lock contention.** Since one thread processes all commands sequentially, there is no need for mutexes, spinlocks, or atomic operations on data structures. Every command sees a consistent state. This is what makes Lua scripts and `MULTI/EXEC` transactions atomic for free -- nothing else can interleave.
+
+4. **Pipeline-friendly.** Clients can send multiple commands without waiting for individual responses. The event loop processes them in sequence and sends all responses back in one batch. Pipelining amortizes the network round-trip cost, and the single thread chews through pipelined commands at memory speed.
+
+**Where single-threaded Redis hits its limit:** CPU-bound operations. A `KEYS *` scan on 10 million keys, a `SORT` on a large list, or a Lua script doing heavy computation blocks the event loop for other clients. One slow command blocks everything.
+
+**The modern nuance (Redis 6+):** Redis is no longer purely single-threaded. The main event loop is still single-threaded, but I/O operations (reading from and writing to sockets) are now offloaded to I/O threads. This helps when the bottleneck is network I/O serialization/deserialization rather than command execution. On high-bandwidth workloads (large values), I/O threading can improve throughput by 2x. But the command execution is still single-threaded -- that is the correctness guarantee.
+
+#### Follow-up: If Redis is single-threaded, how does it handle persistence (RDB snapshots, AOF rewrites) without blocking clients?
+
+**Answer:**
+
+Redis uses `fork()`. When it is time to create an RDB snapshot or rewrite the AOF, Redis forks the process. The child process gets a **copy-on-write** snapshot of the entire memory space. The child writes the snapshot to disk while the parent continues serving requests.
+
+Copy-on-write means the child initially shares all memory pages with the parent. Only when the parent modifies a page (due to a write command) does the OS create a separate copy of that page. For a read-heavy workload, almost no extra memory is needed. For a write-heavy workload, the memory usage during a snapshot can temporarily double in the worst case (every page gets modified).
+
+This is why you should **never run Redis on a machine with swap enabled** -- if the fork causes memory to temporarily exceed physical RAM, the OS starts swapping, and a single swapped page turns a 100-nanosecond operation into a 10-millisecond operation. The latency spike is catastrophic.
+
+The `fork()` call itself can also cause a latency spike. On a Redis instance with 25 GB of data, `fork()` takes 10-20 ms on Linux (copying page table entries). During that time, the event loop is blocked. This is the `latest_fork_usec` metric in `INFO stats` -- monitor it.
+
+#### Follow-up: A developer proposes running multiple Redis instances on the same server to utilize all CPU cores. What are the trade-offs?
+
+**Answer:**
+
+This is actually a valid and common pattern -- it is how Redis was designed to scale vertically before Redis Cluster existed.
+
+**Benefits:**
+- Uses all cores. An 8-core server runs 8 Redis instances, each handling its own keyspace.
+- Each instance has its own event loop, so a slow command on one instance does not affect others.
+
+**Trade-offs:**
+- **Memory overhead.** Each instance has its own memory space. You cannot share data between instances without network calls. If you have 64 GB of RAM and run 8 instances, each gets ~8 GB (minus OS overhead). No benefit of shared caching.
+- **Operational complexity.** 8 instances means 8 ports, 8 configs, 8 monitoring endpoints, 8 persistence schedules. Your deployment and monitoring tooling must handle this.
+- **`fork()` contention.** If multiple instances trigger RDB snapshots simultaneously, the server faces multiple `fork()` calls, potentially doubling memory usage across all instances at once. Stagger snapshot schedules.
+- **Application routing.** The application must know which instance holds which data. This is essentially manual sharding, with all the routing complexity that entails.
+
+In modern deployments, Redis Cluster is usually the better answer -- it handles the sharding, routing, and rebalancing automatically. Running multiple standalone instances is still valid for simple caching use cases where you want isolated keyspaces (e.g., separate instances for sessions vs. cache vs. rate limiting) with different eviction policies and persistence settings.
+
+---
+
+## You are migrating a PostgreSQL table with 2 billion rows from one database to another with zero downtime. How?
+
+**Difficulty:** Staff-Level
+
+**What the interviewer is really testing:** Production migration experience, understanding of data consistency guarantees, and risk management under real-world constraints.
+
+**Strong Answer:**
+
+A 2-billion-row table with zero downtime rules out any strategy that requires locking the source table or stopping writes. This is a CDC (Change Data Capture) based migration.
+
+**Phase 1: Initial bulk copy.**
+- Set up logical replication from the source table using PostgreSQL's logical replication or a tool like `pglogical`. Alternatively, use `pg_dump --no-synchronized-snapshots` in parallel segments to speed up the initial copy.
+- For a 2B row table, the initial copy might take hours or days depending on row size and network bandwidth. The key is to start the CDC capture *before* the bulk copy begins, so that any writes during the copy are recorded.
+
+**Phase 2: CDC catch-up.**
+- While the bulk copy runs, the source continues receiving writes. Logical replication automatically streams these changes (inserts, updates, deletes) to the target.
+- After the initial copy completes, the replication stream catches up. Monitor the replication lag until it drops to sub-second.
+
+**Phase 3: Shadow reads (validation).**
+- Deploy application code that reads from both databases for a percentage of traffic. Compare results. Log discrepancies. This catches issues like missing rows, data type mismatches, or timezone handling differences.
+- Run consistency checks: `SELECT COUNT(*)`, checksum comparisons on key columns, and spot-check critical business queries.
+
+**Phase 4: Cutover.**
+- When confident in data consistency, perform the cutover in a maintenance window as small as possible:
+  1. Stop writes to the source table (or set it to read-only).
+  2. Wait for the last CDC events to replicate (seconds).
+  3. Verify final consistency.
+  4. Switch the application's write connection to the new database.
+  5. Switch reads to the new database.
+- Total write downtime: seconds, not minutes. If you need truly zero write downtime, use a dual-write approach: the application writes to both databases simultaneously during cutover, and you switch reads once you verify consistency.
+
+**Phase 5: Soak and rollback plan.**
+- Keep the old database running for at least 2 weeks. If anything goes wrong, the rollback is: switch connections back to the old database. If you used dual-write during cutover, both databases have the latest data and rollback is instant.
+
+**What can go wrong:**
+- **Sequences.** If the new table uses a sequence for primary keys, ensure the sequence value is set higher than the maximum migrated ID. Otherwise, new inserts collide with migrated rows.
+- **Triggers and constraints.** Logical replication replays raw DML. If the target table has triggers that fire on INSERT (audit logging, denormalization), they will fire for every replicated row -- potentially billions of trigger executions. Disable non-essential triggers during the bulk copy phase.
+- **Large objects and TOAST.** Rows with large text or JSONB columns are stored in TOAST tables. Logical replication handles this, but it increases replication bandwidth significantly. Monitor network throughput.
+- **Schema differences.** If the target schema has additional NOT NULL columns or stricter constraints, replicated rows may violate them. Validate schema compatibility before starting.
+
+#### Follow-up: How would you handle the migration if you also need to transform the data during migration -- for example, splitting one table into two?
+
+**Answer:**
+
+Now you cannot use simple logical replication because the target schema differs from the source. You need a transformation layer in between.
+
+**Option 1: CDC with a stream processor.** Use Debezium to capture changes from the source PostgreSQL WAL and publish them to Kafka. A stream processing consumer (Kafka Streams, Flink, or even a simple application) reads the CDC events, applies the transformation (splitting columns into two tables, reformatting data), and writes to the target tables. This gives you a decoupled, replayable transformation pipeline.
+
+**Option 2: Dual-write at the application layer.** Modify the application to write to both the old single table and the new split tables. Backfill the new tables from the old table using a batch job. Once the backfill completes and the dual-write has been running long enough for consistency, cut over reads to the new tables and remove the dual-write.
+
+**Option 3: Materialized view or trigger-based replication.** Create triggers on the source table that, on every INSERT/UPDATE/DELETE, write the transformed data to the target tables (which can be in the same or a different database via dblink or FDW). Backfill the historical data with a batch job. This is the simplest approach for same-server migrations but does not scale well for cross-server migrations.
+
+The choice depends on latency requirements, operational maturity, and whether the team already runs Kafka/Debezium. For most teams, Option 2 (dual-write with backfill) is the simplest to implement and reason about, even if it requires a temporary code path in the application.
+
+#### Going Deeper: The dual-write approach has a well-known consistency problem. What is it and how do you mitigate it?
+
+**Answer:**
+
+The problem: **partial write failures**. If the application writes to Database A successfully but the write to Database B fails (network error, timeout, constraint violation), the two databases are now inconsistent. Retrying the failed write might succeed, but if the application crashes between the first write and the retry, the data is permanently divergent.
+
+This is fundamentally the **two-phase commit problem** across independent databases -- and there is no general solution that preserves both consistency and availability.
+
+Pragmatic mitigations:
+
+1. **Write to the source of truth first, then asynchronously replicate.** Make Database A the authoritative source. After writing to A, publish an event (to a transactional outbox table in A, then to Kafka). A consumer applies the write to B. If B fails, the event stays in the queue and retries. This is the **transactional outbox pattern** -- it guarantees at-least-once delivery to B at the cost of temporary inconsistency.
+
+2. **Reconciliation job.** Run a periodic job that compares the two databases and fixes discrepancies. This is your safety net -- the dual-write handles the happy path, the reconciliation catches edge cases.
+
+3. **Accept temporary inconsistency.** If the application can tolerate a few seconds of divergence (and for most applications it can), the combination of "write to both + reconciliation" is sufficient. Perfect consistency across two independent databases requires distributed transactions, which most teams rightly avoid.
+
+---
+
+## Your team uses Redis for session storage. An engineer proposes switching to DynamoDB to reduce operational burden. Evaluate this proposal.
+
+**Difficulty:** Senior
+
+**What the interviewer is really testing:** Ability to evaluate a real architectural trade-off with nuance, not just pick a side.
+
+**Strong Answer:**
+
+This is a reasonable proposal. Let me evaluate it honestly by weighing both sides.
+
+**Arguments for switching to DynamoDB:**
+
+- **Operational simplicity.** DynamoDB is fully managed -- no patching, no failover configuration, no memory sizing, no eviction policy tuning. Redis (even managed ElastiCache) requires capacity planning, persistence configuration, and monitoring for fragmentation and memory pressure.
+- **Durability by default.** DynamoDB writes are durable to disk. If a node fails, no data is lost. Redis, even with AOF, can lose the last second of data. For session data in a regulated environment (healthcare, finance), durability matters.
+- **Scaling is automatic.** DynamoDB on-demand mode scales to any traffic level without intervention. Redis requires manual scaling (resizing the instance or adding cluster nodes).
+- **TTL built-in.** DynamoDB's TTL feature automatically deletes expired sessions at zero cost. In Redis, expired keys are cleaned up lazily (on access) or by the active expiry cycle, which can lag under memory pressure.
+
+**Arguments against switching:**
+
+- **Latency.** Redis serves sessions in 0.1-0.5 ms. DynamoDB serves them in 3-10 ms. That is a 10-50x latency increase on every authenticated request. If your API's p99 target is 50 ms and session lookup adds 10 ms, you have used 20% of your latency budget on one operation.
+- **Cost at scale.** At 100,000 session reads per second (a large web app), Redis on a single `r6g.xlarge` costs roughly $300/month. DynamoDB on-demand at 100K RCU/sec costs roughly $5,000/month. Provisioned mode reduces this but requires capacity planning -- negating the "less operational burden" benefit.
+- **Data structure richness.** If sessions contain complex data (nested objects, arrays, counters that increment), Redis Hashes with `HINCRBY` and `HSET` are more expressive than DynamoDB's update expressions. If sessions are simple key-value blobs, this does not matter.
+
+**My recommendation:**
+
+If the team's primary pain is *operating Redis* (frequent paging for memory issues, fragmentation, failover problems), switching to DynamoDB is justified -- but first consider **switching to AWS MemoryDB** instead. MemoryDB is Redis-compatible, fully managed, durable (writes to a distributed WAL), and eliminates most Redis operational burden while keeping Redis's latency and data structure advantages. It is the best of both worlds for this specific use case.
+
+If MemoryDB is not an option (cost, region availability), then DynamoDB is a solid choice *if* the latency increase is acceptable and the cost at your traffic volume makes sense. Prototype it, measure the p99 impact, and make a data-driven decision.
+
+#### Follow-up: The engineer says "latency does not matter because we will put DAX in front of DynamoDB and get the same latency as Redis." Is this correct?
+
+**Answer:**
+
+Partially correct, but with important caveats.
+
+DAX can serve cached reads in ~200 microseconds -- comparable to Redis. So for session *reads* (which dominate), the latency would be similar. But:
+
+1. **Session writes still hit DynamoDB directly.** DAX is a read-through/write-through cache. Writes go to DynamoDB (3-10 ms) and the DAX cache is updated asynchronously. If a user logs in (write) and immediately makes a request (read), the read might hit DAX before the write has propagated -- returning a stale "no session" result. This is a consistency window of typically <10 ms but it can cause authentication flicker.
+
+2. **DAX adds another managed service.** You have DynamoDB + DAX. The "reduce operational burden" argument weakens because now you are operating a cache in front of a database... which is what you were doing with Redis in the first place, just with different branding.
+
+3. **DAX cost.** DAX runs on dedicated nodes (`dax.r5.large` ~$200/month per node, minimum 3 nodes for production). Adding $600+/month for DAX on top of DynamoDB costs approaches or exceeds managed Redis pricing.
+
+The honest assessment: DAX + DynamoDB for sessions is a Rube Goldberg version of what MemoryDB does natively. If sub-millisecond latency matters for sessions, use a purpose-built in-memory store.
+
+---
+
+## What are the real-world differences between PostgreSQL's SERIALIZABLE isolation and DynamoDB's transactions?
+
+**Difficulty:** Senior
+
+**What the interviewer is really testing:** Deep understanding of transaction models across different database paradigms, and whether the candidate understands that "transactions" means very different things in different databases.
+
+**Strong Answer:**
+
+These are fundamentally different transaction models solving different problems.
+
+**PostgreSQL SERIALIZABLE:**
+- Provides true serializability -- the gold standard of isolation. The result is equivalent to some serial ordering of all concurrent transactions, even though they actually executed concurrently.
+- Implemented via SSI (Serializable Snapshot Isolation). PostgreSQL tracks read and write dependencies between concurrent transactions. If it detects a dependency cycle that *could* produce a non-serializable result, it aborts one transaction with a serialization failure. The application must retry.
+- Scope: **any number of tables, any number of rows, any query pattern.** You can read 50 tables and write 30 in a single serializable transaction. The database guarantees correctness.
+- Cost: higher abort rates under contention. The more concurrent transactions touch overlapping data, the more serialization failures you get. At extreme contention, throughput collapses.
+
+**DynamoDB Transactions (`TransactWriteItems` / `TransactGetItems`):**
+- Provides **atomicity and isolation for a batch of up to 100 items** across one or more tables. Either all operations succeed or none do.
+- Isolation is "serializable" at the item level -- concurrent transactions on the same items are serialized. But there is no dependency tracking across arbitrary queries. You specify exactly which items participate in the transaction upfront by their primary keys.
+- No read-then-write logic inside the transaction itself. You can do conditional writes (`ConditionExpression`) to check a value before writing, but you cannot do a query, make a decision, and then write -- that must be done in application code across two API calls.
+- Cost: transactions consume 2x the normal WCU/RCU. A transaction that writes 5 items costs 10 WCU. DynamoDB also has a 25-item limit per `TransactWriteItems` call (though you can include up to 100 items across reads and writes in a mixed transaction).
+
+**The key differences in practice:**
+
+| Aspect | PostgreSQL SERIALIZABLE | DynamoDB Transactions |
+|---|---|---|
+| Scope | Arbitrary queries, any number of rows | Up to 100 explicitly named items |
+| Logic | Full SQL with subqueries, CTEs, JOINs | Conditional expressions on individual items |
+| Conflict detection | Automatic dependency tracking | Optimistic concurrency on named items |
+| Failure mode | Serialization failure (retry needed) | Transaction cancelled (retry needed) |
+| Cost model | Same as normal queries (slightly more CPU) | 2x capacity consumption |
+| Scale | Single database instance | Distributed, any scale |
+
+**When this matters:** If you are building an order placement system where you need to check inventory, reserve stock, create an order, and charge a payment -- all atomically -- PostgreSQL SERIALIZABLE handles this in a single transaction with arbitrary SQL logic. In DynamoDB, you would need to pre-determine the exact items (inventory item, order item, payment item), express the conditions as `ConditionExpression` on each, and submit them as a `TransactWriteItems` batch. The DynamoDB approach works but requires more upfront design and cannot handle dynamic logic (like "find the cheapest available item and reserve it" -- because you do not know the item key until you query).
+
+#### Follow-up: When would you recommend DynamoDB transactions over PostgreSQL SERIALIZABLE?
+
+**Answer:**
+
+When you need transactional guarantees at a scale where a single PostgreSQL instance cannot keep up, and your transaction scope is bounded and predictable.
+
+Concrete example: a gaming platform where each match result updates the stats of 2-10 players atomically. You know exactly which player items you are updating (by their player IDs). You need this to work at 50,000 transactions per second across millions of players. PostgreSQL's SERIALIZABLE cannot handle this throughput on a single instance, and distributed PostgreSQL (Citus, CockroachDB) adds complexity. DynamoDB handles it natively because each transaction touches a small, well-defined set of items that distribute across partitions.
+
+The rule of thumb: if your transactions are **bounded, key-addressable, and high-throughput**, DynamoDB transactions are an excellent fit. If your transactions are **ad-hoc, query-driven, or involve complex business logic**, PostgreSQL is the right tool.
+
+---
+
+## A Redis Cluster node goes down and some commands start returning MOVED and ASK errors. Explain what is happening and how the client should handle it.
+
+**Difficulty:** Intermediate
+
+**What the interviewer is really testing:** Understanding of Redis Cluster's slot-based routing and the client-server protocol during topology changes.
+
+**Strong Answer:**
+
+**MOVED errors** mean the client sent a command to the wrong node for that key's hash slot. The error includes the correct node address: `MOVED 3999 127.0.0.1:6381`. This happens when:
+- The client's slot-to-node mapping is stale (a node went down and slots were reassigned).
+- The client has not yet discovered the cluster topology.
+
+The correct client behavior: update the internal slot map by calling `CLUSTER SLOTS` or `CLUSTER NODES`, then re-send the command to the correct node. Smart Redis clients (like `ioredis`, `redis-py-cluster`) handle this transparently. They cache the slot map and refresh it on MOVED errors.
+
+**ASK errors** mean a slot is in the process of being migrated from one node to another. The slot is *partially* on the old node and *partially* on the new node. The error says: "this specific key has already been migrated to the new node, try there." The error format is `ASK 3999 127.0.0.1:6382`.
+
+The correct client behavior for ASK is different from MOVED:
+1. Send `ASKING` to the target node (this tells the target to accept a command for a slot it does not yet fully own).
+2. Re-send the original command to the target node.
+3. **Do NOT update the slot map.** Unlike MOVED, ASK is temporary. The slot is still being migrated. Future commands for other keys in this slot should still go to the old node (if those keys have not migrated yet).
+
+**The node-down scenario:** When a node goes down, its slots become temporarily unavailable. If the node was a primary, its replica takes over via failover (automatic if `cluster-node-timeout` is configured). During the failover window (typically 15-30 seconds), commands for that node's slots fail with `CLUSTERDOWN` errors. After failover, the client receives MOVED redirections to the new primary.
+
+**What most people miss:** During failover, only the *slots owned by the failed node* are affected. Commands for slots on healthy nodes continue working normally. This is partial availability -- better than total unavailability, but your application must handle errors for the affected key range.
+
+#### Follow-up: What happens to in-flight commands when a Redis Cluster node crashes mid-pipeline?
+
+**Answer:**
+
+If a client has sent a pipeline of 100 commands and the node crashes after processing 50:
+
+- The first 50 commands were executed. If they were writes, those writes are in the node's memory and AOF (if enabled). Whether they survive depends on the persistence configuration and whether the replica received them before the crash.
+- The remaining 50 commands get a connection error. The client receives errors for these commands.
+- The client cannot know exactly which commands succeeded and which did not without checking the data. This is the pipeline atomicity problem -- pipelines are NOT transactions. Each command in a pipeline is independent.
+
+This is why critical multi-step operations should use `MULTI/EXEC` transactions (which are atomic on a single node) or Lua scripts, not pipelines. Pipelines are for performance optimization of independent commands, not for ensuring atomicity.
+
+---
+
+## Your PostgreSQL database is approaching transaction ID wraparound. Explain the urgency and your remediation plan.
+
+**Difficulty:** Senior
+
+**What the interviewer is really testing:** Deep understanding of one of PostgreSQL's most dangerous operational scenarios, and whether the candidate has the judgment to handle a high-pressure situation.
+
+**Strong Answer:**
+
+This is a five-alarm fire. Transaction ID wraparound is the one PostgreSQL failure mode that can cause the database to **shut down and refuse all writes** -- and it is completely preventable.
+
+**Why it happens:** PostgreSQL uses 32-bit transaction IDs (roughly 4 billion values, but effectively 2 billion in each "direction" due to modular arithmetic). Every transaction consumes one ID. VACUUM FREEZE is responsible for marking old transactions as "frozen" -- removing their dependency on the transaction ID counter. If VACUUM FREEZE cannot keep up (because of long-running transactions, disabled autovacuum, or massive tables), the database runs out of usable transaction IDs.
+
+**The warning signs (check immediately):**
+```sql
+-- Check how close each database is to wraparound
+SELECT datname, age(datfrozenxid) AS xid_age,
+       2000000000 - age(datfrozenxid) AS remaining
+FROM pg_database
+ORDER BY age(datfrozenxid) DESC;
+
+-- Check per-table freeze status
+SELECT schemaname, relname, age(relfrozenxid) AS xid_age
+FROM pg_stat_user_tables
+ORDER BY age(relfrozenxid) DESC
+LIMIT 20;
+```
+
+**Severity levels:**
+- `age(datfrozenxid)` > 200 million: investigate why autovacuum is not freezing. Tune it.
+- `age(datfrozenxid)` > 1 billion: urgent. Autovacuum should be running aggressively. Check for blockers.
+- `age(datfrozenxid)` > 2 billion - 1 million: critical. PostgreSQL will start emitting warnings in the logs and will eventually enter read-only "safety mode." Immediate intervention required.
+
+**Remediation plan:**
+
+**Immediate (within minutes):**
+1. Check `pg_stat_activity` for long-running transactions and terminate them. Any open transaction holds back the freeze horizon.
+2. Check if autovacuum is running on the offending tables. If not, start a manual VACUUM FREEZE on the table with the oldest `relfrozenxid`.
+3. Increase `autovacuum_freeze_max_age` awareness -- this is the threshold where autovacuum becomes aggressive about freezing. Default is 200 million. If your tables are well past this, autovacuum should already be trying, but something is blocking it.
+
+**Short-term (hours):**
+1. Run `VACUUM FREEZE` manually on the worst tables. On a huge table, this can take hours. Use `VERBOSE` to monitor progress.
+2. Increase `autovacuum_max_workers` and reduce `autovacuum_vacuum_cost_delay` to let autovacuum work faster across all tables.
+3. If the database is in read-only mode: the only option is running VACUUM FREEZE. No writes are possible until the freeze completes. This is why prevention is critical.
+
+**Long-term prevention:**
+- Monitor `age(datfrozenxid)` as a Tier 1 metric. Alert at 500 million, page at 1 billion.
+- Tune autovacuum aggressively on high-write tables (lower `autovacuum_vacuum_scale_factor`, higher `autovacuum_vacuum_cost_limit`).
+- Set `idle_in_transaction_session_timeout` to prevent long-running transactions from blocking VACUUM.
+- For very large tables (hundreds of millions of rows), partition them. VACUUM FREEZE runs per-partition, making it more manageable.
+
+#### Follow-up: Why can long-running transactions prevent VACUUM FREEZE from doing its job?
+
+**Answer:**
+
+VACUUM can only freeze a transaction ID if no active transaction could possibly need to see the row version that transaction created. PostgreSQL determines this using the **oldest active transaction's snapshot**.
+
+If a transaction started 3 days ago and is still open (even if idle), PostgreSQL must preserve all row versions created since that transaction started. VACUUM cannot freeze any transaction ID newer than that transaction's ID. This means 3 days worth of transaction IDs remain unfrozen, accumulating toward the wraparound limit.
+
+A single idle-in-transaction session can hold back the entire freeze horizon. On a busy system processing 10,000 transactions per second, a 3-day idle transaction accumulates 2.6 billion unfrozen transaction IDs -- very close to the wraparound limit on its own.
+
+This is why `idle_in_transaction_session_timeout` is one of the most important PostgreSQL production settings. The default is 0 (disabled). Set it to something aggressive like 5 minutes. Developers who leave transactions open for debugging should use a separate connection with a higher timeout, not the production pool.
+
+---
+
+## Compare how PostgreSQL, MongoDB, and DynamoDB handle a scenario where you need to count the total number of items matching a condition across your entire dataset.
+
+**Difficulty:** Intermediate
+
+**What the interviewer is really testing:** Understanding of how each database's architecture affects a seemingly simple operation, and why "just do a COUNT" is not the same across databases.
+
+**Strong Answer:**
+
+This is a great question because it exposes fundamental architectural differences through a deceptively simple operation.
+
+**PostgreSQL: `SELECT COUNT(*) FROM orders WHERE status = 'shipped'`**
+
+PostgreSQL must actually scan every matching row to count it -- there is no pre-computed count stored anywhere. With an index on `status`, it does an Index Scan (or Bitmap Index Scan for moderate selectivity). Without an index, it does a full Sequential Scan. On a 500M row table, this can take minutes.
+
+Why no stored count? Because of MVCC. Different transactions see different row versions. A row that is visible to Transaction A might be invisible to Transaction B (it was inserted after B's snapshot). So there is no single "correct" count -- it depends on the transaction's snapshot. PostgreSQL must check visibility for each row.
+
+**Optimization:** Maintain a materialized count in a separate table, updated by triggers or periodic refresh. Or use `pg_stat_user_tables.n_live_tup` for an approximate count (fast but imprecise, based on the last ANALYZE).
+
+**MongoDB: `db.orders.countDocuments({ status: "shipped" })`**
+
+Similar to PostgreSQL -- MongoDB scans the matching documents using an index (if available) or a collection scan. The `countDocuments()` method actually runs an aggregation pipeline (`$match` + `$group` with `$sum`). It is accurate but can be slow on large collections.
+
+MongoDB offers `estimatedDocumentCount()` which reads the collection metadata for an instant but approximate total count (it does not support filters).
+
+**DynamoDB: There is no efficient COUNT.**
+
+DynamoDB does not have a `COUNT` operation in the traditional sense. You have two bad options:
+
+1. `Query` with `Select: 'COUNT'` -- this still reads every matching item (consuming read capacity for each item), it just does not return the data. On millions of items, this is expensive and slow.
+2. `Scan` with a `FilterExpression` -- even worse. Reads every item in the table, applies the filter, and counts matches. For a billion-item table, this costs thousands of dollars in read capacity.
+
+**The DynamoDB way:** Maintain a counter item. `PK=COUNTER, SK=shipped_orders`, updated atomically with `ADD` on every order shipment. Reads are instant (`GetItem`). The trade-off is that the counter must be maintained by the application -- if the update fails or the application has a bug, the count drifts. Reconcile periodically with a full scan job (run during off-peak, accept the cost).
+
+**The architectural lesson:** PostgreSQL and MongoDB trade write simplicity for read flexibility -- you can count anything, anytime, but it costs a scan. DynamoDB trades read flexibility for write and read performance at scale -- you must pre-compute any aggregation you need.
+
+#### Follow-up: What if you need real-time counts displayed on a dashboard -- say, "orders shipped today" updating every second?
+
+**Answer:**
+
+This changes the problem from "how to count" to "how to maintain a running count efficiently."
+
+**PostgreSQL approach:** Use a materialized counter table with a trigger. On every `INSERT INTO orders` with `status = 'shipped'`, a trigger increments the counter in a `daily_stats` table. The dashboard queries the counter table (instant). The risk: trigger contention under high write volume -- all inserts compete for a lock on the same counter row. Mitigate with multiple counter rows (shard the counter by, say, `order_id % 10`, sum the 10 rows on read).
+
+**Redis approach (any source database):** Maintain a Redis counter with `INCR shipped_today`. Reset it at midnight with a TTL or a cron job. The application increments the counter after each successful order shipment write. The dashboard reads from Redis (sub-millisecond). This decouples the counting from the database and works regardless of which database stores the orders.
+
+**DynamoDB approach:** The counter item (`PK=COUNTER#2024-04-09, SK=shipped`) updated with `UpdateExpression: 'ADD shipped_count :one'`. DynamoDB's `ADD` is atomic, so concurrent updates do not lose counts. The dashboard reads this single item.
+
+For all three, the real-time dashboard reads a pre-computed counter, not a live aggregate. This is the **Computed Pattern** -- trade write complexity for read speed. No production system refreshes a `COUNT(*)` query every second against a large table.
+
+#### Going Deeper: The counter approach can drift if the application crashes between writing the order and incrementing the counter. How do you handle this?
+
+**Answer:**
+
+This is the classic dual-write consistency problem. Three approaches:
+
+1. **Transactional outbox.** In PostgreSQL, update both the orders table and the counter table in the same transaction. They are either both committed or both rolled back. Atomic, no drift. This is the simplest and most correct approach when both writes are in the same database.
+
+2. **Event-driven counter.** Do not increment the counter in the application. Instead, use CDC (DynamoDB Streams, PostgreSQL logical replication, MongoDB Change Streams) to capture the order insert event and have a consumer increment the counter. The consumer processes events with at-least-once semantics, so make the counter update idempotent (e.g., track the last processed event ID and skip duplicates).
+
+3. **Periodic reconciliation.** Accept that the counter might drift and run a reconciliation job hourly that does the full `COUNT(*)` scan and corrects the counter. For a dashboard that says "~15,234 orders shipped today," being off by a handful is acceptable. For a financial report, it is not.
+
+The choice depends on how accurate the count needs to be and how much complexity the team can absorb. For dashboards, option 3 is usually sufficient. For billing or compliance, option 1 or 2 is necessary.
+
+---
+
 # Curated Resources
 
 <Note>

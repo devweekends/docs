@@ -1268,6 +1268,644 @@ Search for these on YouTube -- AWS publishes all re:Invent sessions publicly.
 
 ---
 
+## Interview Deep-Dive Questions
+
+<Note>
+**How to use this section.** These questions go beyond surface-level recall. Each one starts with a core question, then chains into follow-ups the way a real senior-to-staff-level interview unfolds. The follow-ups dig into internals, trade-offs, failure modes, and production judgment. Practice answering the core question first, then see if you can handle the follow-up chain without looking at the answers.
+</Note>
+
+### 1. Walk me through exactly what happens inside AWS when a Lambda function cold-starts. Where does the time go, and what levers do you have at each stage?
+
+**Difficulty:** Senior
+
+**What the interviewer is really testing:** Whether you understand the cold start lifecycle at an infrastructure level, not just "it is slow." Can you decompose latency and apply targeted fixes?
+
+**Strong answer:**
+
+A cold start is not one thing -- it is a pipeline of five sequential stages, and each has different optimization levers.
+
+- **Stage 1 -- Code download (~50-500ms).** The Lambda service fetches your deployment package from an internal S3 cache. Larger packages take longer. Container images are cached closer to the execution fleet via ECR's lazy-loading (SOCI -- Seekable OCI), so only the layers you need at startup are fetched. **Lever:** Shrink package size. Use tree-shaking in Node.js, strip unused dependencies in Python. For container images, use a minimal base image (`alpine` or `distroless`) and order Dockerfile layers so frequently-changing code is last.
+
+- **Stage 2 -- Microvm provisioning (~50-100ms).** AWS uses Firecracker to spin up a lightweight microVM. This is largely outside your control, but it is fast because Firecracker was literally purpose-built for this -- it boots a VM in ~125ms. **Lever:** Almost none directly. But choosing more memory indirectly allocates proportional CPU, which speeds up subsequent stages.
+
+- **Stage 3 -- Runtime initialization (~10-5000ms).** The language runtime starts. Python interpreter: fast. Node.js V8: fast. JVM with class loading and JIT warmup: 3-10 seconds. .NET CLR assembly loading: 1-3 seconds. **Lever:** Choose a lighter runtime for cold-start-sensitive paths. For Java, SnapStart snapshots the JVM state after init and restores from the snapshot, cutting cold start from seconds to 200-500ms. For .NET, Native AOT compiles ahead-of-time, eliminating CLR startup.
+
+- **Stage 4 -- Init code execution (~10-2000ms).** Your code outside the handler runs: imports, SDK client creation, DB connection establishment, config loading from Parameter Store or Secrets Manager. **Lever:** This is where you have the most control. Lazy-initialize anything you do not need on every invocation. Cache configuration in memory. Use the AWS SDK's built-in credential provider instead of making explicit STS calls. If you call Secrets Manager during init, that is a network round-trip on every cold start.
+
+- **Stage 5 -- Handler execution.** This happens on every invocation, warm or cold. Not part of cold start.
+
+The critical insight: stages 1-4 happen sequentially, so the total cold start is their sum. A Java Lambda with a 200MB container image calling Secrets Manager during init could easily see 8+ seconds of cold start -- 500ms download, 100ms VM, 5s JVM, 2s init code.
+
+<Tip>
+**The line that separates mid-level from senior:** "I would not just say 'use provisioned concurrency.' I would first instrument Init Duration in CloudWatch, break down where the time is going, fix the cheap problems (package size, init code), and only then reach for provisioned concurrency if the remaining cold start still violates the SLA."
+</Tip>
+
+#### Follow-up: Your team runs Java on Lambda and the CTO refuses to let you switch runtimes. Cold starts are 6 seconds. What do you do?
+
+**Answer:**
+
+This is a real constraint I have seen. Here is the playbook, in order of cost and complexity:
+
+- **Enable SnapStart immediately.** This is the single biggest win for Java Lambda. AWS snapshots the JVM state after your init code runs using CRaC (Coordinated Restore at Checkpoint). On cold start, it restores from snapshot instead of re-initializing the JVM. This typically cuts cold starts from 6s to 400-800ms. It is a configuration flag -- zero code changes for most applications.
+
+- **Audit your init code.** Spring Boot with annotation scanning and component scanning is the biggest offender. If you are using Spring Boot, consider switching to Micronaut, Quarkus, or plain Java (no framework). Quarkus was designed for fast startup and has an explicit Lambda extension. If switching frameworks is off the table, at least disable annotation scanning for packages you do not need.
+
+- **Trim the dependency tree.** Run `mvn dependency:tree` and look for transitive dependencies you do not use. Every JAR that the classloader touches adds startup time. Shade only the classes you use with the Maven Shade plugin.
+
+- **Provisioned concurrency as the final layer.** After SnapStart and init optimization, if cold starts are still above SLA, provision enough warm instances to cover baseline traffic. Use Application Auto Scaling to track the `ProvisionedConcurrencyUtilization` metric and scale provisioned capacity with demand.
+
+- **Measure the cost trade-off.** Provisioned concurrency for 50 instances at 512MB costs roughly $20/day. Compare that to the engineering cost of rewriting in another language. Usually, SnapStart plus provisioned concurrency is dramatically cheaper than a rewrite.
+
+#### Follow-up: What are the gotchas with SnapStart that most people miss?
+
+**Answer:**
+
+SnapStart has three specific traps:
+
+- **Uniqueness assumptions break.** If your init code generates a random seed, UUID, or unique identifier, the snapshot captures that value. Every restored instance starts with the *same* "random" value. This breaks security tokens, encryption IVs, and anything that assumes init-time uniqueness. You must use `CRaC`'s `beforeCheckpoint` and `afterRestore` hooks to re-initialize these values. The AWS docs call this out, but most developers miss it until they see duplicate "unique" IDs in production.
+
+- **Network connections are stale.** A database connection opened during init is in the snapshot but the TCP connection is dead by the time the function restores. You must implement connection validation or re-establishment in `afterRestore`. Connection pools that do health checks on borrow (like HikariCP's `connectionTestQuery`) handle this naturally, but raw connections do not.
+
+- **Deterministic encryption becomes non-deterministic.** If your init code seeds a CSPRNG (cryptographically secure pseudorandom number generator), the snapshot freezes the seed state. All restored instances start from the same PRNG state. This is a subtle security vulnerability. AWS provides the `software.amazon.lambda.snapstart.SnapshotRestore` interface to re-seed after restore.
+
+---
+
+### 2. You are designing a system that processes 500,000 file uploads per day to S3. Each file needs validation, transformation, and loading into a database. Walk me through the architecture.
+
+**Difficulty:** Senior / Staff-Level
+
+**What the interviewer is really testing:** End-to-end event-driven architecture design, back-of-envelope capacity planning, failure handling at scale, and the judgment to pick the right AWS services.
+
+**Strong answer:**
+
+First, some quick math to size the problem. 500K files per day is roughly 6 files per second sustained, with likely peaks of 20-30/s during business hours. This is well within Lambda's comfort zone but high enough that error handling and cost optimization matter.
+
+**The architecture:**
+
+- **Upload path:** Clients upload via pre-signed PUT URLs generated by an API (Lambda behind API Gateway). Files land in an S3 bucket partitioned by date prefix (`uploads/2026/04/10/`). Pre-signed URLs let the client upload directly to S3, so our API never touches the file bytes -- this eliminates a huge bandwidth and memory bottleneck.
+
+- **Event routing:** S3 Event Notifications route to SQS (not directly to Lambda). I put SQS in the middle for three reasons: (1) it buffers during Lambda throttling or cold start bursts, (2) it gives me configurable retry with exponential backoff, and (3) it provides a DLQ for poison messages. I would set the visibility timeout to 6x the Lambda timeout per AWS best practices.
+
+- **Processing Lambda:** Polls SQS, downloads the file from S3, validates it (schema check, file type, size limits, malware scan if required), transforms it (normalize fields, enrich with lookup data), and writes to the database. I would set reserved concurrency at 50-100 to protect the database from connection storms -- this is critical.
+
+- **Database writes:** If the target is DynamoDB, I would use `BatchWriteItem` for throughput. If it is Aurora PostgreSQL, I would use RDS Proxy to pool connections from Lambda (otherwise each concurrent Lambda opens its own connection and you exhaust `max_connections` within minutes). Batch inserts via `COPY` or multi-row `INSERT` rather than one-row-at-a-time.
+
+- **Error handling:** After 3 failed processing attempts, SQS moves the message to a DLQ. A separate Lambda monitors the DLQ depth via CloudWatch Alarm. If the DLQ grows beyond a threshold, it triggers an SNS notification to PagerDuty. I would also write failed records to a separate S3 bucket (`failed-uploads/`) with the error details for manual reprocessing.
+
+- **Idempotency:** Files may be delivered more than once (SQS is at-least-once). I would use a DynamoDB table or a database unique constraint on a hash of the file content or the S3 object key to prevent duplicate processing.
+
+#### Follow-up: The product team now says some files are 5GB+. How does that change your architecture?
+
+**Answer:**
+
+This changes several things:
+
+- **Upload path:** Files over 5GB require multipart upload. The pre-signed URL approach still works but I need to generate pre-signed URLs for each part (using `CreateMultipartUpload`, then `UploadPart` pre-signed URLs, then `CompleteMultipartUpload`). The client-side SDK handles this -- the AWS SDK's `TransferManager` in Java or `boto3`'s `upload_file` with multipart threshold in Python. I must also add a lifecycle policy to abort incomplete multipart uploads after 7 days to avoid hidden storage costs.
+
+- **Processing Lambda timeout:** A 5GB file cannot be downloaded, validated, transformed, and loaded within Lambda's 15-minute timeout. I have two options: (1) use S3 Select to process the file in place if it is CSV/JSON/Parquet -- push the filtering to the storage layer, or (2) move processing to an ECS Fargate task that can run for hours. The SQS message would trigger a Step Functions workflow that launches a Fargate task instead of a Lambda.
+
+- **Memory constraints:** Lambda maxes out at 10 GB memory. A 5GB file loaded entirely into memory leaves little room for processing. For Fargate, I would configure tasks with 8-16 GB memory and stream the file from S3 in chunks rather than loading it all at once.
+
+- **The hybrid approach:** Keep Lambda for files under 100MB (the vast majority) and route large files to Fargate. The SQS consumer Lambda checks the file size from the S3 event metadata. Small files are processed inline; large files trigger a Step Functions workflow that launches a Fargate task. This optimizes cost (Lambda for the 99% of small files) while handling the edge case (Fargate for the 1% of large files).
+
+#### Follow-up: How do you prevent Lambda from overwhelming your Aurora PostgreSQL database with connections?
+
+**Answer:**
+
+This is one of the most common production failures in serverless-to-relational architectures. Lambda can scale to hundreds of concurrent executions in seconds, each opening its own database connection. Aurora PostgreSQL's `max_connections` defaults to around 1,600 for a `db.r5.large`, but each connection consumes memory and process resources.
+
+- **RDS Proxy is the primary solution.** RDS Proxy sits between Lambda and Aurora, maintaining a pool of warm database connections. Hundreds of Lambda instances share a pool of, say, 100 database connections. RDS Proxy handles connection multiplexing, authentication caching, and automatic failover. It adds ~1ms of latency, which is negligible. Cost: roughly $21/month for a small instance.
+
+- **Reserved concurrency as a guard rail.** Even with RDS Proxy, I would set reserved concurrency on the Lambda function to cap the maximum number of simultaneous executions. If the proxy pool is 100 connections and each Lambda holds one connection for 500ms, I would cap Lambda at 200 concurrent executions -- this ensures the proxy is never overwhelmed.
+
+- **Connection reuse in Lambda.** Initialize the database connection outside the handler (in the module scope). The connection persists across warm invocations of the same execution environment. This means a warm Lambda reuses its connection instead of opening a new one per invocation.
+
+- **The pattern I would avoid:** Opening and closing a connection per invocation. This creates massive connection churn, wastes time on TCP + TLS + auth handshake on every request, and generates load on the database's process management.
+
+#### Going Deeper: What happens if RDS Proxy itself becomes the bottleneck?
+
+RDS Proxy scales based on the underlying database instance size -- it provisions enough capacity to handle the database's `max_connections`. But the real bottleneck is rarely the proxy; it is the database's ability to handle concurrent queries. If you are seeing proxy connection timeouts, the actual problem is usually slow queries holding connections open. The fix is query optimization (indexes, query plans, connection timeout settings on the proxy), not more proxy capacity. I would check `pg_stat_activity` in Aurora to see if connections are stuck in `idle in transaction` state, which is a common leak pattern where application code opens a transaction and never commits or rolls back.
+
+---
+
+### 3. Your company runs 200 Lambda functions across 5 teams. You are tasked with designing the AWS account strategy. What do you recommend?
+
+**Difficulty:** Staff-Level
+
+**What the interviewer is really testing:** Organizational architecture thinking, AWS Organizations knowledge, understanding of blast radius and governance, and the ability to balance isolation with operational simplicity.
+
+**Strong answer:**
+
+The way I think about this is: accounts are a security and operational boundary, not an organizational chart. The goal is to contain blast radius, enable independent team velocity, and give finance clean cost attribution -- without drowning in account sprawl.
+
+**My recommended structure for 5 teams and 200 functions:**
+
+- **Management Account** -- AWS Organizations root. No workloads here. Only billing, SCPs, and Control Tower configuration.
+- **Security OU:** Log Archive Account (centralized CloudTrail, Config, GuardDuty findings), Security Tooling Account (Security Hub, IAM Access Analyzer).
+- **Infrastructure OU:** Shared Services Account (CI/CD pipelines, ECR repositories, shared Lambda layers, DNS zones in Route 53), Networking Account (Transit Gateway, VPN, if needed).
+- **Workloads OU:** Split into Production OU and Non-Production OU. Within each, one account per team. So 5 production accounts and 5 development/staging accounts. Total: 10 workload accounts.
+- **Sandbox OU:** Individual developer sandbox accounts with aggressive SCPs (no resources larger than medium, auto-cleanup after 7 days via AWS Nuke).
+
+**Total: ~15 accounts.** This sounds like a lot, but AWS Control Tower automates provisioning with guardrails pre-configured.
+
+**Key SCPs I would apply:**
+
+- **Root OU:** Deny all actions outside approved regions (us-east-1, eu-west-1). Deny root user access. Require S3 encryption. Prevent leaving the organization.
+- **Sandbox OU:** Deny expensive instance types. Deny production service creation (RDS Multi-AZ, Aurora, large DynamoDB tables).
+- **Production OU:** Deny deletion of CloudTrail logs. Deny disabling encryption. Require MFA for destructive actions.
+
+**Cost attribution:** Each team's production and non-production accounts generate separate line items in consolidated billing. No tagging games needed for team-level cost attribution -- the account boundary handles it structurally. Within each account, teams tag by service for finer granularity.
+
+#### Follow-up: Team A needs to read data from Team B's DynamoDB table. How do you handle cross-account access without breaking isolation?
+
+**Answer:**
+
+I have three options, and the right one depends on the access pattern:
+
+- **Cross-account IAM role assumption (my default choice).** Team B creates an IAM role in their account with a trust policy allowing Team A's Lambda execution role to assume it. Team A's Lambda calls `sts:AssumeRole`, gets temporary credentials, and reads from Team B's DynamoDB table. The role in Team B's account has a scoped policy: only `dynamodb:GetItem` and `dynamodb:Query` on the specific table, nothing else. This is auditable (CloudTrail logs every role assumption), revocable (delete the trust policy), and granular (limit by IP, VPC, or condition keys).
+
+- **DynamoDB Streams to EventBridge (for async data sharing).** If Team A does not need synchronous reads but just needs to react to changes in Team B's data, use DynamoDB Streams in Team B's account to publish change events to EventBridge. EventBridge cross-account rules forward relevant events to Team A's event bus. This fully decouples the teams -- Team A does not need any access to Team B's account.
+
+- **Shared data layer (for truly shared data).** If the DynamoDB table is shared reference data (product catalog, config data), consider putting it in the Shared Services account with cross-account read access for all workload accounts. This is appropriate when the data is organizational, not team-owned.
+
+**What I would avoid:** Resource-based policies directly on the DynamoDB table. DynamoDB does not support resource-based policies (unlike S3 or SQS), so the cross-account role approach is the only option for direct access.
+
+#### Follow-up: How do you prevent SCP misconfigurations from causing a production outage?
+
+**Answer:**
+
+This is a real risk. An overly broad deny SCP applied at the wrong OU level can instantly break production across every account in that OU.
+
+- **Test SCPs in a staging OU first.** Create a mirror of your production OU structure with a test account. Apply the SCP there, run automated integration tests, and verify nothing breaks before promoting to the production OU.
+
+- **Use the SCP simulator.** AWS IAM Policy Simulator can evaluate SCPs against specific API calls. Before applying a deny policy, simulate the actions your production services make (Lambda invoke, DynamoDB read/write, S3 access, CloudWatch logging) and verify they are not blocked.
+
+- **Deploy SCPs through CI/CD.** SCPs should be in version control (Terraform or CloudFormation StackSets), deployed through a pipeline with approval gates and automatic rollback. Never apply SCPs manually through the console.
+
+- **Always include a break-glass exclusion.** Every deny SCP should have a condition excluding a specific "break-glass" IAM role that can bypass the restriction in emergencies. This role should require MFA and be heavily audited, but it prevents you from locking yourself out.
+
+- **Monitor with CloudTrail.** Set up CloudWatch alarms on `AccessDenied` events in CloudTrail. A sudden spike in access denied errors after an SCP change indicates something is broken.
+
+---
+
+### 4. Explain the difference between SQS, SNS, EventBridge, and Kinesis. When have you used each one, and when have you made the wrong choice?
+
+**Difficulty:** Intermediate / Senior
+
+**What the interviewer is really testing:** Whether you have genuine production experience with these services versus textbook knowledge. The "wrong choice" part specifically tests self-awareness and learning from mistakes.
+
+**Strong answer:**
+
+The way I think about it is along two axes: *how many consumers* and *do you need replay*.
+
+- **SQS** is a task queue. One message goes to one consumer. Once processed, it is deleted. Think of it as a to-do list: each item gets assigned to one worker. I use SQS for work distribution -- processing uploaded files, handling order fulfillment, running async jobs. The killer feature is simplicity: no shards to manage, no partitioning strategy, nearly infinite throughput for Standard queues, built-in DLQ, and visibility timeout for safe concurrent processing.
+
+- **SNS** is a megaphone. One message goes to many subscribers (Lambda, SQS, HTTP, email, SMS). It is fan-out with no retention -- if the subscriber is down, the message is lost (unless the subscriber is an SQS queue, which buffers it). I use SNS when a single event should trigger multiple independent reactions: "order placed" triggers email, inventory update, and analytics simultaneously.
+
+- **EventBridge** is SNS with brains. It adds content-based filtering (only route high-value orders to fraud detection), schema registry (know what your events look like), cross-account routing, and archive/replay. I use EventBridge as the default for new event-driven integrations. It is more expensive per event than SNS, but the filtering alone eliminates hundreds of lines of consumer-side `if` statements.
+
+- **Kinesis** is a log. Events are ordered within a shard, retained for 1-365 days, and multiple consumers read independently at their own pace from any point in the stream. I use Kinesis for real-time analytics (clickstream data), change data capture (reacting to database changes), and any use case where I need to replay the event history (reprocess last 24 hours after deploying a bug fix).
+
+**A wrong choice I have made:** Early in a project, I used Kinesis for what was fundamentally a task queue. The team needed to process webhook events from a payment provider -- one event, one handler, no replay needed. Kinesis added shard management overhead, required handling the iterator/checkpoint logic, and when a single poison record arrived, it blocked the entire shard for hours because we had not configured `bisectBatchOnFunctionError`. We migrated to SQS in a weekend and the system became dramatically simpler. The lesson: do not reach for the most powerful tool when the simple one fits.
+
+<Warning>
+**The sharp distinction to memorize for interviews:** SQS = work distribution (one consumer per message). SNS/EventBridge = event notification (many consumers per event). Kinesis = event streaming (ordered log with replay). If you get this taxonomy wrong, the interviewer will probe relentlessly.
+</Warning>
+
+#### Follow-up: You need exactly-once processing. Which of these gives it to you?
+
+**Answer:**
+
+None of them give you exactly-once processing out of the box. This is a fundamental distributed systems truth that separates real practitioners from textbook learners.
+
+- **SQS FIFO** claims "exactly-once delivery" within a 5-minute deduplication window. It deduplicates messages with the same `MessageDeduplicationId`. But "exactly-once delivery" is not "exactly-once processing." If your Lambda reads the message, processes it, writes to the database, and then crashes before deleting the message from SQS, the message becomes visible again and gets processed a second time. You still need idempotency in your consumer.
+
+- **Kinesis** is explicitly at-least-once. Checkpointing happens after processing. If the consumer crashes between processing and checkpointing, the record is reprocessed.
+
+- **SNS and EventBridge** are at-least-once. Retry logic can deliver the same event multiple times.
+
+**The real answer:** Build idempotent consumers. Use a deduplication store (DynamoDB with a conditional write on a unique event ID, or a database unique constraint). The pattern is: before processing, check if this event ID has been seen. If yes, skip. If no, process and record the event ID atomically. This works regardless of which messaging service you use, which is exactly the point -- exactly-once semantics is an application concern, not an infrastructure guarantee.
+
+#### Going Deeper: You mentioned Kinesis shard blocking. Walk me through what happens and how to prevent it.
+
+When Lambda processes records from a Kinesis stream, it reads a batch of records from a shard and invokes your function. If the function returns an error, Lambda retries the same batch. It keeps retrying until the records expire from the stream (which could be 24 hours to 365 days depending on your retention setting). During this entire retry loop, no new records on that shard are processed. One poison record blocks all processing on the shard.
+
+**Prevention:**
+
+- **`bisectBatchOnFunctionError: true`** -- After a failure, Lambda splits the batch in half and retries each half. This narrows down to the single failing record through binary search rather than blocking on the entire batch.
+- **`maxRetryAttempts`** -- Set a maximum number of retries (e.g., 3-5). After exhausting retries, the failing record is sent to the on-failure destination.
+- **On-failure destination** -- Route failed records to an SQS queue or SNS topic for investigation. This is your DLQ equivalent for stream sources.
+- **Error handling in your function** -- Catch exceptions per record within the batch. Process what you can, collect failures, and use `batchItemFailures` response (a relatively newer Lambda feature) to report which specific records failed. Lambda retries only the failed records, not the entire batch.
+- **`maxRecordAge`** -- Set a maximum age for records. If a record is older than this threshold, Lambda skips it and sends it to the on-failure destination. This prevents ancient records from blocking the shard indefinitely.
+
+---
+
+### 5. You are building a new microservice. A colleague says "just put it on Lambda" and another says "use Fargate." How do you make this decision?
+
+**Difficulty:** Intermediate
+
+**What the interviewer is really testing:** Structured decision-making about compute platforms, awareness of trade-offs, and the ability to ask clarifying questions instead of jumping to an answer.
+
+**Strong answer:**
+
+My first response would be: "What are the requirements?" Because neither is universally better -- they optimize for different things. Here are the questions I would ask:
+
+- **What is the traffic pattern?** If it is spiky (zero at night, peak during the day), Lambda's scale-to-zero saves money. If it is steady 24/7 traffic, Fargate's always-on pricing wins.
+
+- **What is the latency SLA?** If p99 must be under 100ms, Lambda cold starts are a risk unless I pay for provisioned concurrency. Fargate is always warm.
+
+- **How long does a single request take?** Lambda has a 15-minute hard timeout. If the service does long-running work (video processing, ML training, large file transformations), Lambda is out.
+
+- **What are the dependency requirements?** If the service needs 2GB of ML model files, Lambda's container image path works but cold starts will be painful. Fargate handles large images without cold start penalties.
+
+- **Does it talk to a relational database?** Lambda-to-RDS without RDS Proxy is a foot-gun (connection storms). Fargate maintains persistent connection pools naturally.
+
+- **What does the team know?** If the team has deep container experience with existing Dockerfiles, CI/CD pipelines, and monitoring, Fargate is lower friction. If the team is small and does not want to manage containers, Lambda is simpler.
+
+**My default framework:**
+
+Start with Lambda for new services unless one of these disqualifiers is present: execution longer than 15 minutes, hard latency SLA below 50ms at p99, steady high-traffic workload where containers are 3x+ cheaper, or heavy reliance on relational databases without RDS Proxy. If any of those apply, use Fargate. If none apply, Lambda's operational simplicity wins.
+
+#### Follow-up: At what traffic volume does the cost crossover from Lambda to Fargate typically happen?
+
+**Answer:**
+
+The crossover depends on three variables: memory allocation, execution duration, and traffic steadiness. But for a common configuration (256MB memory, 200ms average duration):
+
+- **Below 1 million requests/month:** Lambda wins overwhelmingly. The free tier alone covers most of this. A Fargate task running 24/7 costs at minimum ~$9/month regardless of traffic.
+
+- **1-10 million requests/month:** Comparable cost. Lambda is roughly $10-80/month. A single Fargate task handling this load costs ~$9-20/month. The difference is not worth optimizing for.
+
+- **10-100 million requests/month:** Fargate wins on raw compute cost. Lambda at 50M requests/month with 256MB/200ms costs ~$200/month. Two Fargate tasks can handle the same load for ~$40/month.
+
+- **Above 100 million requests/month:** Fargate or ECS on EC2 is dramatically cheaper. At this scale, consider EC2 with Savings Plans -- you might save another 50-70%.
+
+The nuance: Lambda's "cost" includes zero operational overhead. You do not configure health checks, manage deployments, set up auto-scaling rules, or handle container image builds. Those tasks consume engineering hours. At $150/hour fully loaded engineer cost, even 2 hours per month of container management eliminates the Lambda-to-Fargate cost savings up to roughly $300/month. For small teams, I bias toward Lambda longer than the raw math suggests.
+
+#### Follow-up: What about App Runner? When does that fit?
+
+**Answer:**
+
+App Runner is the "I want Fargate but even simpler" option. You point it at a container image or a source code repository, and AWS handles build, deploy, scaling, TLS, load balancing -- everything. It is the closest AWS equivalent to Heroku or Google Cloud Run.
+
+**When it fits:** Web applications and APIs where the team does not want to configure VPCs, load balancers, or auto-scaling policies. Prototypes. Services owned by teams that are not infrastructure-savvy. The developer experience is excellent -- push code, get a URL.
+
+**When it does not fit:** When you need VPC integration (private databases, internal services), custom networking, fine-grained scaling controls, or cost optimization. App Runner's pricing is slightly higher than raw Fargate because you are paying for the managed layer. And it has fewer knobs -- you cannot configure health check paths, connection draining timeouts, or scaling cooldown periods with the same granularity as Fargate.
+
+**My honest take:** App Runner is under-discussed. For teams that want container-based deployment without Kubernetes or Fargate complexity, it is a great option. But it occupies a narrow sweet spot -- simpler than Fargate, more capable than Lambda, less flexible than either.
+
+---
+
+### 6. A critical production service depends on DynamoDB. The table is getting hot-partition throttling at 3 AM. Walk me through your diagnosis and fix.
+
+**Difficulty:** Senior
+
+**What the interviewer is really testing:** Real operational debugging ability with DynamoDB, understanding of partition key design, and the ability to diagnose production issues under pressure.
+
+**Strong answer:**
+
+Hot-partition throttling means one or more partition keys are receiving disproportionate traffic. DynamoDB distributes data and throughput across partitions based on the partition key. If one key gets 10x the traffic of others, that partition exhausts its allocated throughput while other partitions sit idle. DynamoDB's adaptive capacity helps (it redistributes throughput to hot partitions over minutes), but it cannot fully compensate for severely skewed access patterns.
+
+**Diagnosis steps:**
+
+1. **Check CloudWatch Contributor Insights.** Enable it on the table -- it shows the most frequently accessed and throttled partition keys. This immediately tells you which keys are hot. If the top key accounts for 30% of all reads at 3 AM, you have found the problem.
+
+2. **Correlate with application behavior.** What runs at 3 AM? Batch jobs, cron tasks, data exports, report generation. A nightly job scanning a specific partition key range (e.g., all orders from yesterday using a partition key of `date=2026-04-09`) concentrates all traffic on one partition.
+
+3. **Check if it is on-demand or provisioned.** On-demand tables can still throttle if traffic exceeds the table's previous peak by more than 2x within 30 minutes. Provisioned tables throttle when consumed capacity exceeds allocated capacity per partition.
+
+**Fixes, from fastest to most architectural:**
+
+- **Immediate: Increase provisioned capacity or switch to on-demand.** This buys time but does not fix the root cause if the partition key design is skewed.
+
+- **Short-term: Add write sharding to the hot key.** Append a random suffix (e.g., `date=2026-04-09#3`) to spread writes across multiple physical partitions. The batch reader scatters-gathers across all suffixes. This is the standard DynamoDB hot-partition pattern.
+
+- **Medium-term: Redesign the access pattern.** If the 3 AM job scans by date, and the partition key is `date`, every daily scan hits one partition. Restructure the key to include another dimension (e.g., `PK = customer_id`, `SK = date`) so that the scan is distributed. Use a GSI if query access patterns require the date-first lookup.
+
+- **Architectural: DAX (DynamoDB Accelerator).** If the 3 AM traffic is read-heavy and reads the same data repeatedly, put DAX in front of the table. DAX caches reads at the item and query level, absorbing the burst without hitting the underlying partition.
+
+#### Follow-up: The hot key is a single global counter that multiple services increment. How do you handle that?
+
+**Answer:**
+
+A global counter on a single DynamoDB item is the classic hot-partition anti-pattern. Every increment hits the same partition key, same physical partition, and that partition maxes out at roughly 1,000 WCUs.
+
+**The scatter-gather counter pattern:**
+
+Instead of one item `{PK: "global_counter", count: N}`, create N shards: `{PK: "counter#0", count: X}`, `{PK: "counter#1", count: Y}`, ..., `{PK: "counter#N", count: Z}`. Each writer randomly picks a shard and increments it. To read the total, query all shards and sum. With 10 shards, you spread write throughput 10x.
+
+- Choose shard count based on expected writes per second. Each shard can handle ~1,000 WCUs, so 10 shards handle ~10,000 increments per second.
+- The trade-off is read complexity: getting the current total requires reading all shards. For use cases where you only need an approximate count or can tolerate 1-second staleness, cache the total in a separate item and update it periodically.
+- If exact real-time counts are needed, use DynamoDB Streams to aggregate changes into a single total asynchronously.
+
+**Alternative: Use ElastiCache Redis.** If the counter is truly global, high-frequency, and needs sub-millisecond reads, Redis `INCR` is atomic and handles hundreds of thousands of increments per second on a single key. Periodically persist the value to DynamoDB for durability. This is what I would recommend if the counter is in a hot path (e.g., rate limiting) rather than just analytics.
+
+---
+
+### 7. Your S3 data transfer bill is $15,000/month. How do you bring it down?
+
+**Difficulty:** Senior
+
+**What the interviewer is really testing:** Deep understanding of S3 cost model, CDN and caching strategies, architectural thinking about data movement, and cost engineering as a core engineering skill.
+
+**Strong answer:**
+
+$15,000/month in S3 data transfer at $0.09/GB means roughly 167 TB of data leaving S3 per month. That is significant. Here is my systematic approach:
+
+**Step 1: Understand where the data is going.** S3 server access logs and CloudTrail S3 data events tell me which buckets, prefixes, and clients are responsible. I would break it down by:
+- S3 to internet (most expensive at $0.09/GB)
+- S3 to CloudFront (cheaper at $0.00/GB for origin fetches in most regions)
+- S3 cross-region (e.g., replication to another region at $0.02/GB)
+- S3 to EC2/Lambda in the same region (free -- but going through NAT Gateway costs $0.045/GB)
+
+**Step 2: Put CloudFront in front of everything serving to the internet.** If end-users or external clients are reading from S3, they should hit a CloudFront distribution, not S3 directly. CloudFront caches objects at edge locations, so repeated requests for the same object are served from cache without hitting S3. For content with even modest cache hit ratios (50-70%), this cuts S3 egress in half. CloudFront's data transfer pricing is also slightly lower than direct S3 egress.
+
+**Step 3: Enable S3 Transfer Acceleration for upload-heavy use cases.** If a chunk of the bill comes from cross-region traffic (e.g., users in Asia uploading to us-east-1), Transfer Acceleration routes through CloudFront edge locations for faster and more efficient transfers.
+
+**Step 4: Eliminate unnecessary cross-region replication.** If you are replicating data to multiple regions for disaster recovery, ask whether all that data needs to be replicated. Often, only critical data (database backups, configuration) needs cross-region copies, while logs and analytics data can stay in one region.
+
+**Step 5: Move compute to the data.** If an analytics pipeline in eu-west-1 is pulling 50 TB/month from S3 in us-east-1, move the pipeline or create a replica bucket in the same region as the compute. Data gravity matters -- move compute to data, not data to compute.
+
+**Step 6: Use S3 Select and Athena to reduce scan volumes.** If clients download entire objects to extract a few fields, S3 Select pushes the filtering to the storage layer. You transfer only the matching rows, not the whole file. For analytics queries, Athena with Parquet-formatted data scans (and transfers) 80-90% less data than querying raw JSON.
+
+#### Follow-up: You put CloudFront in front of S3 and cache hit ratio is only 20%. Why, and how do you fix it?
+
+**Answer:**
+
+A 20% cache hit ratio means 80% of requests are cache misses, which means either the content is not cacheable or the cache is not configured well.
+
+**Common causes:**
+
+- **Unique URLs per user.** If each request includes a unique query string parameter (session token, timestamp, user ID), CloudFront treats each URL as a unique cache key. Fix: Configure CloudFront to ignore irrelevant query strings in the cache key. Whitelist only query parameters that actually change the content (e.g., `size=thumbnail` vs `size=full`).
+
+- **Low TTL or `Cache-Control: no-cache` headers.** If S3 objects have no `Cache-Control` header or set `max-age=0`, CloudFront does not cache them (or caches very briefly). Fix: Set appropriate `Cache-Control` headers on S3 objects. Static assets: `max-age=31536000, immutable`. Dynamic content: use a shorter TTL but still cache (even `max-age=60` dramatically reduces origin load).
+
+- **Long-tail content.** If you serve millions of unique objects and each is accessed once per day, even perfect caching does not help because the first request is always a miss. Fix: This is a content distribution problem, not a caching problem. Consider pre-warming the cache for popular content or accepting the miss rate and focusing on reducing object sizes instead.
+
+- **Single edge location.** If all traffic comes from one region but CloudFront distributes across hundreds of edge locations, each edge sees low traffic and evicts cached content quickly. Fix: Use CloudFront's `Price Class` to restrict to fewer edge locations (higher hit rate per location) or use Origin Shield (an additional caching layer between edge locations and S3 that centralizes cache fills).
+
+**Origin Shield is the underrated fix.** It adds a regional cache between edge locations and S3. Instead of 200 edge locations each making their own origin requests, they all hit Origin Shield first. If Origin Shield has the object cached, it serves it -- one origin request instead of 200. For large-scale distributions, Origin Shield can improve cache hit ratios by 20-40%.
+
+---
+
+### 8. Your team wants to go multi-region active-active. When would you argue against it?
+
+**Difficulty:** Staff-Level
+
+**What the interviewer is really testing:** Architectural maturity, the ability to push back on complexity, and understanding of the real costs and risks of multi-region deployments.
+
+**Strong answer:**
+
+Multi-region active-active is one of the most over-prescribed architectural patterns. It sounds great in a design meeting, but the operational complexity is staggering. I would argue against it in most cases. Here is my framework:
+
+**Argue against when:**
+
+- **The business does not actually need zero-downtime failover.** Most services can tolerate 30-60 seconds of downtime during an active-passive failover. Ask the business: "What is the cost per minute of downtime?" If the answer is less than the engineering cost of maintaining active-active, it is not worth it. For most SaaS companies, active-passive with Route 53 health checks and automated failover provides 99.95%+ availability.
+
+- **The data layer has strong consistency requirements.** Active-active means writes happen in multiple regions simultaneously. For eventually consistent data (user preferences, analytics, content caches), this is manageable. For strongly consistent data (financial balances, inventory counts, sequential ordering), you enter split-brain territory. DynamoDB Global Tables give you eventual consistency with ~1 second replication lag. That 1-second window is where duplicate orders, double-charges, and inventory over-sells live.
+
+- **The team does not have the operational maturity to run it.** Active-active requires: per-region monitoring and alerting, automated failover testing, data conflict resolution strategies, region-aware routing, region-specific deployment pipelines, and engineers who can debug cross-region replication issues at 3 AM. If the team has not mastered single-region operations (observability, incident response, deployment automation), adding a second region multiplies problems rather than solving them.
+
+- **The cost does not justify the benefit.** Active-active roughly doubles your infrastructure cost (two of everything) plus adds 30-50% operational overhead (cross-region replication, routing, testing). For a service doing $1M ARR, spending $500K on active-active infrastructure is absurd. For a service doing $100M ARR where an hour of downtime costs $500K, it is a no-brainer.
+
+**When I would advocate for it:**
+
+- Regulatory requirement (EU data must be served from EU, US from US) -- but this is often better solved with region-pinned routing, not true active-active.
+- Latency-sensitive global user base where 200ms cross-ocean latency is unacceptable.
+- The business genuinely cannot tolerate the 30-60 seconds of active-passive failover (financial trading, real-time gaming, emergency services).
+
+<Tip>
+**The staff-level insight:** "My default recommendation is active-passive with automated failover. This gives you disaster recovery, meets 99.95%+ availability SLAs, and avoids the data consistency nightmare of active-active. I would only move to active-active when I have exhausted single-region reliability improvements (multi-AZ, auto-scaling, circuit breakers) and the business case specifically demands it."
+</Tip>
+
+#### Follow-up: If you do go active-active, how do you handle data conflicts?
+
+**Answer:**
+
+Data conflicts in active-active occur when both regions write to the same record within the replication window. The strategies depend on the data type:
+
+- **Last-writer-wins (LWW).** DynamoDB Global Tables use this by default -- the write with the latest timestamp wins. This is fine for data where the most recent value is always correct (user profile updates, session data, preferences). It is dangerous for counters, balances, or any additive data where both writes carry information.
+
+- **Application-level conflict resolution.** Instead of overwriting, design your data model so writes are additive. Use event sourcing: instead of updating a balance, append a debit/credit event. Both regions can append independently, and the balance is derived by replaying events. Conflicts become "concurrent events" that are both valid.
+
+- **Region-pinning with failover.** Assign each entity (user, account, order) a "home" region. All writes for that entity go to its home region. The other region serves reads from the replica. On failover, the secondary region promotes to writer. This avoids conflicts entirely at the cost of cross-region write latency for entities whose users are in the "wrong" region.
+
+- **CRDTs (Conflict-Free Replicated Data Types).** For specific data structures (counters, sets, flags), CRDTs guarantee that concurrent updates from different regions merge deterministically without conflicts. This is theoretically elegant but requires redesigning your data model around CRDT-compatible structures. Practically, it works for counters (G-Counter), boolean flags (LWW-Register), and sets (OR-Set). It does not work for arbitrary relational data.
+
+- **My recommendation for most teams:** Region-pinning with failover. It sidesteps the conflict problem entirely, is simple to reason about, and gives you active-active read scalability with single-region write simplicity. True active-active writes to the same data from multiple regions should be reserved for teams with deep distributed systems expertise.
+
+---
+
+### 9. Explain VPC Endpoints -- Gateway vs Interface. When do you use each, and what is the cost impact?
+
+**Difficulty:** Intermediate / Senior
+
+**What the interviewer is really testing:** Whether you understand AWS networking costs at a practical level and can optimize real infrastructure spend.
+
+**Strong answer:**
+
+VPC endpoints provide private connectivity from your VPC to AWS services without routing traffic through the internet (via a NAT Gateway or Internet Gateway). There are two types, and they have very different architectures and cost profiles.
+
+**Gateway Endpoints:**
+- Available only for S3 and DynamoDB.
+- Free. No hourly charge, no data processing charge.
+- Implemented as a route table entry. You add the endpoint, associate it with your private subnet route tables, and traffic to S3/DynamoDB is routed directly through the AWS backbone -- it never leaves the AWS network and never touches your NAT Gateway.
+- You should enable these on every VPC with private subnets. There is zero reason not to.
+
+**Interface Endpoints (powered by AWS PrivateLink):**
+- Available for 100+ AWS services (SQS, SNS, ECR, CloudWatch Logs, Secrets Manager, KMS, etc.) and third-party services.
+- Cost: ~$0.01/hour per AZ (~$7.30/month per AZ) plus $0.01/GB of data processed.
+- Implemented as an ENI (Elastic Network Interface) in your subnet. The endpoint gets a private IP address in your VPC, and traffic to the service resolves to that private IP via a private hosted zone.
+- Use when: the data processing savings through avoiding NAT Gateway ($0.045/GB) exceed the endpoint hourly cost. For high-traffic services (ECR image pulls, CloudWatch Logs ingestion), the break-even is usually within the first few GB per month.
+
+**Cost example:** 50 ECS tasks pull container images from ECR 3 times/day. Each pull downloads ~500MB. Monthly data: 50 * 3 * 0.5GB * 30 = 2,250 GB. Through NAT Gateway: 2,250 * $0.045 = $101.25/month. Through ECR Interface Endpoint: $7.30 * 2 AZs + 2,250 * $0.01 = $37.10/month. Savings: $64/month for this single service.
+
+#### Follow-up: You have Interface Endpoints for ECR in two AZs but container image pulls are still going through the NAT Gateway. What went wrong?
+
+**Answer:**
+
+This is a surprisingly common misconfiguration. There are several things to check:
+
+- **Private DNS is not enabled.** When you create an Interface Endpoint, you can enable "Private DNS." This creates a private hosted zone that overrides the public DNS name (e.g., `api.ecr.us-east-1.amazonaws.com`) to resolve to the endpoint's private IP address. If private DNS is not enabled, your ECS tasks still resolve the ECR hostname to its public IP, which routes through the NAT Gateway.
+
+- **DNS resolution is not enabled on the VPC.** The VPC must have `enableDnsSupport` and `enableDnsHostnames` set to true for private hosted zones to work. Check VPC settings.
+
+- **There are actually two ECR endpoints required.** ECR requires both `com.amazonaws.region.ecr.api` (for API calls like authentication) and `com.amazonaws.region.ecr.dkr` (for Docker image layer downloads). Missing either one causes partial or complete fallback to the public endpoint. You also need an S3 Gateway Endpoint because ECR stores image layers in S3.
+
+- **Security group on the endpoint is too restrictive.** Interface Endpoints have security groups. If the security group does not allow inbound HTTPS (port 443) from your ECS tasks' security group, the connection fails and the SDK falls back to the public endpoint.
+
+- **The endpoint is in the wrong AZs.** If your ECS tasks run in AZs where the endpoint does not have an ENI, traffic from those AZs goes through the public path. Create the endpoint in all AZs where your tasks run.
+
+---
+
+### 10. You are designing the CI/CD pipeline for a team with 30 Lambda functions. What is your deployment strategy?
+
+**Difficulty:** Senior
+
+**What the interviewer is really testing:** Practical DevOps thinking for serverless, understanding of deployment safety mechanisms, and the ability to design for both velocity and reliability.
+
+**Strong answer:**
+
+30 Lambda functions is enough that you need structure, but not so many that you need a platform team. My approach:
+
+**Repository structure:** Monorepo with each function in its own directory. Shared code (utilities, models, SDK wrappers) in a `shared/` directory that builds into a Lambda Layer. A change to shared code triggers deployment of all functions that use that layer. A change to a single function deploys only that function.
+
+**Build pipeline (CodePipeline or GitHub Actions):**
+
+1. **On PR:** Lint, unit test, `sam build` to verify the functions compile/package. Run integration tests against a dev-stage AWS account.
+2. **On merge to main:** Build all changed functions, push artifacts to S3 (zip) or ECR (container images), deploy to staging account.
+3. **Staging validation:** Run smoke tests against the staging deployment. If all pass, proceed to production.
+4. **Production deployment:** Deploy with traffic shifting using Lambda aliases and `CodeDeploy` integration.
+
+**Traffic shifting (the critical safety mechanism):**
+
+- Each function has a `live` alias pointing to the current production version.
+- On deployment, I publish a new version and shift the `live` alias using `CodeDeploy` with a canary or linear strategy:
+  - **Canary10Percent5Minutes:** Route 10% of traffic to the new version. If CloudWatch alarms (error rate, latency p99, custom business metrics) trigger within 5 minutes, auto-rollback. If clean, shift to 100%.
+  - **Linear10PercentEvery1Minute:** For less risky changes, shift 10% every minute over 10 minutes.
+- The rollback is instant -- just re-point the alias to the previous version. No re-deployment needed.
+
+**Lambda Layers for shared dependencies:**
+
+- Publish the shared layer as a versioned Layer. Pin production functions to a specific layer version (not `$LATEST`).
+- Layer updates go through the same canary deployment. Deploy the new layer to one function first, validate, then roll out to all functions.
+
+**Infrastructure as Code:** All Lambda configurations (memory, timeout, reserved concurrency, environment variables, event source mappings) are in SAM templates or CDK. No ClickOps. Every change is reviewed in a PR.
+
+#### Follow-up: How do you handle database schema migrations in this serverless CI/CD pipeline?
+
+**Answer:**
+
+Schema migrations in serverless are tricky because there is no persistent server to run migration scripts from. Here is what works:
+
+- **Dedicated migration Lambda.** A Lambda function whose sole purpose is running database migrations. It is triggered as a custom resource in CloudFormation/CDK or as a step in the CI/CD pipeline (invoke via AWS CLI after deployment). It connects to the database via RDS Proxy, runs the migration scripts (using a tool like Flyway, Alembic, or Knex), and reports success/failure.
+
+- **Backward-compatible migrations only.** Since Lambda functions are deployed with canary traffic shifting, the old version and new version run simultaneously during deployment. The database schema must be compatible with both versions. This means: add columns (nullable or with defaults), never rename or drop columns during deployment. Use a two-phase migration: Phase 1 deploys the new schema (additive only) and the new code that can use both old and new schema. Phase 2 (days later, after all traffic has shifted) deploys a cleanup migration that removes the old columns.
+
+- **Migration as a pre-deploy step.** In the CI/CD pipeline, run the migration Lambda *before* deploying the new function code. If the migration fails, the deployment stops and the old code continues running against the old schema. If the migration succeeds, deploy the new code that uses the new schema.
+
+- **For DynamoDB:** There are no schema migrations in the traditional sense (DynamoDB is schemaless). But adding a new GSI takes time and consumes write capacity. Add new GSIs in a separate deployment step, monitor the backfill progress, and only deploy the code that queries the new GSI after the backfill completes.
+
+#### Going Deeper: How do you test 30 Lambda functions locally before deploying?
+
+**SAM CLI local invoke** is the primary tool. `sam local invoke FunctionName -e event.json` runs your function in a Docker container that mimics the Lambda runtime. It is not perfect (no cold start simulation, no IAM role), but it catches most logic errors.
+
+For integration testing, I would use `sam local start-api` to spin up a local API Gateway + Lambda environment, then run the API test suite against it. For event-driven functions (SQS, S3 triggers), use `sam local invoke` with sample events generated by `sam local generate-event`.
+
+The honest caveat: local testing catches code bugs but not deployment bugs, IAM issues, or VPC networking problems. I would maintain a dedicated dev/test AWS account where the CI pipeline deploys on every PR and runs integration tests against real AWS services. The confidence hierarchy is: unit tests (fast, local) -> local Lambda testing (medium, Docker) -> integration tests in dev account (slow, real AWS) -> canary deployment in production (final safety net).
+
+---
+
+### 11. What is the most expensive mistake you have seen (or made) on AWS, and what did you learn from it?
+
+**Difficulty:** Senior (tests production experience and self-awareness)
+
+**What the interviewer is really testing:** Real-world experience, not theoretical knowledge. They want to see humility, systematic thinking about cost, and whether you have actually operated AWS at scale.
+
+**Strong answer (example narrative):**
+
+The most expensive mistake I saw was a recursive Lambda invocation that went undetected for 4 hours on a Friday night. A Lambda function processed images uploaded to an S3 bucket. The processed output was written back to the *same* bucket with a different prefix. But the S3 event notification was configured with no prefix filter -- it triggered on all `PutObject` events, not just the upload prefix. So: upload triggers Lambda, Lambda writes output to same bucket, output triggers Lambda again, which writes another output, infinitely.
+
+In 4 hours, the function executed 23 million times and generated 4 TB of duplicate output objects. The bill was around $12,000 -- Lambda invocations, S3 PUT requests, S3 storage, and the biggest chunk was S3 request costs on the millions of PUTs.
+
+**What I learned:**
+
+- **Always use prefix filters on S3 event notifications.** Source prefix and destination prefix must be different, and the event notification must filter to only the source prefix.
+- **Set reserved concurrency on every Lambda function.** If this function had reserved concurrency of 10, the loop would have been throttled and the blast radius contained.
+- **AWS now has recursive loop detection** for Lambda-S3-Lambda loops (released 2023). But do not rely on detection -- design to prevent recursion.
+- **Set up AWS Budgets with action thresholds.** A budget action can automatically apply an SCP that denies Lambda invocations if the monthly spend exceeds a threshold. We now have a $500 daily anomaly alert on every account.
+- **Use a separate destination bucket.** The simplest architectural fix is never writing output to the same bucket as input. Two buckets, one event notification, zero recursion risk.
+
+<Warning>
+**Why interviewers love this question:** It separates engineers who have run things in production from those who have only studied. If you cannot name a real expensive mistake (yours or one you witnessed), it signals limited production experience. Have a genuine story ready -- the more specific the dollar amount and the more concrete the lesson, the more credible you are.
+</Warning>
+
+#### Follow-up: How do you set up cost guardrails to prevent runaway bills on a new AWS account?
+
+**Answer:**
+
+- **AWS Budgets:** Create a monthly budget with alerts at 50%, 80%, and 100% of expected spend. At 100%, trigger a budget action that notifies via SNS and optionally applies an SCP restricting resource creation.
+
+- **Cost Anomaly Detection:** Enable it on the billing account. It uses ML to detect unusual spending patterns and alerts within hours rather than waiting for the end of the month. Configure alerts for both percentage-based (50% above forecast) and absolute-dollar thresholds ($100 anomaly).
+
+- **SCPs for sandbox accounts:** Deny creation of expensive resources (large EC2 instances, large RDS instances, Redshift clusters, SageMaker endpoints). Deny actions in regions you do not use.
+
+- **Lambda concurrency limits:** Set account-level concurrency limits in non-production accounts to a low number (100-200). This prevents any single runaway function from generating millions of invocations.
+
+- **S3 lifecycle policies from day one:** Abort incomplete multipart uploads after 3 days. Expire old object versions after 30 days. Transition to cheaper storage classes on a schedule.
+
+- **Tag enforcement:** Use AWS Organizations Tag Policies to require `team` and `environment` tags on all resources. Untagged resources generate unattributable costs that nobody optimizes.
+
+---
+
+### 12. You need to migrate a monolithic application from EC2 to a cloud-native architecture. How do you approach this?
+
+**Difficulty:** Staff-Level
+
+**What the interviewer is really testing:** Strategic migration planning, risk management, understanding of the Strangler Fig pattern, and the judgment to prioritize what to migrate first.
+
+**Strong answer:**
+
+The first thing I would not do is rewrite everything at once. The big-bang rewrite is the highest-risk approach and fails more often than it succeeds. Instead, I use the Strangler Fig pattern -- incrementally replacing pieces of the monolith with cloud-native services while the monolith continues running.
+
+**Phase 0 -- Understand the monolith (2-4 weeks).**
+
+Before touching anything, I would map the monolith's components, their dependencies, data stores, and traffic patterns. Identify which components have clear boundaries (a payments module that talks to a specific set of tables) versus which are deeply entangled (a "utils" module imported by everything). Use application performance monitoring (X-Ray, Datadog APM) to trace request flows and identify hot paths.
+
+**Phase 1 -- Lift and shift to containers (2-4 weeks).**
+
+Containerize the monolith as-is and deploy on ECS Fargate. No code changes, no re-architecture. This gets you off EC2, into a reproducible deployment pipeline, with auto-scaling and health checks. The monolith runs identically -- just in a container. This de-risks the migration: if anything breaks later, you can always fall back to "container running the monolith."
+
+**Phase 2 -- Extract the easiest, highest-value component (4-8 weeks).**
+
+Pick a component that is: (a) loosely coupled (few dependencies on other monolith code), (b) independently deployable (has its own API or event interface), and (c) a good candidate for serverless (event-driven, bursty traffic, or stateless). Common first extractions: image processing, email/notification sending, report generation, webhook handling.
+
+Extract it into a Lambda function or Fargate service. Route traffic to the new service using an API Gateway or load balancer rule. The monolith continues handling everything else.
+
+**Phase 3 -- Repeat for each component (ongoing).**
+
+Work through the monolith component by component, extracting to the appropriate compute platform. For each extraction: deploy the new service alongside the monolith, shadow traffic or canary to verify correctness, then cut over. Keep the monolith code for that component intact but unreachable as a rollback path for 2-4 weeks.
+
+**Phase 4 -- Decommission the monolith.**
+
+When the last component is extracted, the monolith container is an empty shell. Turn it off. In practice, this takes 6-18 months for a medium-sized monolith.
+
+**Key decisions at each phase:**
+
+- **Database:** Do not try to split the database first. That is the hardest part. Start with the monolith and new services sharing the same database (via RDS Proxy if needed). Extract service-specific tables into their own databases (DynamoDB, separate RDS instances) later, once the service boundaries are stable.
+
+- **Authentication:** Extract auth into a shared service early (Cognito, Auth0, or a custom auth service). Every new microservice needs auth, and having a consistent auth layer prevents each service from reimplementing it differently.
+
+- **Shared data:** Use an event bus (EventBridge) from the beginning. When the monolith writes an order, it publishes an `OrderCreated` event. New services subscribe to events rather than querying the monolith's database. This decouples the extraction pace from the data migration pace.
+
+#### Follow-up: The CTO wants the migration done in 3 months. How do you push back?
+
+**Answer:**
+
+I would present data, not opinions. "Here is what we can realistically deliver in 3 months, and here is what that timeline risks."
+
+**What 3 months can deliver:** Phase 1 (containerization) and Phase 2 (one component extraction). This gives us a deployable, auto-scaling container setup, a CI/CD pipeline, and proof that the extraction pattern works. We will have migrated one component end-to-end and validated the approach.
+
+**What 3 months cannot deliver safely:** Full decomposition of a monolith into microservices. Rushing this leads to: services with unclear boundaries that need to be re-merged, data consistency bugs from premature database splitting, and an explosion of inter-service communication complexity that nobody has monitoring for yet.
+
+**The risk framework:** "Each week we spend on the migration is a week we are not shipping features. The Strangler Fig approach lets us do both -- we ship features on the monolith while extracting components in parallel. If we try to do everything in 3 months, we do neither well."
+
+**My concrete proposal:** "Give me 3 months for Phase 1 and Phase 2. After that, we will have a validated pattern, a realistic velocity measurement, and I can give you an evidence-based timeline for the rest. I would rather under-promise and over-deliver than commit to an aggressive timeline that leads to cutting corners on testing and monitoring."
+
+#### Going Deeper: How do you handle the database during migration -- do you split it early or late?
+
+Late. Always late. Premature database splitting is the number one reason monolith-to-microservice migrations fail.
+
+Here is why: when you extract a service from the monolith but both still share the same database, you can move incrementally. The new service reads and writes to the same tables. If something goes wrong, you can revert to the monolith handling that component without any data migration.
+
+When you split the database, you introduce: data synchronization (change data capture between the old and new databases), distributed transactions (what was a single database transaction is now a cross-service saga), and migration risk (moving data between databases while both systems are live).
+
+My approach: share the database until the service boundary is stable (the service has been running independently for 2-4 months with no boundary changes). Then split the data using DynamoDB Streams or PostgreSQL logical replication to keep the old and new databases in sync during the transition period. Once the new service is fully cut over, decommission the sync and drop the tables from the old database.
+
+The exception: if the monolith's database is itself the bottleneck (connection limits, query contention, scaling ceiling), then an early database split for the highest-traffic service is justified -- but do it for operational reasons, not for architectural purity.
+
+---
+
 ## Cross-Chapter Connections
 
 <Note>

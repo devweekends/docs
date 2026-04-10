@@ -2806,3 +2806,653 @@ Reading about system design is necessary but not sufficient. You would not prepa
 <Tip>
 **The ultimate test of readiness**: Can you design a system you have never practiced, using only the framework? Try "Design a distributed file storage system like Dropbox" or "Design a ride-sharing matching system like Uber." If you can produce a coherent 45-minute answer to a novel problem using the Clarify-Estimate-Design-Deep Dive-Trade-Offs framework, you are ready. If you find yourself lost without a memorized solution to fall back on, practice the framework more -- not more solutions.
 </Tip>
+
+---
+
+## Interview Deep-Dive Questions
+
+These questions simulate the kind of probing, multi-layered interrogation you will face from experienced system design interviewers. Each question starts at a specific point and then drills deeper through follow-ups -- exactly how a real 45-minute interview unfolds. Use them for self-study or peer practice.
+
+<AccordionGroup>
+
+<Accordion title="Q1: Why would you choose fan-out on write over fan-out on read, and when does that decision break down?">
+
+### Question
+
+You are designing a social feed system. Walk me through the trade-off between fan-out on write (push model) and fan-out on read (pull model). When does one clearly beat the other, and what forces you into a hybrid?
+
+**Difficulty**: Senior | **Concepts tested**: Write amplification, read latency, hybrid architectures, real-world scaling judgment
+
+### Strong Answer
+
+The way I think about this is through the lens of where you want to pay the cost -- at write time or at read time.
+
+- **Fan-out on write** means when a user publishes a post, you immediately push that post ID into every follower's pre-computed feed cache (typically a Redis sorted set). The read path becomes trivially fast -- just read from the cache. The cost is *write amplification*: one post from a user with 1,000 followers generates 1,000 writes. For a system where the vast majority of users have a few hundred followers, this is the correct default because reads outnumber writes by 10-100x, and you want reads to be sub-50ms.
+
+- **Fan-out on read** means you store posts per-author and at read time you query all followed authors, merge their posts, rank, and return the top N. There is zero write amplification -- one post is one write. But the read path is expensive: if I follow 300 users, the system must scatter-gather 300 queries, merge-sort the results, and return. At scale, this is too slow for a good user experience (500ms+ for a feed load).
+
+- **The decision breaks down at the celebrity boundary.** A user with 10 million followers posting once means 10 million cache writes. During peak events -- an election, a Super Bowl halftime tweet -- that can mean hundreds of millions of writes in a burst that backs up your fan-out queue by minutes or hours. This is exactly the problem Twitter faced publicly. The solution is a hybrid: fan-out on write for normal users (say, under 10K followers), and fan-out on read for celebrities. At read time, you merge the pre-computed feed with a small number of celebrity post lookups. The threshold should be dynamic based on current system load -- during peak traffic, lower the threshold to reduce write pressure.
+
+- **Real-world example**: Facebook, Twitter/X, and Instagram all converged on this hybrid approach independently. Twitter documented their migration from pure fan-out-on-write to hybrid around 2012-2013 specifically because of the celebrity problem. The fact that three of the largest feed systems arrived at the same architecture is strong evidence that the hybrid is the correct design for this problem class.
+
+#### Follow-up: How do you decide the exact follower threshold for switching from push to pull?
+
+A static threshold (like 10K) is a reasonable starting point, but in production you want it to be adaptive. The key insight is that the *cost* of a fan-out depends on two things: the follower count AND the current state of the system.
+
+- During normal load, you might fan out for users with up to 50K followers because the queue has spare capacity.
+- During a traffic spike (breaking news, sporting event), you lower the threshold to 5K or even 1K to protect the fan-out workers from falling behind.
+- The simplest implementation is a single configuration value that the fan-out service reads each batch: `MAX_FANOUT_FOLLOWERS`. Monitor Kafka consumer lag -- when lag exceeds 5 minutes, automatically lower the threshold. When lag returns to normal, raise it.
+- A more sophisticated approach uses a cost function: `fanout_cost = follower_count * current_queue_depth_factor`. If the cost exceeds a budget, defer to read-time merge. This makes the system self-tuning.
+
+The trade-off is that lowering the threshold means more work at read time (more celebrity posts to merge), which slightly increases feed-fetch latency. But a 50ms increase in read latency is vastly preferable to a fan-out queue that is 30 minutes behind.
+
+#### Follow-up: What happens to the user experience during the transition period when you change the threshold?
+
+This is a subtle UX question. When you lower the threshold from 50K to 5K:
+
+- Users who follow someone with 20K followers were previously getting that person's posts via their pre-computed feed cache. Now that person is suddenly treated as a "celebrity" and their posts must be merged at read time.
+- If the feed service does not know to look up this author's posts, they simply disappear from the feed until the next full read-time merge.
+- The fix: maintain a per-user "celebrity list" that is updated when the threshold changes. When a user's feed is fetched, the Feed Service checks both the pre-computed cache AND the celebrity list. The celebrity list is rebuilt periodically or on threshold change.
+- There is also a cache warming concern: when you *raise* the threshold back, posts from those users need to be fanned out again. You do not retroactively fan out old posts -- you start from the next post. Users may see a slight discontinuity in their feed timeline. In practice, this is barely noticeable because feed ranking surfaces the most relevant content regardless of delivery mechanism.
+
+#### Going Deeper: How would you handle the edge case where a normal user suddenly goes viral (10 followers yesterday, 5 million followers today)?
+
+This is the "emergent celebrity" problem. Your system was happily fanning out for this user when they had 10 followers. Now they have 5 million, but your system has not reclassified them yet.
+
+- **Detection**: Run a periodic job (every 5-10 minutes) that checks follower counts against the current threshold. Flag users who have crossed the threshold as "newly promoted" celebrities.
+- **Transition**: Stop fan-out for the newly promoted user immediately. Their future posts use the pull model. Existing posts already in followers' caches remain there (no need to remove them).
+- **The dangerous window**: If the user posts during the time between crossing the threshold and detection (up to 10 minutes), the fan-out service attempts to push to millions of followers. This is exactly the kind of burst that can back up the queue. Mitigation: add a pre-flight check in the fan-out worker itself -- before processing a fan-out event, re-check the author's current follower count. If it now exceeds the threshold, skip the fan-out and let the read path handle it. This adds one extra lookup per fan-out event but protects against the race condition.
+- WhatsApp and Telegram sidestep this entirely by not having a public feed -- every message is point-to-point or to a defined group. The viral celebrity problem is unique to open social graphs.
+
+</Accordion>
+
+<Accordion title="Q2: You said you would use Redis for caching. Walk me through exactly what happens when Redis goes down in your URL shortener.">
+
+### Question
+
+In your URL shortener design, you have Redis as a cache-aside layer in front of the database. The Redis instance just died completely. Walk me through what happens to the system -- second by second, from the user's perspective and from the infrastructure's perspective.
+
+**Difficulty**: Senior | **Concepts tested**: Graceful degradation, thundering herd, cache recovery strategies, production incident response
+
+### Strong Answer
+
+Let me walk through this as a timeline, because the failure unfolds in stages.
+
+- **Second 0 -- Redis dies.** The application servers' Redis clients start getting connection refused errors or timeouts. How quickly they detect this depends on the client configuration -- a health check interval of 1-2 seconds with a connection timeout of 500ms means detection within 2-3 seconds.
+
+- **Seconds 1-3 -- Cache misses begin.** Every redirect request that would have been a cache hit now falls through to the database. Latency jumps from ~5ms (cache hit) to ~20-50ms (database read). Users probably do not notice yet because 50ms is still fast for a redirect.
+
+- **Seconds 3-10 -- Thundering herd risk.** Here is where it gets dangerous. If your system processes 350K reads/sec at peak and your cache hit rate was 99%, that means only ~3,500 reads/sec were hitting the database. Now ALL 350K reads/sec hit the database simultaneously. A typical PostgreSQL instance handles ~10K TPS, a DynamoDB table in on-demand mode scales up but not instantly. You are looking at a potential 100x spike to the database.
+
+- **The mitigation that matters**: request coalescing (also called collapsed forwarding). If 1,000 requests for the same popular short URL arrive within a 100ms window, only ONE request hits the database. The other 999 wait for that single query to return and share the result. This is not a theoretical optimization -- it is the difference between your database surviving and falling over. Libraries like `singleflight` in Go or similar patterns in other languages implement this.
+
+- **Seconds 10-30 -- Stabilization.** With request coalescing, the database load is manageable but elevated. Latency is higher than normal (50-100ms per redirect instead of 5ms). You are degraded but functional. The monitoring system fires alerts for the Redis outage and elevated database latency.
+
+- **Recovery plan**: Do NOT just restart Redis and let it fill up organically. A cold cache with 350K reads/sec means the database stays under heavy load for potentially hours while the cache warms. Instead, run a cache warming script that pre-loads the top 20% of URLs by access frequency (this 20% generates 80% of traffic). You can derive this from access logs or a pre-computed popularity ranking. Load these into Redis before routing traffic back to it. Then switch traffic back to the cache-first path. The warm-up should take minutes, not hours.
+
+- **From the user's perspective**: Redirects were maybe 30-50ms slower for a few minutes. They almost certainly did not notice. This is the power of graceful degradation -- the system got worse, not broken.
+
+#### Follow-up: What if it is not a total Redis failure but a partial one -- say, 1 out of 3 Redis cluster nodes goes down?
+
+This is actually more insidious than a total failure.
+
+- With Redis Cluster, each node owns a subset of the hash slots (the keyspace). When one node dies, all keys on that node become inaccessible. The other two nodes continue serving their keys fine.
+- This means some short URLs resolve instantly from cache (their keys are on healthy nodes) and others are slow (their keys were on the dead node). The inconsistency is invisible to monitoring that only tracks averages -- your average latency might look fine while one-third of users experience degraded performance.
+- Detection: track cache hit rate per node or per hash slot range, not just globally. A sudden drop from 99% to 66% is the signature of a single-node failure in a 3-node cluster.
+- Redis Cluster has automatic failover (if you have replicas configured): the replica of the failed master gets promoted to master within 10-30 seconds. During the failover window, requests for keys on that shard fail. Your application code should handle this with a fallback to database read -- the same cache-miss path, but triggered by a Redis error rather than a cache miss.
+- The lesson: always configure at least one replica per master in a Redis Cluster. The cost is 2x the memory, but the availability improvement is enormous.
+
+#### Follow-up: How would you design the cache warming script? What are the pitfalls?
+
+The cache warming script has several non-obvious challenges.
+
+- **Data source**: You need to know which URLs are "hot." Options: (1) maintain a real-time access counter in the database or a separate analytics system, (2) parse recent access logs, or (3) use the previous cache contents if you have periodic snapshots (Redis RDB dumps). Option 1 is most reliable. Option 3 is fastest but only works if you have regular backups.
+- **Pace the warming**: If you dump 20 million key-value pairs into Redis as fast as possible, you saturate Redis's network bandwidth and CPU during the load. Rate-limit the warming to ~50K writes/sec (about half Redis's capacity) so the node can simultaneously serve live traffic.
+- **Stale data risk**: The warming script reads from the database, but URLs may have been created, modified, or expired since the data was read. For a URL shortener this is low risk (URLs are mostly immutable), but for a system with mutable data, you need to validate freshness. Set a short TTL on warmed entries (say, 5 minutes) so stale entries expire quickly and get refreshed from the database.
+- **The biggest pitfall**: warming the cache while traffic is still hitting the database. You need to coordinate the cutover -- warm the cache, then redirect traffic to use it. If traffic starts using the cache while it is only 10% warmed, you get a 90% miss rate, which is barely better than no cache.
+
+</Accordion>
+
+<Accordion title="Q3: Explain the difference between at-most-once, at-least-once, and exactly-once delivery. Why is exactly-once so hard?">
+
+### Question
+
+In your task scheduler design, you chose at-least-once delivery with idempotent tasks. Explain the three delivery semantics, why exactly-once is effectively impossible in a distributed system, and how you achieve the practical equivalent.
+
+**Difficulty**: Senior to Staff | **Concepts tested**: Distributed systems fundamentals, Two Generals Problem, idempotency, production trade-offs
+
+### Strong Answer
+
+The way I think about this is through the lens of what happens when things go wrong -- specifically, when the acknowledgment message is lost.
+
+- **At-most-once**: Fire and forget. Send the message, do not retry. If the message is lost, it is gone. Simple and fast, but lossy. Use case: logging, metrics collection, non-critical analytics events. You accept that some data is lost.
+
+- **At-least-once**: Send the message, wait for an acknowledgment. If you do not receive the ack within a timeout, retransmit. The problem: the receiver may have processed the message and sent the ack, but the ack was lost. You retransmit, and the receiver processes it again. You get duplicates. Use case: anything where losing a message is unacceptable (payment processing, task execution, order fulfillment). You accept potential duplicates and design for them.
+
+- **Exactly-once**: Each message is processed exactly one time. No duplicates, no losses. Sounds ideal, but here is why it is effectively impossible in an unreliable network.
+
+Consider the fundamental problem: the sender sends a message, the receiver processes it, and the receiver sends an acknowledgment. If the ack is lost, the sender cannot distinguish between "receiver processed it and the ack was lost" and "receiver never received it." This is a variant of the Two Generals Problem, which has no deterministic solution over an unreliable channel. No matter how many acknowledgments you add (ack-of-ack-of-ack), you always have the problem of the last message potentially being lost.
+
+- **The practical equivalent**: At-least-once delivery plus idempotent processing. You guarantee the message is delivered at least once (with retries), and you guarantee that processing it multiple times has the same effect as processing it once. The receiver maintains a deduplication table -- when it processes a message, it records the message ID. On subsequent deliveries, it checks the ID and skips reprocessing. From the outside, this *looks* like exactly-once, which is why Kafka calls its consumer semantics "exactly-once" -- it is really at-least-once with built-in dedup and transactional writes.
+
+- **Real-world example**: In the task scheduler, a worker picks up a "charge customer $50" task. It calls the payment API with an idempotency key. The payment succeeds. The worker tries to mark the task as COMPLETED, but the network times out. The zombie detector eventually re-enqueues the task. Another worker picks it up and calls the payment API with the same idempotency key. The payment system recognizes the key and returns the original result without charging again. From the customer's perspective, they were charged exactly once.
+
+#### Follow-up: How does Kafka achieve what it calls "exactly-once semantics" if true exactly-once is impossible?
+
+Great question -- Kafka's "exactly-once" is carefully scoped and often misunderstood.
+
+- Kafka achieves exactly-once *within the Kafka ecosystem* by combining three mechanisms: idempotent producers (each message has a sequence number, the broker deduplicates), transactional writes (a producer can write to multiple partitions atomically), and transactional consumers (a consumer reads and writes offsets in the same transaction).
+- What this means concretely: a Kafka Streams application that reads from topic A, processes the message, and writes to topic B will do so exactly once -- even if the consumer crashes and restarts. The offset commit and the output write happen in the same transaction.
+- What this does NOT mean: if your Kafka consumer calls an external system (sends an email, writes to a database, calls an API), Kafka has no way to make that external call idempotent. If the consumer crashes after calling the external system but before committing the offset, the message will be reprocessed and the external system will be called again. Exactly-once only applies to the Kafka-to-Kafka path.
+- This is why the task scheduler design combines at-least-once delivery with application-level idempotency keys -- because the "task" typically involves calling external systems where Kafka's transactional guarantees do not extend.
+
+#### Follow-up: What are the performance implications of idempotency? It sounds like you need a lookup on every operation.
+
+Yes, and this is a real cost that you should not hand-wave.
+
+- **Every idempotent operation requires a read-before-write**: check the dedup table, then execute if the key is new. This doubles the number of I/O operations on the critical path.
+- **The dedup table grows over time**: if you process 56 million tasks per day and store idempotency keys for 7 days, you have ~400 million entries in the dedup table. At ~50 bytes per entry, that is ~20 GB -- easily fits in Redis or a dedicated DynamoDB table.
+- **TTL is essential**: idempotency keys should expire after a reasonable window (1 hour to 7 days depending on the use case). Without TTL, the dedup table grows unbounded. The TTL must be longer than the maximum retry window -- if your retry policy allows retries for up to 1 hour, the idempotency key must live for at least 1 hour.
+- **In practice, the overhead is minimal**: the dedup check is a single key lookup in Redis or DynamoDB (~1ms). Compared to the task execution itself (seconds to minutes), 1ms of overhead is negligible. The correctness guarantee is worth far more than the performance cost.
+- **Where it gets expensive**: high-throughput, low-latency systems where every microsecond matters (trading systems, game servers). In those cases, you might accept at-most-once for non-critical operations and reserve idempotent at-least-once for operations that must not be duplicated (trades, inventory decrements).
+
+</Accordion>
+
+<Accordion title="Q4: How do you handle hot partitions in a distributed database, and how would you detect one before it causes an outage?">
+
+### Question
+
+In several of the system designs above -- chat messages partitioned by conversation_id, feeds partitioned by user_id, tasks partitioned by task type -- there is a risk of hot partitions. Explain what a hot partition is, how you would detect one, and what strategies you would use to mitigate it.
+
+**Difficulty**: Senior | **Concepts tested**: Database internals, partition key design, monitoring, data modeling
+
+### Strong Answer
+
+A hot partition is when one partition in a distributed database receives a disproportionate share of the traffic -- reads, writes, or both -- compared to other partitions. In a system like DynamoDB or Cassandra, each partition key maps to a physical partition on a specific set of nodes. If one partition key is orders of magnitude more popular than others, the nodes hosting it become a bottleneck while other nodes sit idle.
+
+- **Concrete example**: In the chat system, conversation_id is the partition key. Most conversations have a few hundred messages per day. But a group chat for a 500-person company channel might receive 50,000 messages per day -- all hitting the same partition. That single partition is handling 100x the load of an average partition.
+
+- **Another example**: In DynamoDB, each partition supports ~3,000 Read Capacity Units and ~1,000 Write Capacity Units per second. If a celebrity's user feed receives 10,000 reads/sec, a single partition cannot handle it, regardless of how much total capacity you have provisioned.
+
+**Detection strategies**:
+
+- **DynamoDB**: Use CloudWatch Contributor Insights, which identifies the most-accessed partition keys. It shows the top N partition keys by read/write volume over a time window. If one key accounts for more than 10% of total traffic, that is a hot partition.
+- **Cassandra**: Monitor per-partition read/write latencies using `nodetool cfstats` or through your monitoring system (Prometheus with Cassandra exporter). Look for P99 latency spikes that are localized to specific nodes. The `nodetool toppartitions` command samples and reports the most accessed partitions.
+- **General approach**: Instrument your application to log partition key access patterns. Aggregate in your analytics pipeline and set alerts for skew beyond a threshold (e.g., any single key exceeding 5x the average).
+
+**Mitigation strategies**:
+
+- **Write sharding (adding a suffix)**: Append a random suffix to the partition key. Instead of `conversation_id = "chat_ABC"`, use `conversation_id = "chat_ABC#3"` (where 3 is a random number from 0-9). This spreads writes across 10 partitions. The cost: reads must scatter-gather across all 10 sub-partitions and merge results. This is the standard DynamoDB pattern for handling hot keys.
+- **Time-based sub-partitioning**: For the chat system specifically, use `(conversation_id, year_month)` as a composite partition key. Current messages go to the current month's partition; historical queries read from older partitions. This naturally distributes the growing dataset and keeps the "hot" partition (current month) manageable.
+- **Caching the hot partition**: Put a cache (Redis, DAX) in front of the hot partition. If a celebrity's profile is accessed 10K times per second, cache it in Redis and let 99% of reads hit the cache. Only 1% (100 reads/sec) reach the database partition.
+- **Application-level routing**: If you know certain entities will always be hot (celebrity accounts, viral posts), route them to a dedicated, scaled-up data store separate from the main database. This is effectively application-level sharding by hotness.
+
+#### Follow-up: In DynamoDB specifically, does adaptive capacity solve the hot partition problem, or do you still need to worry about it?
+
+DynamoDB's adaptive capacity helps but does not eliminate the problem.
+
+- Adaptive capacity allows DynamoDB to reallocate unused throughput from cold partitions to hot ones. If you have 10,000 RCUs provisioned across 10 partitions and one partition needs 5,000 RCUs while the others need 500 each, adaptive capacity can handle that redistribution.
+- However, there are hard limits. A single partition cannot exceed its per-partition throughput limits (~3,000 RCU, ~1,000 WCU), regardless of adaptive capacity. If your hot partition genuinely needs 10,000 RCUs, adaptive capacity cannot help -- you need write sharding or a cache.
+- DynamoDB's on-demand mode is more generous with burst handling (up to 2x your previous peak), but the per-partition limits still apply.
+- The practical implication: for most workloads, adaptive capacity means you do not need to worry about moderate hotspots. But for extreme hotspots (celebrity accounts, viral content, flash sales), you still need explicit mitigation strategies.
+
+#### Follow-up: How would you design the partition key for a notification system where some users receive 100x more notifications than others?
+
+The challenge here is asymmetric write volume -- a power user or a highly active account receives far more notifications than a typical user.
+
+- **Option 1: User ID as partition key with write sharding**: Use `user_id#shard` as the partition key, where shard is computed as `hash(notification_id) % N`. For high-volume users, set N=10; for normal users, N=1 (no sharding). The application knows each user's shard count from a user metadata table.
+- **Option 2: Time-based partitioning**: Use `user_id#date` as the partition key. Each day gets a new partition. This naturally bounds partition size and keeps recent notifications (the ones users actually read) on a small number of partitions.
+- **Option 3: Separate hot and cold storage**: Keep the last 24 hours of notifications in a Redis sorted set per user (fast reads, no partition limits). Older notifications live in DynamoDB with time-based partitioning. Most notification reads are for recent items, so the Redis layer handles 95%+ of reads.
+- In my experience, Option 2 is the best balance of simplicity and effectiveness. It works without requiring the application to track per-user shard counts, and it naturally gives you a retention/archival boundary (delete partitions older than 90 days).
+
+</Accordion>
+
+<Accordion title="Q5: Your rate limiter uses Redis Lua scripts for atomicity. What happens under extreme contention, and what are the alternatives?">
+
+### Question
+
+You proposed using Redis Lua scripts to atomically check and increment rate limit counters. Walk me through how this works under extreme contention -- thousands of requests per second for the same rate limit key. What are the failure modes, and when would you consider alternatives to Redis?
+
+**Difficulty**: Senior | **Concepts tested**: Redis internals, concurrency models, distributed rate limiting trade-offs, alternatives evaluation
+
+### Strong Answer
+
+First, let me explain why Lua scripts work for this. Redis is single-threaded for command execution. A Lua script executes atomically -- no other Redis command can interleave during the script. This means our rate limit check (read counter, increment, check against limit, set TTL if needed) happens as one indivisible operation. There are no race conditions at the Redis level.
+
+- **Under extreme contention** (say, 100K requests/sec all hitting the same rate limit key for a popular API endpoint), the Lua script still works correctly because of Redis's single-threaded model. Each script execution takes ~0.05-0.1ms. At 100K ops/sec, the total time spent executing Lua scripts for this key is ~5-10 seconds per second of wall-clock time -- which is impossible. In practice, Redis pipelines and batches these, and the throughput limit is Redis's overall ops/sec capacity (~100K-200K ops/sec for simple commands on a single instance), not per-key contention.
+
+- **The real bottleneck is network round-trips**, not Lua execution. Each rate limit check requires one network round-trip from the API server to Redis (~0.5ms in the same AZ). At 100K requests/sec, that is 100K round-trips. If you have 10 API servers, each sends 10K requests/sec to Redis, which is well within Redis's capacity.
+
+- **When Redis becomes the bottleneck**: If you need more than ~200K rate limit checks per second, a single Redis instance is insufficient. Solutions: Redis Cluster (shard by rate limit key) or multiple Redis instances with client-side routing. Since rate limit keys are typically `user_id:endpoint`, the key distribution is naturally uniform across shards.
+
+**Failure modes specific to Lua scripts**:
+
+- **Long-running Lua script blocks everything**: Redis blocks all other commands while a Lua script runs. If your script has a bug (infinite loop) or does expensive operations (large ZRANGEBYSCORE), it blocks the entire Redis instance. Mitigation: keep Lua scripts minimal (ours is 6 lines), and set the `lua-time-limit` config (default 5 seconds) to kill runaway scripts.
+- **Memory growth**: If you use sliding window log (storing every timestamp in a sorted set), a hot key can accumulate millions of entries. The Lua script that cleans up old entries (`ZREMRANGEBYSCORE`) runs in O(log N + M) where M is the number of removed entries. For very hot keys, this cleanup can be expensive. This is another reason to prefer the sliding window counter algorithm -- it uses only two counters per window, not a growing sorted set.
+
+**Alternatives to Redis for rate limiting**:
+
+- **Local in-memory rate limiting**: Each API server maintains its own token bucket per user. No network round-trip, sub-microsecond latency. The trade-off: limits are enforced per-server, not globally. A user hitting 10 different servers gets 10x the effective limit. Use this as a secondary defense layer alongside Redis, or as a fallback when Redis is down.
+- **Envoy/Istio rate limiting in the service mesh**: The sidecar proxy handles rate limiting with its own shared state (typically backed by Redis). The advantage is that rate limiting is decoupled from application code.
+- **Cell-based rate limiting (Cloudflare's approach)**: Each edge node limits independently and periodically synchronizes counts to a coordination layer. Gives approximate global enforcement with zero cross-node latency for the check itself.
+
+#### Follow-up: How would you implement a sliding window counter in Redis using Lua, and why does it beat the sorted set approach at scale?
+
+The sliding window counter is a brilliant optimization. Here is how it works in Redis.
+
+- Maintain two keys per rate limit: `counter:{key}:{current_window}` and `counter:{key}:{previous_window}`. Each is a simple integer counter with a TTL equal to 2x the window size.
+- When a request arrives, the Lua script calculates the weighted count: `weighted = previous_count * (1 - elapsed_fraction_of_current_window) + current_count`. If weighted is under the limit, increment the current window counter and allow.
+- Total Redis memory per rate limit: 2 keys with integer values -- roughly 100 bytes. Compare that to the sorted set approach where you store a timestamp per request: 100 requests/minute per user means 100 entries of ~32 bytes each = 3,200 bytes. At 10 million users, that is 32 GB for sorted sets vs 1 GB for sliding window counters. A 32x memory reduction.
+- The accuracy trade-off: the sliding window counter is an approximation. It assumes requests in the previous window were uniformly distributed, which may not be true if traffic is bursty within a window. In practice, the error is less than 1%, which is acceptable for all but the most precise rate limiting needs (financial transaction limits).
+
+#### Follow-up: If Redis is unavailable and you fail-open, how do you prevent abuse during the outage window?
+
+Failing open means accepting that for a brief period, rate limits are not enforced. Here is how you minimize the blast radius.
+
+- **Local rate limiters as secondary defense**: Each API server runs a local in-memory token bucket. Set the local limit to 10x the normal per-user limit (generous, to avoid false positives from traffic distribution unevenness). This catches obvious abuse (thousands of requests/sec from one user) even without Redis.
+- **Monitor and respond**: Alert immediately on Redis failure. The average Redis recovery (with Sentinel or Cluster auto-failover) is 15-30 seconds. During this window, the local rate limiter is your only defense.
+- **Post-incident analysis**: After Redis recovers, run an anomaly detection query on access logs during the outage window. Identify users who significantly exceeded their normal rate. Take retroactive action (warn, temporarily restrict) if abuse is detected.
+- **Circuit breaker with delayed close**: After Redis comes back, do not immediately trust it. Use a circuit breaker that transitions from open (fail-open) to half-open (test Redis with a canary key every second) to closed (normal operation) over 30-60 seconds. This prevents thrashing if Redis is flapping.
+
+</Accordion>
+
+<Accordion title="Q6: Design the WebSocket connection management layer for a chat system handling 5 million concurrent connections.">
+
+### Question
+
+You need to maintain 5 million persistent WebSocket connections for a chat system. Walk me through how you would architect the connection management layer -- from how connections are assigned to servers, to how you route a message from User A on Server 1 to User B on Server 3.
+
+**Difficulty**: Staff-Level | **Concepts tested**: WebSocket scaling, connection routing, pub/sub systems, stateful service challenges
+
+### Strong Answer
+
+Managing 5 million persistent connections is fundamentally different from handling 5 million stateless HTTP requests. WebSocket connections are *stateful* -- the server holding a user's connection must be the one that pushes messages to that user. This introduces a routing problem that does not exist in stateless architectures.
+
+**Connection assignment and server capacity**:
+
+- A typical server handles ~10K-50K concurrent WebSocket connections depending on the language runtime and how much processing happens per message. At 10K per server, you need 500 servers. At 50K per server (Erlang, Go, or optimized Node.js), you need 100 servers.
+- Use a Network Load Balancer (Layer 4), not an Application Load Balancer (Layer 7), for WebSocket connections. NLB passes through TCP connections directly, adding minimal overhead. ALB terminates and re-establishes connections, adding latency and memory overhead.
+- Connection assignment is typically random (NLB round-robin or least-connections). There is no need for sticky sessions at the LB level because the routing table (below) handles message delivery.
+
+**Connection routing table**:
+
+- When a user connects, the Chat Server registers the mapping `user_id -> server_id` in a shared store (Redis hash map). When the user disconnects, the mapping is removed.
+- This routing table is the single most critical piece of infrastructure. Every message delivery starts with a lookup: "Which server holds User B's connection?" The lookup must be sub-millisecond.
+- Redis is ideal here: `HSET connections user:B "chat-server-42"` gives O(1) lookups. With 5 million entries at ~50 bytes each, the table is ~250 MB -- trivially fits in memory.
+
+**Message routing flow**:
+
+1. User A sends a message via WebSocket to Chat Server 1.
+2. Chat Server 1 persists the message to the Message Store (Cassandra).
+3. Chat Server 1 looks up User B's server: `HGET connections user:B` returns `chat-server-3`.
+4. Chat Server 1 publishes the message to a Redis Pub/Sub channel that Chat Server 3 subscribes to. Alternatively, Chat Server 1 makes a direct gRPC call to Chat Server 3.
+5. Chat Server 3 receives the message and pushes it to User B via the WebSocket connection.
+
+**Redis Pub/Sub vs direct server-to-server communication**:
+
+- **Redis Pub/Sub**: Each Chat Server subscribes to a channel named after itself (e.g., `channel:chat-server-3`). Senders publish to the target server's channel. Pros: decoupled, simple. Cons: Redis Pub/Sub is fire-and-forget (no persistence), so if a server misses a message (brief disconnection from Redis), the message is lost. Also, every Chat Server subscribes to its own channel, so Redis maintains 500 subscriptions -- lightweight.
+- **Direct gRPC**: Chat Servers call each other directly via gRPC using the routing table. Pros: point-to-point, no broker, lower latency. Cons: creates O(N^2) potential connections between servers, and requires service discovery.
+- **My recommendation**: Redis Pub/Sub for simplicity. The fire-and-forget limitation is mitigated because messages are already persisted to Cassandra before routing. If a message is lost in Pub/Sub, the recipient client's reconnection logic catches up from the database.
+
+#### Follow-up: What happens when a Chat Server crashes and 10K users need to reconnect?
+
+This is the thundering herd problem applied to WebSocket reconnection.
+
+- 10K clients detect the disconnection (TCP reset or heartbeat timeout) and trigger their reconnection logic. If they all reconnect immediately, the load balancer distributes 10K new connection requests across remaining servers in a burst.
+- **Client-side mitigation**: exponential backoff with jitter. Each client waits `random(0, min(2^attempt * 100ms, 30s))` before reconnecting. This spreads the 10K reconnections over 10-30 seconds instead of hitting all at once.
+- **Server-side**: When a client reconnects (to a different server now), it sends its last received message ID. The new server fetches all messages since that ID from Cassandra and pushes them. This "catch-up" ensures zero message loss.
+- **Routing table cleanup**: The dead server's entries in the routing table become stale. The stale entries will cause message delivery to fail (publishing to a Pub/Sub channel nobody subscribes to). Two cleanup strategies: (1) set a TTL on routing entries and refresh with heartbeats, or (2) have each Chat Server periodically validate its own entries on startup and remove stale ones from the previous instance.
+- **Capacity headroom**: This is why you should not run Chat Servers at 100% connection capacity. If each server handles 10K connections and you have 500 servers, you are at 100% capacity -- a single server failure means 10K users cannot reconnect (all other servers are full). Run at 80% capacity (servers handle 8K each), leaving 20% headroom for redistributing connections during failures.
+
+#### Follow-up: How would you handle the routing table during a Redis outage?
+
+Without the routing table, you cannot route messages to the correct server. This is a critical dependency.
+
+- **Short-term (seconds)**: Chat Servers cache a local copy of recent routing lookups. If Server 1 recently looked up that User B is on Server 3, it uses the cached result. This works for ongoing conversations but fails for new conversations.
+- **Fallback broadcast**: If the routing table is unavailable, fall back to broadcasting the message to ALL Chat Servers. Each server checks if it holds the recipient's connection and delivers if yes, ignores if no. This is O(N) where N is the number of servers, which is expensive but functional. At 500 servers, you are sending 500 messages instead of 1 for each chat message -- a 500x overhead. Acceptable for a brief outage, catastrophic if prolonged.
+- **Redis HA**: This is why the routing table must be in a highly available Redis setup (Sentinel with automatic failover, or Redis Cluster with replicas). Target recovery time: under 15 seconds. The broadcast fallback covers the gap.
+- **Alternative**: Use a consistent hashing ring to deterministically assign users to servers. No routing table needed -- you compute `server = hash(user_id) % N`. The problem: rebalancing when servers are added or removed causes mass disconnection and reconnection. Consistent hashing minimizes this (only ~1/N users are affected), but it is still disruptive. Most production systems prefer the routing table approach for its flexibility.
+
+</Accordion>
+
+<Accordion title="Q7: How do you design a system to handle scheduled tasks that must execute within 1 second of their target time?">
+
+### Question
+
+Your task scheduler promises to execute delayed tasks within 1 second of their scheduled time. How do you achieve this precision at scale -- 10 million tasks per day -- without resorting to busy-polling the database every 100 milliseconds?
+
+**Difficulty**: Senior | **Concepts tested**: Scheduling algorithms, timer wheels, database polling trade-offs, distributed coordination
+
+### Strong Answer
+
+The core tension is between precision and efficiency. Polling the database every 100ms gives you sub-second precision but hammers the database with queries. Polling every 10 seconds is efficient but you miss your 1-second SLA. The solution is a two-tier architecture: a **database-backed durable store** for long-horizon scheduling, and an **in-memory timer** for short-horizon precision.
+
+**Tier 1 -- Database scan (long horizon)**:
+
+- A scheduler process polls the database every 5-10 seconds: `SELECT * FROM tasks WHERE next_run_at <= NOW() + interval '30 seconds' AND status = 'PENDING'`.
+- This query uses a partial index (`idx_tasks_pending ON tasks (next_run_at) WHERE status IN ('PENDING', 'RETRYING')`) so it is fast even with millions of rows.
+- The scheduler loads these "soon-to-execute" tasks into memory and moves them to Tier 2.
+
+**Tier 2 -- In-memory timer (short horizon)**:
+
+- Tasks within the next 30 seconds are held in a **timer wheel** (or a priority queue sorted by execution time) in the scheduler's memory.
+- A timer thread checks the wheel every 100ms. When a task's execution time arrives, it enqueues the task to the work queue (Redis sorted set or SQS).
+- The precision is now bounded by the timer resolution (100ms), well within the 1-second SLA.
+
+**Why a timer wheel instead of `sleep()`**:
+
+- A timer wheel (also called a timing wheel, Hashed and Hierarchical Timing Wheels from the Varghese and Lauck paper) is a ring buffer of time slots. Inserting a timer is O(1), firing expired timers is O(1) per timer. This beats a sorted list (O(log N) insert) when you have thousands of timers expiring per second.
+- In practice, for 10M tasks/day, you have ~650 tasks coming due per second at peak. A simple min-heap priority queue is sufficient at this scale. Timer wheels become important at 100K+ timers per second.
+
+**Durability during scheduler restart**:
+
+- If the scheduler crashes, the in-memory timers are lost. On restart, the scheduler re-scans the database for tasks where `next_run_at <= NOW() + 30 seconds`. Tasks that were in-memory but not yet enqueued are re-discovered and processed, possibly a few seconds late (the restart time).
+- This is acceptable: a scheduler restart that takes 5-10 seconds means a few tasks execute 5-10 seconds late during the restart window. The database is the source of truth; the in-memory tier is an optimization for precision.
+
+#### Follow-up: How do you handle the case where two scheduler instances both load the same task from the database?
+
+This is the double-scheduling problem, and it is surprisingly subtle.
+
+- If you run multiple scheduler instances for HA (active-passive with leader election), only the leader scans the database and loads tasks. The passive instance does nothing until it becomes leader.
+- If you run active-active schedulers (for throughput, not just HA), you need to partition the work. Options: (1) each scheduler owns a range of task IDs (hash-based partitioning), (2) each scheduler uses `SELECT FOR UPDATE SKIP LOCKED` to atomically claim tasks without overlapping.
+- The `SKIP LOCKED` approach is elegant: when Scheduler A selects tasks, it locks them. Scheduler B's concurrent query skips the locked rows and picks up different tasks. No coordination protocol needed -- PostgreSQL handles it.
+- Even with `SKIP LOCKED`, you need the idempotency guarantee at the worker level. There is a window where the scheduler loads a task, marks it as SCHEDULED, but crashes before enqueuing it. The task stays in SCHEDULED state. A watchdog process (or the standby scheduler) picks up SCHEDULED tasks that have been in that state for longer than expected (say, 30 seconds) and re-enqueues them.
+
+#### Follow-up: This design keeps 30 seconds of tasks in memory. What if the scheduler needs to handle a burst of 100K tasks all scheduled for the same second?
+
+This is a thundering herd at the scheduling level.
+
+- If 100K tasks are all scheduled for exactly 12:00:00, the scheduler's Tier 1 scan at 11:59:30 loads all 100K into memory. At 12:00:00, the timer fires for all of them.
+- The scheduler cannot enqueue 100K tasks to the work queue in zero time. If each enqueue takes 0.05ms (Redis ZADD), that is 5 seconds -- some tasks execute 5 seconds late.
+- **Mitigation 1**: Pre-enqueue. When the scheduler loads tasks into memory, immediately enqueue them to the work queue with a "visibility delay" or "delayed execution" setting. The queue holds them until the execution time. This shifts the burst from the timer-fire moment to the database-scan moment, which is less time-sensitive.
+- **Mitigation 2**: Shard the scheduler. If you have 4 scheduler instances, each handling ~25K of the 100K tasks, the per-instance burst is manageable.
+- **Mitigation 3**: Accept imprecision during bursts. If 100K tasks are scheduled for the same second, delivering them over a 5-second window (12:00:00 to 12:00:05) is a reasonable degradation. The 1-second SLA is for normal conditions; burst conditions have a documented relaxed SLA.
+- In my experience, the pre-enqueue approach (Mitigation 1) is the most practical because it leverages the queue's existing scalability rather than requiring you to scale the scheduler itself.
+
+</Accordion>
+
+<Accordion title="Q8: Compare how you would store notification delivery state versus chat message state. Why are the requirements fundamentally different?">
+
+### Question
+
+Both the notification system and the chat system need to track whether a message was delivered. But you would design the storage very differently. Explain why.
+
+**Difficulty**: Intermediate to Senior | **Concepts tested**: Data modeling, access patterns, consistency requirements, storage trade-offs
+
+### Strong Answer
+
+The way I think about this is through the lens of access patterns and consistency requirements. These two seemingly similar "was it delivered?" questions lead to radically different storage designs.
+
+**Chat message storage**:
+
+- **Access pattern**: Sequential reads within a conversation. "Give me the last 50 messages in this conversation" is the dominant query. Users scroll backward through history.
+- **Write pattern**: Append-only. New messages are added at the end of a conversation's timeline. Edits and deletes are rare (and modeled as new events, not mutations).
+- **Consistency requirement**: Per-conversation causal ordering. If I reply to your message, my reply must appear after yours. But ordering across conversations does not matter.
+- **Partition strategy**: Partition by `conversation_id` with a clustering key on message timestamp or sequence number. All messages in a conversation are co-located for efficient range reads.
+- **Database choice**: Cassandra or ScyllaDB -- optimized for append-heavy, time-series-like workloads with range queries within a partition.
+- **Delivery state**: Simple. Each message has a status: `sent` (persisted on server), `delivered` (recipient's device acknowledged receipt), `read` (recipient opened the conversation). This state is updated by the recipient's client and is non-critical -- if a delivery receipt is lost, the user sees a single check mark instead of a double check mark. Not ideal but not a correctness issue.
+
+**Notification delivery state**:
+
+- **Access pattern**: Random reads by notification ID or user ID. "What is the status of notification X?" or "Show me all notifications for user Y sorted by recency." Also analytical queries: "What is the delivery rate for notification type Z across all users this week?"
+- **Write pattern**: Status transitions through a state machine: `queued -> sent -> delivered -> opened -> clicked`. Each transition is an update, not an append. Multiple channels may each have their own delivery state (push: delivered, email: opened, SMS: sent).
+- **Consistency requirement**: Strong consistency for deduplication (you must not send the same notification twice) and for delivery tracking (analytics dashboards must reflect actual delivery counts). Eventual consistency for the user-facing in-app notification list is acceptable.
+- **Partition strategy**: Partition by `user_id` for the user-facing queries, but you also need indexes by `notification_type` and `timestamp` for analytics. This is a multi-access-pattern problem.
+- **Database choice**: DynamoDB with a GSI (Global Secondary Index) on `notification_type + timestamp` for analytics queries. Or a dual-storage approach: DynamoDB for real-time delivery state and user-facing queries, S3 + Athena for analytics.
+- **Delivery state**: Complex. You track state per channel per notification. A single notification might be: push=delivered, email=sent, SMS=failed. Each state transition triggers different logic (retry SMS, increment delivery counter, fire a webhook to the calling service).
+
+**The fundamental differences**:
+
+1. Chat messages are immutable after creation; notification state is mutable (transitions through a state machine).
+2. Chat queries are conversation-scoped (narrow range scan); notification queries span multiple dimensions (by user, by type, by status, by time).
+3. Chat delivery is a nice-to-have UX signal; notification delivery is a business metric and sometimes a legal requirement (proof of SMS delivery for regulatory compliance).
+4. Chat scales by conversation count (millions of small partitions); notification scales by per-user volume (some users get 100x more notifications than others, creating hot partitions).
+
+#### Follow-up: How would you handle the scenario where you need to show both chat messages and notifications in a unified inbox (like LinkedIn)?
+
+This is a data federation problem -- merging two different data models into one view.
+
+- **Do NOT try to store both in the same table.** Their access patterns and data models are too different. Merging them compromises the performance of both.
+- **Build a unified feed service** that queries both the chat message store and the notification store in parallel, merges the results by timestamp, and returns a combined view.
+- **Caching the unified view**: Pre-compute the unified inbox for active users in Redis (sorted set with timestamp as score, containing references to either chat messages or notifications). Update the sorted set on new chat messages AND new notifications.
+- **The tricky part is ordering**: Chat messages have per-conversation sequence numbers. Notifications have creation timestamps. To merge them, normalize both to UTC timestamps. For chat messages, the timestamp is when the message was sent. For notifications, it is when the notification was created.
+- LinkedIn and Facebook both take this approach -- separate backend systems for messages and notifications, unified in a single "inbox" view for the user. The unification happens at the presentation layer, not the storage layer.
+
+#### Follow-up: For the notification system, how do you track "opened" and "clicked" states across email, push, and in-app without over-engineering it?
+
+Each channel has a fundamentally different mechanism for tracking engagement.
+
+- **Email**: Embed a 1x1 tracking pixel in the email body. When the user's email client loads the image, your server logs the "opened" event. For "clicked," use redirect URLs that pass through your tracking service before forwarding to the destination. Caveat: many email clients now block tracking pixels (Apple Mail Privacy Protection), so email open rates are increasingly unreliable. Track clicks as the more reliable engagement signal.
+- **Push**: APNs and FCM provide delivery receipts (the notification reached the device). For "opened" (user tapped the notification), the mobile app sends a callback to your API when the notification is opened. This requires client-side instrumentation.
+- **In-app**: Track "seen" (the notification appeared in the user's notification list) and "clicked" (the user tapped it). Both are client-side events sent to your API. These are the most reliable engagement signals because you control the client.
+- **Storage**: Write all engagement events to a stream (Kinesis, Kafka). A consumer updates the notification record's status and publishes the event to an analytics pipeline. The real-time delivery state (in DynamoDB) reflects the latest status per channel. The analytics pipeline (S3 + Athena) provides aggregate views.
+- **Do not block dispatch on tracking setup.** The notification should send regardless of whether tracking infrastructure is healthy. If the tracking pixel URL is down, the email still sends -- you just lose the open tracking for that email.
+
+</Accordion>
+
+<Accordion title="Q9: What is the difference between a load balancer, an API gateway, and a reverse proxy? When would you use each in a system design?">
+
+### Question
+
+Candidates often draw a "load balancer" box at the top of their system design without explaining what it actually does. Walk me through the differences between a load balancer, an API gateway, and a reverse proxy. When would you use one versus the other, and when do they overlap?
+
+**Difficulty**: Intermediate | **Concepts tested**: Networking fundamentals, infrastructure architecture, separation of concerns
+
+### Strong Answer
+
+These three concepts have significant overlap, which is why they cause confusion. In practice, a single product (like NGINX or AWS ALB) can serve as all three simultaneously. But the *responsibilities* are distinct.
+
+- **Reverse Proxy**: A server that sits in front of your backend servers and forwards client requests to them. The client talks to the proxy, not directly to the backend. The core job is *indirection* -- hiding the backend's identity, IP addresses, and topology from the client. NGINX, HAProxy, and Envoy are all reverse proxies. A reverse proxy can do SSL termination, caching, compression, and request buffering. It is the broadest concept of the three.
+
+- **Load Balancer**: A reverse proxy with a specific additional responsibility -- distributing traffic across multiple backend servers. It implements a *distribution algorithm* (round-robin, least-connections, weighted, IP-hash, consistent hashing). The core job is *spreading load evenly* so no single server is overwhelmed. Load balancers operate at Layer 4 (TCP level, like AWS NLB) or Layer 7 (HTTP level, like AWS ALB). Layer 4 is faster (just forwards TCP packets) but cannot make decisions based on HTTP content. Layer 7 can route based on URL path, headers, cookies.
+
+- **API Gateway**: A load balancer with *application-layer intelligence*. Beyond distributing traffic, it handles concerns like authentication, rate limiting, request transformation, API versioning, circuit breaking, and API key management. The core job is *managing the API lifecycle*. Kong, AWS API Gateway, and Apigee are API gateways. Think of it as a load balancer plus a middleware pipeline.
+
+**When to use each**:
+
+- **Just a reverse proxy**: You have one backend server and want SSL termination, caching, and protection from direct internet exposure. Small deployments, simple architectures.
+- **Load balancer**: You have multiple backend servers and need to distribute traffic. Most system designs need this at minimum. Use L4 (NLB) for raw TCP throughput (WebSocket, gRPC) and L7 (ALB) when you need path-based routing.
+- **API Gateway**: You have multiple microservices, external API consumers, and need centralized auth, rate limiting, and API management. The gateway is the single entry point. Most medium-to-large systems need this. In a system design interview, putting "API Gateway" at the top of your diagram signals that you understand these cross-cutting concerns are best handled in one place, not scattered across services.
+
+**In practice, they layer**: Internet -> CDN -> API Gateway (authentication, rate limiting) -> Load Balancer (traffic distribution) -> Backend Servers. But many products collapse multiple layers -- AWS ALB acts as both a load balancer and a basic reverse proxy. Kong acts as both an API gateway and a load balancer.
+
+#### Follow-up: In the chat system design, you used an NLB instead of an ALB for WebSocket connections. Why?
+
+The choice comes down to how each handles persistent connections.
+
+- **ALB (Layer 7)** terminates the TCP connection from the client and creates a new TCP connection to the backend. For WebSocket, this means the ALB maintains TWO connections per user (client-to-ALB and ALB-to-backend). At 5 million concurrent users, the ALB maintains 10 million TCP connections. ALB also inspects HTTP headers on each frame, adding latency.
+- **NLB (Layer 4)** passes TCP packets through without terminating the connection. The client has a direct TCP connection to the backend (through the NLB). At 5 million concurrent users, the NLB is forwarding packets for 5 million connections -- it does not maintain state for each one (or minimal state). This is dramatically more efficient.
+- **NLB also supports millions of concurrent connections** by design, while ALB has lower connection limits and higher per-connection memory overhead.
+- **The trade-off**: NLB cannot do path-based routing, header inspection, or SSL termination (well, it can do TLS passthrough, and newer NLBs support TLS termination). If you need to route `/api/*` to one service and `/ws/*` to another, you need ALB. A common pattern is: ALB for the REST API endpoints, NLB for the WebSocket endpoints.
+
+#### Follow-up: Where does the rate limiter sit in this stack? Before the load balancer, inside the API gateway, or after?
+
+The placement depends on what you are rate limiting.
+
+- **At the CDN/edge level**: Rate limiting by IP address to prevent DDoS. This is the first line of defense. AWS WAF rate-based rules or Cloudflare's edge rate limiting do this before the request even reaches your infrastructure. Cost: very low latency, but you can only limit by IP or simple headers.
+- **At the API Gateway**: Rate limiting by API key, user ID, or custom dimensions. This is where most per-user rate limiting happens. The gateway authenticates the request (extracts user identity), then checks the rate limit. AWS API Gateway has built-in throttling. Custom gateways (Kong) support plugin-based rate limiting.
+- **In the application**: Rate limiting by business logic (e.g., max 3 password attempts per minute, max 10 friend requests per hour). This is too specific for the gateway and must live in the application code.
+- **Best practice is layered rate limiting**: IP-level at the edge (coarse, prevents DDoS), user-level at the gateway (medium, enforces API quotas), business-logic-level in the application (fine, enforces product rules). Each layer catches different types of abuse, and the combination is more robust than any single layer.
+
+</Accordion>
+
+<Accordion title="Q10: Walk me through how you would debug a system where messages in a chat application are arriving out of order.">
+
+### Question
+
+Users are reporting that messages in their conversations sometimes appear out of order -- they see a reply before the original message. You are the on-call engineer. Walk me through how you would diagnose this and what the likely root causes are.
+
+**Difficulty**: Senior | **Concepts tested**: Debugging distributed systems, message ordering, clock skew, causal consistency, production investigation
+
+### Strong Answer
+
+Out-of-order messages in a chat system are one of the trickiest distributed systems bugs because the root cause can be at any layer -- client, network, server, or database. Here is how I would systematically investigate.
+
+**Step 1 -- Reproduce and characterize the problem**:
+
+- Is it happening for all users or specific users? Specific conversations? Specific server regions? Check the support tickets for patterns.
+- Is it 1-to-1 chats, group chats, or both? Group chats have a fan-out step that 1-to-1 chats do not -- more opportunities for reordering.
+- Is the reordering consistent (Message B always appears before Message A) or transient (refresh fixes it)? Consistent reordering points to a storage or ordering problem. Transient reordering points to a delivery race condition.
+
+**Step 2 -- Check the most common root causes**:
+
+- **Clock skew between Chat Servers**: If you are using timestamps for ordering and two Chat Servers have clocks that differ by even 100ms, messages processed by different servers can be ordered incorrectly. Server 1's clock is 200ms ahead of Server 2's clock. User A sends at 12:00:00.000 (processed by Server 1, timestamp 12:00:00.200). User B replies at 12:00:00.100 (processed by Server 2, timestamp 12:00:00.100). The reply appears to have been sent *before* the original message.
+  - **Diagnosis**: Compare server clocks. Check NTP synchronization status. If clock offsets exceed 10ms, this is likely the cause.
+  - **Fix**: Use server-generated sequence numbers per conversation (monotonically increasing), not wall-clock timestamps. A single Chat Server (the "owner" for that conversation) assigns sequence numbers, guaranteeing causal order.
+
+- **Race condition in the delivery path**: User A and User B send messages nearly simultaneously. Message A is persisted to Cassandra but the Pub/Sub delivery to User B is slow. Message B is persisted and delivered to User A quickly. User A sees Message B before their own Message A is confirmed delivered. This is a perceived reordering on the sender side.
+  - **Diagnosis**: Check message persistence timestamps vs delivery timestamps. If persistence order is correct but delivery order differs, this is a delivery race condition.
+  - **Fix**: The client should render messages in sequence-number order, not delivery order. When Message B arrives with sequence number 5 and Message A (sequence 4) has not arrived yet, the client either waits briefly (50-100ms) for Message A or renders Message B and reorders when Message A arrives.
+
+- **Cassandra read-repair or consistency level issue**: If you are reading with consistency level ONE from a replica that has not yet received the most recent write (which was written at consistency level QUORUM), you might read stale data. The client fetches messages, gets an incomplete list, then on the next fetch gets the full list. Messages appear to "insert" into the middle of the conversation.
+  - **Diagnosis**: Check your Cassandra read/write consistency levels. If reads are at ONE and writes at QUORUM, there is a window where replicas disagree.
+  - **Fix**: Read at QUORUM as well (guarantees you read your own writes), or use LOCAL_QUORUM for both reads and writes in multi-datacenter setups.
+
+**Step 3 -- Instrument and verify**:
+
+- Add a distributed trace (X-Ray, Jaeger) to the message pipeline. Each message gets a trace ID that follows it from client send to server persist to Pub/Sub to recipient delivery. The trace shows exactly where time was spent and in what order events occurred.
+- Add a client-side event: when the client renders a message, log the `{message_id, sequence_number, display_timestamp, delivery_timestamp}`. This lets you compare what the server sent vs what the client displayed.
+
+#### Follow-up: You mentioned using per-conversation sequence numbers. How do you generate those in a distributed system without a single point of failure?
+
+This is the core of the problem. You need a monotonically increasing counter per conversation, and it must be fast and reliable.
+
+- **Option 1 -- Single writer per conversation**: Assign each conversation to a single Chat Server (the "home" server for that conversation, determined by hashing the conversation_id). That server maintains an in-memory counter for the conversation and increments it for each message. Fast (no network hop for sequence generation) and correct (single writer = no conflicts). The downside: if the home server crashes, a new server takes over and must read the latest sequence number from the database before it can assign new ones.
+- **Option 2 -- Database-generated sequences**: Use the database to atomically assign sequence numbers. In Cassandra, this is not natively supported (no auto-increment). In PostgreSQL, use a `SEQUENCE` or a `SELECT ... FOR UPDATE` on a counter row. This is slower (database round-trip per message) but eliminates the single-writer bottleneck.
+- **Option 3 -- Snowflake-like IDs**: Generate globally unique, time-ordered IDs (timestamp + machine ID + sequence). These are not strictly sequential (they have gaps) but they are monotonically increasing, which is sufficient for ordering. Twitter's Snowflake, Discord's Snowflakes, and ULIDs all follow this pattern. The trade-off: ordering is timestamp-based, so clock skew still affects ordering across servers. But within a single server (likely for a single conversation), the ordering is guaranteed by the local sequence counter.
+- My recommendation for a chat system: Option 1 (single writer per conversation) for message ordering. It is the simplest correct solution. Use consistent hashing to assign conversations to servers, with a fallback to database-read on server failover.
+
+#### Follow-up: How would you test for message ordering issues before they hit production?
+
+This is a testing methodology question that separates experienced engineers from theoretical ones.
+
+- **Chaos testing**: Inject artificial clock skew (50-200ms) between Chat Servers in a staging environment. Send rapid-fire messages in test conversations and verify ordering. If your ordering is timestamp-based, you will immediately see reordering. If it is sequence-based, it should be immune.
+- **Concurrent message injection**: Write a load test that has N clients in the same conversation all sending messages as fast as possible. Verify that all clients see the exact same message order. This catches race conditions in the delivery path.
+- **Network delay injection**: Use a tool like `tc` (traffic control) or Toxiproxy to add random delays (10-500ms) to the Pub/Sub layer. Verify that the client-side rendering logic handles out-of-order delivery correctly (waits for gaps, reorders on display).
+- **Partition testing**: Simulate a Redis Pub/Sub outage. Messages should be persisted to Cassandra even though delivery is delayed. When Pub/Sub recovers, verify that clients catch up in the correct order by reading from the database.
+- The key principle: ordering bugs only manifest under concurrency and latency variance. Single-client, low-latency testing will never find them. Your test environment must be adversarial.
+
+</Accordion>
+
+<Accordion title="Q11: You are designing for 99.99% availability. What does that actually mean in practice, and how does it change your architecture?">
+
+### Question
+
+Many system design candidates say they want "four nines" availability without understanding the implications. Walk me through what 99.99% availability means in real terms, and how the architecture of a URL shortener changes when you go from 99.9% to 99.99%.
+
+**Difficulty**: Senior to Staff | **Concepts tested**: Availability math, redundancy, failure domains, operational maturity, SLA vs SLO
+
+### Strong Answer
+
+Let me start with what the numbers actually mean in terms of allowed downtime.
+
+- **99.9% (three nines)**: 8.76 hours of downtime per year, or ~43 minutes per month. This allows for a bad deployment that takes 30 minutes to roll back, plus one brief infrastructure incident per month.
+- **99.99% (four nines)**: 52.6 minutes of downtime per year, or ~4.4 minutes per month. You essentially cannot have a single incident that takes more than 5 minutes to detect and mitigate. Manual intervention is too slow for most incidents.
+- **99.999% (five nines)**: 5.26 minutes per year. This requires near-zero human involvement in failure recovery. Only the most critical systems (DNS root servers, core financial infrastructure) target this.
+
+Going from three nines to four nines is not a 0.09% improvement -- it is a 10x reduction in allowed downtime. That 10x has cascading architectural implications.
+
+**How the URL shortener architecture changes**:
+
+**At 99.9% (the design we built)**:
+- Single-region deployment. Database primary with one replica. Manual or semi-automated failover. Redis with Sentinel. Single points of failure are acceptable if recovery is fast.
+- An incident playbook where on-call can SSH in, diagnose, and fix within 30 minutes.
+
+**At 99.99%, everything changes**:
+
+- **Multi-region active-active**: A single-region outage (AWS availability zone failure, even a full region failure) cannot exceed 4 minutes. You need at least two active regions, each capable of handling full traffic. DNS-based failover (Route 53 health checks) detects a region failure and routes traffic to the healthy region within seconds.
+- **Zero-downtime deployments**: A bad deploy cannot cause more than 4 minutes of downtime. This means canary deployments (deploy to 1% of traffic, monitor for 5 minutes, then gradually increase), instant rollback (keep the previous version running and switch traffic back in seconds), and blue-green deployments.
+- **Automated failover everywhere**: Database failover must be automated (Patroni, RDS Multi-AZ) with detection-to-recovery under 30 seconds. Redis failover must be automated (Sentinel, Cluster). No component can require a human to restart it.
+- **Health checking at every layer**: Load balancers health-check the API servers every 5 seconds. API servers health-check Redis and the database. If any dependency is unhealthy, the server removes itself from the load balancer. Unhealthy servers are replaced automatically (ECS, Kubernetes).
+- **Blast radius isolation**: Changes should only affect a fraction of users. Deploy to one AZ first. Use feature flags to gate new code paths. If something breaks, it breaks for 10% of users, not 100%.
+- **Observability budget**: You need to detect issues within 60 seconds (leaves 3 minutes for mitigation). This means real-time dashboards, sub-minute alerting, and synthetic monitoring (a canary that continuously shortens and resolves URLs, alerting if latency exceeds thresholds or resolution fails).
+
+The cost of four nines is roughly 3-5x the infrastructure cost of three nines (multi-region, more replicas, more redundancy) plus significantly higher operational investment (automated testing, canary pipelines, runbooks).
+
+#### Follow-up: How do you measure availability in practice? Is it just "server uptime"?
+
+Great question -- this is where many teams get it wrong.
+
+- **Naive approach**: Measure uptime as "the server process is running." By this measure, a server that returns HTTP 500 on every request is "available." This is meaningless.
+- **Correct approach**: Measure availability from the user's perspective. A request is "successful" if it returns a correct response within the latency SLA. Availability = (successful requests) / (total requests) over a time window.
+- **For the URL shortener**: A redirect request is successful if it returns a 302 with the correct Location header within 100ms. Anything else (500 error, timeout, wrong redirect, latency > 100ms) counts as a failure.
+- **SLI vs SLO vs SLA**: The SLI (Service Level Indicator) is the metric you measure (redirect success rate). The SLO (Service Level Objective) is your internal target (99.99%). The SLA (Service Level Agreement) is the contractual promise to customers (usually lower than SLO -- promise 99.9%, target 99.99%, so you have an error budget).
+- **Error budgets**: If your SLO is 99.99%, you have a 0.01% error budget per month -- about 4 minutes of failures. When the error budget is consumed, the team should freeze feature deployments and focus on reliability. This is the Google SRE approach, and it creates a concrete, data-driven tension between shipping features and maintaining reliability.
+
+#### Going Deeper: How do you handle the case where one region is "available" but returning degraded results -- say, serving stale cached data because the database is lagging?
+
+This is the "partially available" problem, and it is the hardest part of availability measurement.
+
+- **Define what "correct" means**: For the URL shortener, a redirect to the correct URL is correct even if it is served from a stale cache. A redirect to the WRONG URL (because of replication lag in a multi-region setup where the URL was recently updated) is incorrect and should count as a failure, even though the server returned a 302.
+- **Implement correctness checks**: Periodically resolve a set of known test URLs and verify the destination. If a region is returning stale or incorrect results, its health check should fail, and traffic should be routed away.
+- **Replication lag monitoring**: In a multi-region setup with asynchronous replication, the secondary region might be seconds behind the primary. A URL created in the primary region might not be resolvable in the secondary region for a few seconds. For a URL shortener, this is rarely a problem (users do not use a short URL within seconds of creating it). For systems where this matters, read-your-writes consistency is achieved by routing the creator's subsequent requests to the primary region.
+- **The philosophical point**: Availability is not binary. A system can be "up" but "degraded." Mature organizations track multiple SLIs -- latency, error rate, correctness, freshness -- and define availability as the intersection of all of them meeting their thresholds. This is harder to measure but gives a much more honest picture of service health.
+
+</Accordion>
+
+<Accordion title="Q12: If you had to pick one system from these six to build from scratch at a startup with three engineers, which one and how would you simplify it?">
+
+### Question
+
+You are a tech lead at an early-stage startup with three backend engineers. The product needs a notification system. You do not have the time or team to build the full architecture described in Problem 6. Walk me through how you would simplify it to ship in two weeks while still building something that can scale later.
+
+**Difficulty**: Staff-Level | **Concepts tested**: Engineering judgment, build vs buy, incremental architecture, pragmatism, scope management
+
+### Strong Answer
+
+This is fundamentally a judgment question, not a technical one. The right answer is NOT to build a simplified version of the full architecture. The right answer is to identify what you absolutely must build versus what you can buy.
+
+**Week 1 -- Buy everything you can**:
+
+- **Push notifications**: Use Firebase Cloud Messaging (FCM) directly. It handles device token management, multi-platform delivery, and retry logic. Three API calls: register device token, send to token, send to topic. No custom push worker needed.
+- **Email**: Use SendGrid or AWS SES with their template system. Store templates in SendGrid, not in your own database. SendGrid handles bounce management, unsubscribe links (CAN-SPAM compliance), and delivery tracking. One API call to send.
+- **SMS**: Use Twilio. One API call to send. Twilio handles delivery receipts, phone number validation, and regulatory compliance per country.
+- **In-app notifications**: This is the only part you must build, because it is tied to your application's data model.
+
+**What you actually build**:
+
+- A single `notifications` table in your existing PostgreSQL database: `{id, user_id, type, title, body, read, created_at}`.
+- A `notification_preferences` table: `{user_id, channel, enabled}`. Default everything to enabled.
+- A single API endpoint: `POST /internal/notify` that your other services call. This endpoint: (1) checks user preferences, (2) writes to the notifications table (for in-app), (3) calls SendGrid/FCM/Twilio directly (synchronous for now -- yes, synchronous).
+- A REST endpoint for the frontend: `GET /api/notifications` for the in-app notification list, and `PATCH /api/notifications/{id}/read`.
+
+**What you explicitly skip**:
+
+- No message queue. Send notifications synchronously. If SendGrid is slow (200ms), your API response is 200ms slower. At startup scale (hundreds of notifications per day), this is fine.
+- No deduplication service. Use a unique constraint on `(user_id, type, idempotency_key)` in PostgreSQL. If a duplicate arrives, the INSERT fails. Done.
+- No rate limiting per user. At startup scale with real users, nobody is getting spammed. Add this when you have data showing it is a problem.
+- No priority queues. Everything is sent immediately. A 2FA code and a marketing email go through the same path.
+- No aggregation. If a user gets 20 likes, they get 20 notifications. Fix this when users complain.
+- No multi-provider failover. If Twilio is down, SMS fails. You have three engineers -- operating a failover system is more expensive than the occasional missed SMS.
+
+**The architecture that scales later**:
+
+The key decision is making `POST /internal/notify` the single entry point. Every service in your codebase calls this one endpoint. When you need to scale:
+
+- **Month 3**: Replace the synchronous external API calls with a background job queue (Sidekiq, BullMQ, Celery). The API endpoint writes to the queue, returns immediately. Workers process the queue asynchronously. You have just added the async dispatch layer.
+- **Month 6**: Add Redis for dedup (replacing the PostgreSQL unique constraint, which is getting slow under load). Add per-user rate limiting.
+- **Month 12**: Split into separate queues by priority. Add notification aggregation. Consider replacing FCM/SendGrid direct calls with SNS or a dedicated notification service.
+
+The point is: every enhancement is additive. You never rewrite the core. The `POST /internal/notify` contract stays stable. This is what "building for the future without over-engineering the present" actually looks like.
+
+#### Follow-up: How do you convince the product team that skipping aggregation and rate limiting is okay for now?
+
+With data and risk framing.
+
+- **Aggregation**: "At our current scale of 500 daily active users, the median user receives 3 notifications per day. The busiest user receives 15. Notification fatigue is not a problem yet. When we have data showing users are disabling notifications, we build aggregation. Building it now costs 2 engineer-weeks and delays the launch."
+- **Rate limiting**: "We do not have users who are being spammed because we control all the notification sources -- it is our own code sending notifications. Rate limiting protects against runaway code or abuse, but we can achieve the same protection with a `MAX_NOTIFICATIONS_PER_HOUR = 20` constant in the notify endpoint. One line of code, not a Redis-backed distributed rate limiter."
+- **The general principle**: Defer complexity until you have evidence it is needed. Every premature abstraction has a maintenance cost. Three engineers maintaining a rate limiting service is three engineers not building features.
+
+#### Follow-up: At what point does the "buy everything" approach break down and you need to build custom?
+
+The trigger is usually one of three things:
+
+1. **Cost**: At 10 million emails per month, SES costs $1,000. SendGrid costs $5,000+. At 100 million, the difference is significant. You start building custom email infrastructure (dedicated IP management, templating, bounce handling) when the cost of the managed service exceeds the cost of an engineer maintaining custom infrastructure.
+2. **Control**: You need notification behaviors that the managed service does not support. For example, "do not send push notifications during the user's sleeping hours based on their timezone" requires preference logic that FCM does not provide. Or "aggregate 20 like notifications into one" requires application-level batching before calling FCM.
+3. **Reliability**: When your notification SLA exceeds what the managed service provides. If you need 99.99% delivery for 2FA codes, depending on a single provider (Twilio) is a risk. You need multi-provider failover, which means building a dispatch layer.
+
+In my experience, most startups hit trigger 2 (control) first -- they need custom preferences, aggregation, or quiet hours. Trigger 1 (cost) usually comes later, after the user base is large enough that the engineering investment pays for itself. Trigger 3 (reliability) is rare until you are at significant scale.
+
+</Accordion>
+
+</AccordionGroup>

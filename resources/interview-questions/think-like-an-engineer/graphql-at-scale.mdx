@@ -1533,3 +1533,623 @@ Airbnb adopted GraphQL as a **frontend gateway** on top of their existing servic
 - **[Messaging, Concurrency, and State](/resources/interview-questions/think-like-an-engineer/messaging-concurrency-state)** -- Subscription architecture relies on pub/sub patterns (Redis Pub/Sub, Kafka) covered extensively there. The event-driven architecture behind "mutation triggers event, event triggers subscription push" is the same pattern used in event sourcing and CQRS systems.
 - **[Multi-Tenancy, DDD, and Documentation](/resources/interview-questions/think-like-an-engineer/multitenancy-ddd-docs)** -- Federation is a practical application of domain-driven design. Subgraph ownership maps to bounded contexts. Schema governance maps to context mapping. That chapter provides the organizational and architectural theory behind why federation works when subgraphs follow domain boundaries and fails when they do not.
 </Note>
+
+---
+
+## Interview Deep-Dive Questions
+
+These questions go beyond surface-level knowledge. They simulate the multi-round probing that happens in senior and staff-level interviews -- where the interviewer keeps digging until they find the boundary of your understanding.
+
+### 1. You inherit a federated GraphQL API where the gateway's P99 latency has degraded from 200ms to 1.2 seconds over the past quarter. Walk me through how you diagnose and fix this.
+
+**What the interviewer is really testing:** Can you reason about performance in a distributed system with multiple moving parts (gateway, subgraphs, databases, network)? Do you have a systematic debugging methodology, or do you start guessing?
+
+**Strong answer:**
+
+I would work outside-in, from the broadest signal to the narrowest cause.
+
+**Step 1: Identify which operations degraded.** Not all operations are slow -- P99 is a tail metric. I would pull operation-level latency data from Apollo Studio or our Prometheus metrics and sort by P99 increase over the quarter. Often it is 3-5 operations responsible for the entire regression. If *every* operation degraded uniformly, that points to infrastructure (gateway CPU, network, TLS overhead), not application logic.
+
+**Step 2: Examine the gateway query plans for the slowest operations.** Apollo Router (or Apollo Gateway) generates a query plan for each incoming operation -- which subgraphs to call, in what order, and what data to pass between them. I would trace the slowest operations and look for **waterfall patterns**: sequential subgraph calls where the gateway fetches from subgraph A, waits, then fetches from subgraph B using data from A, waits again, then fetches from subgraph C. A new `@requires` directive added in the past quarter could introduce a previously-parallel call into a sequential chain, adding 200-400ms per hop.
+
+**Step 3: Check if new subgraphs or fields were added.** Schema changes over a quarter are the most likely culprit for gradual degradation. A new team might have added a subgraph with slow resolvers, or an existing subgraph might have added fields that trigger expensive database queries. I would diff the supergraph schema between the start and end of the quarter and correlate with the latency timeline.
+
+**Step 4: Subgraph-level latency.** For the offending operations, check the per-subgraph response time. If the gateway is calling subgraph X and it takes 800ms, the problem is in subgraph X, not the gateway. Drill into that subgraph's resolver traces -- look for missing DataLoaders, N+1 queries, or slow downstream service calls.
+
+**Step 5: Gateway infrastructure.** If subgraphs are all fast but the gateway is slow, check: (a) CPU utilization on the gateway instances -- query planning is CPU-bound, and if traffic grew while instance count stayed flat, you get CPU contention; (b) memory pressure if caching supergraph schemas in-memory; (c) whether the gateway was upgraded or the supergraph schema grew significantly (more types = more complex query planning).
+
+**Step 6: Fix based on root cause.** If it is waterfall dependencies, restructure the schema to reduce cross-subgraph `@requires` chains. If it is a slow subgraph, add DataLoaders or caching. If it is gateway infrastructure, scale horizontally or migrate from the Node.js Apollo Gateway to the Rust-based Apollo Router, which handles query planning significantly faster.
+
+#### Follow-up: How would you prevent this kind of gradual degradation from happening again?
+
+I would establish **performance budgets per operation** and **alert on regressions in CI and production**.
+
+In CI: add a schema check step that simulates query plans for critical operations after every subgraph schema change. If a change introduces a new sequential subgraph dependency that increases the estimated latency of a critical operation by more than some threshold, the build fails with a warning. Apollo's `rover subgraph check` can validate composition, but for performance budgets you would need a custom step that runs the query planner against representative operations and asserts on the plan shape (number of sequential fetches, number of subgraphs involved).
+
+In production: set up Prometheus alerts on P95 and P99 latency per named operation. If `GetProductPage` P99 exceeds 500ms for more than 15 minutes, page the on-call team. The key is per-operation alerting, not aggregate -- aggregate latency hides regressions in specific operations.
+
+Organizationally: require a "performance impact" section in every subgraph schema change PR. If you are adding a `@requires` directive or a new entity reference, document the expected cross-subgraph call pattern. This is the same discipline as writing migration notes for database changes -- it forces the author to think about the operational impact.
+
+#### Follow-up: What is the difference between Apollo Gateway and Apollo Router, and when does the choice matter?
+
+Apollo Gateway is the original Node.js-based federation gateway. Apollo Router is the newer Rust-based replacement. The functional behavior is identical -- both read the supergraph schema, plan queries, and orchestrate subgraph calls.
+
+The difference is **raw performance**. Query planning is CPU-bound: the gateway parses the incoming operation, walks the supergraph schema to determine which subgraphs own which fields, builds a dependency graph of subgraph calls, and serializes the execution plan. In Node.js, this is single-threaded and GC-paused. In Rust, it is multi-threaded with no GC pauses. At low traffic, the difference is negligible. At high traffic (thousands of requests per second) or with complex supergraphs (20+ subgraphs, deeply nested operations), the Router can be 5-10x faster at query planning.
+
+The choice matters when you are seeing elevated P99 latencies that correlate with gateway CPU utilization rather than subgraph response time. If your traces show that subgraphs respond in 50ms but the total gateway response time is 400ms, the extra 350ms is query planning overhead. That is when migrating from Gateway to Router gives immediate, measurable improvement.
+
+For a small team with 2-3 subgraphs and moderate traffic, either works fine. For a large organization at scale, Router is the clear choice.
+
+#### Going Deeper: How does the federation query planner actually decide the order of subgraph calls?
+
+The query planner builds a **dependency graph** by walking the incoming operation against the supergraph schema. For each field in the query, it knows which subgraph owns that field. When a field in subgraph B depends on data from subgraph A (via `@requires` or entity resolution), it creates an edge from A to B in the dependency graph.
+
+The planner then topologically sorts this graph. Independent subgraph calls (no dependencies between them) are executed in **parallel**. Dependent calls are executed **sequentially** -- the gateway waits for the upstream subgraph to return before calling the downstream one.
+
+For example: if the client queries `{ product(id: "42") { name price reviews { rating } shippingCost } }`, and `name`/`price` are in the Products subgraph, `reviews` are in the Reviews subgraph, and `shippingCost` is in the Shipping subgraph with `@requires(fields: "weight")` where `weight` comes from Products -- the planner will:
+1. Call Products subgraph (gets `name`, `price`, `weight`)
+2. In parallel: call Reviews subgraph (gets `reviews`) AND call Shipping subgraph (gets `shippingCost`, using `weight` from step 1)
+
+The planner is smart enough to batch the entity resolution call to Reviews and the `@requires`-driven call to Shipping into a single parallel step since neither depends on the other. The worst case is a chain of `@requires` directives where each subgraph depends on data from the previous one -- that creates a fully sequential waterfall.
+
+---
+
+### 2. You are designing the authorization model for a federated GraphQL API. Where does auth logic live, and how do you prevent a subgraph from leaking data it should not?
+
+**What the interviewer is really testing:** Do you understand the unique auth challenges of GraphQL (field-level granularity, federation boundary crossing, the "one endpoint" problem), or do you just say "check the token in middleware" and stop there?
+
+**Strong answer:**
+
+Authorization in GraphQL is fundamentally more granular than REST because the client controls which fields are requested. In REST, you authorize per endpoint. In GraphQL, you must authorize per field -- or at minimum, per type. Here is how I structure it.
+
+**Layer 1: Authentication at the gateway.** The gateway validates the JWT or session token on every request. If the token is invalid, the request is rejected with an `UNAUTHENTICATED` error before any subgraph is called. The gateway extracts the user identity and permissions from the token and passes them to subgraphs via request headers (typically a custom header like `x-user-id` and `x-user-roles`).
+
+**Layer 2: Authorization in each subgraph resolver.** This is where people make mistakes. It is tempting to put all auth logic in the gateway, but that violates the principle of federation -- each subgraph owns its domain, including who can access what. The Orders subgraph knows that only the order owner (or an admin) should see order details. The gateway should not need to know this business rule.
+
+In practice, I implement auth as a **resolver middleware or directive**:
+
+```graphql
+type Order @key(fields: "id") {
+  id: ID!
+  status: OrderStatus!
+  items: [OrderItem!]! @auth(requires: OWNER)
+  total: Money! @auth(requires: OWNER)
+  internalNotes: String @auth(requires: ADMIN)
+}
+```
+
+The `@auth` directive is implemented as a resolver wrapper that checks the user context (passed from the gateway) against the authorization rule before the resolver executes. If the check fails, the field returns `null` with a `FORBIDDEN` error in the `errors` array.
+
+**Layer 3: Entity resolution security.** This is the federated gotcha. When the Reviews subgraph receives an `_entities` call to resolve `Product` entities, it must trust that the gateway has already authenticated the request. But it must *not* trust that the caller is authorized to see every field. If the Reviews subgraph extends `Product` with a `moderationFlags` field that only admins should see, that auth check must happen in the Reviews subgraph's resolver, not rely on the gateway.
+
+**Layer 4: Field-level visibility.** Some fields should not even *appear* in the schema for certain users. This is harder -- GraphQL introspection shows the full schema to everyone. Options: (a) disable introspection in production; (b) use schema masking (Apollo Router supports this) to serve different schema views based on the caller's role; (c) accept that the schema is visible but enforce authorization at the resolver level so unauthorized access returns `null`.
+
+#### Follow-up: A developer on the Reviews team adds a resolver that returns user email addresses without any auth check. How do you catch this before production?
+
+This is a governance and process problem as much as a technical one. I would layer multiple safeguards:
+
+**Automated:** Add a custom schema linting rule (via `graphql-eslint` or a custom CI check) that flags any field returning a type known to contain PII (like `User` or `Email`) that lacks an `@auth` directive. This is a heuristic -- it catches the obvious cases.
+
+**Code review:** Subgraph schema changes go through a review process that includes a security-focused reviewer. The review checklist includes: "Does every new field that returns user data have appropriate authorization?" This is the same discipline as reviewing database migration scripts for sensitive column access.
+
+**Integration testing:** Write authorization test cases for every entity type: "As an unauthenticated user, querying [entity] should return UNAUTHENTICATED." "As user A, querying user B's [entity] should return FORBIDDEN or null." These tests run against the composed supergraph in CI.
+
+**Runtime monitoring:** Even with all the above, mistakes happen. Monitor for unusual field access patterns -- if the `reviews.author.email` field suddenly starts getting requested at 10x its normal rate, that could indicate that a client discovered an unprotected field. Alert on anomalous field usage spikes.
+
+The key insight is that authorization in federated GraphQL requires **defense in depth** because the system has multiple entry points (each subgraph) and the schema is discoverable.
+
+#### Follow-up: How does this compare to authorization in a REST API?
+
+In REST, authorization is typically per-endpoint. You put an auth middleware on `/api/orders/:id` that checks if the caller owns the order. Every request to that endpoint returns the same fields, so field-level authorization is rarely needed.
+
+In GraphQL, the same "endpoint" (`/graphql`) can return vastly different data depending on the query. A query for `{ order(id: "1") { status } }` might be fine for any authenticated user to see, but `{ order(id: "1") { items { sku price } paymentMethod { last4 } } }` reveals financial information that only the owner should access. Same endpoint, same type, different fields, different authorization requirements.
+
+This means GraphQL authorization is inherently more complex. The attack surface is larger because the client controls what data to request. You cannot rely on "this endpoint is protected" -- you need "this field is protected." The tradeoff is that GraphQL gives you a single place (the schema) where you can declaratively express authorization rules (`@auth` directives), which can actually be *more* auditable than scattered REST middleware if done well.
+
+---
+
+### 3. Your DataLoader is not batching as expected -- individual resolvers are still firing separate database queries. What went wrong?
+
+**What the interviewer is really testing:** Deep understanding of DataLoader's batching mechanism (event loop ticks), common implementation mistakes, and the ability to debug a non-obvious performance issue.
+
+**Strong answer:**
+
+DataLoader batches requests that are enqueued during the **same tick of the event loop** (in Node.js) or the same execution phase. If individual queries are still firing, something is breaking the batching window. Here are the most common causes, in order of how often I have seen them:
+
+**1. Awaiting inside a loop instead of using Promise.all.** This is the number one cause. If a resolver does this:
+
+```javascript
+// BROKEN: each iteration awaits, so each load() runs in a separate tick
+for (const product of products) {
+  const reviews = await reviewLoader.load(product.id);
+  // ...
+}
+```
+
+Each `await` yields control back to the event loop, so the DataLoader dispatches the batch after each iteration. The fix is to collect all promises and resolve them together:
+
+```javascript
+// CORRECT: all load() calls happen in the same tick
+const reviewPromises = products.map(p => reviewLoader.load(p.id));
+const allReviews = await Promise.all(reviewPromises);
+```
+
+**2. DataLoader created at the wrong scope.** If the DataLoader is created inside the resolver function instead of in the request context, each resolver invocation gets a fresh DataLoader with an empty batch queue. The whole point of DataLoader is that multiple resolvers share the same instance so their requests can be batched together.
+
+**3. The batch function has a bug in result ordering.** DataLoader requires the batch function to return results in the **exact same order** as the input keys. If your batch function returns results in database order (which may differ from the input key order), DataLoader cannot correctly map results to requestors. It will not throw an error -- it will silently return wrong data. This does not prevent batching per se, but it is the most common bug in DataLoader implementations and can look like batching is broken when debugging.
+
+**4. Using an async framework that does not have the same event loop semantics.** DataLoader was designed for Node.js's event loop. If you are using it in a different runtime (Deno, Bun, or a non-Node GraphQL server), the batching tick may behave differently. In some cases, you need to provide a custom `batchScheduleFn` to control when the batch dispatches.
+
+**5. GraphQL execution engine executing resolvers sequentially.** Some GraphQL server implementations resolve sibling fields sequentially rather than concurrently. If your server resolves field A, dispatches its DataLoader batch, then resolves field B, the two fields' loads will never be in the same batch. This is rare with major frameworks (Apollo Server, graphql-js resolve sibling fields concurrently) but can happen with less common implementations.
+
+#### Follow-up: How would you test that DataLoader is actually batching correctly?
+
+I would add instrumentation at the batch function level. Wrap the batch function with logging that records the batch size on every invocation:
+
+```javascript
+const reviewLoader = new DataLoader(async (keys) => {
+  console.log(`[DataLoader] Batching ${keys.length} review lookups`);
+  // ... actual batch query
+});
+```
+
+In integration tests, I would send a GraphQL query requesting 50 products with reviews and assert that the batch function is called exactly once (or a small number of times if there are multiple ticks) with approximately 50 keys, rather than being called 50 times with 1 key each.
+
+For production monitoring, I track a custom metric: `dataloader_batch_size` histogram. If the P50 batch size for a loader is 1, batching is not working. If it matches the expected cardinality of the parent list, it is working correctly. This metric is cheap to collect and immediately diagnostic.
+
+#### Follow-up: Can DataLoader cause data consistency issues within a single request?
+
+Yes, because DataLoader caches results for the lifetime of the instance (which is the request, if you created it correctly). If your request involves a mutation that modifies data and a subsequent query that reads it, the DataLoader's per-request cache might serve stale data from before the mutation.
+
+Example: a resolver reads user A's profile via `userLoader.load("A")`, which caches the result. Later in the same request (perhaps a complex mutation), user A's profile is updated in the database. A subsequent `userLoader.load("A")` returns the cached (stale) version, not the updated one.
+
+The fix is to call `userLoader.clear("A")` after the mutation, which evicts that key from the cache. Alternatively, for mutations that you know will modify data, bypass the DataLoader and query the database directly. The DataLoader pattern is designed for read-heavy resolution within a single request, and mixing reads and writes within the same DataLoader requires careful cache invalidation.
+
+---
+
+### 4. Compare schema-first and code-first GraphQL development. You are starting a new federated API with five teams -- which approach do you pick and why?
+
+**What the interviewer is really testing:** Can you reason about developer workflow trade-offs at an organizational level, not just individual preference? Do you understand how the choice affects federation, cross-team collaboration, and long-term maintainability?
+
+**Strong answer:**
+
+For a federated API with five teams, I would choose **schema-first**. Here is my reasoning.
+
+**The core difference:** Schema-first means you write the SDL (`.graphql` files) as the source of truth, then implement resolvers that conform to it. Code-first means you write resolver code (using libraries like Nexus, Pothos, or gqlgen) and the schema is generated as a build artifact.
+
+**Why schema-first for federation:**
+
+The schema is the **contract between teams**. In a federated architecture, the Products team needs to know what fields the Reviews team is extending on `Product`. The Reviews team needs to know what `@key` fields are available. The frontend team needs to plan features against the schema before backend work starts. With schema-first, the SDL is a readable, diffable artifact that serves as the single source of truth for cross-team communication. You can review a schema change in a PR without understanding the implementation language of each subgraph.
+
+With code-first, the "schema" lives embedded in TypeScript or Go code. To understand what the Reviews subgraph exposes, you have to read the Reviews team's code, in their language, with their framework's abstractions. For a cross-team review, this is a barrier. The generated schema is a build output, not a first-class artifact -- it exists only after the build runs.
+
+**When code-first wins:** For a single team building a non-federated API, code-first has a real advantage: type safety between your schema and implementation is guaranteed at compile time. With schema-first, the resolver and the schema can drift apart (you declare a field in SDL but forget to implement the resolver). Code-first makes that impossible.
+
+**The hybrid middle ground:** Some teams use schema-first for the SDL contract but generate resolver scaffolding from the schema (using `graphql-codegen` or similar). This gives you the readability of schema-first for cross-team collaboration and some of the type safety of code-first within each subgraph.
+
+**My recommendation for the five-team setup:** Schema-first SDL files checked into each subgraph's repository, published to a schema registry (Apollo Studio or GraphQL Hive) on merge. Schema changes require a PR review that includes a member of the schema governance group. The registry validates composition on every push. Each team implements resolvers in whatever language and framework they prefer -- the SDL is the contract, not the implementation.
+
+#### Follow-up: How do you prevent the schema-first "drift" problem where the SDL and resolvers get out of sync?
+
+Three mechanisms:
+
+**1. Integration tests that query every field.** Write a test suite that sends an introspection query to the running subgraph, extracts every field from the introspected schema, and sends a query for each one. Any field that exists in the SDL but has no resolver will return an error. Run this in CI on every commit.
+
+**2. Code generation for resolver types.** Use `graphql-codegen` to generate TypeScript interfaces for your resolvers from the SDL. If the SDL declares a `Product.reviews` field, the generated `ProductResolvers` interface requires a `reviews` method. Missing resolvers are compile-time errors. You still write the SDL first, but the resolver types are derived from it automatically.
+
+**3. Composition validation in CI.** Apollo's `rover subgraph check` validates that your subgraph schema is well-formed and composes with the supergraph. If you have a field in the SDL that references a type that does not exist or violates a federation rule, composition fails. This does not catch missing resolvers directly, but it catches structural inconsistencies.
+
+The combination of these three catches drift at compile time (codegen), integration time (tests), and composition time (registry checks).
+
+#### Follow-up: What if the five teams use different backend languages -- say, two use TypeScript, one uses Go, one uses Python, and one uses Java?
+
+This is actually where schema-first shines the most. The SDL is language-agnostic. A `.graphql` file looks the same regardless of which language implements it. Each team picks the GraphQL library best suited to their language: Apollo Server for TypeScript, gqlgen for Go, Strawberry for Python, Netflix DGS for Java. They all implement the same SDL contract in their language's idioms.
+
+With code-first, this would be nearly impossible. Each language's code-first library has different abstractions for defining types, directives, and entities. There is no cross-language way to "review the schema" without generating the SDL first -- at which point you have reinvented schema-first with an extra step.
+
+The federation gateway does not care what language each subgraph uses. It only sees the composed supergraph schema and the HTTP responses from each subgraph's `_entities` resolver. This is one of federation's biggest organizational wins: teams have language autonomy while presenting a unified API.
+
+---
+
+### 5. A client team complains that their GraphQL query returns correct data in staging but partially null data in production. The query has not changed. How do you debug this?
+
+**What the interviewer is really testing:** Systematic debugging of a distributed system issue with partial failures -- the kind of problem that separates senior engineers from mid-levels. Can you reason about why the same query behaves differently across environments?
+
+**Strong answer:**
+
+Partial nulls in GraphQL mean some resolvers succeeded and some failed. The `errors` array in the response is the first thing I look at -- it tells me exactly which fields failed and why. But let me walk through the full diagnostic.
+
+**Step 1: Get the actual response, including the `errors` array.** The client team may be looking at `data` and not seeing the errors. GraphQL's partial response model means `data.order.items` can be `null` while `data.order.status` is present -- and the error explaining *why* items is null is in a separate `errors` array. Pull the full response body from logs or have the client reproduce with full response logging.
+
+**Step 2: Identify the failing resolvers from the error paths.** Each error has a `path` field (e.g., `["order", "items"]`) that tells me exactly which resolver failed. The `extensions.code` tells me the category -- `INTERNAL_SERVER_ERROR`, `DOWNSTREAM_SERVICE_ERROR`, `FORBIDDEN`, etc.
+
+**Step 3: Check for environment-specific differences.** The query works in staging but not production. Common culprits:
+
+- **Data differences.** The product in staging has 5 reviews; the product in production has 50,000. A resolver that works fine with 5 items might time out or hit a memory limit with 50,000. Check if the failing fields involve large data sets.
+- **Authorization differences.** Staging might use a permissive auth configuration (e.g., all fields accessible). Production has field-level auth. If the client's token lacks a required scope or role, specific fields return `FORBIDDEN` nulls.
+- **Downstream service health.** The Reviews service might be healthy in staging but degraded in production. If the resolver for `reviews` calls a downstream service that is timing out, you get null with an error.
+- **Missing DataLoader in production context.** If the DataLoader is created conditionally or depends on a configuration that differs between environments, it might not batch correctly in production, causing timeouts.
+- **Rate limiting.** Production rate limits are stricter. The client's query might exceed the cost budget in production but not staging (where limits are relaxed).
+
+**Step 4: Reproduce with tracing.** If the above does not reveal the cause, enable Apollo Tracing or OpenTelemetry on the production request (or a production-like environment) and trace the exact query. Per-resolver timing will show where the failure occurs and how long the failing resolver ran before erroring.
+
+**Step 5: Check if it is intermittent.** "Works in staging, fails in production" could mean "fails intermittently in production." A downstream service with occasional high latency, a database connection pool that is exhausted under production load, or a race condition that only manifests at production concurrency levels -- these all produce intermittent partial nulls.
+
+#### Follow-up: The error says "DOWNSTREAM_SERVICE_ERROR" on the `reviews` field. Staging and production both call the same Reviews microservice. What do you check next?
+
+Even if they call the "same" service logically, the production and staging instances likely differ. I would check:
+
+**Connection parameters:** Production might have stricter timeouts. If the resolver has a 5-second timeout and the Reviews service occasionally takes 6 seconds under production load, you get intermittent failures. Staging, with less load, always responds in 2 seconds.
+
+**Network topology:** In production, the gateway might be in a different availability zone from the Reviews service, adding latency. Or a service mesh sidecar (Envoy, Istio) might be applying retry policies or circuit-breaking that differ from staging.
+
+**Scale-dependent behavior:** The Reviews service in production handles 100x the traffic of staging. If it is hitting database connection limits, memory pressure, or garbage collection pauses under load, it fails intermittently. Check the Reviews service's own metrics -- CPU, memory, database connection pool utilization, error rate.
+
+**Data volume:** The specific entities being queried in production might have significantly more reviews than those in staging. A product with 10,000 reviews might cause the Reviews service to OOM or exceed its response size limit, while the same query in staging against a product with 50 reviews succeeds.
+
+I would pull the Reviews service's logs for the same time window, filtered by the request correlation ID (if you have distributed tracing), to see the error from the Reviews service's perspective. The GraphQL layer knows the downstream call failed; the Reviews service's logs tell you *why*.
+
+#### Going Deeper: How do you build your GraphQL API so that partial failures like this degrade gracefully instead of confusing the client?
+
+This is a schema design and client architecture question.
+
+**On the schema side:** Design nullable fields for anything that comes from a separate data source. If `Product.reviews` comes from the Reviews service, make it nullable (`reviews: [Review!]`). If the Reviews service is down, the product still renders with `reviews: null`. Never make a field non-nullable if its data source can fail independently -- you will turn a partial failure into a total failure because GraphQL propagates null up to the nearest nullable parent.
+
+**On the client side:** Build components to handle null gracefully. The `ProductPage` component should render the product name and price even if `reviews` is null. Show a "Reviews unavailable" placeholder, not a full-page error. This is where GraphQL's partial response model is a genuine advantage over REST -- you get *everything that worked* and can render it.
+
+**On the error handling side:** Classify errors in a middleware layer. `DOWNSTREAM_SERVICE_ERROR` with `extensions.serviceName: "reviews-service"` gets a "This section is temporarily unavailable" treatment. `UNAUTHENTICATED` gets a redirect to login. `RATE_LIMITED` gets a retry-after. The client should never show a raw error message from the GraphQL response.
+
+---
+
+### 6. How would you implement cost-based rate limiting for a public GraphQL API from scratch? Walk through the algorithm.
+
+**What the interviewer is really testing:** Can you design a non-trivial system that balances fairness, performance, and developer experience? Do you understand the unique challenge of GraphQL where every request has a different cost?
+
+**Strong answer:**
+
+Traditional rate limiting (100 requests/minute) is meaningless for GraphQL because `{ me { name } }` and a deeply nested query requesting 10,000 nodes are both "one request." Cost-based rate limiting charges each request proportional to its actual expense.
+
+**The cost calculation algorithm:**
+
+Each field in the schema has a base cost. Scalar fields cost 0 or 1. Object fields cost 1. List fields cost their base times the requested count. The total cost is the sum of all field costs in the query, with list multipliers applied recursively.
+
+```
+cost(field) = baseCost + childCost * multiplier
+
+where:
+  baseCost = defined per field (default 1 for objects, 0 for scalars)
+  childCost = sum of cost(child) for all selected children
+  multiplier = value of the pagination argument (first/last) for list fields, or 1 otherwise
+```
+
+For example, with this schema:
+
+```graphql
+type Query {
+  products(first: Int = 10): ProductConnection  # baseCost: 1
+}
+type Product {
+  name: String           # cost: 0
+  reviews(first: Int = 5): ReviewConnection  # baseCost: 1
+}
+type Review {
+  rating: Int            # cost: 0
+  author: User           # cost: 1
+}
+```
+
+The query `{ products(first: 50) { edges { node { name reviews(first: 10) { edges { node { rating author { name } } } } } } } }` costs:
+
+- `products`: 1 + (inner cost) * 50
+- Inner per product: `name`(0) + `reviews`(1 + inner * 10)
+- Inner per review: `rating`(0) + `author`(1 + 0)
+- Per review: 1 + 1 * 10 = 11... wait, let me be precise:
+- Per review: `rating`(0) + `author`(1) = 1
+- `reviews` per product: 1 + 1 * 10 = 11
+- Per product total: 0 + 11 = 11
+- `products` total: 1 + 11 * 50 = 551
+
+So this query costs 551 units.
+
+**The rate limiting mechanism:**
+
+I would use a **sliding window with token bucket** approach (similar to Shopify's leaky bucket):
+
+- Each API consumer gets a bucket that holds a maximum of (say) 2000 cost units
+- The bucket refills at a constant rate (say, 100 units per second)
+- Each request deducts its calculated cost from the bucket
+- If the bucket has insufficient units, the request is rejected with a `429`-equivalent GraphQL error including `retryAfter` and current cost information
+
+The beauty of the token bucket is that it allows bursts (a client can send an expensive query occasionally) while preventing sustained abuse (a client cannot continuously send expensive queries).
+
+**Implementation detail:** The cost is calculated **before execution**, during query validation. This is critical -- you do not want to run an expensive query and *then* tell the client they exceeded their limit. The static cost analysis happens against the AST and schema, not against actual data, so it is fast (sub-millisecond).
+
+**Developer experience:** Return the cost information in every response, as GitHub and Shopify do:
+
+```json
+{
+  "extensions": {
+    "cost": {
+      "requestedQueryCost": 551,
+      "actualQueryCost": 423,
+      "throttleStatus": {
+        "maximumAvailable": 2000,
+        "currentlyAvailable": 1449,
+        "restoreRate": 100
+      }
+    }
+  }
+}
+```
+
+Note the distinction between `requestedQueryCost` (the static estimate based on `first` arguments) and `actualQueryCost` (the real cost after execution -- often lower because some lists return fewer items than requested). Charge based on the actual cost, but validate against the requested cost before execution.
+
+#### Follow-up: What are the limitations of static cost analysis, and how do you handle them?
+
+Static analysis uses the `first`/`last` pagination arguments to estimate list sizes. But it cannot know the *actual* cardinality of a list at analysis time. If a field returns a list without pagination (bad schema design, but it happens), the static analyzer has to use a default multiplier -- say 100 -- which might be wildly wrong in either direction.
+
+Also, the cost of a field might vary based on runtime conditions. A `search(query: "a")` might return 50,000 results while `search(query: "xyzzy123")` returns 3. The static cost is the same for both.
+
+To handle this, I would combine static analysis (pre-execution rejection for obviously expensive queries) with **runtime cost tracking** (measure the actual cost during execution and update the rate limit bucket post-execution). If the actual cost significantly exceeds the estimate, log it as a signal to adjust the field's cost weight. Over time, the static estimates converge toward reality.
+
+For unbounded lists, the answer is: do not have them. Enforce pagination on every list field. This is both a performance and a rate limiting concern. If a list field lacks pagination, add a default limit (e.g., max 100 items) and enforce it in the resolver.
+
+#### Follow-up: How does this interact with persisted queries? Can you skip cost analysis for known queries?
+
+Yes, and this is a significant optimization. If you use persisted queries (where only pre-registered query hashes are allowed), you can **pre-compute the cost of every registered query** at registration time and store it alongside the hash. At runtime, when a client sends a hash, you look up the pre-computed cost instead of running the analysis on every request. This reduces the per-request overhead to a hash lookup plus a bucket check.
+
+The trade-off: if a query's cost depends on variable values (e.g., `products(first: $count)`), you cannot fully pre-compute -- you need to evaluate the cost formula with the provided variable values. But the formula itself (the structure of the cost tree) is pre-computed, so evaluation is just arithmetic.
+
+For public APIs where arbitrary queries are allowed, you cannot use this optimization. But for first-party clients using APQ (Automatic Persisted Queries), it is a significant win -- especially at high request rates where the cost analysis computation itself becomes measurable.
+
+---
+
+### 7. Explain the difference between `@defer`, `@stream`, and subscriptions. When would you pick each, and what are the infrastructure implications?
+
+**What the interviewer is really testing:** Understanding of incremental delivery mechanisms in GraphQL, the transport layer differences, and the ability to choose the right tool for the right problem. This separates people who have read about these features from people who have operated them.
+
+**Strong answer:**
+
+All three are mechanisms for delivering data to the client over time rather than in a single response, but they solve different problems and have very different operational characteristics.
+
+**`@defer`** delivers parts of a *single query response* incrementally. The server returns the non-deferred fields immediately, then streams the deferred fragment as a subsequent chunk over the same HTTP response (using multipart HTTP responses or chunked transfer encoding). The connection is short-lived -- it opens, streams the chunks, and closes.
+
+Use case: a product page where the name and price resolve in 10ms from a fast cache, but reviews take 500ms from a slow microservice. With `@defer`, the client renders the product immediately and fills in reviews when they arrive. No second request needed.
+
+**`@stream`** is similar but for lists. Instead of waiting for all 100 items in a list to resolve, the server streams each item (or each batch of items) as they become available. Same transport as `@defer` -- multipart responses over a single HTTP connection.
+
+Use case: a search results page where results come from multiple backends with different latencies. The first 5 results from the fast index arrive in 50ms; the next 20 from the slower secondary index arrive over the next 500ms. With `@stream`, the user sees results immediately and more appear progressively.
+
+**Subscriptions** maintain a **persistent, bidirectional connection** (WebSocket) between client and server. The client subscribes to an event, and the server pushes updates whenever that event occurs -- potentially hours or days later. The connection stays open indefinitely.
+
+Use case: real-time notifications, live chat, collaborative editing, live sports scores -- anything where the server needs to push data to the client at unpredictable times.
+
+**Infrastructure implications are dramatically different:**
+
+- `@defer` and `@stream` use standard HTTP infrastructure. They are stateless (each request is independent), work with load balancers, CDNs (with some caveats for streaming), and scale the same way your regular GraphQL endpoint does. The server just holds the response open slightly longer. Cost: minimal.
+
+- Subscriptions require WebSocket infrastructure. Each active subscription is an open TCP connection consuming memory and file descriptors on the server. They are **stateful** -- the connection is pinned to a specific server instance, which means you need sticky sessions at the load balancer. Scaling to 100,000 concurrent subscriptions means 100,000 open connections. You need a pub/sub backend (Redis, Kafka) to broadcast events across server instances. Cost: significant.
+
+**Decision framework:**
+- If you need to speed up the initial load of a single query: `@defer` / `@stream`
+- If you need the server to push updates after the initial query completes: subscriptions
+- If you are considering subscriptions but updates are infrequent (every 30+ seconds): polling is almost certainly simpler and cheaper
+
+#### Follow-up: What is the current browser and tooling support for `@defer` and `@stream`?
+
+As of mid-2025, `@defer` and `@stream` are still not finalized in the GraphQL spec -- they are an RFC that has been in progress for several years. However, they have working implementations:
+
+- **Apollo Client** supports `@defer` since version 3.7. Apollo Router supports it on the gateway side.
+- **Relay** has experimental `@defer` support.
+- **urql** has community-contributed support.
+- **Apollo Server** and **graphql-yoga** support `@defer` and `@stream` via the `graphql-js` reference implementation.
+
+The transport layer uses **multipart HTTP responses** (content-type: `multipart/mixed`). Most modern browsers handle this natively, but you need a GraphQL client that knows how to parse multipart responses and incrementally update the cache.
+
+The practical gotcha: not all CDNs and reverse proxies handle chunked/streaming HTTP responses well. Some will buffer the entire response before forwarding it, which defeats the purpose. You may need to configure your infrastructure layer (Nginx, Cloudflare, etc.) to disable response buffering for your GraphQL endpoint.
+
+#### Follow-up: Can you use `@defer` in a federated setup? What complications arise?
+
+Yes, but it adds complexity to the gateway's query planning. When a deferred fragment includes fields from a different subgraph, the gateway must:
+
+1. Execute the non-deferred portion (possibly across multiple subgraphs)
+2. Return the initial response to the client
+3. Execute the deferred portion (possibly requiring entity resolution across subgraphs)
+4. Stream the deferred result as a subsequent chunk
+
+The gateway must maintain state for the open response -- it cannot be a purely stateless request-response proxy. Apollo Router supports this, but it means the gateway holds resources (memory, connection) for each in-flight deferred response until all chunks are delivered.
+
+The complication is when the deferred fragment depends on data from the non-deferred portion via `@requires`. The gateway has the data from step 1, but it needs to hold onto it until step 3. For long-running deferrals (e.g., a deferred field that calls a slow ML service), this increases the gateway's memory footprint. At high concurrency, this can become a scaling concern.
+
+---
+
+### 8. You need to deprecate a widely-used field in your public GraphQL API. 2,000 third-party integrations reference it. Walk me through the process end to end.
+
+**What the interviewer is really testing:** Communication, empathy for API consumers, operational discipline, and understanding that schema evolution is as much a people problem as a technical one.
+
+**Strong answer:**
+
+This is a multi-month process where the technical execution is straightforward but the human coordination is the hard part.
+
+**Month 1: Analysis and announcement.**
+
+First, understand the impact. Use field-level analytics to determine: how many distinct clients reference this field, how frequently, and for what operations. "2,000 integrations" is the total, but maybe 1,800 of them call it once a month and 200 call it millions of times a day. The heavy users need personal outreach; the light users need clear documentation.
+
+Announce the deprecation in three places: (1) the schema itself via `@deprecated(reason: "Use 'priceV2' field instead. Will be removed on YYYY-MM-DD.")`, (2) the API changelog or developer blog, (3) direct email or notification to developers registered for API updates. Include the **reason** (why we are deprecating), the **replacement** (what to use instead, with code examples), and the **timeline** (when the field will stop working).
+
+**Months 2-4: Migration support and monitoring.**
+
+Publish a migration guide with before/after code examples in the most common languages your consumers use. If you have a developer relations team, have them create blog posts or videos. For the top 20 heaviest users, reach out directly -- offer migration support, answer questions, and understand if the timeline works for them.
+
+Monitor the field's usage weekly. Plot a graph of unique clients and request volume over time. Share this graph internally and in developer updates -- "Usage has dropped from 2,000 to 1,200 integrations. Here is what is left."
+
+**Months 4-5: Warning responses.**
+
+Before removing the field, add a warning in the response `extensions`:
+
+```json
+{
+  "extensions": {
+    "deprecationWarnings": [
+      {
+        "field": "Product.price",
+        "message": "This field will be removed on 2026-09-01. Use 'priceV2' instead.",
+        "removalDate": "2026-09-01",
+        "migrationGuide": "https://docs.example.com/migrate-price-field"
+      }
+    ]
+  }
+}
+```
+
+This is non-breaking -- the field still works -- but it surfaces the deprecation in the response itself, catching developers who missed the email and blog post.
+
+**Month 6: Soft removal.**
+
+Instead of hard-removing the field, change its resolver to return a **stub value** with a prominent error. For a price field, return `0` and include an error in the `errors` array with `extensions.code: "DEPRECATED_FIELD"` and a link to the migration guide. Log every request that hits the deprecated field so you can identify the remaining holdouts.
+
+**Month 7+: Hard removal.**
+
+Remove the field from the schema. Requests that reference it will fail with a validation error ("Cannot query field 'price' on type 'Product'"). By this point, you should have near-zero usage based on your monitoring.
+
+#### Follow-up: What if 50 integrations are still using the field at the deadline and refuse to migrate?
+
+This is a business decision, not a technical one. Options:
+
+**Extend the deadline.** If the remaining 50 are significant partners or high-revenue integrations, extending by 2-3 months is pragmatic. Communicate the new deadline clearly and set a hard "no more extensions" date.
+
+**Version the API.** If the field cannot be removed without breaking critical partners, introduce a versioned schema. The current schema continues to serve the deprecated field for clients that explicitly request `api-version: 2025-01`. The new default schema does not include it. This is what Shopify does -- they version their API quarterly and maintain previous versions for 12 months.
+
+**Accept the breakage.** For a public API with thousands of integrations, some breakage is inevitable. If 50 out of 2,000 have not migrated after 6 months of notice, direct outreach, and stub responses, the cost of maintaining the deprecated field indefinitely may exceed the cost of those 50 integrations experiencing a breakage. This is a judgment call that involves product, business, and engineering leadership.
+
+The key insight is to never surprise your consumers. If an integration breaks, it should be because they ignored months of warnings, not because you pulled the rug out without notice.
+
+---
+
+### 9. Your team is debating whether to use GraphQL subscriptions or polling for a live dashboard that shows order counts updating in near-real-time. Make the case for each side.
+
+**What the interviewer is really testing:** Pragmatic engineering judgment. Can you argue both sides honestly, or are you a hammer looking for a nail? Do you understand the infrastructure cost of each approach?
+
+**Strong answer:**
+
+**The case for polling:**
+
+Polling means the client sends a regular GraphQL query every N seconds (say, every 5 seconds) and re-renders with the new data.
+
+*Why it wins here:* A dashboard showing order counts does not need sub-second latency. If the count updates every 5 seconds instead of instantly, no business decision is affected. Polling uses your existing HTTP infrastructure -- no WebSockets, no sticky sessions, no pub/sub backend. Every request is stateless, load-balanced, and cacheable. If you have 500 dashboard users, that is 500 * (60/5) = 6,000 queries per minute -- trivially handleable by any GraphQL server, and you can even cache the response for 5 seconds so all 500 users hit the cache.
+
+Operationally, polling is invisible. It uses the same monitoring, the same load balancers, the same error handling as every other query. When the server goes down, the next poll returns an error and the client shows "Data unavailable." When it comes back, the next poll succeeds. No reconnection logic needed.
+
+*The honest downside:* If you poll every 5 seconds, the average staleness is 2.5 seconds and the maximum is 5 seconds. For a dashboard, this is fine. For a chat application, it is not.
+
+**The case for subscriptions:**
+
+Subscriptions mean the client opens a WebSocket, subscribes to `orderCountChanged`, and the server pushes updates the instant they happen.
+
+*Why it might win:* If the dashboard is mission-critical (war room during a flash sale, for example) and showing counts that are even 5 seconds stale could cause bad decisions (like turning off a promotion too late), subscriptions deliver updates in under 100ms. Subscriptions also eliminate wasted requests -- with polling, 99% of polls return the same data because nothing changed. Subscriptions only send data when something actually changed.
+
+*The honest downside:* Subscriptions require WebSocket infrastructure. For 500 dashboard users, that is 500 persistent connections. Each connection is pinned to a server instance, so you need sticky sessions. You need a pub/sub layer (Redis) so that when the Orders service updates a count, the event reaches the server instance that has the subscriber. When the server restarts, all 500 connections drop and must reconnect -- you need reconnection logic with backoff in the client. Your monitoring must track WebSocket connection health in addition to HTTP metrics. All of this for a feature where polling would have worked.
+
+**My recommendation for this specific case:** Start with polling at 5-second intervals. It is simpler by an order of magnitude and the user experience is indistinguishable from real-time for a dashboard use case. If product requirements change (e.g., the dashboard needs to show individual order events as they happen, not just counts), migrate to subscriptions at that point with a clear understanding of the infrastructure cost.
+
+The rule I follow: **subscriptions are for when the user is waiting for something to happen** (a chat message, a notification, a collaborative cursor). **Polling is for when the user is looking at data that changes** (dashboards, feeds, status pages). The distinction is subtle but drives the right infrastructure choice.
+
+#### Follow-up: What about Server-Sent Events (SSE) as a middle ground?
+
+SSE is a one-directional streaming protocol over HTTP. The server pushes events to the client, but the client cannot send messages back (unlike WebSockets). For GraphQL, you can implement subscriptions over SSE instead of WebSocket by streaming the subscription events as SSE messages.
+
+**Advantages over WebSocket:**
+- Uses standard HTTP, so it works with existing load balancers, proxies, and CDNs without special configuration
+- Automatic reconnection is built into the browser's `EventSource` API
+- Simpler server implementation -- no WebSocket upgrade handshake, no frame parsing
+- Works through corporate proxies that block WebSocket upgrades
+
+**Disadvantages:**
+- One-directional only (server to client). For GraphQL subscriptions this is fine (the subscription query is sent via a normal HTTP request, and events are streamed back via SSE)
+- Limited to text data (no binary)
+- Browser limit of ~6 concurrent SSE connections per domain (in HTTP/1.1; HTTP/2 fixes this)
+
+For the dashboard use case, SSE is arguably the best choice: it gives you push semantics (no wasted polling requests) with HTTP-compatible infrastructure (no sticky sessions, no WebSocket complexity). Libraries like `graphql-sse` implement the GraphQL-over-SSE protocol.
+
+---
+
+### 10. How would you design a GraphQL schema for a system where the same `User` type is owned by three different teams (Identity, Social, Commerce), each with their own fields?
+
+**What the interviewer is really testing:** Federation schema design skills, understanding of entity ownership, and organizational awareness. Can you navigate the political and technical challenges of shared types?
+
+**Strong answer:**
+
+This is the classic federation challenge: a core entity type that multiple domains want to extend. The answer is to use federation entities with a clear ownership model.
+
+**Step 1: Designate a primary owner.** The Identity team owns the `User` entity because they own the core identity data (ID, email, name, auth credentials). They define the entity with its `@key`:
+
+```graphql
+# Identity subgraph (primary owner)
+type User @key(fields: "id") {
+  id: ID!
+  email: String!
+  displayName: String!
+  avatarUrl: String
+  createdAt: DateTime!
+}
+```
+
+**Step 2: Other teams extend the entity.** The Social and Commerce teams contribute their domain-specific fields to `User`:
+
+```graphql
+# Social subgraph
+type User @key(fields: "id") {
+  id: ID!
+  friends(first: Int = 10, after: String): UserConnection!
+  followers: FollowerConnection!
+  posts(first: Int = 10, after: String): PostConnection!
+}
+
+# Commerce subgraph
+type User @key(fields: "id") {
+  id: ID!
+  orders(first: Int = 10, after: String): OrderConnection!
+  wishlist: [Product!]!
+  defaultShippingAddress: Address
+  loyaltyPoints: Int!
+}
+```
+
+Each subgraph declares `User` with `@key(fields: "id")` and adds only the fields it owns. The gateway composes these into a single `User` type with all fields from all three subgraphs.
+
+**Step 3: Establish field ownership rules.** This is the governance part. The rules I would establish:
+
+- **A field is owned by exactly one subgraph.** If both Social and Commerce want a `User.activityScore` field, they must agree on which subgraph owns it, or create distinctly named fields (`socialActivityScore`, `purchaseScore`).
+- **The primary owner (Identity) has veto power on changes to the `@key` fields.** Changing the key definition affects every subgraph that references the entity.
+- **New fields require composition validation in CI.** Before any subgraph merges a change that adds fields to `User`, the CI pipeline runs composition and validates that there are no naming conflicts.
+
+**Step 4: Handle cross-subgraph field dependencies.** If the Commerce subgraph's `loyaltyPoints` calculation depends on the user's `createdAt` (from Identity) to determine tier level:
+
+```graphql
+# Commerce subgraph
+type User @key(fields: "id") {
+  id: ID!
+  createdAt: DateTime @external
+  loyaltyTier: LoyaltyTier! @requires(fields: "createdAt")
+}
+```
+
+The `@external` marks `createdAt` as owned by another subgraph, and `@requires` tells the gateway to fetch `createdAt` from Identity before resolving `loyaltyTier` in Commerce.
+
+#### Follow-up: What happens when two subgraphs accidentally define the same field on `User`?
+
+Schema composition fails. Apollo's composition engine detects that two subgraphs define `User.activityScore` (for example) and rejects the composition with an error like: "Field 'User.activityScore' is defined in both the Social and Commerce subgraphs. A field can only be defined in one subgraph."
+
+This is the beauty of composition -- it catches this conflict at build time, not at runtime. The fix is for the two teams to coordinate: either one team removes their field and delegates to the other, or they rename their fields to be distinct.
+
+If both teams legitimately need to provide the same field (same name, same semantics), they can use the `@shareable` directive in Federation v2, which explicitly allows multiple subgraphs to resolve the same field. The gateway will pick one (typically the first to respond). But `@shareable` should be used sparingly -- it means multiple subgraphs can return different values for the same field, which can cause inconsistencies if their data sources disagree.
+
+#### Follow-up: With three teams extending `User`, how do you manage schema reviews so that one team's change does not break another's?
+
+**Automated composition checks in CI.** Every subgraph runs `rover subgraph check` against the production supergraph as part of its PR pipeline. If the Social team's change breaks composition with the Commerce team's current schema, the PR fails before merge. This is non-negotiable -- it is the federation equivalent of a build check.
+
+**Schema change proposals.** For non-trivial changes (adding a new entity, changing a key, renaming a field), I would require a lightweight RFC process: a one-page document describing the change, its impact on other subgraphs, and the migration plan. The other teams review it asynchronously. This is not bureaucracy -- it is communication scaled to the organization.
+
+**Schema governance group.** A rotating group of one representative from each team that reviews cross-subgraph changes weekly. They enforce naming conventions, pagination patterns, and error handling consistency across the supergraph. They also maintain a style guide (e.g., "all list fields use Relay connections, all mutations return a payload type with an `errors` field").
+
+The organizational principle: **federation decentralizes implementation but requires centralized governance of the contract.** Each team can deploy their subgraph independently, but the schema -- the contract between subgraphs and clients -- must be reviewed collectively.
