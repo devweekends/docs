@@ -248,6 +248,44 @@ Table formats bring database-like capabilities (ACID transactions, schema evolut
 **The industry is converging on Iceberg.** As of 2025, Snowflake, BigQuery, Databricks, AWS Athena, Dremio, and Trino all support Iceberg natively. Its vendor-neutral governance (under Apache Foundation) and hidden partitioning (users do not need to know partition columns to get partition pruning) make it the safest long-term bet. Delta Lake is excellent if you are committed to the Databricks ecosystem. Hudi excels at upsert-heavy workloads (CDC pipelines).
 </Tip>
 
+### 3.3 Table Format Decision Framework
+
+Choosing a table format is one of the stickiest decisions in a data platform -- switching later is a multi-quarter migration. The right answer depends on your workload profile, ecosystem commitments, and operational maturity.
+
+| Decision Factor | Choose Iceberg | Choose Delta Lake | Choose Hudi |
+|----------------|----------------|-------------------|-------------|
+| **Multi-engine reads** | You query from Spark, Trino, Flink, AND a warehouse | You are Databricks-first | You tolerate Spark/Flink only |
+| **Partition evolution** | Partitioning strategy will change over time | Partitioning is stable | Partitioning is stable |
+| **Upsert volume** | Moderate (batch merges) | Moderate (MERGE INTO) | Heavy -- millions of row-level upserts/day from CDC |
+| **Vendor lock-in tolerance** | Low (Apache Foundation governance) | Medium (Databricks stewards, open-sourced) | Low-Medium (Apache Foundation) |
+| **Time travel needs** | Snapshot-based, cheap | Log-based, configurable retention | Timeline-based, per-record |
+| **Community momentum (2025)** | Highest (every major vendor adopted) | Strong (Databricks ecosystem) | Niche (CDC-heavy shops, AWS-oriented) |
+
+<AccordionGroup>
+<Accordion title="Interview: Your team is choosing between Iceberg and Delta Lake for a new lakehouse. How do you decide?">
+
+**Strong Answer Framework:**
+
+The decision tree I would walk through:
+
+**1. Engine diversity.** If we need to read the same tables from Spark, Trino, Snowflake, and Flink -- Iceberg wins. Its catalog abstraction (HiveCatalog, REST catalog, Nessie) means any engine can read without Databricks-specific libraries. Delta Lake has improved here with UniForm, but Iceberg's multi-engine story is more mature.
+
+**2. Partition evolution.** Iceberg's hidden partitioning lets you change partition strategy (e.g., from daily to hourly) without rewriting data. Delta Lake requires explicit `PARTITIONED BY` and changing it means rewriting the table. If your access patterns will evolve -- which they always do -- Iceberg is more forgiving.
+
+**3. Ecosystem commitment.** If the company is all-in on Databricks (Unity Catalog, MLflow, Photon), Delta Lake is the native citizen. You get the deepest integration, the best performance optimizations (liquid clustering, predictive I/O), and the smoothest dbt integration. Fighting the ecosystem is expensive.
+
+**4. CDC workload profile.** If 80% of your writes are row-level upserts from Debezium CDC, Hudi's record-level indexing is genuinely faster than Iceberg's copy-on-write or merge-on-read. But Hudi's ecosystem is narrower -- you trade write performance for read flexibility.
+
+**My default recommendation for a new project in 2025:** Iceberg, unless you are committed to Databricks -- then Delta Lake. Hudi only if CDC upserts are your dominant write pattern and you have benchmarked it against Iceberg MoR (merge-on-read).
+
+**Red Flag Answer:** "We should use Delta Lake because it's the most popular" -- popularity is not a technical argument. Or: "Iceberg because Netflix uses it" -- cargo-culting without understanding the trade-offs.
+
+**Follow-up: "How would you migrate from Delta Lake to Iceberg if the business decides to move off Databricks?"**
+
+Databricks actually anticipated this -- Delta Lake UniForm writes Iceberg metadata alongside Delta metadata, so tables can be read by Iceberg-compatible engines without data conversion. For a full migration: (1) Enable UniForm on existing Delta tables. (2) Validate that Iceberg reads produce identical results (row counts, checksums). (3) Switch read engines to Iceberg catalogs. (4) Once all readers are on Iceberg, stop writing Delta metadata. The data files (Parquet) are identical -- only the metadata layer changes.
+</Accordion>
+</AccordionGroup>
+
 ---
 
 # Part II -- Pipelines and Processing
@@ -359,6 +397,48 @@ Operations that require grouping data by key (`groupBy`, `join`, `repartition`) 
 | Full table scans when only recent data needed | **Partition pruning** -- partition by date, filter early | Reads 1/365th of the data |
 | Spark reads columns it does not need | **Predicate pushdown** with Parquet/ORC | Reads only needed columns from storage |
 | Out of memory errors | Increase `spark.sql.shuffle.partitions`, use disk-based join strategies | Trades memory for disk I/O |
+
+### 5.2 Batch Processing: Failure and Recovery
+
+Every batch pipeline will fail. The question is how fast you detect it, how cleanly you recover, and whether recovery introduces data corruption.
+
+| Failure Mode | What Happens | Detection | Recovery Pattern |
+|-------------|-------------|-----------|-----------------|
+| **Task OOM (Out of Memory)** | Executor dies mid-partition, partial output may exist | Spark UI shows failed stages, executor lost events | Increase memory OR repartition to reduce per-task data. Delete partial output before retry. |
+| **Data skew blows up one task** | 99 tasks finish in 2 minutes, 1 task runs for 3 hours | Spark UI task duration histogram, one bar 100x taller | Salt the skewed key, enable AQE skew handling (`spark.sql.adaptive.skewJoin.enabled`) |
+| **Upstream table schema changed** | Read fails on column mismatch, or worse -- silently reads NULLs | Schema validation at read time, dbt source tests | Pin schemas explicitly. Add schema-change detection in bronze layer. Never assume upstream stability. |
+| **Source data arrived late or incomplete** | Pipeline runs on time but processes partial input | Row count checks vs expected volume, freshness sensors | Implement a "gate" that blocks the pipeline until source readiness is confirmed (Airflow `ExternalTaskSensor`, dbt `source freshness`) |
+| **Cluster preemption (spot instances)** | Cloud provider reclaims spot nodes mid-job | Spark task failures with "executor lost" pattern | Use checkpointing for long jobs. Mix on-demand and spot nodes. Design jobs to be restartable from the last successful stage. |
+| **Output corruption from partial write** | Pipeline crashes after writing 50% of partitions | Row count reconciliation, partition-level checksums | Write to a staging location, then atomically swap (`ALTER TABLE SWAP`, `RENAME`). Never write directly to the production table. |
+
+<Warning>
+**The cardinal sin of batch recovery:** Rerunning a failed pipeline that uses `INSERT INTO` (append mode) without first cleaning up partial output. You end up with duplicate data for the partitions that succeeded before the failure. Always use overwrite-by-partition or MERGE for idempotent recovery.
+</Warning>
+
+<AccordionGroup>
+<Accordion title="Interview: Your Spark job ran for 6 hours, failed at 95% completion, and needs to deliver by 6 AM. It is 4 AM. What do you do?">
+
+**Strong Answer Framework:**
+
+This is a triage question -- the interviewer is testing your ability to make fast, pragmatic decisions under pressure.
+
+**Minute 0-5: Assess.** What failed? Check the Spark UI for the failed stage. If it is a single skewed task in the last stage, the fix is different from a cluster-wide OOM.
+
+**If it is a single skewed task:** (1) Identify the hot key from the Spark UI (look at the task with 100x more input records). (2) If AQE is not enabled, enable it and restart just the failed stage (if your job is checkpointed). (3) If no checkpointing, restart the entire job but add a salt to the join key for the known hot key -- this is a 10-minute code change.
+
+**If it is OOM across many tasks:** (1) Increase `spark.sql.shuffle.partitions` from 200 to 2000 (smaller partitions = less memory per task). (2) Increase executor memory. (3) Restart.
+
+**If the output table already has partial data:** Check if the write mode is overwrite-by-partition. If yes, safe to restart -- it will overwrite the partial partitions. If it is append mode, you MUST truncate the target partition before restarting or you will get duplicates.
+
+**If the job cannot possibly finish by 6 AM:** Communicate to stakeholders immediately. Offer a partial delivery: "We can deliver data through yesterday with 95% of tables ready. The remaining 5% will land by 8 AM." A partial, known-incomplete delivery with clear communication is always better than a silent miss.
+
+**Red Flag Answer:** "I would just restart the job." Without diagnosing the root cause, you will likely hit the same failure again and waste another 6 hours.
+
+**Follow-up: "How would you redesign this pipeline so a 95% failure does not mean starting from zero?"**
+
+Checkpoint intermediate results. Break the monolithic 6-hour job into stages that write intermediate DataFrames to Parquet. Use Airflow to orchestrate stages independently -- if stage 3 of 5 fails, rerun from stage 3. The cost is more storage for intermediate files and slightly more orchestration complexity, but the recovery time drops from 6 hours to ~1 hour.
+</Accordion>
+</AccordionGroup>
 
 ---
 
