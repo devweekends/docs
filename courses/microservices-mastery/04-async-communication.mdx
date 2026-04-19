@@ -22,6 +22,12 @@ Think of async communication like the postal system versus a phone call. With a 
 
 ## Why Asynchronous Communication?
 
+Before we dive into the mechanics of message brokers, let's make sure we deeply understand why async exists at all. In a synchronous architecture, service A calls service B and waits for a response before continuing. Every service in the chain becomes a liability: if any one of them is slow, the whole chain is slow; if any one of them is down, the whole chain is down. This coupling is the silent killer of microservices -- teams start splitting the monolith to get independence, then accidentally rebuild the monolith with HTTP cables instead of function calls.
+
+Async flips the dependency. Instead of "I call you and wait," it's "I drop a message and trust someone will process it." The producer doesn't need to know who the consumers are, how many there are, or whether they're currently up. That decoupling is the single most important architectural property async gives you -- everything else (better throughput, natural retries, elastic scaling) is downstream of it.
+
+The tradeoff is complexity. You now have to reason about eventual consistency ("when will this actually happen?"), message ordering, duplicate delivery, and broker operations. Many teams underestimate this and reach for async too early, before they actually need it. A good rule: stay synchronous until the coupling pain becomes concrete (cascading failures, head-of-line blocking, inability to scale one service independently). Then pay the async tax deliberately.
+
 ### Sync vs Async Comparison
 
 ```
@@ -91,6 +97,10 @@ ASYNCHRONOUS COMMUNICATION
 
 ## Message Queue Patterns
 
+There are two foundational patterns you need to internalize before writing any broker code: point-to-point (queue) and publish-subscribe (topic). The difference is not about which broker technology you use -- RabbitMQ, Kafka, SQS, and Azure Service Bus all support both -- it's about the delivery semantics you want. Choosing the wrong pattern is one of the most common and expensive mistakes in event-driven systems: if you use a queue where you needed a topic, new consumers will silently miss events; if you use a topic where you needed a queue, the same work gets done multiple times.
+
+The mental shortcut: ask "is this work or is this news?" If it's work (send this email, charge this card, resize this image), you want point-to-point -- exactly one worker should do the job. If it's news (an order was placed, a user signed up), you want pub/sub -- every interested party should hear about it.
+
 ### Point-to-Point (Queue)
 
 One message, one consumer. Work distribution pattern.
@@ -130,361 +140,806 @@ Used for: Event broadcasting, notifications
 
 ## RabbitMQ Implementation
 
+RabbitMQ is a "smart broker, dumb consumer" system built on the AMQP protocol. The broker is responsible for routing, retry policies, dead-lettering, and priorities; consumers just receive whatever the broker hands them. This model is excellent when your messaging needs are rich and varied -- different queues with different priorities, complex routing rules, per-message TTLs. It's less ideal when you need to replay past events or process millions of messages per second; that's Kafka's turf.
+
+Before we look at the code, understand the four core AMQP concepts: producers publish to **exchanges**, not directly to queues. An exchange applies **bindings** (routing rules) to decide which queue(s) a message lands in. Consumers then read from queues. This indirection is what gives RabbitMQ its flexibility -- you can swap routing logic without changing producer or consumer code.
+
 ### Setup and Connection
 
-```javascript
-// config/rabbitmq.js
-// This module manages the single RabbitMQ connection for the service.
-// One connection per service, multiple channels per connection -- this is the
-// recommended pattern from the RabbitMQ team. Creating a new connection per
-// request is an anti-pattern that exhausts file descriptors.
-const amqp = require('amqplib');
+A common beginner mistake with RabbitMQ is treating connections like HTTP connections: open one per request, close it when done. Don't. Opening a TCP connection plus an AMQP handshake is expensive (tens to hundreds of milliseconds), and RabbitMQ has hard limits on concurrent connections per node. The correct pattern is one long-lived connection per service process, with many lightweight **channels** multiplexed over it. Channels are cheap, thread-local units of work. If you ignore this and open a connection per publish, you'll exhaust file descriptors, blow through RabbitMQ's connection limit in production, and wonder why the broker falls over at moderate load.
 
-class RabbitMQConnection {
-  constructor() {
-    this.connection = null;
-    this.channel = null;
-  }
+The code below also enables a heartbeat. Without heartbeats, a network partition can leave your service in a zombie state -- the TCP connection still appears open at the OS level, but the broker has already moved on. Heartbeats force both sides to periodically confirm the connection is alive.
 
-  async connect() {
-    try {
-      this.connection = await amqp.connect({
-        hostname: process.env.RABBITMQ_HOST || 'localhost',
-        port: process.env.RABBITMQ_PORT || 5672,
-        username: process.env.RABBITMQ_USER || 'guest',
-        password: process.env.RABBITMQ_PASS || 'guest',
-        vhost: process.env.RABBITMQ_VHOST || '/',
-        heartbeat: 60  // Detects dead connections; without this, a network partition
-                       // can leave your service thinking it is connected when it is not
-      });
+<Tabs>
+  <Tab title="Node.js">
+  ```javascript
+  // config/rabbitmq.js
+  // This module manages the single RabbitMQ connection for the service.
+  // One connection per service, multiple channels per connection -- this is the
+  // recommended pattern from the RabbitMQ team. Creating a new connection per
+  // request is an anti-pattern that exhausts file descriptors.
+  const amqp = require('amqplib');
 
-      this.channel = await this.connection.createChannel();
+  class RabbitMQConnection {
+    constructor() {
+      this.connection = null;
+      this.channel = null;
+    }
+
+    async connect() {
+      try {
+        this.connection = await amqp.connect({
+          hostname: process.env.RABBITMQ_HOST || 'localhost',
+          port: process.env.RABBITMQ_PORT || 5672,
+          username: process.env.RABBITMQ_USER || 'guest',
+          password: process.env.RABBITMQ_PASS || 'guest',
+          vhost: process.env.RABBITMQ_VHOST || '/',
+          heartbeat: 60  // Detects dead connections; without this, a network partition
+                         // can leave your service thinking it is connected when it is not
+        });
+
+        this.channel = await this.connection.createChannel();
+        
+        // Handle connection events
+        this.connection.on('error', (err) => {
+          console.error('RabbitMQ connection error:', err);
+          this.reconnect();
+        });
+        
+        this.connection.on('close', () => {
+          console.log('RabbitMQ connection closed');
+          this.reconnect();
+        });
+        
+        console.log('Connected to RabbitMQ');
+        return this.channel;
+      } catch (error) {
+        console.error('Failed to connect to RabbitMQ:', error);
+        throw error;
+      }
+    }
+
+    async reconnect() {
+      console.log('Attempting to reconnect to RabbitMQ...');
+      await new Promise(resolve => setTimeout(resolve, 5000));
+      await this.connect();
+    }
+
+    async setupExchanges() {
+      // Direct exchange for point-to-point
+      await this.channel.assertExchange('direct_exchange', 'direct', { durable: true });
       
-      // Handle connection events
-      this.connection.on('error', (err) => {
-        console.error('RabbitMQ connection error:', err);
-        this.reconnect();
-      });
+      // Topic exchange for routing patterns
+      await this.channel.assertExchange('topic_exchange', 'topic', { durable: true });
       
-      this.connection.on('close', () => {
-        console.log('RabbitMQ connection closed');
-        this.reconnect();
-      });
+      // Fanout exchange for broadcasting
+      await this.channel.assertExchange('fanout_exchange', 'fanout', { durable: true });
       
-      console.log('Connected to RabbitMQ');
-      return this.channel;
-    } catch (error) {
-      console.error('Failed to connect to RabbitMQ:', error);
-      throw error;
+      // Dead letter exchange -- messages that fail after max retries land here.
+      // This is your safety net: monitor this queue and alert on it. Messages in the
+      // DLQ represent real business operations that failed and need human attention.
+      await this.channel.assertExchange('dlx_exchange', 'direct', { durable: true });
+    }
+
+    async close() {
+      await this.channel?.close();
+      await this.connection?.close();
     }
   }
 
-  async reconnect() {
-    console.log('Attempting to reconnect to RabbitMQ...');
-    await new Promise(resolve => setTimeout(resolve, 5000));
-    await this.connect();
-  }
+  module.exports = new RabbitMQConnection();
+  ```
+  </Tab>
+  <Tab title="Python">
+  ```python
+  # config/rabbitmq.py
+  # One long-lived connection per process, multiple channels on top.
+  # We use aio-pika because it's the idiomatic async AMQP client for Python --
+  # pika (sync) works too, but blocks your event loop if you're running FastAPI
+  # or any asyncio-based service.
+  import asyncio
+  import logging
+  import os
+  from typing import Optional
 
-  async setupExchanges() {
-    // Direct exchange for point-to-point
-    await this.channel.assertExchange('direct_exchange', 'direct', { durable: true });
-    
-    // Topic exchange for routing patterns
-    await this.channel.assertExchange('topic_exchange', 'topic', { durable: true });
-    
-    // Fanout exchange for broadcasting
-    await this.channel.assertExchange('fanout_exchange', 'fanout', { durable: true });
-    
-    // Dead letter exchange -- messages that fail after max retries land here.
-    // This is your safety net: monitor this queue and alert on it. Messages in the
-    // DLQ represent real business operations that failed and need human attention.
-    await this.channel.assertExchange('dlx_exchange', 'direct', { durable: true });
-  }
+  import aio_pika
+  from aio_pika import ExchangeType
+  from aio_pika.abc import AbstractRobustConnection, AbstractRobustChannel
 
-  async close() {
-    await this.channel?.close();
-    await this.connection?.close();
-  }
-}
+  logger = logging.getLogger(__name__)
 
-module.exports = new RabbitMQConnection();
-```
+
+  class RabbitMQConnection:
+      def __init__(self) -> None:
+          self.connection: Optional[AbstractRobustConnection] = None
+          self.channel: Optional[AbstractRobustChannel] = None
+
+      async def connect(self) -> AbstractRobustChannel:
+          try:
+              # connect_robust auto-reconnects on network errors --
+              # this replaces the manual reconnect loop you'd write with pika.
+              self.connection = await aio_pika.connect_robust(
+                  host=os.getenv("RABBITMQ_HOST", "localhost"),
+                  port=int(os.getenv("RABBITMQ_PORT", "5672")),
+                  login=os.getenv("RABBITMQ_USER", "guest"),
+                  password=os.getenv("RABBITMQ_PASS", "guest"),
+                  virtualhost=os.getenv("RABBITMQ_VHOST", "/"),
+                  heartbeat=60,  # detect half-open connections
+              )
+              self.channel = await self.connection.channel()
+              # publisher confirms: the broker ACKs every publish.
+              # Without this, a publish can silently fail on broker crash.
+              await self.channel.set_qos(prefetch_count=10)
+
+              self.connection.close_callbacks.add(self._on_close)
+              logger.info("Connected to RabbitMQ")
+              return self.channel
+          except Exception:
+              logger.exception("Failed to connect to RabbitMQ")
+              raise
+
+      def _on_close(self, connection, exc) -> None:
+          logger.warning("RabbitMQ connection closed: %s", exc)
+
+      async def setup_exchanges(self) -> None:
+          assert self.channel is not None
+          # Durable=True means the exchange survives broker restarts.
+          await self.channel.declare_exchange(
+              "direct_exchange", ExchangeType.DIRECT, durable=True
+          )
+          await self.channel.declare_exchange(
+              "topic_exchange", ExchangeType.TOPIC, durable=True
+          )
+          await self.channel.declare_exchange(
+              "fanout_exchange", ExchangeType.FANOUT, durable=True
+          )
+          # Dead-letter exchange: monitor this; messages here = humans needed.
+          await self.channel.declare_exchange(
+              "dlx_exchange", ExchangeType.DIRECT, durable=True
+          )
+
+      async def close(self) -> None:
+          if self.channel:
+              await self.channel.close()
+          if self.connection:
+              await self.connection.close()
+
+
+  rabbitmq = RabbitMQConnection()
+  ```
+  </Tab>
+</Tabs>
 
 ### Producer Implementation
 
-```javascript
-// messaging/producer.js
-class MessageProducer {
-  constructor(channel) {
-    this.channel = channel;
+The producer is the easy half of messaging -- but it hides a few critical decisions. First, `persistent: true` (or `delivery_mode=2` in Python) writes messages to disk on the broker. Without it, every message sits only in RAM, and a broker restart throws them all away. For any business event you care about, you want persistence. Second, messages are opaque bytes to the broker; you need to set `contentType` so consumers know how to parse them. Third, always include a `messageId` and a `correlationId` -- the first lets consumers deduplicate, the second lets you trace a single user action across a dozen services in your logs.
+
+A subtle tradeoff: persistent messages are ~10x slower than transient ones because they involve an fsync. If you're publishing telemetry where losing a few messages on broker crash is acceptable, turn persistence off and gain throughput. If you're publishing "payment charged," pay the cost.
+
+<Tabs>
+  <Tab title="Node.js">
+  ```javascript
+  // messaging/producer.js
+  class MessageProducer {
+    constructor(channel) {
+      this.channel = channel;
+    }
+
+    // Send to specific queue (Point-to-Point)
+    async sendToQueue(queue, message, options = {}) {
+      await this.channel.assertQueue(queue, {
+        durable: true,
+        deadLetterExchange: 'dlx_exchange',
+        deadLetterRoutingKey: `${queue}.dlq`
+      });
+
+      const content = Buffer.from(JSON.stringify(message));
+      
+      return this.channel.sendToQueue(queue, content, {
+        persistent: true,
+        messageId: message.id || this.generateId(),
+        timestamp: Date.now(),
+        contentType: 'application/json',
+        headers: {
+          'x-retry-count': 0,
+          'x-source-service': process.env.SERVICE_NAME,
+          ...options.headers
+        }
+      });
+    }
+
+    // Publish to exchange (Pub/Sub)
+    async publish(exchange, routingKey, event, options = {}) {
+      const content = Buffer.from(JSON.stringify(event));
+      
+      return this.channel.publish(exchange, routingKey, content, {
+        persistent: true,
+        messageId: event.eventId || this.generateId(),
+        timestamp: Date.now(),
+        contentType: 'application/json',
+        type: event.eventType,
+        headers: {
+          'x-event-version': event.version || '1.0',
+          'x-correlation-id': event.correlationId,
+          'x-source-service': process.env.SERVICE_NAME,
+          ...options.headers
+        }
+      });
+    }
+
+    // Publish domain event with standard structure
+    async publishDomainEvent(event) {
+      const routingKey = event.eventType; // e.g., 'order.created'
+      
+      await this.publish('topic_exchange', routingKey, {
+        eventId: event.eventId,
+        eventType: event.eventType,
+        occurredAt: event.occurredAt || new Date().toISOString(),
+        version: event.version || '1.0',
+        correlationId: event.correlationId,
+        data: event.data,
+        metadata: {
+          service: process.env.SERVICE_NAME,
+          environment: process.env.NODE_ENV
+        }
+      });
+    }
+
+    generateId() {
+      return `${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+    }
   }
 
-  // Send to specific queue (Point-to-Point)
-  async sendToQueue(queue, message, options = {}) {
-    await this.channel.assertQueue(queue, {
-      durable: true,
-      deadLetterExchange: 'dlx_exchange',
-      deadLetterRoutingKey: `${queue}.dlq`
-    });
+  module.exports = MessageProducer;
+  ```
+  </Tab>
+  <Tab title="Python">
+  ```python
+  # messaging/producer.py
+  import json
+  import os
+  import uuid
+  from datetime import datetime, timezone
+  from typing import Any, Optional
 
-    const content = Buffer.from(JSON.stringify(message));
-    
-    return this.channel.sendToQueue(queue, content, {
-      persistent: true,
-      messageId: message.id || this.generateId(),
-      timestamp: Date.now(),
-      contentType: 'application/json',
-      headers: {
-        'x-retry-count': 0,
-        'x-source-service': process.env.SERVICE_NAME,
-        ...options.headers
-      }
-    });
-  }
+  import aio_pika
+  from aio_pika import DeliveryMode, Message
+  from aio_pika.abc import AbstractRobustChannel
+  from pydantic import BaseModel, Field
 
-  // Publish to exchange (Pub/Sub)
-  async publish(exchange, routingKey, event, options = {}) {
-    const content = Buffer.from(JSON.stringify(event));
-    
-    return this.channel.publish(exchange, routingKey, content, {
-      persistent: true,
-      messageId: event.eventId || this.generateId(),
-      timestamp: Date.now(),
-      contentType: 'application/json',
-      type: event.eventType,
-      headers: {
-        'x-event-version': event.version || '1.0',
-        'x-correlation-id': event.correlationId,
-        'x-source-service': process.env.SERVICE_NAME,
-        ...options.headers
-      }
-    });
-  }
 
-  // Publish domain event with standard structure
-  async publishDomainEvent(event) {
-    const routingKey = event.eventType; // e.g., 'order.created'
-    
-    await this.publish('topic_exchange', routingKey, {
-      eventId: event.eventId,
-      eventType: event.eventType,
-      occurredAt: event.occurredAt || new Date().toISOString(),
-      version: event.version || '1.0',
-      correlationId: event.correlationId,
-      data: event.data,
-      metadata: {
-        service: process.env.SERVICE_NAME,
-        environment: process.env.NODE_ENV
-      }
-    });
-  }
+  class DomainEvent(BaseModel):
+      """Canonical event envelope. Use Pydantic so every producer emits the
+      same shape -- consumers rely on this contract."""
+      event_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+      event_type: str
+      occurred_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+      version: str = "1.0"
+      correlation_id: Optional[str] = None
+      data: dict[str, Any]
+      metadata: dict[str, Any] = Field(default_factory=dict)
 
-  generateId() {
-    return `${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
-  }
-}
 
-module.exports = MessageProducer;
-```
+  class MessageProducer:
+      def __init__(self, channel: AbstractRobustChannel) -> None:
+          self.channel = channel
+          self.service_name = os.getenv("SERVICE_NAME", "unknown")
+
+      async def send_to_queue(
+          self,
+          queue_name: str,
+          payload: dict[str, Any],
+          headers: Optional[dict[str, Any]] = None,
+      ) -> None:
+          # Declare queue with a DLX binding so poison messages land in DLQ.
+          queue = await self.channel.declare_queue(
+              queue_name,
+              durable=True,
+              arguments={
+                  "x-dead-letter-exchange": "dlx_exchange",
+                  "x-dead-letter-routing-key": f"{queue_name}.dlq",
+              },
+          )
+
+          msg = Message(
+              body=json.dumps(payload).encode(),
+              delivery_mode=DeliveryMode.PERSISTENT,  # survives broker restart
+              message_id=payload.get("id") or str(uuid.uuid4()),
+              timestamp=datetime.now(timezone.utc),
+              content_type="application/json",
+              headers={
+                  "x-retry-count": 0,
+                  "x-source-service": self.service_name,
+                  **(headers or {}),
+              },
+          )
+          # default exchange ("") routes by queue name -- this is point-to-point.
+          await self.channel.default_exchange.publish(msg, routing_key=queue.name)
+
+      async def publish(
+          self,
+          exchange_name: str,
+          routing_key: str,
+          event: DomainEvent,
+          extra_headers: Optional[dict[str, Any]] = None,
+      ) -> None:
+          exchange = await self.channel.get_exchange(exchange_name)
+          msg = Message(
+              body=event.model_dump_json().encode(),
+              delivery_mode=DeliveryMode.PERSISTENT,
+              message_id=event.event_id,
+              timestamp=event.occurred_at,
+              content_type="application/json",
+              type=event.event_type,
+              headers={
+                  "x-event-version": event.version,
+                  "x-correlation-id": event.correlation_id or "",
+                  "x-source-service": self.service_name,
+                  **(extra_headers or {}),
+              },
+          )
+          await exchange.publish(msg, routing_key=routing_key)
+
+      async def publish_domain_event(self, event: DomainEvent) -> None:
+          # Routing key = event type, e.g., "order.created" -> topic subscribers
+          # bound on "order.*" or "order.#" receive it.
+          event.metadata.setdefault("service", self.service_name)
+          event.metadata.setdefault("environment", os.getenv("ENV", "dev"))
+          await self.publish("topic_exchange", event.event_type, event)
+  ```
+  </Tab>
+</Tabs>
 
 ### Consumer Implementation
 
-```javascript
-// messaging/consumer.js
-class MessageConsumer {
-  constructor(channel) {
-    this.channel = channel;
-    this.handlers = new Map();
-  }
+Consumers are where most of the hard problems live. Three things to internalize before reading the code:
 
-  // Subscribe to queue
-  async consumeQueue(queue, handler, options = {}) {
-    const { prefetch = 10, noAck = false } = options;
-    
-    await this.channel.assertQueue(queue, {
-      durable: true,
-      deadLetterExchange: 'dlx_exchange',
-      deadLetterRoutingKey: `${queue}.dlq`
-    });
+**Prefetch (QoS) is load balancing's secret weapon.** By default, RabbitMQ will push as many messages as possible to each consumer. If one consumer is fast and another is slow, they end up with equal queue depths, so the slow one becomes a bottleneck. Setting prefetch to a small number (often just 1-10) forces fair dispatch: the broker only sends the next message after the consumer has ack'd the previous batch. This is the single most impactful tuning knob in RabbitMQ.
 
-    // Set prefetch for fair dispatch
-    await this.channel.prefetch(prefetch);
+**Ack timing matters enormously.** If you ack before processing and then crash, the message is lost -- the broker thinks you succeeded. If you ack after processing and then crash, the message is redelivered to another consumer -- which means your handler must be idempotent. The standard pattern is "ack after success, nack on failure" which gives at-least-once semantics. Do not take shortcuts here; this is how companies lose orders.
 
-    console.log(`Consuming from queue: ${queue}`);
+**Retries need backoff, not tight loops.** A naive retry just re-queues the failing message immediately, which hammers the broker and the downstream service. Always use exponential backoff with a maximum retry count. After the max is exceeded, send the message to a DLQ where a human can investigate.
 
-    await this.channel.consume(queue, async (msg) => {
-      if (!msg) return;
-
-      const startTime = Date.now();
-      const content = JSON.parse(msg.content.toString());
-      const messageId = msg.properties.messageId;
-
-      try {
-        console.log(`Processing message ${messageId} from ${queue}`);
-        
-        await handler(content, msg.properties, msg.fields);
-        
-        if (!noAck) {
-          this.channel.ack(msg);
-        }
-        
-        console.log(`Message ${messageId} processed in ${Date.now() - startTime}ms`);
-      } catch (error) {
-        console.error(`Error processing message ${messageId}:`, error);
-        
-        const retryCount = (msg.properties.headers?.['x-retry-count'] || 0) + 1;
-        const maxRetries = options.maxRetries || 3;
-        
-        if (retryCount <= maxRetries) {
-          // Retry with delay
-          await this.retryMessage(queue, content, msg.properties, retryCount);
-          this.channel.ack(msg);
-        } else {
-          // Send to dead letter queue
-          this.channel.nack(msg, false, false);
-          console.log(`Message ${messageId} sent to DLQ after ${maxRetries} retries`);
-        }
-      }
-    }, { noAck });
-  }
-
-  // Subscribe to topic exchange
-  async subscribeToTopic(patterns, handler, options = {}) {
-    const queueName = options.queueName || 
-      `${process.env.SERVICE_NAME}.${patterns.join('_').replace(/[.#*]/g, '_')}`;
-
-    const queue = await this.channel.assertQueue(queueName, {
-      durable: true,
-      deadLetterExchange: 'dlx_exchange',
-      deadLetterRoutingKey: `${queueName}.dlq`
-    });
-
-    // Bind queue to each pattern
-    for (const pattern of patterns) {
-      await this.channel.bindQueue(queue.queue, 'topic_exchange', pattern);
-      console.log(`Bound ${queue.queue} to pattern: ${pattern}`);
+<Tabs>
+  <Tab title="Node.js">
+  ```javascript
+  // messaging/consumer.js
+  class MessageConsumer {
+    constructor(channel) {
+      this.channel = channel;
+      this.handlers = new Map();
     }
 
-    await this.consumeQueue(queue.queue, handler, options);
-  }
+    // Subscribe to queue
+    async consumeQueue(queue, handler, options = {}) {
+      const { prefetch = 10, noAck = false } = options;
+      
+      await this.channel.assertQueue(queue, {
+        durable: true,
+        deadLetterExchange: 'dlx_exchange',
+        deadLetterRoutingKey: `${queue}.dlq`
+      });
 
-  async retryMessage(queue, content, properties, retryCount) {
-    const delay = Math.pow(2, retryCount) * 1000; // Exponential backoff
-    
-    // Use delayed message plugin or simple setTimeout
-    await new Promise(resolve => setTimeout(resolve, delay));
-    
-    await this.channel.sendToQueue(queue, Buffer.from(JSON.stringify(content)), {
-      ...properties,
-      headers: {
-        ...properties.headers,
-        'x-retry-count': retryCount,
-        'x-original-timestamp': properties.timestamp,
-        'x-retry-timestamp': Date.now()
+      // Set prefetch for fair dispatch
+      await this.channel.prefetch(prefetch);
+
+      console.log(`Consuming from queue: ${queue}`);
+
+      await this.channel.consume(queue, async (msg) => {
+        if (!msg) return;
+
+        const startTime = Date.now();
+        const content = JSON.parse(msg.content.toString());
+        const messageId = msg.properties.messageId;
+
+        try {
+          console.log(`Processing message ${messageId} from ${queue}`);
+          
+          await handler(content, msg.properties, msg.fields);
+          
+          if (!noAck) {
+            this.channel.ack(msg);
+          }
+          
+          console.log(`Message ${messageId} processed in ${Date.now() - startTime}ms`);
+        } catch (error) {
+          console.error(`Error processing message ${messageId}:`, error);
+          
+          const retryCount = (msg.properties.headers?.['x-retry-count'] || 0) + 1;
+          const maxRetries = options.maxRetries || 3;
+          
+          if (retryCount <= maxRetries) {
+            // Retry with delay
+            await this.retryMessage(queue, content, msg.properties, retryCount);
+            this.channel.ack(msg);
+          } else {
+            // Send to dead letter queue
+            this.channel.nack(msg, false, false);
+            console.log(`Message ${messageId} sent to DLQ after ${maxRetries} retries`);
+          }
+        }
+      }, { noAck });
+    }
+
+    // Subscribe to topic exchange
+    async subscribeToTopic(patterns, handler, options = {}) {
+      const queueName = options.queueName || 
+        `${process.env.SERVICE_NAME}.${patterns.join('_').replace(/[.#*]/g, '_')}`;
+
+      const queue = await this.channel.assertQueue(queueName, {
+        durable: true,
+        deadLetterExchange: 'dlx_exchange',
+        deadLetterRoutingKey: `${queueName}.dlq`
+      });
+
+      // Bind queue to each pattern
+      for (const pattern of patterns) {
+        await this.channel.bindQueue(queue.queue, 'topic_exchange', pattern);
+        console.log(`Bound ${queue.queue} to pattern: ${pattern}`);
       }
-    });
-  }
-}
 
-module.exports = MessageConsumer;
-```
+      await this.consumeQueue(queue.queue, handler, options);
+    }
+
+    async retryMessage(queue, content, properties, retryCount) {
+      const delay = Math.pow(2, retryCount) * 1000; // Exponential backoff
+      
+      // Use delayed message plugin or simple setTimeout
+      await new Promise(resolve => setTimeout(resolve, delay));
+      
+      await this.channel.sendToQueue(queue, Buffer.from(JSON.stringify(content)), {
+        ...properties,
+        headers: {
+          ...properties.headers,
+          'x-retry-count': retryCount,
+          'x-original-timestamp': properties.timestamp,
+          'x-retry-timestamp': Date.now()
+        }
+      });
+    }
+  }
+
+  module.exports = MessageConsumer;
+  ```
+  </Tab>
+  <Tab title="Python">
+  ```python
+  # messaging/consumer.py
+  import asyncio
+  import json
+  import logging
+  import os
+  from datetime import datetime, timezone
+  from typing import Any, Awaitable, Callable, Iterable
+
+  import aio_pika
+  from aio_pika.abc import AbstractIncomingMessage, AbstractRobustChannel
+
+  logger = logging.getLogger(__name__)
+
+  Handler = Callable[[dict[str, Any], AbstractIncomingMessage], Awaitable[None]]
+
+
+  class MessageConsumer:
+      def __init__(self, channel: AbstractRobustChannel) -> None:
+          self.channel = channel
+          self.service_name = os.getenv("SERVICE_NAME", "unknown")
+
+      async def consume_queue(
+          self,
+          queue_name: str,
+          handler: Handler,
+          prefetch: int = 10,
+          max_retries: int = 3,
+      ) -> None:
+          # Prefetch caps the in-flight messages per consumer -- crucial for
+          # fair dispatch when consumers process at different speeds.
+          await self.channel.set_qos(prefetch_count=prefetch)
+
+          queue = await self.channel.declare_queue(
+              queue_name,
+              durable=True,
+              arguments={
+                  "x-dead-letter-exchange": "dlx_exchange",
+                  "x-dead-letter-routing-key": f"{queue_name}.dlq",
+              },
+          )
+          logger.info("Consuming from queue: %s", queue_name)
+
+          async def _on_message(message: AbstractIncomingMessage) -> None:
+              started = datetime.now(timezone.utc)
+              message_id = message.message_id or "<no-id>"
+              # async with message.process() would auto-ack; we handle acks manually
+              # because we need retry logic.
+              try:
+                  payload = json.loads(message.body)
+                  await handler(payload, message)
+                  await message.ack()
+                  elapsed = (datetime.now(timezone.utc) - started).total_seconds() * 1000
+                  logger.info("Processed %s in %.1fms", message_id, elapsed)
+              except Exception:
+                  logger.exception("Error processing message %s", message_id)
+                  retry_count = int((message.headers or {}).get("x-retry-count", 0)) + 1
+                  if retry_count <= max_retries:
+                      await self._retry(queue_name, message, retry_count)
+                      await message.ack()
+                  else:
+                      # nack with requeue=False routes to the DLX.
+                      await message.nack(requeue=False)
+                      logger.warning(
+                          "Message %s sent to DLQ after %d retries",
+                          message_id,
+                          max_retries,
+                      )
+
+          await queue.consume(_on_message)
+
+      async def subscribe_to_topic(
+          self,
+          patterns: Iterable[str],
+          handler: Handler,
+          queue_name: str | None = None,
+          prefetch: int = 10,
+      ) -> None:
+          patterns = list(patterns)
+          qname = queue_name or (
+              f"{self.service_name}."
+              + "_".join(p.replace(".", "_").replace("#", "_").replace("*", "_") for p in patterns)
+          )
+          queue = await self.channel.declare_queue(
+              qname,
+              durable=True,
+              arguments={
+                  "x-dead-letter-exchange": "dlx_exchange",
+                  "x-dead-letter-routing-key": f"{qname}.dlq",
+              },
+          )
+          exchange = await self.channel.get_exchange("topic_exchange")
+          for pattern in patterns:
+              await queue.bind(exchange, routing_key=pattern)
+              logger.info("Bound %s to pattern %s", qname, pattern)
+
+          await self.consume_queue(qname, handler, prefetch=prefetch)
+
+      async def _retry(
+          self,
+          queue_name: str,
+          message: AbstractIncomingMessage,
+          retry_count: int,
+      ) -> None:
+          # Exponential backoff: 2s, 4s, 8s, ...
+          delay = 2**retry_count
+          await asyncio.sleep(delay)
+          new_headers = dict(message.headers or {})
+          new_headers.update(
+              {
+                  "x-retry-count": retry_count,
+                  "x-retry-timestamp": datetime.now(timezone.utc).isoformat(),
+              }
+          )
+          await self.channel.default_exchange.publish(
+              aio_pika.Message(
+                  body=message.body,
+                  headers=new_headers,
+                  content_type=message.content_type,
+                  message_id=message.message_id,
+                  delivery_mode=aio_pika.DeliveryMode.PERSISTENT,
+              ),
+              routing_key=queue_name,
+          )
+  ```
+  </Tab>
+</Tabs>
 
 ### Order Service Example
 
-```javascript
-// order-service/events.js
-const MessageProducer = require('../messaging/producer');
+Now let's see what it looks like to actually use these primitives in a real domain. The shape of the code below is the critical pattern: the Order service publishes events describing what happened in its world (an order was created, paid, shipped), and it does not know who listens. The Inventory service subscribes to the events it cares about and reacts. Neither service calls the other directly. If tomorrow you add a Recommendations service that also wants to hear about orders, you don't touch Order or Inventory -- you just subscribe.
 
-class OrderEventPublisher {
-  constructor(channel) {
-    this.producer = new MessageProducer(channel);
-  }
+This is the payoff of async: you can add new consumers (analytics, fraud detection, email notifications, loyalty points) without modifying any existing service. Contrast that with a synchronous world, where adding a new consumer means the Order service has to learn about it, handle its failures, and potentially slow down to wait for it.
 
-  async orderCreated(order) {
-    await this.producer.publishDomainEvent({
-      eventType: 'order.created',
-      correlationId: order.correlationId,
-      data: {
-        orderId: order.id,
-        customerId: order.customerId,
-        items: order.items.map(item => ({
-          productId: item.productId,
-          quantity: item.quantity,
-          price: item.price
-        })),
-        totalAmount: order.totalAmount,
-        shippingAddress: order.shippingAddress,
-        createdAt: order.createdAt
-      }
-    });
-  }
+<Tabs>
+  <Tab title="Node.js">
+  ```javascript
+  // order-service/events.js
+  const MessageProducer = require('../messaging/producer');
 
-  async orderPaid(orderId, paymentId, amount) {
-    await this.producer.publishDomainEvent({
-      eventType: 'order.paid',
-      data: { orderId, paymentId, amount }
-    });
-  }
+  class OrderEventPublisher {
+    constructor(channel) {
+      this.producer = new MessageProducer(channel);
+    }
 
-  async orderShipped(orderId, trackingNumber, carrier) {
-    await this.producer.publishDomainEvent({
-      eventType: 'order.shipped',
-      data: { orderId, trackingNumber, carrier }
-    });
-  }
+    async orderCreated(order) {
+      await this.producer.publishDomainEvent({
+        eventType: 'order.created',
+        correlationId: order.correlationId,
+        data: {
+          orderId: order.id,
+          customerId: order.customerId,
+          items: order.items.map(item => ({
+            productId: item.productId,
+            quantity: item.quantity,
+            price: item.price
+          })),
+          totalAmount: order.totalAmount,
+          shippingAddress: order.shippingAddress,
+          createdAt: order.createdAt
+        }
+      });
+    }
 
-  async orderCancelled(orderId, reason) {
-    await this.producer.publishDomainEvent({
-      eventType: 'order.cancelled',
-      data: { orderId, reason }
-    });
-  }
-}
+    async orderPaid(orderId, paymentId, amount) {
+      await this.producer.publishDomainEvent({
+        eventType: 'order.paid',
+        data: { orderId, paymentId, amount }
+      });
+    }
 
-// Inventory service listening
-// inventory-service/eventHandlers.js
-class InventoryEventHandler {
-  constructor(consumer, inventoryService) {
-    this.consumer = consumer;
-    this.inventoryService = inventoryService;
-  }
+    async orderShipped(orderId, trackingNumber, carrier) {
+      await this.producer.publishDomainEvent({
+        eventType: 'order.shipped',
+        data: { orderId, trackingNumber, carrier }
+      });
+    }
 
-  async start() {
-    await this.consumer.subscribeToTopic(
-      ['order.created', 'order.cancelled'],
-      this.handleOrderEvent.bind(this),
-      { queueName: 'inventory-service.orders' }
-    );
-  }
-
-  async handleOrderEvent(event, properties) {
-    switch (event.eventType) {
-      case 'order.created':
-        await this.reserveInventory(event.data);
-        break;
-      case 'order.cancelled':
-        await this.releaseInventory(event.data);
-        break;
+    async orderCancelled(orderId, reason) {
+      await this.producer.publishDomainEvent({
+        eventType: 'order.cancelled',
+        data: { orderId, reason }
+      });
     }
   }
 
-  async reserveInventory(orderData) {
-    for (const item of orderData.items) {
-      await this.inventoryService.reserve(
-        item.productId,
-        item.quantity,
-        orderData.orderId
+  // Inventory service listening
+  // inventory-service/eventHandlers.js
+  class InventoryEventHandler {
+    constructor(consumer, inventoryService) {
+      this.consumer = consumer;
+      this.inventoryService = inventoryService;
+    }
+
+    async start() {
+      await this.consumer.subscribeToTopic(
+        ['order.created', 'order.cancelled'],
+        this.handleOrderEvent.bind(this),
+        { queueName: 'inventory-service.orders' }
       );
     }
-    console.log(`Inventory reserved for order ${orderData.orderId}`);
-  }
 
-  async releaseInventory(orderData) {
-    await this.inventoryService.releaseByOrder(orderData.orderId);
-    console.log(`Inventory released for order ${orderData.orderId}`);
+    async handleOrderEvent(event, properties) {
+      switch (event.eventType) {
+        case 'order.created':
+          await this.reserveInventory(event.data);
+          break;
+        case 'order.cancelled':
+          await this.releaseInventory(event.data);
+          break;
+      }
+    }
+
+    async reserveInventory(orderData) {
+      for (const item of orderData.items) {
+        await this.inventoryService.reserve(
+          item.productId,
+          item.quantity,
+          orderData.orderId
+        );
+      }
+      console.log(`Inventory reserved for order ${orderData.orderId}`);
+    }
+
+    async releaseInventory(orderData) {
+      await this.inventoryService.releaseByOrder(orderData.orderId);
+      console.log(`Inventory released for order ${orderData.orderId}`);
+    }
   }
-}
-```
+  ```
+  </Tab>
+  <Tab title="Python">
+  ```python
+  # order_service/events.py
+  from decimal import Decimal
+  from typing import Any
+
+  from messaging.producer import DomainEvent, MessageProducer
+
+
+  class OrderEventPublisher:
+      def __init__(self, producer: MessageProducer) -> None:
+          self.producer = producer
+
+      async def order_created(self, order: dict[str, Any]) -> None:
+          await self.producer.publish_domain_event(
+              DomainEvent(
+                  event_type="order.created",
+                  correlation_id=order.get("correlation_id"),
+                  data={
+                      "order_id": order["id"],
+                      "customer_id": order["customer_id"],
+                      "items": [
+                          {
+                              "product_id": item["product_id"],
+                              "quantity": item["quantity"],
+                              "price": str(item["price"]),  # Decimal -> str for JSON
+                          }
+                          for item in order["items"]
+                      ],
+                      "total_amount": str(order["total_amount"]),
+                      "shipping_address": order["shipping_address"],
+                      "created_at": order["created_at"].isoformat(),
+                  },
+              )
+          )
+
+      async def order_paid(self, order_id: str, payment_id: str, amount: Decimal) -> None:
+          await self.producer.publish_domain_event(
+              DomainEvent(
+                  event_type="order.paid",
+                  data={"order_id": order_id, "payment_id": payment_id, "amount": str(amount)},
+              )
+          )
+
+      async def order_shipped(
+          self, order_id: str, tracking_number: str, carrier: str
+      ) -> None:
+          await self.producer.publish_domain_event(
+              DomainEvent(
+                  event_type="order.shipped",
+                  data={
+                      "order_id": order_id,
+                      "tracking_number": tracking_number,
+                      "carrier": carrier,
+                  },
+              )
+          )
+
+      async def order_cancelled(self, order_id: str, reason: str) -> None:
+          await self.producer.publish_domain_event(
+              DomainEvent(
+                  event_type="order.cancelled",
+                  data={"order_id": order_id, "reason": reason},
+              )
+          )
+
+
+  # inventory_service/event_handlers.py
+  from aio_pika.abc import AbstractIncomingMessage
+
+  from messaging.consumer import MessageConsumer
+
+
+  class InventoryEventHandler:
+      def __init__(self, consumer: MessageConsumer, inventory_service) -> None:
+          self.consumer = consumer
+          self.inventory = inventory_service
+
+      async def start(self) -> None:
+          await self.consumer.subscribe_to_topic(
+              patterns=["order.created", "order.cancelled"],
+              handler=self.handle_order_event,
+              queue_name="inventory-service.orders",
+          )
+
+      async def handle_order_event(
+          self, event: dict[str, Any], msg: AbstractIncomingMessage
+      ) -> None:
+          event_type = event.get("event_type")
+          data = event.get("data", {})
+          if event_type == "order.created":
+              await self._reserve(data)
+          elif event_type == "order.cancelled":
+              await self._release(data)
+
+      async def _reserve(self, data: dict[str, Any]) -> None:
+          for item in data["items"]:
+              await self.inventory.reserve(
+                  item["product_id"], item["quantity"], data["order_id"]
+              )
+
+      async def _release(self, data: dict[str, Any]) -> None:
+          await self.inventory.release_by_order(data["order_id"])
+  ```
+  </Tab>
+</Tabs>
 
 ---
 
@@ -505,6 +960,12 @@ Kafka excels at high-throughput, ordered event streaming. Where RabbitMQ is a sm
 | Operational complexity | Moderate | High (ZooKeeper/KRaft, partition rebalancing) |
 
 ### Kafka Concepts
+
+Before any code, the mental model: a Kafka topic is an ordered, append-only log split into **partitions**. Each partition is a completely independent, ordered sequence of messages. You cannot guarantee ordering across partitions -- only within one. This is not a bug; it's what lets Kafka scale. If all messages had to be globally ordered, a single node's write speed would cap the system. By sharding into partitions, you can parallelize writes and reads across the cluster.
+
+The partition key is your routing decision. If you publish with `key="order-123"`, Kafka hashes the key and picks a partition -- and every future message with that same key lands on the same partition. This is how you guarantee ordering for a single entity (all events for order-123 are in order) while still scaling horizontally.
+
+Consumer groups are the other magical piece. A group is a set of consumer processes that share the work of reading a topic. Each partition is assigned to exactly one consumer in the group. Add another group, and it independently reads the same topic with its own offsets -- that's pub/sub. Add more consumers to the same group, and you parallelize within that subscription -- that's work distribution. Kafka gives you both patterns from the same primitive.
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
@@ -545,582 +1006,1216 @@ Kafka excels at high-throughput, ordered event streaming. Where RabbitMQ is a sm
 
 ### Kafka Producer
 
-```javascript
-// kafka/producer.js
-const { Kafka, Partitioners } = require('kafkajs');
+The Kafka producer has more knobs than the RabbitMQ producer because Kafka exposes more of its internals. The one you absolutely must get right is the **partition key**. Choose a key that identifies the entity whose events must stay ordered (order ID, user ID, account ID). Choose badly -- say, always using `null` as key -- and Kafka will round-robin your events across partitions, shattering any ordering guarantee. Choose too narrowly -- a single hot key -- and all your traffic ends up on one partition, defeating the whole point of sharding.
 
-class KafkaProducer {
-  constructor() {
-    this.kafka = new Kafka({
-      clientId: process.env.SERVICE_NAME,
-      brokers: (process.env.KAFKA_BROKERS || 'localhost:9092').split(','),
-      retry: {
-        initialRetryTime: 100,
-        retries: 8
-      }
-    });
-    
-    this.producer = this.kafka.producer({
-      createPartitioner: Partitioners.DefaultPartitioner,
-      allowAutoTopicCreation: true,
-      transactionTimeout: 30000
-    });
-  }
+Other critical settings: `acks=all` (wait for all replicas to confirm the write, trading latency for durability), `enable.idempotence=true` (prevents duplicate writes on producer retries, which happen more often than you think on flaky networks), and `compression.type=snappy` or `lz4` (often 3-5x throughput improvement at a tiny CPU cost). Default settings are tuned for "development" not "production" -- read the docs.
 
-  async connect() {
-    await this.producer.connect();
-    console.log('Kafka producer connected');
-  }
+<Tabs>
+  <Tab title="Node.js">
+  ```javascript
+  // kafka/producer.js
+  const { Kafka, Partitioners } = require('kafkajs');
 
-  async disconnect() {
-    await this.producer.disconnect();
-  }
-
-  // Send single message
-  async send(topic, message, key = null) {
-    const result = await this.producer.send({
-      topic,
-      messages: [{
-        key: key ? String(key) : null,
-        value: JSON.stringify(message),
-        headers: {
-          'event-type': message.eventType,
-          'event-id': message.eventId,
-          'correlation-id': message.correlationId || '',
-          'source-service': process.env.SERVICE_NAME,
-          'timestamp': String(Date.now())
+  class KafkaProducer {
+    constructor() {
+      this.kafka = new Kafka({
+        clientId: process.env.SERVICE_NAME,
+        brokers: (process.env.KAFKA_BROKERS || 'localhost:9092').split(','),
+        retry: {
+          initialRetryTime: 100,
+          retries: 8
         }
-      }]
-    });
-    
-    return result;
-  }
-
-  // Send batch of messages
-  async sendBatch(topic, messages) {
-    const result = await this.producer.send({
-      topic,
-      messages: messages.map(msg => ({
-        key: msg.key ? String(msg.key) : null,
-        value: JSON.stringify(msg.value),
-        headers: {
-          'event-type': msg.value.eventType,
-          'event-id': msg.value.eventId,
-          'source-service': process.env.SERVICE_NAME
-        }
-      }))
-    });
-    
-    return result;
-  }
-
-  // Transactional send (exactly-once semantics)
-  async sendInTransaction(messages) {
-    const transaction = await this.producer.transaction();
-    
-    try {
-      for (const { topic, key, value } of messages) {
-        await transaction.send({
-          topic,
-          messages: [{
-            key: key ? String(key) : null,
-            value: JSON.stringify(value)
-          }]
-        });
-      }
+      });
       
-      await transaction.commit();
-    } catch (error) {
-      await transaction.abort();
-      throw error;
+      this.producer = this.kafka.producer({
+        createPartitioner: Partitioners.DefaultPartitioner,
+        allowAutoTopicCreation: true,
+        transactionTimeout: 30000
+      });
+    }
+
+    async connect() {
+      await this.producer.connect();
+      console.log('Kafka producer connected');
+    }
+
+    async disconnect() {
+      await this.producer.disconnect();
+    }
+
+    // Send single message
+    async send(topic, message, key = null) {
+      const result = await this.producer.send({
+        topic,
+        messages: [{
+          key: key ? String(key) : null,
+          value: JSON.stringify(message),
+          headers: {
+            'event-type': message.eventType,
+            'event-id': message.eventId,
+            'correlation-id': message.correlationId || '',
+            'source-service': process.env.SERVICE_NAME,
+            'timestamp': String(Date.now())
+          }
+        }]
+      });
+      
+      return result;
+    }
+
+    // Send batch of messages
+    async sendBatch(topic, messages) {
+      const result = await this.producer.send({
+        topic,
+        messages: messages.map(msg => ({
+          key: msg.key ? String(msg.key) : null,
+          value: JSON.stringify(msg.value),
+          headers: {
+            'event-type': msg.value.eventType,
+            'event-id': msg.value.eventId,
+            'source-service': process.env.SERVICE_NAME
+          }
+        }))
+      });
+      
+      return result;
+    }
+
+    // Transactional send (exactly-once semantics)
+    async sendInTransaction(messages) {
+      const transaction = await this.producer.transaction();
+      
+      try {
+        for (const { topic, key, value } of messages) {
+          await transaction.send({
+            topic,
+            messages: [{
+              key: key ? String(key) : null,
+              value: JSON.stringify(value)
+            }]
+          });
+        }
+        
+        await transaction.commit();
+      } catch (error) {
+        await transaction.abort();
+        throw error;
+      }
     }
   }
-}
 
-module.exports = KafkaProducer;
-```
+  module.exports = KafkaProducer;
+  ```
+  </Tab>
+  <Tab title="Python">
+  ```python
+  # kafka/producer.py
+  import json
+  import logging
+  import os
+  import time
+  from typing import Any, Optional
+
+  from aiokafka import AIOKafkaProducer
+
+  logger = logging.getLogger(__name__)
+
+
+  class KafkaProducer:
+      """Thin wrapper around AIOKafkaProducer. Uses idempotent + acks=all so that
+      retries don't produce duplicates and writes aren't acknowledged until every
+      in-sync replica has the record."""
+
+      def __init__(self) -> None:
+          self.service_name = os.getenv("SERVICE_NAME", "unknown")
+          self._producer: Optional[AIOKafkaProducer] = None
+
+      async def connect(self) -> None:
+          self._producer = AIOKafkaProducer(
+              bootstrap_servers=os.getenv("KAFKA_BROKERS", "localhost:9092"),
+              client_id=self.service_name,
+              enable_idempotence=True,   # prevents duplicates on retry
+              acks="all",                # wait for all ISR replicas
+              compression_type="snappy", # massive throughput win for JSON payloads
+              max_batch_size=16384,
+              linger_ms=10,              # small batching window for better throughput
+          )
+          await self._producer.start()
+          logger.info("Kafka producer connected")
+
+      async def disconnect(self) -> None:
+          if self._producer:
+              await self._producer.stop()
+
+      async def send(
+          self,
+          topic: str,
+          message: dict[str, Any],
+          key: Optional[str] = None,
+      ) -> None:
+          assert self._producer is not None
+          # Key choice is critical: same key -> same partition -> ordered.
+          # Use entity IDs (order_id, user_id) as keys, never timestamps or UUIDs
+          # unless you explicitly don't care about ordering.
+          headers = [
+              ("event-type", message.get("event_type", "").encode()),
+              ("event-id", str(message.get("event_id", "")).encode()),
+              ("correlation-id", str(message.get("correlation_id", "")).encode()),
+              ("source-service", self.service_name.encode()),
+              ("timestamp", str(int(time.time() * 1000)).encode()),
+          ]
+          await self._producer.send_and_wait(
+              topic=topic,
+              value=json.dumps(message).encode(),
+              key=key.encode() if key else None,
+              headers=headers,
+          )
+
+      async def send_batch(
+          self, topic: str, messages: list[dict[str, Any]]
+      ) -> None:
+          assert self._producer is not None
+          # aiokafka batches under the hood based on linger_ms + max_batch_size,
+          # so we just fire the sends concurrently.
+          batch = self._producer.create_batch()
+          for msg in messages:
+              batch.append(
+                  key=msg["key"].encode() if msg.get("key") else None,
+                  value=json.dumps(msg["value"]).encode(),
+                  timestamp=None,
+              )
+          await self._producer.send_batch(batch, topic, partition=None)
+
+      async def send_in_transaction(
+          self, messages: list[dict[str, Any]]
+      ) -> None:
+          """Exactly-once write across multiple topics.
+          Requires transactional_id set on the producer constructor."""
+          assert self._producer is not None
+          async with self._producer.transaction():
+              for item in messages:
+                  await self._producer.send(
+                      topic=item["topic"],
+                      value=json.dumps(item["value"]).encode(),
+                      key=item["key"].encode() if item.get("key") else None,
+                  )
+  ```
+  </Tab>
+</Tabs>
 
 ### Kafka Consumer
 
-```javascript
-// kafka/consumer.js
-const { Kafka } = require('kafkajs');
+Kafka consumers are where the "smart consumer" philosophy bites hardest. Unlike RabbitMQ, the broker doesn't track what you've processed -- you do. Your consumer periodically **commits** an offset saying "I've processed through offset 12345 in partition 2." If you crash before committing, you'll re-read from your last committed offset. If you commit before actually processing, you'll skip messages on crash.
 
-class KafkaConsumer {
-  constructor(groupId) {
-    this.kafka = new Kafka({
-      clientId: process.env.SERVICE_NAME,
-      brokers: (process.env.KAFKA_BROKERS || 'localhost:9092').split(',')
-    });
-    
-    this.consumer = this.kafka.consumer({
-      groupId,
-      sessionTimeout: 30000,
-      heartbeatInterval: 3000,
-      maxWaitTimeInMs: 5000,
-      retry: {
-        initialRetryTime: 100,
-        retries: 8
-      }
-    });
-    
-    this.handlers = new Map();
-  }
+This leads to two common offset-management strategies. **Auto-commit** periodically commits the current position in the background. It's easy to set up but gives you at-most-once semantics if you're not careful -- a commit can happen between receiving and processing, and a crash loses the message. **Manual commit after processing** gives at-least-once semantics: you only commit after you've successfully processed. This is what you almost always want, and it means your handlers must be idempotent.
 
-  async connect() {
-    await this.consumer.connect();
-    console.log(`Kafka consumer connected for group: ${this.groupId}`);
-  }
+Watch the heartbeat. If your handler takes longer than `session.timeout.ms`, Kafka thinks you died and rebalances your partitions to another consumer. Now two consumers are processing the same batch -- the original one that isn't actually dead and the replacement. This is a classic source of duplicate processing in Kafka.
 
-  async disconnect() {
-    await this.consumer.disconnect();
-  }
+<Tabs>
+  <Tab title="Node.js">
+  ```javascript
+  // kafka/consumer.js
+  const { Kafka } = require('kafkajs');
 
-  // Subscribe to topics
-  async subscribe(topics, handler, options = {}) {
-    const { fromBeginning = false, autoCommit = true } = options;
-    
-    for (const topic of topics) {
-      await this.consumer.subscribe({ topic, fromBeginning });
-      console.log(`Subscribed to topic: ${topic}`);
+  class KafkaConsumer {
+    constructor(groupId) {
+      this.kafka = new Kafka({
+        clientId: process.env.SERVICE_NAME,
+        brokers: (process.env.KAFKA_BROKERS || 'localhost:9092').split(',')
+      });
+      
+      this.consumer = this.kafka.consumer({
+        groupId,
+        sessionTimeout: 30000,
+        heartbeatInterval: 3000,
+        maxWaitTimeInMs: 5000,
+        retry: {
+          initialRetryTime: 100,
+          retries: 8
+        }
+      });
+      
+      this.handlers = new Map();
     }
 
-    await this.consumer.run({
-      autoCommit,
-      autoCommitInterval: 5000,
-      eachMessage: async ({ topic, partition, message }) => {
-        const event = JSON.parse(message.value.toString());
-        const metadata = {
-          topic,
-          partition,
-          offset: message.offset,
-          key: message.key?.toString(),
-          timestamp: message.timestamp,
-          headers: this.parseHeaders(message.headers)
-        };
+    async connect() {
+      await this.consumer.connect();
+      console.log(`Kafka consumer connected for group: ${this.groupId}`);
+    }
 
-        try {
-          await handler(event, metadata);
-          
-          if (!autoCommit) {
-            await this.consumer.commitOffsets([{
-              topic,
-              partition,
-              offset: (BigInt(message.offset) + 1n).toString()
-            }]);
+    async disconnect() {
+      await this.consumer.disconnect();
+    }
+
+    // Subscribe to topics
+    async subscribe(topics, handler, options = {}) {
+      const { fromBeginning = false, autoCommit = true } = options;
+      
+      for (const topic of topics) {
+        await this.consumer.subscribe({ topic, fromBeginning });
+        console.log(`Subscribed to topic: ${topic}`);
+      }
+
+      await this.consumer.run({
+        autoCommit,
+        autoCommitInterval: 5000,
+        eachMessage: async ({ topic, partition, message }) => {
+          const event = JSON.parse(message.value.toString());
+          const metadata = {
+            topic,
+            partition,
+            offset: message.offset,
+            key: message.key?.toString(),
+            timestamp: message.timestamp,
+            headers: this.parseHeaders(message.headers)
+          };
+
+          try {
+            await handler(event, metadata);
+            
+            if (!autoCommit) {
+              await this.consumer.commitOffsets([{
+                topic,
+                partition,
+                offset: (BigInt(message.offset) + 1n).toString()
+              }]);
+            }
+          } catch (error) {
+            console.error(`Error processing message from ${topic}:`, error);
+            // Could implement retry logic or send to DLQ
+            throw error;
           }
-        } catch (error) {
-          console.error(`Error processing message from ${topic}:`, error);
-          // Could implement retry logic or send to DLQ
-          throw error;
         }
-      }
-    });
-  }
-
-  // Subscribe with batch processing
-  async subscribeBatch(topics, handler, options = {}) {
-    const { fromBeginning = false, batchSize = 100 } = options;
-    
-    for (const topic of topics) {
-      await this.consumer.subscribe({ topic, fromBeginning });
+      });
     }
 
-    await this.consumer.run({
-      autoCommit: false,
-      eachBatch: async ({ batch, resolveOffset, heartbeat, isRunning, isStale }) => {
-        const messages = batch.messages.map(message => ({
-          event: JSON.parse(message.value.toString()),
-          offset: message.offset,
-          key: message.key?.toString()
-        }));
-
-        // Process in chunks
-        for (let i = 0; i < messages.length; i += batchSize) {
-          if (!isRunning() || isStale()) break;
-          
-          const chunk = messages.slice(i, i + batchSize);
-          await handler(chunk, batch.topic, batch.partition);
-          
-          resolveOffset(chunk[chunk.length - 1].offset);
-          await heartbeat();
-        }
+    // Subscribe with batch processing
+    async subscribeBatch(topics, handler, options = {}) {
+      const { fromBeginning = false, batchSize = 100 } = options;
+      
+      for (const topic of topics) {
+        await this.consumer.subscribe({ topic, fromBeginning });
       }
-    });
-  }
 
-  parseHeaders(headers) {
-    const parsed = {};
-    for (const [key, value] of Object.entries(headers || {})) {
-      parsed[key] = value?.toString();
+      await this.consumer.run({
+        autoCommit: false,
+        eachBatch: async ({ batch, resolveOffset, heartbeat, isRunning, isStale }) => {
+          const messages = batch.messages.map(message => ({
+            event: JSON.parse(message.value.toString()),
+            offset: message.offset,
+            key: message.key?.toString()
+          }));
+
+          // Process in chunks
+          for (let i = 0; i < messages.length; i += batchSize) {
+            if (!isRunning() || isStale()) break;
+            
+            const chunk = messages.slice(i, i + batchSize);
+            await handler(chunk, batch.topic, batch.partition);
+            
+            resolveOffset(chunk[chunk.length - 1].offset);
+            await heartbeat();
+          }
+        }
+      });
     }
-    return parsed;
-  }
-}
 
-module.exports = KafkaConsumer;
-```
+    parseHeaders(headers) {
+      const parsed = {};
+      for (const [key, value] of Object.entries(headers || {})) {
+        parsed[key] = value?.toString();
+      }
+      return parsed;
+    }
+  }
+
+  module.exports = KafkaConsumer;
+  ```
+  </Tab>
+  <Tab title="Python">
+  ```python
+  # kafka/consumer.py
+  import json
+  import logging
+  import os
+  from typing import Any, Awaitable, Callable, Iterable
+
+  from aiokafka import AIOKafkaConsumer, TopicPartition
+
+  logger = logging.getLogger(__name__)
+
+  MessageHandler = Callable[[dict[str, Any], dict[str, Any]], Awaitable[None]]
+
+
+  class KafkaConsumer:
+      def __init__(self, group_id: str) -> None:
+          self.group_id = group_id
+          self.service_name = os.getenv("SERVICE_NAME", "unknown")
+          self._consumer: AIOKafkaConsumer | None = None
+
+      async def connect(self, topics: Iterable[str], from_beginning: bool = False) -> None:
+          self._consumer = AIOKafkaConsumer(
+              *topics,
+              bootstrap_servers=os.getenv("KAFKA_BROKERS", "localhost:9092"),
+              group_id=self.group_id,
+              client_id=self.service_name,
+              # Manual commits so we can ensure at-least-once after successful processing.
+              enable_auto_commit=False,
+              auto_offset_reset="earliest" if from_beginning else "latest",
+              session_timeout_ms=30_000,
+              heartbeat_interval_ms=3_000,
+              max_poll_interval_ms=300_000,  # give handlers plenty of time before rebalance
+          )
+          await self._consumer.start()
+          logger.info("Kafka consumer %s connected to %s", self.group_id, list(topics))
+
+      async def disconnect(self) -> None:
+          if self._consumer:
+              await self._consumer.stop()
+
+      async def consume(self, handler: MessageHandler) -> None:
+          """Main consume loop. Commits after successful processing (at-least-once).
+          Raising from the handler stops the loop -- caller decides retry/DLQ policy."""
+          assert self._consumer is not None
+          async for msg in self._consumer:
+              event = json.loads(msg.value)
+              metadata = {
+                  "topic": msg.topic,
+                  "partition": msg.partition,
+                  "offset": msg.offset,
+                  "key": msg.key.decode() if msg.key else None,
+                  "timestamp": msg.timestamp,
+                  "headers": {
+                      k: v.decode() if isinstance(v, (bytes, bytearray)) else v
+                      for k, v in (msg.headers or [])
+                  },
+              }
+              try:
+                  await handler(event, metadata)
+                  # Commit AFTER successful processing. Commit the next offset
+                  # (the position to resume from), which is current + 1.
+                  tp = TopicPartition(msg.topic, msg.partition)
+                  await self._consumer.commit({tp: msg.offset + 1})
+              except Exception:
+                  logger.exception("Error processing %s@%d:%d", msg.topic, msg.partition, msg.offset)
+                  # Caller's responsibility: retry, DLQ, or re-raise.
+                  raise
+
+      async def consume_batches(
+          self,
+          handler: Callable[[list[dict[str, Any]], str, int], Awaitable[None]],
+          batch_size: int = 100,
+          timeout_ms: int = 1000,
+      ) -> None:
+          """Batch consumption improves throughput when the handler can do
+          bulk work (batch DB inserts, bulk external API calls)."""
+          assert self._consumer is not None
+          while True:
+              records = await self._consumer.getmany(
+                  timeout_ms=timeout_ms, max_records=batch_size
+              )
+              for tp, messages in records.items():
+                  if not messages:
+                      continue
+                  events = [json.loads(m.value) for m in messages]
+                  await handler(events, tp.topic, tp.partition)
+                  # Commit the offset after the last message in this batch.
+                  await self._consumer.commit({tp: messages[-1].offset + 1})
+  ```
+  </Tab>
+</Tabs>
 
 ### Order Service with Kafka
 
-```javascript
-// order-service/kafkaEvents.js
-const KafkaProducer = require('../kafka/producer');
+This example illustrates two things worth pausing on. First, note how the producer uses `order.id` as the Kafka key. That's deliberate: all events for a given order (created, paid, shipped, cancelled) will land on the same partition and be consumed in order. If we used random keys or none at all, an "order.paid" event could be processed before "order.created" by different consumers -- a nightmare for downstream services.
 
-class OrderKafkaPublisher {
-  constructor() {
-    this.producer = new KafkaProducer();
-  }
+Second, note the in-memory `processedEvents` set in the consumer. This is a cheap, fragile idempotency mechanism -- it only works if the service never restarts and never runs multiple replicas. Real production idempotency uses Redis, a database table, or a Kafka-native pattern like transactional processing. We're showing the simple version here for clarity; swap it out for a Redis-backed version (shown later) before going to production.
 
-  async initialize() {
-    await this.producer.connect();
-  }
+<Tabs>
+  <Tab title="Node.js">
+  ```javascript
+  // order-service/kafkaEvents.js
+  const KafkaProducer = require('../kafka/producer');
 
-  async orderCreated(order) {
-    // Use orderId as key for ordering
-    await this.producer.send('orders', {
-      eventId: `evt-${Date.now()}`,
-      eventType: 'order.created',
-      occurredAt: new Date().toISOString(),
-      data: {
-        orderId: order.id,
-        customerId: order.customerId,
-        items: order.items,
-        totalAmount: order.totalAmount
-      }
-    }, order.id); // Key ensures same order events go to same partition
-  }
+  class OrderKafkaPublisher {
+    constructor() {
+      this.producer = new KafkaProducer();
+    }
 
-  async orderStatusChanged(orderId, oldStatus, newStatus) {
-    await this.producer.send('orders', {
-      eventId: `evt-${Date.now()}`,
-      eventType: 'order.status_changed',
-      data: { orderId, oldStatus, newStatus }
-    }, orderId);
-  }
-}
+    async initialize() {
+      await this.producer.connect();
+    }
 
-// inventory-service/kafkaHandler.js
-const KafkaConsumer = require('../kafka/consumer');
+    async orderCreated(order) {
+      // Use orderId as key for ordering
+      await this.producer.send('orders', {
+        eventId: `evt-${Date.now()}`,
+        eventType: 'order.created',
+        occurredAt: new Date().toISOString(),
+        data: {
+          orderId: order.id,
+          customerId: order.customerId,
+          items: order.items,
+          totalAmount: order.totalAmount
+        }
+      }, order.id); // Key ensures same order events go to same partition
+    }
 
-class InventoryKafkaHandler {
-  constructor(inventoryService) {
-    this.consumer = new KafkaConsumer('inventory-service');
-    this.inventoryService = inventoryService;
-    this.processedEvents = new Set(); // For idempotency
-  }
-
-  async start() {
-    await this.consumer.connect();
-    
-    await this.consumer.subscribe(['orders'], async (event, metadata) => {
-      // Idempotency check
-      if (this.processedEvents.has(event.eventId)) {
-        console.log(`Skipping duplicate event: ${event.eventId}`);
-        return;
-      }
-
-      switch (event.eventType) {
-        case 'order.created':
-          await this.handleOrderCreated(event.data);
-          break;
-        case 'order.cancelled':
-          await this.handleOrderCancelled(event.data);
-          break;
-      }
-
-      this.processedEvents.add(event.eventId);
-      
-      // Cleanup old event IDs periodically
-      if (this.processedEvents.size > 10000) {
-        this.processedEvents.clear();
-      }
-    });
-  }
-
-  async handleOrderCreated(data) {
-    for (const item of data.items) {
-      await this.inventoryService.reserve(
-        item.productId,
-        item.quantity,
-        data.orderId
-      );
+    async orderStatusChanged(orderId, oldStatus, newStatus) {
+      await this.producer.send('orders', {
+        eventId: `evt-${Date.now()}`,
+        eventType: 'order.status_changed',
+        data: { orderId, oldStatus, newStatus }
+      }, orderId);
     }
   }
 
-  async handleOrderCancelled(data) {
-    await this.inventoryService.releaseByOrder(data.orderId);
+  // inventory-service/kafkaHandler.js
+  const KafkaConsumer = require('../kafka/consumer');
+
+  class InventoryKafkaHandler {
+    constructor(inventoryService) {
+      this.consumer = new KafkaConsumer('inventory-service');
+      this.inventoryService = inventoryService;
+      this.processedEvents = new Set(); // For idempotency
+    }
+
+    async start() {
+      await this.consumer.connect();
+      
+      await this.consumer.subscribe(['orders'], async (event, metadata) => {
+        // Idempotency check
+        if (this.processedEvents.has(event.eventId)) {
+          console.log(`Skipping duplicate event: ${event.eventId}`);
+          return;
+        }
+
+        switch (event.eventType) {
+          case 'order.created':
+            await this.handleOrderCreated(event.data);
+            break;
+          case 'order.cancelled':
+            await this.handleOrderCancelled(event.data);
+            break;
+        }
+
+        this.processedEvents.add(event.eventId);
+        
+        // Cleanup old event IDs periodically
+        if (this.processedEvents.size > 10000) {
+          this.processedEvents.clear();
+        }
+      });
+    }
+
+    async handleOrderCreated(data) {
+      for (const item of data.items) {
+        await this.inventoryService.reserve(
+          item.productId,
+          item.quantity,
+          data.orderId
+        );
+      }
+    }
+
+    async handleOrderCancelled(data) {
+      await this.inventoryService.releaseByOrder(data.orderId);
+    }
   }
-}
-```
+  ```
+  </Tab>
+  <Tab title="Python">
+  ```python
+  # order_service/kafka_events.py
+  import uuid
+  from datetime import datetime, timezone
+  from typing import Any
+
+  from kafka.producer import KafkaProducer
+
+
+  class OrderKafkaPublisher:
+      def __init__(self) -> None:
+          self.producer = KafkaProducer()
+
+      async def initialize(self) -> None:
+          await self.producer.connect()
+
+      async def order_created(self, order: dict[str, Any]) -> None:
+          # key=order["id"] guarantees all events for this order go to the same
+          # partition -> consumers process them in the order they were published.
+          await self.producer.send(
+              topic="orders",
+              message={
+                  "event_id": f"evt-{uuid.uuid4()}",
+                  "event_type": "order.created",
+                  "occurred_at": datetime.now(timezone.utc).isoformat(),
+                  "data": {
+                      "order_id": order["id"],
+                      "customer_id": order["customer_id"],
+                      "items": order["items"],
+                      "total_amount": str(order["total_amount"]),
+                  },
+              },
+              key=order["id"],
+          )
+
+      async def order_status_changed(
+          self, order_id: str, old_status: str, new_status: str
+      ) -> None:
+          await self.producer.send(
+              topic="orders",
+              message={
+                  "event_id": f"evt-{uuid.uuid4()}",
+                  "event_type": "order.status_changed",
+                  "data": {
+                      "order_id": order_id,
+                      "old_status": old_status,
+                      "new_status": new_status,
+                  },
+              },
+              key=order_id,
+          )
+
+
+  # inventory_service/kafka_handler.py
+  from collections import deque
+  from typing import Any
+
+  from kafka.consumer import KafkaConsumer
+
+
+  class InventoryKafkaHandler:
+      def __init__(self, inventory_service) -> None:
+          self.consumer = KafkaConsumer(group_id="inventory-service")
+          self.inventory = inventory_service
+          # Sliding window of recently seen event IDs. Cheap and good enough
+          # for single-instance deployments. Swap for Redis in production.
+          self._processed: set[str] = set()
+          self._processed_order: deque[str] = deque(maxlen=10_000)
+
+      async def start(self) -> None:
+          await self.consumer.connect(topics=["orders"], from_beginning=False)
+          await self.consumer.consume(self._on_event)
+
+      async def _on_event(self, event: dict[str, Any], metadata: dict[str, Any]) -> None:
+          event_id = event["event_id"]
+          if event_id in self._processed:
+              return  # duplicate
+
+          event_type = event["event_type"]
+          if event_type == "order.created":
+              await self._handle_created(event["data"])
+          elif event_type == "order.cancelled":
+              await self._handle_cancelled(event["data"])
+
+          self._processed.add(event_id)
+          self._processed_order.append(event_id)
+          if len(self._processed) > 10_000:
+              # Evict oldest IDs so the set doesn't grow unbounded.
+              while len(self._processed) > 10_000:
+                  old = self._processed_order.popleft()
+                  self._processed.discard(old)
+
+      async def _handle_created(self, data: dict[str, Any]) -> None:
+          for item in data["items"]:
+              await self.inventory.reserve(
+                  item["product_id"], item["quantity"], data["order_id"]
+              )
+
+      async def _handle_cancelled(self, data: dict[str, Any]) -> None:
+          await self.inventory.release_by_order(data["order_id"])
+  ```
+  </Tab>
+</Tabs>
 
 ---
 
 ## Event Design Best Practices
 
+A well-designed event schema is the most underrated investment in an event-driven system. Events are your public API to the rest of the organization -- once a service publishes `order.created` with a certain shape, every downstream consumer depends on it, and changing that shape becomes a coordination nightmare across teams. Unlike HTTP APIs where you can version by URL (`/v1/orders`, `/v2/orders`), events tend to sprawl unversioned because nobody thought to version them.
+
+Spend the 30 minutes at design time to nail down the envelope. Include metadata fields that future-you will need: an event ID for deduplication, an event type for routing, an occurred_at timestamp for temporal queries, a version for schema evolution, a correlation ID for distributed tracing, and the event data itself as a nested object. Separate envelope from payload -- it lets you evolve each independently.
+
+A common anti-pattern: stuffing every possible field into the data object "just in case." Resist. Events should describe what happened, not carry a full entity snapshot. If a consumer needs data that isn't in the event, it should either be in the event (if the producer owns it) or fetched from the producer (if the producer is the authority). Fat events that duplicate every service's data become impossible to evolve.
+
 ### Event Schema Design
 
-```javascript
-// Good Event Schema
-const orderCreatedEvent = {
-  // Metadata
-  eventId: "evt-abc123",           // Unique event identifier
-  eventType: "order.created",       // Dot-notation type
-  eventVersion: "1.2",              // Schema version
-  occurredAt: "2024-01-15T10:30:00Z", // When it happened
-  correlationId: "corr-xyz789",     // For tracing
-  causationId: "cmd-def456",        // What caused this event
-  
-  // Source info
-  source: {
-    service: "order-service",
-    instance: "order-service-pod-abc",
-    environment: "production"
-  },
-  
-  // The actual event data
-  data: {
-    orderId: "ord-123",
-    customerId: "cust-456",
-    items: [
-      { productId: "prod-789", quantity: 2, unitPrice: 29.99 }
-    ],
-    totalAmount: 59.98,
-    currency: "USD",
-    status: "CREATED",
-    createdAt: "2024-01-15T10:30:00Z"
-  }
-};
+<Tabs>
+  <Tab title="Node.js">
+  ```javascript
+  // Good Event Schema
+  const orderCreatedEvent = {
+    // Metadata
+    eventId: "evt-abc123",           // Unique event identifier
+    eventType: "order.created",       // Dot-notation type
+    eventVersion: "1.2",              // Schema version
+    occurredAt: "2024-01-15T10:30:00Z", // When it happened
+    correlationId: "corr-xyz789",     // For tracing
+    causationId: "cmd-def456",        // What caused this event
+    
+    // Source info
+    source: {
+      service: "order-service",
+      instance: "order-service-pod-abc",
+      environment: "production"
+    },
+    
+    // The actual event data
+    data: {
+      orderId: "ord-123",
+      customerId: "cust-456",
+      items: [
+        { productId: "prod-789", quantity: 2, unitPrice: 29.99 }
+      ],
+      totalAmount: 59.98,
+      currency: "USD",
+      status: "CREATED",
+      createdAt: "2024-01-15T10:30:00Z"
+    }
+  };
 
-// Event Type Naming Convention
-const eventTypes = {
-  // Entity.Action format
-  "order.created": "When an order is placed",
-  "order.paid": "When payment is confirmed",
-  "order.shipped": "When order leaves warehouse",
-  "order.delivered": "When customer receives order",
-  "order.cancelled": "When order is cancelled",
-  "order.refunded": "When refund is processed",
-  
-  // For status changes
-  "order.status_changed": "Generic status change",
-  
-  // For sub-entities
-  "order.item_added": "Item added to existing order",
-  "order.item_removed": "Item removed from order"
-};
-```
+  // Event Type Naming Convention
+  const eventTypes = {
+    // Entity.Action format
+    "order.created": "When an order is placed",
+    "order.paid": "When payment is confirmed",
+    "order.shipped": "When order leaves warehouse",
+    "order.delivered": "When customer receives order",
+    "order.cancelled": "When order is cancelled",
+    "order.refunded": "When refund is processed",
+    
+    // For status changes
+    "order.status_changed": "Generic status change",
+    
+    // For sub-entities
+    "order.item_added": "Item added to existing order",
+    "order.item_removed": "Item removed from order"
+  };
+  ```
+  </Tab>
+  <Tab title="Python">
+  ```python
+  # Canonical event schema as a Pydantic model.
+  # Using Pydantic gives you validation at both publish-time (producer) and
+  # consume-time (consumer) -- a malformed event fails fast instead of silently
+  # corrupting downstream state.
+  from datetime import datetime
+  from decimal import Decimal
+  from typing import Any, Literal, Optional
+
+  from pydantic import BaseModel, Field
+
+
+  class EventSource(BaseModel):
+      service: str
+      instance: str
+      environment: Literal["development", "staging", "production"]
+
+
+  class OrderItem(BaseModel):
+      product_id: str
+      quantity: int = Field(ge=1)
+      unit_price: Decimal
+
+
+  class OrderCreatedData(BaseModel):
+      order_id: str
+      customer_id: str
+      items: list[OrderItem]
+      total_amount: Decimal
+      currency: str = "USD"
+      status: Literal["CREATED", "PAID", "SHIPPED", "CANCELLED"]
+      created_at: datetime
+
+
+  class OrderCreatedEvent(BaseModel):
+      # Envelope
+      event_id: str
+      event_type: Literal["order.created"] = "order.created"
+      event_version: str = "1.2"
+      occurred_at: datetime
+      correlation_id: Optional[str] = None
+      causation_id: Optional[str] = None
+      source: EventSource
+      # Payload
+      data: OrderCreatedData
+
+
+  # Event type naming convention -- entity.action, lowercase, dot-separated.
+  EVENT_TYPES: dict[str, str] = {
+      # Lifecycle
+      "order.created": "When an order is placed",
+      "order.paid": "When payment is confirmed",
+      "order.shipped": "When order leaves warehouse",
+      "order.delivered": "When customer receives order",
+      "order.cancelled": "When order is cancelled",
+      "order.refunded": "When refund is processed",
+      # Generic state change
+      "order.status_changed": "Generic status change",
+      # Sub-entity events
+      "order.item_added": "Item added to existing order",
+      "order.item_removed": "Item removed from order",
+  }
+  ```
+  </Tab>
+</Tabs>
 
 ### Schema Evolution
 
-```javascript
-// Version 1.0
-const eventV1 = {
-  eventType: "order.created",
-  eventVersion: "1.0",
-  data: {
-    orderId: "ord-123",
-    customerId: "cust-456",
-    total: 59.98  // Just a number
-  }
-};
+Schemas must evolve; the goal is to evolve them without breaking every consumer. There are two kinds of changes: **backward-compatible** (old consumers can still parse new events -- e.g., adding an optional field) and **breaking** (old consumers will error or misinterpret -- e.g., removing a field, renaming a field, changing a field's type). Backward-compatible changes are free; breaking changes require careful orchestration.
 
-// Version 1.1 - Added field (backward compatible)
-const eventV1_1 = {
-  eventType: "order.created",
-  eventVersion: "1.1",
-  data: {
-    orderId: "ord-123",
-    customerId: "cust-456",
-    total: 59.98,
-    currency: "USD"  // New optional field
-  }
-};
+The standard strategy: never make a breaking change in place. Instead, publish both the old and new schema in parallel for a migration period. Roll consumers onto the new schema one by one, monitor that they're healthy, then retire the old schema once all consumers have moved. This is tedious but it's the only way to coordinate schema changes across teams without forcing a synchronous upgrade.
 
-// Version 2.0 - Breaking change
-const eventV2 = {
-  eventType: "order.created",
-  eventVersion: "2.0",
-  data: {
-    orderId: "ord-123",
-    customerId: "cust-456",
-    amount: {          // Changed structure
-      value: 59.98,
-      currency: "USD"
+Use a **schema registry** (Confluent Schema Registry, AWS Glue Schema Registry, or Azure Schema Registry) for anything beyond toy scale. It enforces compatibility rules at publish time -- a producer trying to publish a breaking change gets rejected before the broker ever sees it. This is much better than discovering the break in production when three consumer services crash.
+
+<Tabs>
+  <Tab title="Node.js">
+  ```javascript
+  // Version 1.0
+  const eventV1 = {
+    eventType: "order.created",
+    eventVersion: "1.0",
+    data: {
+      orderId: "ord-123",
+      customerId: "cust-456",
+      total: 59.98  // Just a number
     }
-  }
-};
+  };
 
-// Consumer handling multiple versions
-class EventHandler {
-  handleOrderCreated(event) {
-    const version = event.eventVersion;
+  // Version 1.1 - Added field (backward compatible)
+  const eventV1_1 = {
+    eventType: "order.created",
+    eventVersion: "1.1",
+    data: {
+      orderId: "ord-123",
+      customerId: "cust-456",
+      total: 59.98,
+      currency: "USD"  // New optional field
+    }
+  };
+
+  // Version 2.0 - Breaking change
+  const eventV2 = {
+    eventType: "order.created",
+    eventVersion: "2.0",
+    data: {
+      orderId: "ord-123",
+      customerId: "cust-456",
+      amount: {          // Changed structure
+        value: 59.98,
+        currency: "USD"
+      }
+    }
+  };
+
+  // Consumer handling multiple versions
+  class EventHandler {
+    handleOrderCreated(event) {
+      const version = event.eventVersion;
+      
+      if (version.startsWith('1.')) {
+        return this.handleV1(event.data);
+      } else if (version.startsWith('2.')) {
+        return this.handleV2(event.data);
+      } else {
+        throw new Error(`Unsupported event version: ${version}`);
+      }
+    }
     
-    if (version.startsWith('1.')) {
-      return this.handleV1(event.data);
-    } else if (version.startsWith('2.')) {
-      return this.handleV2(event.data);
-    } else {
-      throw new Error(`Unsupported event version: ${version}`);
+    handleV1(data) {
+      // Handle v1.x events
+      const amount = {
+        value: data.total,
+        currency: data.currency || 'USD'
+      };
+      // ... process
+    }
+    
+    handleV2(data) {
+      // Handle v2.x events
+      const amount = data.amount;
+      // ... process
     }
   }
-  
-  handleV1(data) {
-    // Handle v1.x events
-    const amount = {
-      value: data.total,
-      currency: data.currency || 'USD'
-    };
-    // ... process
+  ```
+  </Tab>
+  <Tab title="Python">
+  ```python
+  from decimal import Decimal
+  from typing import Any
+
+
+  # Version 1.0
+  event_v1 = {
+      "event_type": "order.created",
+      "event_version": "1.0",
+      "data": {
+          "order_id": "ord-123",
+          "customer_id": "cust-456",
+          "total": 59.98,  # just a number
+      },
   }
-  
-  handleV2(data) {
-    // Handle v2.x events
-    const amount = data.amount;
-    // ... process
+
+  # Version 1.1 - additive (backward compatible)
+  event_v1_1 = {
+      "event_type": "order.created",
+      "event_version": "1.1",
+      "data": {
+          "order_id": "ord-123",
+          "customer_id": "cust-456",
+          "total": 59.98,
+          "currency": "USD",  # new optional field
+      },
   }
-}
-```
+
+  # Version 2.0 - breaking (shape change)
+  event_v2 = {
+      "event_type": "order.created",
+      "event_version": "2.0",
+      "data": {
+          "order_id": "ord-123",
+          "customer_id": "cust-456",
+          "amount": {"value": 59.98, "currency": "USD"},
+      },
+  }
+
+
+  class EventHandler:
+      """Handle multiple schema versions by dispatching on event_version.
+      Keep one code path per major version; retire old ones only after all
+      producers have upgraded."""
+
+      async def handle_order_created(self, event: dict[str, Any]) -> None:
+          version: str = event["event_version"]
+          data = event["data"]
+          if version.startswith("1."):
+              await self._handle_v1(data)
+          elif version.startswith("2."):
+              await self._handle_v2(data)
+          else:
+              raise ValueError(f"Unsupported event version: {version}")
+
+      async def _handle_v1(self, data: dict[str, Any]) -> None:
+          amount = {
+              "value": Decimal(str(data["total"])),
+              "currency": data.get("currency", "USD"),
+          }
+          # ... process with normalized amount
+
+      async def _handle_v2(self, data: dict[str, Any]) -> None:
+          amount = data["amount"]  # already structured
+          # ... process
+  ```
+  </Tab>
+</Tabs>
 
 ---
 
 ## Message Guarantees
 
+There are three possible delivery semantics, and understanding which one you have (and which one you need) is fundamental. **At-most-once**: each message is delivered zero or one times -- no duplicates, but you can lose messages on failure. Use only when lost data is acceptable (e.g., click telemetry). **At-least-once**: each message is delivered one or more times -- no data loss, but duplicates are possible. This is the default sane choice and what you'll want 90% of the time. **Exactly-once**: each message is delivered exactly once. Sounds ideal, but it's expensive, only works within specific technology boundaries (Kafka transactions, for example), and does not cross from messaging into side effects like sending emails or calling external APIs.
+
+The practical answer is almost always "at-least-once with idempotent consumers." Accept that duplicates will happen and make your handlers safe to run twice. This is radically simpler than chasing exactly-once across service boundaries, and it works with any broker.
+
 ### At-Least-Once Delivery
 
-```javascript
-// Consumer with at-least-once guarantee
-// Messages may be processed multiple times
-class AtLeastOnceConsumer {
-  constructor(channel) {
-    this.channel = channel;
-  }
+<Tabs>
+  <Tab title="Node.js">
+  ```javascript
+  // Consumer with at-least-once guarantee
+  // Messages may be processed multiple times
+  class AtLeastOnceConsumer {
+    constructor(channel) {
+      this.channel = channel;
+    }
 
-  async consume(queue, handler) {
-    await this.channel.prefetch(1);
-    
-    await this.channel.consume(queue, async (msg) => {
-      try {
-        await handler(JSON.parse(msg.content.toString()));
-        // Only ack after successful processing
-        this.channel.ack(msg);
-      } catch (error) {
-        // Requeue for retry
-        this.channel.nack(msg, false, true);
-      }
-    });
+    async consume(queue, handler) {
+      await this.channel.prefetch(1);
+      
+      await this.channel.consume(queue, async (msg) => {
+        try {
+          await handler(JSON.parse(msg.content.toString()));
+          // Only ack after successful processing
+          this.channel.ack(msg);
+        } catch (error) {
+          // Requeue for retry
+          this.channel.nack(msg, false, true);
+        }
+      });
+    }
   }
-}
-```
+  ```
+  </Tab>
+  <Tab title="Python">
+  ```python
+  # At-least-once: ack AFTER successful processing; on failure, nack with
+  # requeue=True so the broker redelivers. Duplicates are possible if the
+  # consumer crashes after processing but before the ack -- your handler
+  # MUST be idempotent.
+  import json
+  from typing import Any, Awaitable, Callable
+
+  from aio_pika.abc import AbstractIncomingMessage, AbstractRobustChannel
+
+
+  class AtLeastOnceConsumer:
+      def __init__(self, channel: AbstractRobustChannel) -> None:
+          self.channel = channel
+
+      async def consume(
+          self,
+          queue_name: str,
+          handler: Callable[[dict[str, Any]], Awaitable[None]],
+      ) -> None:
+          await self.channel.set_qos(prefetch_count=1)
+          queue = await self.channel.declare_queue(queue_name, durable=True)
+
+          async def _on_message(message: AbstractIncomingMessage) -> None:
+              try:
+                  await handler(json.loads(message.body))
+                  await message.ack()
+              except Exception:
+                  # requeue=True puts it back on the queue for redelivery.
+                  await message.nack(requeue=True)
+
+          await queue.consume(_on_message)
+  ```
+  </Tab>
+</Tabs>
 
 ### Idempotent Consumer
 
-```javascript
-// Idempotent consumer - safe for at-least-once delivery
-class IdempotentConsumer {
-  constructor(channel, idempotencyStore) {
-    this.channel = channel;
-    this.store = idempotencyStore; // Redis or database
-  }
+Idempotency is the single most important property for at-least-once messaging. An idempotent handler produces the same result no matter how many times it runs with the same input. "Charge customer $50" is not idempotent -- run it twice, charge twice. "Set order total to $50" is idempotent. "Insert order record" is not idempotent without a unique constraint; "Insert order record if not exists" is.
 
-  async consume(queue, handler) {
-    await this.channel.consume(queue, async (msg) => {
-      const eventId = msg.properties.messageId;
-      
-      // Check if already processed
-      const isProcessed = await this.store.isProcessed(eventId);
-      if (isProcessed) {
-        console.log(`Skipping duplicate: ${eventId}`);
-        this.channel.ack(msg);
-        return;
-      }
+The standard implementation: before processing, atomically check "have I seen this event ID before?" in a shared store (Redis, a DB table). If yes, ack and skip. If no, process, record that you've seen it, then ack. The tricky part is atomicity -- you need the "record" step to be in the same transaction as the business operation, otherwise you can crash between them and still double-process. Many production systems use a database table as the idempotency store alongside the business DB specifically to get a single transaction.
 
-      try {
-        const content = JSON.parse(msg.content.toString());
+<Tabs>
+  <Tab title="Node.js">
+  ```javascript
+  // Idempotent consumer - safe for at-least-once delivery
+  class IdempotentConsumer {
+    constructor(channel, idempotencyStore) {
+      this.channel = channel;
+      this.store = idempotencyStore; // Redis or database
+    }
+
+    async consume(queue, handler) {
+      await this.channel.consume(queue, async (msg) => {
+        const eventId = msg.properties.messageId;
         
-        // Process with idempotency key
-        await this.store.startProcessing(eventId);
-        await handler(content);
-        await this.store.markProcessed(eventId);
-        
-        this.channel.ack(msg);
-      } catch (error) {
-        await this.store.clearProcessing(eventId);
-        this.channel.nack(msg, false, true);
-      }
-    });
-  }
-}
+        // Check if already processed
+        const isProcessed = await this.store.isProcessed(eventId);
+        if (isProcessed) {
+          console.log(`Skipping duplicate: ${eventId}`);
+          this.channel.ack(msg);
+          return;
+        }
 
-// Redis-based idempotency store
-class RedisIdempotencyStore {
-  constructor(redis) {
-    this.redis = redis;
-    this.ttl = 7 * 24 * 60 * 60; // 7 days
-  }
-
-  async isProcessed(eventId) {
-    const status = await this.redis.get(`event:${eventId}`);
-    return status === 'processed';
-  }
-
-  async startProcessing(eventId) {
-    // Use SETNX to prevent concurrent processing
-    const set = await this.redis.set(
-      `event:${eventId}`,
-      'processing',
-      'NX',
-      'EX',
-      300 // 5 minute lock
-    );
-    if (!set) {
-      throw new Error('Event already being processed');
+        try {
+          const content = JSON.parse(msg.content.toString());
+          
+          // Process with idempotency key
+          await this.store.startProcessing(eventId);
+          await handler(content);
+          await this.store.markProcessed(eventId);
+          
+          this.channel.ack(msg);
+        } catch (error) {
+          await this.store.clearProcessing(eventId);
+          this.channel.nack(msg, false, true);
+        }
+      });
     }
   }
 
-  async markProcessed(eventId) {
-    await this.redis.set(`event:${eventId}`, 'processed', 'EX', this.ttl);
-  }
+  // Redis-based idempotency store
+  class RedisIdempotencyStore {
+    constructor(redis) {
+      this.redis = redis;
+      this.ttl = 7 * 24 * 60 * 60; // 7 days
+    }
 
-  async clearProcessing(eventId) {
-    await this.redis.del(`event:${eventId}`);
+    async isProcessed(eventId) {
+      const status = await this.redis.get(`event:${eventId}`);
+      return status === 'processed';
+    }
+
+    async startProcessing(eventId) {
+      // Use SETNX to prevent concurrent processing
+      const set = await this.redis.set(
+        `event:${eventId}`,
+        'processing',
+        'NX',
+        'EX',
+        300 // 5 minute lock
+      );
+      if (!set) {
+        throw new Error('Event already being processed');
+      }
+    }
+
+    async markProcessed(eventId) {
+      await this.redis.set(`event:${eventId}`, 'processed', 'EX', this.ttl);
+    }
+
+    async clearProcessing(eventId) {
+      await this.redis.del(`event:${eventId}`);
+    }
   }
-}
-```
+  ```
+  </Tab>
+  <Tab title="Python">
+  ```python
+  # Idempotent consumer with a Redis-backed store.
+  # Two-phase: SETNX 'processing' lock -> handler -> mark 'processed'.
+  # If the handler fails, clear the lock so retries can succeed.
+  import json
+  from typing import Any, Awaitable, Callable
+
+  import redis.asyncio as aioredis
+  from aio_pika.abc import AbstractIncomingMessage, AbstractRobustChannel
+
+
+  class RedisIdempotencyStore:
+      """Tracks event IDs in Redis with a 7-day TTL. Short enough to be cheap,
+      long enough to cover every reasonable duplicate scenario."""
+
+      def __init__(self, redis: aioredis.Redis) -> None:
+          self.redis = redis
+          self.ttl = 7 * 24 * 60 * 60  # seconds
+
+      async def is_processed(self, event_id: str) -> bool:
+          status = await self.redis.get(f"event:{event_id}")
+          return status == b"processed"
+
+      async def start_processing(self, event_id: str) -> None:
+          # NX = only set if not exists. Prevents two workers from concurrently
+          # processing the same event. 5-minute lock in case a worker crashes.
+          ok = await self.redis.set(
+              f"event:{event_id}", "processing", nx=True, ex=300
+          )
+          if not ok:
+              raise RuntimeError(f"Event {event_id} already being processed")
+
+      async def mark_processed(self, event_id: str) -> None:
+          await self.redis.set(f"event:{event_id}", "processed", ex=self.ttl)
+
+      async def clear_processing(self, event_id: str) -> None:
+          await self.redis.delete(f"event:{event_id}")
+
+
+  class IdempotentConsumer:
+      def __init__(
+          self,
+          channel: AbstractRobustChannel,
+          store: RedisIdempotencyStore,
+      ) -> None:
+          self.channel = channel
+          self.store = store
+
+      async def consume(
+          self,
+          queue_name: str,
+          handler: Callable[[dict[str, Any]], Awaitable[None]],
+      ) -> None:
+          queue = await self.channel.declare_queue(queue_name, durable=True)
+
+          async def _on_message(message: AbstractIncomingMessage) -> None:
+              event_id = message.message_id or ""
+              if await self.store.is_processed(event_id):
+                  await message.ack()  # duplicate, already handled
+                  return
+              try:
+                  await self.store.start_processing(event_id)
+                  await handler(json.loads(message.body))
+                  await self.store.mark_processed(event_id)
+                  await message.ack()
+              except Exception:
+                  await self.store.clear_processing(event_id)
+                  await message.nack(requeue=True)
+
+          await queue.consume(_on_message)
+  ```
+  </Tab>
+</Tabs>
 
 ### Exactly-Once with Kafka
 
-```javascript
-// Kafka exactly-once semantics
-const producer = kafka.producer({
-  idempotent: true,  // Enable idempotent producer
-  transactionalId: 'order-processor'  // For transactions
-});
+Kafka's "exactly-once semantics" (EOS) is the closest any broker comes to the real thing, but it has a strict scope: it only guarantees exactly-once within Kafka -- meaning a consume-transform-produce loop where input, output, and consumer offsets are all committed in one transaction. It does not extend to calling an external service or writing to an arbitrary database. The moment your side effect leaves the Kafka-aware world, you're back to at-least-once territory and need idempotency.
 
-// Transactional producer
-await producer.transaction();
+Practically: use Kafka transactions for stream-processing jobs that read from one topic, transform, and write to another topic. Use idempotent consumers for anything involving external side effects. Don't let the "exactly-once" marketing fool you into thinking you've escaped duplicate handling entirely.
 
-try {
-  await producer.send({
-    topic: 'orders-processed',
-    messages: [{ value: JSON.stringify(result) }]
+<Tabs>
+  <Tab title="Node.js">
+  ```javascript
+  // Kafka exactly-once semantics
+  const producer = kafka.producer({
+    idempotent: true,  // Enable idempotent producer
+    transactionalId: 'order-processor'  // For transactions
   });
-  
-  // Commit consumer offsets in same transaction
-  await producer.sendOffsets({
-    consumerGroupId: 'order-processor',
-    topics: [{
-      topic: 'orders',
-      partitions: [{ partition: 0, offset: '100' }]
-    }]
-  });
-  
-  await producer.commit();
-} catch (error) {
-  await producer.abort();
-  throw error;
-}
-```
+
+  // Transactional producer
+  await producer.transaction();
+
+  try {
+    await producer.send({
+      topic: 'orders-processed',
+      messages: [{ value: JSON.stringify(result) }]
+    });
+    
+    // Commit consumer offsets in same transaction
+    await producer.sendOffsets({
+      consumerGroupId: 'order-processor',
+      topics: [{
+        topic: 'orders',
+        partitions: [{ partition: 0, offset: '100' }]
+      }]
+    });
+    
+    await producer.commit();
+  } catch (error) {
+    await producer.abort();
+    throw error;
+  }
+  ```
+  </Tab>
+  <Tab title="Python">
+  ```python
+  # Kafka exactly-once in Python via aiokafka's transactional API.
+  # Scope: only covers "consume -> produce -> commit offset" within Kafka.
+  # Side effects outside Kafka (DB writes, API calls) still need idempotency.
+  from aiokafka import AIOKafkaProducer, TopicPartition
+
+  producer = AIOKafkaProducer(
+      bootstrap_servers="localhost:9092",
+      enable_idempotence=True,
+      transactional_id="order-processor",
+  )
+  await producer.start()
+
+  try:
+      async with producer.transaction():
+          await producer.send(
+              topic="orders-processed",
+              value=b'{"status": "done"}',
+          )
+          # Commit the consumer offsets inside the same transaction.
+          # This ties the output message and the input offset together --
+          # either both commit or neither does.
+          await producer.send_offsets_to_transaction(
+              {TopicPartition("orders", 0): 100},
+              group_id="order-processor",
+          )
+  except Exception:
+      # aborting happens automatically if the context manager exits with an exception,
+      # but re-raise so the caller sees the failure.
+      raise
+  finally:
+      await producer.stop()
+  ```
+  </Tab>
+</Tabs>
 
 ---
 
@@ -1130,82 +2225,183 @@ Dead Letter Queues (DLQs) are the exception-handling mechanism of async systems.
 
 **Production pitfall:** The number one operational mistake with DLQs is not monitoring them. Teams set up DLQs, messages silently accumulate, and nobody notices until a customer reports that their order from two weeks ago never shipped. Set up alerts on DLQ depth, and build a simple admin tool to inspect and replay DLQ messages.
 
-```javascript
-// Dead Letter Queue Handler
-class DeadLetterHandler {
-  constructor(channel) {
-    this.channel = channel;
-  }
+<Tabs>
+  <Tab title="Node.js">
+  ```javascript
+  // Dead Letter Queue Handler
+  class DeadLetterHandler {
+    constructor(channel) {
+      this.channel = channel;
+    }
 
-  async setupDLQ(originalQueue) {
-    const dlqName = `${originalQueue}.dlq`;
-    
-    // Create DLQ
-    await this.channel.assertQueue(dlqName, { durable: true });
-    
-    // Create original queue with DLX
-    await this.channel.assertQueue(originalQueue, {
-      durable: true,
-      deadLetterExchange: '',
-      deadLetterRoutingKey: dlqName
-    });
-  }
-
-  async processDLQ(dlqName, retryHandler) {
-    await this.channel.consume(dlqName, async (msg) => {
-      const content = JSON.parse(msg.content.toString());
-      const headers = msg.properties.headers || {};
-      const deathInfo = headers['x-death']?.[0];
+    async setupDLQ(originalQueue) {
+      const dlqName = `${originalQueue}.dlq`;
       
-      console.log(`DLQ message:`, {
-        originalQueue: deathInfo?.queue,
-        reason: deathInfo?.reason,
-        count: deathInfo?.count,
-        firstDeathTime: deathInfo?.time
+      // Create DLQ
+      await this.channel.assertQueue(dlqName, { durable: true });
+      
+      // Create original queue with DLX
+      await this.channel.assertQueue(originalQueue, {
+        durable: true,
+        deadLetterExchange: '',
+        deadLetterRoutingKey: dlqName
       });
+    }
 
-      try {
-        // Attempt manual retry or alerting
-        const shouldRetry = await retryHandler(content, deathInfo);
+    async processDLQ(dlqName, retryHandler) {
+      await this.channel.consume(dlqName, async (msg) => {
+        const content = JSON.parse(msg.content.toString());
+        const headers = msg.properties.headers || {};
+        const deathInfo = headers['x-death']?.[0];
         
-        if (shouldRetry) {
-          // Send back to original queue
-          await this.channel.sendToQueue(
-            deathInfo.queue,
-            Buffer.from(JSON.stringify(content)),
-            {
-              headers: {
-                ...headers,
-                'x-manual-retry': true,
-                'x-retry-timestamp': Date.now()
+        console.log(`DLQ message:`, {
+          originalQueue: deathInfo?.queue,
+          reason: deathInfo?.reason,
+          count: deathInfo?.count,
+          firstDeathTime: deathInfo?.time
+        });
+
+        try {
+          // Attempt manual retry or alerting
+          const shouldRetry = await retryHandler(content, deathInfo);
+          
+          if (shouldRetry) {
+            // Send back to original queue
+            await this.channel.sendToQueue(
+              deathInfo.queue,
+              Buffer.from(JSON.stringify(content)),
+              {
+                headers: {
+                  ...headers,
+                  'x-manual-retry': true,
+                  'x-retry-timestamp': Date.now()
+                }
               }
-            }
-          );
-        } else {
-          // Store for investigation
-          await this.storeForInvestigation(content, deathInfo);
+            );
+          } else {
+            // Store for investigation
+            await this.storeForInvestigation(content, deathInfo);
+          }
+          
+          this.channel.ack(msg);
+        } catch (error) {
+          console.error('DLQ processing error:', error);
+          // Keep in DLQ for manual intervention
+          this.channel.nack(msg, false, false);
         }
-        
-        this.channel.ack(msg);
-      } catch (error) {
-        console.error('DLQ processing error:', error);
-        // Keep in DLQ for manual intervention
-        this.channel.nack(msg, false, false);
-      }
-    });
-  }
+      });
+    }
 
-  async storeForInvestigation(message, deathInfo) {
-    // Store in database for manual investigation
-    await db.collection('failed_messages').insertOne({
-      message,
-      deathInfo,
-      storedAt: new Date(),
-      status: 'pending_investigation'
-    });
+    async storeForInvestigation(message, deathInfo) {
+      // Store in database for manual investigation
+      await db.collection('failed_messages').insertOne({
+        message,
+        deathInfo,
+        storedAt: new Date(),
+        status: 'pending_investigation'
+      });
+    }
   }
-}
-```
+  ```
+  </Tab>
+  <Tab title="Python">
+  ```python
+  # DLQ handler: picks up messages that exhausted retries, lets a human or
+  # automated policy decide to replay or park for investigation.
+  import json
+  import logging
+  from datetime import datetime, timezone
+  from typing import Any, Awaitable, Callable, Optional
+
+  import aio_pika
+  from aio_pika.abc import AbstractIncomingMessage, AbstractRobustChannel
+
+  logger = logging.getLogger(__name__)
+
+  RetryDecision = Callable[[dict[str, Any], Optional[dict[str, Any]]], Awaitable[bool]]
+
+
+  class DeadLetterHandler:
+      def __init__(self, channel: AbstractRobustChannel, db) -> None:
+          self.channel = channel
+          self.db = db  # e.g., motor client for MongoDB
+
+      async def setup_dlq(self, original_queue: str) -> None:
+          dlq_name = f"{original_queue}.dlq"
+          await self.channel.declare_queue(dlq_name, durable=True)
+          await self.channel.declare_queue(
+              original_queue,
+              durable=True,
+              arguments={
+                  "x-dead-letter-exchange": "",
+                  "x-dead-letter-routing-key": dlq_name,
+              },
+          )
+
+      async def process_dlq(
+          self,
+          dlq_name: str,
+          retry_decision: RetryDecision,
+      ) -> None:
+          queue = await self.channel.declare_queue(dlq_name, durable=True)
+
+          async def _on_message(message: AbstractIncomingMessage) -> None:
+              try:
+                  content = json.loads(message.body)
+                  headers = dict(message.headers or {})
+                  death = (headers.get("x-death") or [{}])[0]
+
+                  logger.warning(
+                      "DLQ message: original_queue=%s reason=%s count=%s first_death=%s",
+                      death.get("queue"),
+                      death.get("reason"),
+                      death.get("count"),
+                      death.get("time"),
+                  )
+
+                  should_retry = await retry_decision(content, death)
+                  if should_retry and death.get("queue"):
+                      # Replay to the original queue with a manual-retry marker.
+                      new_headers = {
+                          **headers,
+                          "x-manual-retry": True,
+                          "x-retry-timestamp": datetime.now(timezone.utc).isoformat(),
+                      }
+                      await self.channel.default_exchange.publish(
+                          aio_pika.Message(
+                              body=message.body,
+                              headers=new_headers,
+                              content_type=message.content_type,
+                              delivery_mode=aio_pika.DeliveryMode.PERSISTENT,
+                          ),
+                          routing_key=death["queue"],
+                      )
+                  else:
+                      await self._store_for_investigation(content, death)
+                  await message.ack()
+              except Exception:
+                  logger.exception("DLQ processing failed")
+                  # Keep in DLQ for manual intervention -- don't requeue.
+                  await message.nack(requeue=False)
+
+          await queue.consume(_on_message)
+
+      async def _store_for_investigation(
+          self,
+          message: dict[str, Any],
+          death_info: dict[str, Any],
+      ) -> None:
+          await self.db.failed_messages.insert_one(
+              {
+                  "message": message,
+                  "death_info": death_info,
+                  "stored_at": datetime.now(timezone.utc),
+                  "status": "pending_investigation",
+              }
+          )
+  ```
+  </Tab>
+</Tabs>
 
 ---
 

@@ -7,6 +7,8 @@ description: "Master client-side vs server-side load balancing, algorithms, heal
 
 Load balancing is critical for distributing traffic across service instances efficiently and reliably. Think of a load balancer like a restaurant host seating guests -- a bad host sends everyone to the same table while others sit empty. A good host considers which section has capacity, which server is fastest, and whether a particular guest always sits in the same spot. The choice of algorithm matters far more than most teams realize: the wrong algorithm under high load can turn a 50ms request into a 5-second timeout.
 
+The reason load balancing deserves an entire chapter is that it sits at the fault line between two very different worlds. On one side is capacity planning: do your instances have enough CPU to handle expected load? On the other side is latency engineering: are requests reaching the fastest instance right now? A naive load balancer solves the first problem but ignores the second -- it will happily route 20% of traffic to a dying instance because "it is still in the pool." A sophisticated load balancer treats every instance as a live, shifting quantity and routes based on real-time behavior, not static configuration. The patterns in this chapter exist because teams have learned, often painfully, that assumptions about instance health do not hold under load.
+
 <Info>
 **Learning Objectives:**
 - Understand client-side vs server-side load balancing
@@ -18,6 +20,10 @@ Load balancing is critical for distributing traffic across service instances eff
 ---
 
 ## Client-Side vs Server-Side Load Balancing
+
+Before choosing an algorithm, you must first choose **where the load balancing happens**. This is one of the most consequential architectural decisions in microservices, and yet most teams default to whatever their platform provides (Kubernetes Service -> server-side, gRPC -> client-side) without understanding the tradeoffs. Server-side load balancing is simpler: clients talk to a single endpoint and the load balancer decides where traffic goes. Client-side load balancing is more powerful: the client itself knows about all backend instances and decides directly, eliminating one network hop and enabling per-request routing intelligence.
+
+The catch with server-side: you have added a proxy that every request traverses. If that proxy is slow, has bugs, or is overloaded, all your traffic suffers. The catch with client-side: every service that calls the target service needs the load balancing logic embedded in it -- a Python service, a Go service, and a Node service all need compatible client-side load balancers. This is why companies like Netflix and Uber built service meshes (Envoy, Linkerd): they give you client-side load balancing without forcing every language to reimplement it. In modern microservices, the answer is often "both" -- server-side at the edge (for external traffic) and client-side or mesh-based internally.
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
@@ -56,6 +62,10 @@ Load balancing is critical for distributing traffic across service instances eff
 ```
 
 ### Server-Side: NGINX Configuration
+
+NGINX has been the default choice for server-side HTTP load balancing for over a decade, and the config below demonstrates why. Notice how the configuration is declarative -- you describe the upstream pool, the algorithm, the health check rules, and let NGINX handle the mechanics. The downside is also visible: this configuration is static. To change weights or add a server, you edit the file and reload NGINX. That does not scale when you have 50 microservices and hundreds of instances coming and going via Kubernetes autoscaling. This is why cloud-native environments prefer dynamic service discovery (Consul, Kubernetes Service, Envoy xDS) even though the underlying algorithms are the same.
+
+One specific anti-pattern worth highlighting: running NGINX with `ip_hash` and then wondering why one server is overwhelmed. `ip_hash` buckets clients by IP, so if most of your traffic comes from a small number of IPs (think mobile carriers, corporate NATs), the distribution will be badly skewed. Use `ip_hash` only when you genuinely need session affinity and you have verified your client IP distribution is diverse.
 
 ```nginx
 # nginx.conf - Production-ready load balancing
@@ -108,220 +118,445 @@ server {
 }
 ```
 
-### Client-Side: Node.js Implementation
+### Client-Side: Implementation
 
-```javascript
-// client-side-lb.js - Client-side load balancing with service discovery
+Now let us build client-side load balancing from scratch. The goal of this implementation is to show the moving parts clearly: service discovery integration, health check loop, algorithm selection, and automatic retry with failover. In production you would typically not implement this yourself -- you would use gRPC's built-in load balancer, a service mesh like Linkerd, or a library like Netflix's Ribbon (Java) or go-micro (Go). But understanding the mechanics is essential because when something goes wrong (and it will), you need to know which layer to debug.
 
-const EventEmitter = require('events');
+Pay close attention to how we track per-instance metrics (activeConnections, responseTime, consecutiveFailures). These are the inputs that make intelligent algorithms like least-connections and least-response-time actually work. Without this tracking, your "load balancer" is just round-robin with extra steps. The failure-counting logic is subtle: we remove an instance after 3 consecutive failures, but a single success resets the counter. This prevents flapping when a network blip causes one failed request, while still catching instances that are genuinely broken.
 
-class ClientSideLoadBalancer extends EventEmitter {
-  constructor(options = {}) {
-    super();
-    this.serviceName = options.serviceName;
-    this.registry = options.registry;
-    this.algorithm = options.algorithm || 'round-robin';
-    this.healthCheckInterval = options.healthCheckInterval || 10000;
-    
-    this.instances = [];
-    this.currentIndex = 0;
-    this.healthStatus = new Map();
-    
-    this.initializeDiscovery();
-    this.startHealthChecks();
-  }
+What would happen if you skipped the health check entirely? The load balancer would continue sending 20% of traffic to a dead instance until the service registry eventually removed it (typically 30-60 seconds later). Every one of those requests would time out or return 502 errors, multiplying the impact of a single instance failure. Client-side health checks close this gap -- you start routing away from unhealthy instances within seconds, not minutes.
 
-  async initializeDiscovery() {
-    // Initial fetch from service registry
-    await this.refreshInstances();
-    
-    // Subscribe to registry updates
-    this.registry.on('instances-changed', (serviceName) => {
-      if (serviceName === this.serviceName) {
-        this.refreshInstances();
-      }
-    });
-  }
+<Tabs>
+  <Tab title="Node.js">
+  ```javascript
+  // client-side-lb.js - Client-side load balancing with service discovery
 
-  async refreshInstances() {
-    try {
-      const instances = await this.registry.getInstances(this.serviceName);
-      this.instances = instances.map(instance => ({
-        ...instance,
-        weight: instance.weight || 1,
-        activeConnections: 0,
-        responseTime: 0,
-        consecutiveFailures: 0
-      }));
-      this.emit('instances-updated', this.instances);
-    } catch (error) {
-      this.emit('error', error);
-    }
-  }
+  const EventEmitter = require('events');
 
-  startHealthChecks() {
-    setInterval(async () => {
-      for (const instance of this.instances) {
-        try {
-          const start = Date.now();
-          const response = await fetch(`http://${instance.host}:${instance.port}/health`, {
-            timeout: 5000
-          });
-          const latency = Date.now() - start;
-          
-          this.healthStatus.set(instance.id, {
-            healthy: response.ok,
-            latency,
-            lastCheck: Date.now()
-          });
-          
-          instance.responseTime = latency;
-          instance.consecutiveFailures = 0;
-        } catch (error) {
-          const status = this.healthStatus.get(instance.id) || {};
-          instance.consecutiveFailures++;
-          this.healthStatus.set(instance.id, {
-            ...status,
-            healthy: false,
-            lastCheck: Date.now(),
-            error: error.message
-          });
-        }
-      }
-    }, this.healthCheckInterval);
-  }
-
-  // Get next available instance based on algorithm
-  getNextInstance() {
-    const healthyInstances = this.instances.filter(
-      i => (this.healthStatus.get(i.id)?.healthy !== false) && 
-           i.consecutiveFailures < 3
-    );
-
-    if (healthyInstances.length === 0) {
-      throw new Error(`No healthy instances available for ${this.serviceName}`);
-    }
-
-    switch (this.algorithm) {
-      case 'round-robin':
-        return this.roundRobin(healthyInstances);
-      case 'weighted-round-robin':
-        return this.weightedRoundRobin(healthyInstances);
-      case 'least-connections':
-        return this.leastConnections(healthyInstances);
-      case 'least-response-time':
-        return this.leastResponseTime(healthyInstances);
-      case 'random':
-        return this.random(healthyInstances);
-      default:
-        return this.roundRobin(healthyInstances);
-    }
-  }
-
-  roundRobin(instances) {
-    const instance = instances[this.currentIndex % instances.length];
-    this.currentIndex++;
-    return instance;
-  }
-
-  weightedRoundRobin(instances) {
-    // Create weighted list
-    const weighted = [];
-    for (const instance of instances) {
-      for (let i = 0; i < instance.weight; i++) {
-        weighted.push(instance);
-      }
-    }
-    
-    const instance = weighted[this.currentIndex % weighted.length];
-    this.currentIndex++;
-    return instance;
-  }
-
-  leastConnections(instances) {
-    return instances.reduce((min, current) => 
-      current.activeConnections < min.activeConnections ? current : min
-    );
-  }
-
-  leastResponseTime(instances) {
-    return instances.reduce((best, current) => {
-      const currentScore = current.activeConnections * 0.5 + current.responseTime * 0.5;
-      const bestScore = best.activeConnections * 0.5 + best.responseTime * 0.5;
-      return currentScore < bestScore ? current : best;
-    });
-  }
-
-  random(instances) {
-    return instances[Math.floor(Math.random() * instances.length)];
-  }
-
-  // Execute request with automatic failover
-  async execute(requestFn, options = {}) {
-    const maxRetries = options.retries || 3;
-    const retryDelay = options.retryDelay || 100;
-    let lastError;
-
-    for (let attempt = 0; attempt < maxRetries; attempt++) {
-      const instance = this.getNextInstance();
+  class ClientSideLoadBalancer extends EventEmitter {
+    constructor(options = {}) {
+      super();
+      this.serviceName = options.serviceName;
+      this.registry = options.registry;
+      this.algorithm = options.algorithm || 'round-robin';
+      this.healthCheckInterval = options.healthCheckInterval || 10000;
       
-      try {
-        instance.activeConnections++;
-        const start = Date.now();
-        
-        const result = await requestFn(instance);
-        
-        instance.responseTime = Date.now() - start;
-        instance.activeConnections--;
-        
-        return result;
-      } catch (error) {
-        instance.activeConnections--;
-        instance.consecutiveFailures++;
-        lastError = error;
-        
-        this.emit('request-failed', { instance, error, attempt });
-        
-        if (attempt < maxRetries - 1) {
-          await this.delay(retryDelay * Math.pow(2, attempt));
+      this.instances = [];
+      this.currentIndex = 0;
+      this.healthStatus = new Map();
+      
+      this.initializeDiscovery();
+      this.startHealthChecks();
+    }
+
+    async initializeDiscovery() {
+      // Initial fetch from service registry
+      await this.refreshInstances();
+      
+      // Subscribe to registry updates
+      this.registry.on('instances-changed', (serviceName) => {
+        if (serviceName === this.serviceName) {
+          this.refreshInstances();
         }
+      });
+    }
+
+    async refreshInstances() {
+      try {
+        const instances = await this.registry.getInstances(this.serviceName);
+        this.instances = instances.map(instance => ({
+          ...instance,
+          weight: instance.weight || 1,
+          activeConnections: 0,
+          responseTime: 0,
+          consecutiveFailures: 0
+        }));
+        this.emit('instances-updated', this.instances);
+      } catch (error) {
+        this.emit('error', error);
       }
     }
 
-    throw lastError;
+    startHealthChecks() {
+      setInterval(async () => {
+        for (const instance of this.instances) {
+          try {
+            const start = Date.now();
+            const response = await fetch(`http://${instance.host}:${instance.port}/health`, {
+              timeout: 5000
+            });
+            const latency = Date.now() - start;
+            
+            this.healthStatus.set(instance.id, {
+              healthy: response.ok,
+              latency,
+              lastCheck: Date.now()
+            });
+            
+            instance.responseTime = latency;
+            instance.consecutiveFailures = 0;
+          } catch (error) {
+            const status = this.healthStatus.get(instance.id) || {};
+            instance.consecutiveFailures++;
+            this.healthStatus.set(instance.id, {
+              ...status,
+              healthy: false,
+              lastCheck: Date.now(),
+              error: error.message
+            });
+          }
+        }
+      }, this.healthCheckInterval);
+    }
+
+    // Get next available instance based on algorithm
+    getNextInstance() {
+      const healthyInstances = this.instances.filter(
+        i => (this.healthStatus.get(i.id)?.healthy !== false) && 
+             i.consecutiveFailures < 3
+      );
+
+      if (healthyInstances.length === 0) {
+        throw new Error(`No healthy instances available for ${this.serviceName}`);
+      }
+
+      switch (this.algorithm) {
+        case 'round-robin':
+          return this.roundRobin(healthyInstances);
+        case 'weighted-round-robin':
+          return this.weightedRoundRobin(healthyInstances);
+        case 'least-connections':
+          return this.leastConnections(healthyInstances);
+        case 'least-response-time':
+          return this.leastResponseTime(healthyInstances);
+        case 'random':
+          return this.random(healthyInstances);
+        default:
+          return this.roundRobin(healthyInstances);
+      }
+    }
+
+    roundRobin(instances) {
+      const instance = instances[this.currentIndex % instances.length];
+      this.currentIndex++;
+      return instance;
+    }
+
+    weightedRoundRobin(instances) {
+      // Create weighted list
+      const weighted = [];
+      for (const instance of instances) {
+        for (let i = 0; i < instance.weight; i++) {
+          weighted.push(instance);
+        }
+      }
+      
+      const instance = weighted[this.currentIndex % weighted.length];
+      this.currentIndex++;
+      return instance;
+    }
+
+    leastConnections(instances) {
+      return instances.reduce((min, current) => 
+        current.activeConnections < min.activeConnections ? current : min
+      );
+    }
+
+    leastResponseTime(instances) {
+      return instances.reduce((best, current) => {
+        const currentScore = current.activeConnections * 0.5 + current.responseTime * 0.5;
+        const bestScore = best.activeConnections * 0.5 + best.responseTime * 0.5;
+        return currentScore < bestScore ? current : best;
+      });
+    }
+
+    random(instances) {
+      return instances[Math.floor(Math.random() * instances.length)];
+    }
+
+    // Execute request with automatic failover
+    async execute(requestFn, options = {}) {
+      const maxRetries = options.retries || 3;
+      const retryDelay = options.retryDelay || 100;
+      let lastError;
+
+      for (let attempt = 0; attempt < maxRetries; attempt++) {
+        const instance = this.getNextInstance();
+        
+        try {
+          instance.activeConnections++;
+          const start = Date.now();
+          
+          const result = await requestFn(instance);
+          
+          instance.responseTime = Date.now() - start;
+          instance.activeConnections--;
+          
+          return result;
+        } catch (error) {
+          instance.activeConnections--;
+          instance.consecutiveFailures++;
+          lastError = error;
+          
+          this.emit('request-failed', { instance, error, attempt });
+          
+          if (attempt < maxRetries - 1) {
+            await this.delay(retryDelay * Math.pow(2, attempt));
+          }
+        }
+      }
+
+      throw lastError;
+    }
+
+    delay(ms) {
+      return new Promise(resolve => setTimeout(resolve, ms));
+    }
   }
 
-  delay(ms) {
-    return new Promise(resolve => setTimeout(resolve, ms));
-  }
-}
+  // Usage example
+  const axios = require('axios');
 
-// Usage example
-const axios = require('axios');
-
-const userServiceLB = new ClientSideLoadBalancer({
-  serviceName: 'user-service',
-  registry: serviceRegistry,
-  algorithm: 'least-connections'
-});
-
-// Make requests through the load balancer
-async function getUser(userId) {
-  return userServiceLB.execute(async (instance) => {
-    const response = await axios.get(
-      `http://${instance.host}:${instance.port}/users/${userId}`,
-      { timeout: 5000 }
-    );
-    return response.data;
+  const userServiceLB = new ClientSideLoadBalancer({
+    serviceName: 'user-service',
+    registry: serviceRegistry,
+    algorithm: 'least-connections'
   });
-}
 
-module.exports = { ClientSideLoadBalancer };
-```
+  // Make requests through the load balancer
+  async function getUser(userId) {
+    return userServiceLB.execute(async (instance) => {
+      const response = await axios.get(
+        `http://${instance.host}:${instance.port}/users/${userId}`,
+        { timeout: 5000 }
+      );
+      return response.data;
+    });
+  }
+
+  module.exports = { ClientSideLoadBalancer };
+  ```
+  </Tab>
+  <Tab title="Python">
+  ```python
+  # Client-side load balancer with service discovery integration.
+  # Uses httpx for async HTTP, a background task for health checking,
+  # and asyncio primitives for safe concurrent access to instance state.
+  # In production you would plug this into a registry like python-consul2
+  # or etcd3-py; here the Registry is abstracted behind a Protocol.
+
+  from __future__ import annotations
+
+  import asyncio
+  import logging
+  import random
+  import time
+  from dataclasses import dataclass, field
+  from typing import Any, Awaitable, Callable, Literal, Protocol
+
+  import httpx
+
+  log = logging.getLogger(__name__)
+
+  Algorithm = Literal[
+      "round-robin",
+      "weighted-round-robin",
+      "least-connections",
+      "least-response-time",
+      "random",
+  ]
+
+
+  @dataclass
+  class Instance:
+      id: str
+      host: str
+      port: int
+      weight: int = 1
+      active_connections: int = 0
+      response_time_ms: float = 0.0
+      consecutive_failures: int = 0
+      healthy: bool = True
+      last_check: float = 0.0
+
+
+  class Registry(Protocol):
+      async def get_instances(self, service_name: str) -> list[Instance]: ...
+      def on_change(self, service_name: str, callback: Callable[[], Awaitable[None]]) -> None: ...
+
+
+  class ClientSideLoadBalancer:
+      """Client-side load balancer with pluggable algorithms and active health checks.
+
+      Owns a long-lived httpx.AsyncClient for connection pooling. All algorithm
+      methods operate only on the currently-healthy subset of instances.
+      """
+
+      def __init__(
+          self,
+          service_name: str,
+          registry: Registry,
+          algorithm: Algorithm = "round-robin",
+          health_check_interval: float = 10.0,
+          max_failures: int = 3,
+      ) -> None:
+          self.service_name = service_name
+          self._registry = registry
+          self._algorithm = algorithm
+          self._health_check_interval = health_check_interval
+          self._max_failures = max_failures
+
+          self._instances: list[Instance] = []
+          self._current_index = 0
+          self._lock = asyncio.Lock()
+          self._client = httpx.AsyncClient(timeout=httpx.Timeout(5.0))
+          self._health_task: asyncio.Task[None] | None = None
+
+      async def start(self) -> None:
+          await self._refresh_instances()
+          self._registry.on_change(self.service_name, self._refresh_instances)
+          self._health_task = asyncio.create_task(self._health_check_loop())
+
+      async def close(self) -> None:
+          if self._health_task:
+              self._health_task.cancel()
+          await self._client.aclose()
+
+      async def _refresh_instances(self) -> None:
+          fresh = await self._registry.get_instances(self.service_name)
+          async with self._lock:
+              # Preserve runtime stats across refresh to avoid losing warm-up state.
+              by_id = {i.id: i for i in self._instances}
+              merged: list[Instance] = []
+              for inst in fresh:
+                  existing = by_id.get(inst.id)
+                  if existing:
+                      inst.active_connections = existing.active_connections
+                      inst.response_time_ms = existing.response_time_ms
+                      inst.consecutive_failures = existing.consecutive_failures
+                      inst.healthy = existing.healthy
+                  merged.append(inst)
+              self._instances = merged
+
+      async def _health_check_loop(self) -> None:
+          while True:
+              try:
+                  await self._check_all()
+              except asyncio.CancelledError:
+                  raise
+              except Exception:
+                  log.exception("health check loop error")
+              await asyncio.sleep(self._health_check_interval)
+
+      async def _check_all(self) -> None:
+          async with self._lock:
+              instances = list(self._instances)
+
+          await asyncio.gather(*(self._check_one(i) for i in instances))
+
+      async def _check_one(self, instance: Instance) -> None:
+          url = f"http://{instance.host}:{instance.port}/health"
+          start = time.perf_counter()
+          try:
+              r = await self._client.get(url, timeout=5.0)
+              latency_ms = (time.perf_counter() - start) * 1000
+              instance.response_time_ms = latency_ms
+              instance.last_check = time.time()
+              instance.healthy = r.is_success
+              if r.is_success:
+                  instance.consecutive_failures = 0
+          except httpx.HTTPError:
+              instance.consecutive_failures += 1
+              instance.healthy = False
+              instance.last_check = time.time()
+
+      # ---------- algorithms ----------
+
+      def _healthy(self) -> list[Instance]:
+          return [
+              i for i in self._instances
+              if i.healthy and i.consecutive_failures < self._max_failures
+          ]
+
+      def _next_instance(self) -> Instance:
+          pool = self._healthy()
+          if not pool:
+              raise RuntimeError(f"No healthy instances for {self.service_name}")
+
+          if self._algorithm == "round-robin":
+              chosen = pool[self._current_index % len(pool)]
+              self._current_index += 1
+              return chosen
+          if self._algorithm == "weighted-round-robin":
+              expanded = [i for i in pool for _ in range(i.weight)]
+              chosen = expanded[self._current_index % len(expanded)]
+              self._current_index += 1
+              return chosen
+          if self._algorithm == "least-connections":
+              return min(pool, key=lambda i: i.active_connections)
+          if self._algorithm == "least-response-time":
+              return min(
+                  pool,
+                  key=lambda i: i.active_connections * 0.5 + i.response_time_ms * 0.5,
+              )
+          if self._algorithm == "random":
+              return random.choice(pool)
+          raise ValueError(f"unknown algorithm: {self._algorithm}")
+
+      # ---------- request execution ----------
+
+      async def execute(
+          self,
+          request_fn: Callable[[Instance, httpx.AsyncClient], Awaitable[Any]],
+          retries: int = 3,
+          retry_delay: float = 0.1,
+      ) -> Any:
+          last_error: BaseException | None = None
+
+          for attempt in range(retries):
+              instance = self._next_instance()
+              instance.active_connections += 1
+              start = time.perf_counter()
+              try:
+                  result = await request_fn(instance, self._client)
+                  instance.response_time_ms = (time.perf_counter() - start) * 1000
+                  return result
+              except Exception as exc:
+                  instance.consecutive_failures += 1
+                  last_error = exc
+                  log.warning(
+                      "request to %s failed on attempt %d/%d: %s",
+                      instance.id, attempt + 1, retries, exc,
+                  )
+                  if attempt < retries - 1:
+                      await asyncio.sleep(retry_delay * (2 ** attempt))
+              finally:
+                  instance.active_connections -= 1
+
+          assert last_error is not None
+          raise last_error
+
+
+  # ---------- usage ----------
+
+  async def get_user(lb: ClientSideLoadBalancer, user_id: str) -> dict[str, Any]:
+      async def call(instance: Instance, client: httpx.AsyncClient) -> dict[str, Any]:
+          r = await client.get(f"http://{instance.host}:{instance.port}/users/{user_id}")
+          r.raise_for_status()
+          return r.json()
+
+      return await lb.execute(call)
+  ```
+  </Tab>
+</Tabs>
 
 ---
 
 ## Load Balancing Algorithms
+
+The algorithm you choose is effectively a hypothesis about your workload. Round-robin assumes all instances are identical and all requests take equal time. Least-connections assumes requests vary in duration but instances are otherwise equal. Least-response-time assumes instances themselves vary in speed. Consistent hashing assumes you need keys to stick to specific instances (for caching or partitioning). When your hypothesis matches reality, the algorithm works well. When it does not, you get mysterious tail latency or cache misses that nobody can explain.
+
+The most common mistake is picking an algorithm that sounds smart without validating it matches your workload. I have seen teams switch from round-robin to least-response-time expecting better performance, only to find that it created a feedback loop: the fastest instance got all the traffic, its response time crept up, another instance became fastest, and so on. The resulting oscillation was worse than round-robin's simple equal distribution. This is why Power of Two Choices (P2C) -- discussed below -- has become the default in modern proxies like Envoy. It has the intelligence of least-connections without the herding problem.
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
@@ -369,150 +604,278 @@ module.exports = { ClientSideLoadBalancer };
 
 ### Advanced Algorithms Implementation
 
-```javascript
-// advanced-lb-algorithms.js
+The algorithms below demonstrate the ideas behind production load balancers. Weighted Round Robin with smooth distribution prevents clumping (naive weighted round-robin sends all weight-5 requests consecutively, which can overwhelm that instance; the smooth version interleaves them). Consistent hashing with virtual nodes is the foundation of distributed caches like Memcached and Redis Cluster; without virtual nodes, removing one server would cause 30-50% of keys to remap, but with 150 virtual nodes per server, that drops to a few percent.
 
-class LoadBalancingAlgorithms {
-  // Weighted Round Robin with smooth distribution
-  static createWeightedRoundRobin(instances) {
-    let currentWeight = 0;
-    let maxWeight = Math.max(...instances.map(i => i.weight));
-    let gcdWeight = instances.reduce((a, b) => gcd(a, b.weight), instances[0].weight);
-    let currentIndex = -1;
+Power of Two Choices (P2C) is the algorithm I recommend for most modern load balancers. The math is surprising: picking 2 random instances and choosing the less loaded one outperforms least-connections in realistic workloads. Why? Because pure least-connections creates a herd effect -- the load balancer sees instance A has 3 connections and instance B has 4, routes to A, and 10ms later the next decision sees A has 4 and B has 4, and the next client also picks A, and so on. With P2C, the randomness breaks the herding. The mathematical analysis (Azar, Broder, Karlin, Upfal 1994) shows P2C achieves O(log log n) maximum load while random achieves O(log n / log log n) -- a dramatic improvement for essentially no extra cost.
 
-    function gcd(a, b) {
-      return b === 0 ? a : gcd(b, a % b);
-    }
+<Tabs>
+  <Tab title="Node.js">
+  ```javascript
+  // advanced-lb-algorithms.js
 
-    return function getNext() {
-      while (true) {
-        currentIndex = (currentIndex + 1) % instances.length;
-        
-        if (currentIndex === 0) {
-          currentWeight -= gcdWeight;
-          if (currentWeight <= 0) {
-            currentWeight = maxWeight;
+  class LoadBalancingAlgorithms {
+    // Weighted Round Robin with smooth distribution
+    static createWeightedRoundRobin(instances) {
+      let currentWeight = 0;
+      let maxWeight = Math.max(...instances.map(i => i.weight));
+      let gcdWeight = instances.reduce((a, b) => gcd(a, b.weight), instances[0].weight);
+      let currentIndex = -1;
+
+      function gcd(a, b) {
+        return b === 0 ? a : gcd(b, a % b);
+      }
+
+      return function getNext() {
+        while (true) {
+          currentIndex = (currentIndex + 1) % instances.length;
+          
+          if (currentIndex === 0) {
+            currentWeight -= gcdWeight;
+            if (currentWeight <= 0) {
+              currentWeight = maxWeight;
+            }
+          }
+          
+          if (instances[currentIndex].weight >= currentWeight) {
+            return instances[currentIndex];
           }
         }
+      };
+    }
+
+    // Consistent Hashing with virtual nodes
+    static createConsistentHash(instances, virtualNodes = 150) {
+      const ring = new Map();
+      const sortedKeys = [];
+
+      // Add virtual nodes for each instance
+      for (const instance of instances) {
+        for (let i = 0; i < virtualNodes; i++) {
+          const key = hash(`${instance.id}-${i}`);
+          ring.set(key, instance);
+          sortedKeys.push(key);
+        }
+      }
+      
+      sortedKeys.sort((a, b) => a - b);
+
+      function hash(str) {
+        let hash = 0;
+        for (let i = 0; i < str.length; i++) {
+          hash = ((hash << 5) - hash) + str.charCodeAt(i);
+          hash = hash & hash;
+        }
+        return Math.abs(hash);
+      }
+
+      return function getNode(key) {
+        const keyHash = hash(key);
         
-        if (instances[currentIndex].weight >= currentWeight) {
-          return instances[currentIndex];
+        // Binary search for first key >= keyHash
+        let low = 0, high = sortedKeys.length - 1;
+        
+        while (low < high) {
+          const mid = Math.floor((low + high) / 2);
+          if (sortedKeys[mid] < keyHash) {
+            low = mid + 1;
+          } else {
+            high = mid;
+          }
         }
-      }
-    };
-  }
 
-  // Consistent Hashing with virtual nodes
-  static createConsistentHash(instances, virtualNodes = 150) {
-    const ring = new Map();
-    const sortedKeys = [];
-
-    // Add virtual nodes for each instance
-    for (const instance of instances) {
-      for (let i = 0; i < virtualNodes; i++) {
-        const key = hash(`${instance.id}-${i}`);
-        ring.set(key, instance);
-        sortedKeys.push(key);
-      }
-    }
-    
-    sortedKeys.sort((a, b) => a - b);
-
-    function hash(str) {
-      let hash = 0;
-      for (let i = 0; i < str.length; i++) {
-        hash = ((hash << 5) - hash) + str.charCodeAt(i);
-        hash = hash & hash;
-      }
-      return Math.abs(hash);
+        // Wrap around if key is larger than all
+        const index = sortedKeys[low] >= keyHash ? low : 0;
+        return ring.get(sortedKeys[index]);
+      };
     }
 
-    return function getNode(key) {
-      const keyHash = hash(key);
-      
-      // Binary search for first key >= keyHash
-      let low = 0, high = sortedKeys.length - 1;
-      
-      while (low < high) {
-        const mid = Math.floor((low + high) / 2);
-        if (sortedKeys[mid] < keyHash) {
-          low = mid + 1;
-        } else {
-          high = mid;
+    // Power of Two Choices (P2C)
+    // This deceptively simple algorithm has mathematical guarantees that make it surprisingly effective.
+    // By picking just 2 random servers and choosing the less loaded one, you avoid the "herd effect"
+    // where all clients pick the same "best" server (least-connections) and overwhelm it.
+    // Used by Envoy, HAProxy, and Netflix Zuul in production. The max load is O(log(log(n))).
+    static createP2C(instances) {
+      return function getNext() {
+        if (instances.length === 1) return instances[0];
+        
+        // Pick two random instances
+        const i1 = Math.floor(Math.random() * instances.length);
+        let i2 = Math.floor(Math.random() * instances.length);
+        while (i2 === i1) {
+          i2 = Math.floor(Math.random() * instances.length);
         }
+
+        // Choose the one with fewer active connections
+        return instances[i1].activeConnections <= instances[i2].activeConnections
+          ? instances[i1]
+          : instances[i2];
+      };
+    }
+
+    // Adaptive Load Balancing (based on real-time metrics)
+    static createAdaptive(instances) {
+      return function getNext() {
+        // Calculate scores based on multiple factors
+        const scored = instances.map(instance => ({
+          instance,
+          score: calculateScore(instance)
+        }));
+
+        // Sort by score (lower is better)
+        scored.sort((a, b) => a.score - b.score);
+        
+        // Weighted random from top 3
+        const topN = scored.slice(0, Math.min(3, scored.length));
+        const totalWeight = topN.reduce((sum, s) => sum + (1 / s.score), 0);
+        
+        let random = Math.random() * totalWeight;
+        for (const { instance, score } of topN) {
+          random -= (1 / score);
+          if (random <= 0) return instance;
+        }
+        
+        return topN[0].instance;
+      };
+
+      function calculateScore(instance) {
+        // Lower score = better
+        const connectionScore = instance.activeConnections * 0.3;
+        const latencyScore = instance.avgResponseTime * 0.4;
+        const errorScore = instance.errorRate * 100 * 0.3;
+        
+        return connectionScore + latencyScore + errorScore + 0.001; // Avoid division by zero
       }
-
-      // Wrap around if key is larger than all
-      const index = sortedKeys[low] >= keyHash ? low : 0;
-      return ring.get(sortedKeys[index]);
-    };
-  }
-
-  // Power of Two Choices (P2C)
-  // This deceptively simple algorithm has mathematical guarantees that make it surprisingly effective.
-  // By picking just 2 random servers and choosing the less loaded one, you avoid the "herd effect"
-  // where all clients pick the same "best" server (least-connections) and overwhelm it.
-  // Used by Envoy, HAProxy, and Netflix Zuul in production. The max load is O(log(log(n))).
-  static createP2C(instances) {
-    return function getNext() {
-      if (instances.length === 1) return instances[0];
-      
-      // Pick two random instances
-      const i1 = Math.floor(Math.random() * instances.length);
-      let i2 = Math.floor(Math.random() * instances.length);
-      while (i2 === i1) {
-        i2 = Math.floor(Math.random() * instances.length);
-      }
-
-      // Choose the one with fewer active connections
-      return instances[i1].activeConnections <= instances[i2].activeConnections
-        ? instances[i1]
-        : instances[i2];
-    };
-  }
-
-  // Adaptive Load Balancing (based on real-time metrics)
-  static createAdaptive(instances) {
-    return function getNext() {
-      // Calculate scores based on multiple factors
-      const scored = instances.map(instance => ({
-        instance,
-        score: calculateScore(instance)
-      }));
-
-      // Sort by score (lower is better)
-      scored.sort((a, b) => a.score - b.score);
-      
-      // Weighted random from top 3
-      const topN = scored.slice(0, Math.min(3, scored.length));
-      const totalWeight = topN.reduce((sum, s) => sum + (1 / s.score), 0);
-      
-      let random = Math.random() * totalWeight;
-      for (const { instance, score } of topN) {
-        random -= (1 / score);
-        if (random <= 0) return instance;
-      }
-      
-      return topN[0].instance;
-    };
-
-    function calculateScore(instance) {
-      // Lower score = better
-      const connectionScore = instance.activeConnections * 0.3;
-      const latencyScore = instance.avgResponseTime * 0.4;
-      const errorScore = instance.errorRate * 100 * 0.3;
-      
-      return connectionScore + latencyScore + errorScore + 0.001; // Avoid division by zero
     }
   }
-}
 
-module.exports = { LoadBalancingAlgorithms };
-```
+  module.exports = { LoadBalancingAlgorithms };
+  ```
+  </Tab>
+  <Tab title="Python">
+  ```python
+  # Advanced load balancing algorithms in Python.
+  # Uses hashlib for stable cross-process hashing, bisect for the ring
+  # lookup, and math.gcd for smooth weighted round-robin. All algorithms
+  # return a callable so they can be swapped at runtime.
+
+  from __future__ import annotations
+
+  import bisect
+  import hashlib
+  import math
+  import random
+  from dataclasses import dataclass
+  from functools import reduce
+  from typing import Callable
+
+
+  @dataclass
+  class Instance:
+      id: str
+      host: str
+      port: int
+      weight: int = 1
+      active_connections: int = 0
+      avg_response_time_ms: float = 0.0
+      error_rate: float = 0.0
+
+
+  def _stable_hash(key: str) -> int:
+      """Deterministic cross-process hash. Python's hash() is salted per process."""
+      return int(hashlib.md5(key.encode(), usedforsecurity=False).hexdigest()[:16], 16)
+
+
+  def smooth_weighted_round_robin(instances: list[Instance]) -> Callable[[], Instance]:
+      """Smooth weighted round robin -- spaces out requests to high-weight servers."""
+      max_weight = max(i.weight for i in instances)
+      gcd_weight = reduce(math.gcd, (i.weight for i in instances))
+
+      state = {"index": -1, "current_weight": 0}
+
+      def get_next() -> Instance:
+          while True:
+              state["index"] = (state["index"] + 1) % len(instances)
+              if state["index"] == 0:
+                  state["current_weight"] -= gcd_weight
+                  if state["current_weight"] <= 0:
+                      state["current_weight"] = max_weight
+              if instances[state["index"]].weight >= state["current_weight"]:
+                  return instances[state["index"]]
+
+      return get_next
+
+
+  def consistent_hash(
+      instances: list[Instance], virtual_nodes: int = 150
+  ) -> Callable[[str], Instance]:
+      """Classic consistent hashing with virtual nodes for even distribution.
+
+      Returns a function that maps a request key to an instance. Adding or
+      removing an instance only remaps ~1/N of the keys.
+      """
+      ring: list[tuple[int, Instance]] = []
+      for inst in instances:
+          for i in range(virtual_nodes):
+              ring.append((_stable_hash(f"{inst.id}-{i}"), inst))
+      ring.sort(key=lambda kv: kv[0])
+      keys = [h for h, _ in ring]
+
+      def get_node(request_key: str) -> Instance:
+          h = _stable_hash(request_key)
+          idx = bisect.bisect_left(keys, h)
+          if idx == len(keys):  # wrap around
+              idx = 0
+          return ring[idx][1]
+
+      return get_node
+
+
+  def power_of_two_choices(instances: list[Instance]) -> Callable[[], Instance]:
+      """P2C: pick two random instances, choose the one with fewer connections.
+
+      Outperforms least-connections in practice because the randomness breaks
+      the herd effect. Used by Envoy's LEAST_REQUEST, HAProxy, Netflix Zuul.
+      The max load is O(log log n) vs O(log n / log log n) for pure random.
+      """
+      def get_next() -> Instance:
+          if len(instances) == 1:
+              return instances[0]
+          a, b = random.sample(instances, 2)
+          return a if a.active_connections <= b.active_connections else b
+
+      return get_next
+
+
+  def adaptive_lb(instances: list[Instance]) -> Callable[[], Instance]:
+      """Score-based adaptive load balancing. Blends connection count, latency,
+      and error rate into a single score and picks from the top 3 using weighted
+      random -- so we don't always hammer the single best instance.
+      """
+      def score(inst: Instance) -> float:
+          connection_score = inst.active_connections * 0.3
+          latency_score = inst.avg_response_time_ms * 0.4
+          error_score = inst.error_rate * 100 * 0.3
+          return connection_score + latency_score + error_score + 0.001
+
+      def get_next() -> Instance:
+          ranked = sorted(instances, key=score)[:3]
+          weights = [1.0 / score(i) for i in ranked]
+          return random.choices(ranked, weights=weights, k=1)[0]
+
+      return get_next
+  ```
+  </Tab>
+</Tabs>
 
 ---
 
 ## Health Checking Strategies
+
+Health checks are the eyes of the load balancer. If they report wrong, the load balancer makes wrong decisions -- routing to dead instances or evicting healthy ones. The most important distinction in health checking is between liveness (is the process alive?) and readiness (can it handle traffic?). This sounds pedantic but it is the single most common mistake I see in production: teams implement a single "health" endpoint that checks everything, use it for both liveness and readiness, and then wonder why their system goes into a death spiral whenever a downstream dependency has a bad day.
+
+The failure mode is subtle but catastrophic. Imagine your `/health` endpoint checks the database. The database has a slow query that makes health checks time out. Kubernetes sees liveness failures and restarts your pods. The new pods also fail the check (database is still slow). Kubernetes marks them failed and kills them too. Within minutes you have zero pods, the database recovers, but there are no pods to serve traffic. You have a full outage. The fix: liveness checks should be shallow (just "is the HTTP server responding?"), and only readiness checks should verify dependencies.
+
+The deep health check is the third kind: an endpoint used by humans and dashboards to see rich dependency status. It is NOT what the load balancer polls. It tells you *why* a service is degraded, not whether it should receive traffic.
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
@@ -554,201 +917,410 @@ module.exports = { LoadBalancingAlgorithms };
 
 ### Comprehensive Health Check Service
 
-```javascript
-// health-check-service.js
+The service below is the minimum viable implementation of a proper health check subsystem. The design has three parts: a registration mechanism (where each dependency declares how to check itself), a background runner (so health checks happen continuously, not per-request), and three HTTP endpoints (liveness, readiness, deep). The background execution is critical -- if you check dependencies on every incoming request, your health check becomes a DoS vector. A misbehaving caller can hammer /health and multiply the load on every dependency. Instead, check dependencies on a timer and return cached results.
 
-const express = require('express');
+One detail worth emphasizing: health checks should have aggressive timeouts. A health check that takes 10 seconds to fail makes your "unhealthy" detection take 30+ seconds (since you typically need 3 consecutive failures). Use 2-5 second timeouts for critical dependencies and make your instance's response time budget proportional. If your service's SLA is 500ms, a 5-second health check timeout is 10x your SLA -- that is too slow.
 
-class HealthCheckService {
-  constructor() {
-    this.checks = new Map();
-    this.status = 'starting';
-    this.startTime = Date.now();
-  }
+<Tabs>
+  <Tab title="Node.js">
+  ```javascript
+  // health-check-service.js
 
-  // Register a health check
-  registerCheck(name, checkFn, options = {}) {
-    this.checks.set(name, {
-      fn: checkFn,
-      critical: options.critical !== false, // Default to critical
-      timeout: options.timeout || 5000,
-      interval: options.interval || 30000,
-      lastResult: null,
-      lastCheck: null
-    });
+  const express = require('express');
 
-    // Start periodic checking
-    if (options.interval) {
-      setInterval(() => this.runCheck(name), options.interval);
-    }
-  }
-
-  async runCheck(name) {
-    const check = this.checks.get(name);
-    if (!check) return null;
-
-    const startTime = Date.now();
-    
-    try {
-      const result = await Promise.race([
-        check.fn(),
-        new Promise((_, reject) => 
-          setTimeout(() => reject(new Error('Health check timeout')), check.timeout)
-        )
-      ]);
-
-      check.lastResult = {
-        status: 'healthy',
-        latency: Date.now() - startTime,
-        ...result
-      };
-    } catch (error) {
-      check.lastResult = {
-        status: 'unhealthy',
-        error: error.message,
-        latency: Date.now() - startTime
-      };
+  class HealthCheckService {
+    constructor() {
+      this.checks = new Map();
+      this.status = 'starting';
+      this.startTime = Date.now();
     }
 
-    check.lastCheck = Date.now();
-    return check.lastResult;
-  }
-
-  async runAllChecks() {
-    const results = {};
-    
-    for (const [name, check] of this.checks) {
-      results[name] = await this.runCheck(name);
-    }
-
-    return results;
-  }
-
-  getOverallStatus(checkResults) {
-    const criticalChecks = Array.from(this.checks.entries())
-      .filter(([_, check]) => check.critical)
-      .map(([name]) => name);
-
-    const hasUnhealthyCritical = criticalChecks.some(
-      name => checkResults[name]?.status === 'unhealthy'
-    );
-
-    const hasAnyUnhealthy = Object.values(checkResults).some(
-      r => r?.status === 'unhealthy'
-    );
-
-    if (hasUnhealthyCritical) return 'unhealthy';
-    if (hasAnyUnhealthy) return 'degraded';
-    return 'healthy';
-  }
-
-  // Express middleware for health endpoints
-  createRouter() {
-    const router = express.Router();
-
-    // Liveness probe - is the process running?
-    router.get('/healthz', (req, res) => {
-      res.status(200).json({
-        status: 'alive',
-        uptime: Date.now() - this.startTime
+    // Register a health check
+    registerCheck(name, checkFn, options = {}) {
+      this.checks.set(name, {
+        fn: checkFn,
+        critical: options.critical !== false, // Default to critical
+        timeout: options.timeout || 5000,
+        interval: options.interval || 30000,
+        lastResult: null,
+        lastCheck: null
       });
-    });
 
-    // Readiness probe - can we handle traffic?
-    router.get('/ready', async (req, res) => {
-      if (this.status !== 'ready') {
-        return res.status(503).json({
-          status: this.status,
-          message: 'Service not ready'
-        });
+      // Start periodic checking
+      if (options.interval) {
+        setInterval(() => this.runCheck(name), options.interval);
+      }
+    }
+
+    async runCheck(name) {
+      const check = this.checks.get(name);
+      if (!check) return null;
+
+      const startTime = Date.now();
+      
+      try {
+        const result = await Promise.race([
+          check.fn(),
+          new Promise((_, reject) => 
+            setTimeout(() => reject(new Error('Health check timeout')), check.timeout)
+          )
+        ]);
+
+        check.lastResult = {
+          status: 'healthy',
+          latency: Date.now() - startTime,
+          ...result
+        };
+      } catch (error) {
+        check.lastResult = {
+          status: 'unhealthy',
+          error: error.message,
+          latency: Date.now() - startTime
+        };
       }
 
-      // Quick check of critical dependencies
-      const criticalResults = {};
+      check.lastCheck = Date.now();
+      return check.lastResult;
+    }
+
+    async runAllChecks() {
+      const results = {};
+      
       for (const [name, check] of this.checks) {
-        if (check.critical) {
-          criticalResults[name] = check.lastResult;
-        }
+        results[name] = await this.runCheck(name);
       }
 
-      const hasUnhealthy = Object.values(criticalResults).some(
+      return results;
+    }
+
+    getOverallStatus(checkResults) {
+      const criticalChecks = Array.from(this.checks.entries())
+        .filter(([_, check]) => check.critical)
+        .map(([name]) => name);
+
+      const hasUnhealthyCritical = criticalChecks.some(
+        name => checkResults[name]?.status === 'unhealthy'
+      );
+
+      const hasAnyUnhealthy = Object.values(checkResults).some(
         r => r?.status === 'unhealthy'
       );
 
-      if (hasUnhealthy) {
-        return res.status(503).json({
-          status: 'not_ready',
-          checks: criticalResults
+      if (hasUnhealthyCritical) return 'unhealthy';
+      if (hasAnyUnhealthy) return 'degraded';
+      return 'healthy';
+    }
+
+    // Express middleware for health endpoints
+    createRouter() {
+      const router = express.Router();
+
+      // Liveness probe - is the process running?
+      router.get('/healthz', (req, res) => {
+        res.status(200).json({
+          status: 'alive',
+          uptime: Date.now() - this.startTime
         });
-      }
-
-      res.status(200).json({ status: 'ready' });
-    });
-
-    // Deep health check - detailed status of all dependencies
-    router.get('/health', async (req, res) => {
-      const checkResults = await this.runAllChecks();
-      const overallStatus = this.getOverallStatus(checkResults);
-
-      const statusCode = overallStatus === 'healthy' ? 200 : 
-                         overallStatus === 'degraded' ? 200 : 503;
-
-      res.status(statusCode).json({
-        status: overallStatus,
-        timestamp: new Date().toISOString(),
-        uptime: Date.now() - this.startTime,
-        version: process.env.APP_VERSION || 'unknown',
-        checks: checkResults
       });
+
+      // Readiness probe - can we handle traffic?
+      router.get('/ready', async (req, res) => {
+        if (this.status !== 'ready') {
+          return res.status(503).json({
+            status: this.status,
+            message: 'Service not ready'
+          });
+        }
+
+        // Quick check of critical dependencies
+        const criticalResults = {};
+        for (const [name, check] of this.checks) {
+          if (check.critical) {
+            criticalResults[name] = check.lastResult;
+          }
+        }
+
+        const hasUnhealthy = Object.values(criticalResults).some(
+          r => r?.status === 'unhealthy'
+        );
+
+        if (hasUnhealthy) {
+          return res.status(503).json({
+            status: 'not_ready',
+            checks: criticalResults
+          });
+        }
+
+        res.status(200).json({ status: 'ready' });
+      });
+
+      // Deep health check - detailed status of all dependencies
+      router.get('/health', async (req, res) => {
+        const checkResults = await this.runAllChecks();
+        const overallStatus = this.getOverallStatus(checkResults);
+
+        const statusCode = overallStatus === 'healthy' ? 200 : 
+                           overallStatus === 'degraded' ? 200 : 503;
+
+        res.status(statusCode).json({
+          status: overallStatus,
+          timestamp: new Date().toISOString(),
+          uptime: Date.now() - this.startTime,
+          version: process.env.APP_VERSION || 'unknown',
+          checks: checkResults
+        });
+      });
+
+      return router;
+    }
+
+    setReady() {
+      this.status = 'ready';
+    }
+
+    setNotReady(reason) {
+      this.status = reason || 'not_ready';
+    }
+  }
+
+  // Usage example
+  const healthService = new HealthCheckService();
+
+  // Register database check
+  healthService.registerCheck('database', async () => {
+    const start = Date.now();
+    await pool.query('SELECT 1');
+    return { latency: Date.now() - start };
+  }, { critical: true, interval: 30000 });
+
+  // Register Redis check
+  healthService.registerCheck('redis', async () => {
+    const start = Date.now();
+    await redis.ping();
+    return { latency: Date.now() - start };
+  }, { critical: true, interval: 30000 });
+
+  // Register external API check
+  healthService.registerCheck('payment-api', async () => {
+    const response = await fetch('https://api.stripe.com/v1/health', {
+      timeout: 5000
     });
+    return { status: response.ok ? 'reachable' : 'unreachable' };
+  }, { critical: false, interval: 60000 });
 
-    return router;
-  }
+  // Mount health routes
+  app.use(healthService.createRouter());
 
-  setReady() {
-    this.status = 'ready';
-  }
+  // Mark service as ready after initialization
+  await initializeDatabase();
+  await warmUpCaches();
+  healthService.setReady();
 
-  setNotReady(reason) {
-    this.status = reason || 'not_ready';
-  }
-}
+  module.exports = { HealthCheckService };
+  ```
+  </Tab>
+  <Tab title="Python">
+  ```python
+  # FastAPI health check service with separate liveness, readiness, and deep endpoints.
+  # Background tasks run each dependency check on its own interval so incoming
+  # requests read cached results instead of triggering a fresh check every time.
 
-// Usage example
-const healthService = new HealthCheckService();
+  from __future__ import annotations
 
-// Register database check
-healthService.registerCheck('database', async () => {
-  const start = Date.now();
-  await pool.query('SELECT 1');
-  return { latency: Date.now() - start };
-}, { critical: true, interval: 30000 });
+  import asyncio
+  import os
+  import time
+  from dataclasses import dataclass, field
+  from typing import Any, Awaitable, Callable
 
-// Register Redis check
-healthService.registerCheck('redis', async () => {
-  const start = Date.now();
-  await redis.ping();
-  return { latency: Date.now() - start };
-}, { critical: true, interval: 30000 });
+  from fastapi import APIRouter, FastAPI
+  from fastapi.responses import JSONResponse
 
-// Register external API check
-healthService.registerCheck('payment-api', async () => {
-  const response = await fetch('https://api.stripe.com/v1/health', {
-    timeout: 5000
-  });
-  return { status: response.ok ? 'reachable' : 'unreachable' };
-}, { critical: false, interval: 60000 });
+  CheckFn = Callable[[], Awaitable[dict[str, Any]]]
 
-// Mount health routes
-app.use(healthService.createRouter());
 
-// Mark service as ready after initialization
-await initializeDatabase();
-await warmUpCaches();
-healthService.setReady();
+  @dataclass
+  class Check:
+      fn: CheckFn
+      critical: bool = True
+      timeout_s: float = 5.0
+      interval_s: float = 30.0
+      last_result: dict[str, Any] | None = None
+      last_check_at: float = 0.0
+      _task: asyncio.Task[None] | None = field(default=None, repr=False)
 
-module.exports = { HealthCheckService };
-```
+
+  class HealthCheckService:
+      """Owns all registered dependency checks and exposes liveness / readiness / deep endpoints.
+
+      Background tasks run checks on their configured intervals. The HTTP handlers read
+      cached results (O(1)) to avoid turning /health into an amplifier under load.
+      """
+
+      def __init__(self) -> None:
+          self._checks: dict[str, Check] = {}
+          self._status: str = "starting"
+          self._start_time = time.time()
+
+      def register(
+          self,
+          name: str,
+          fn: CheckFn,
+          *,
+          critical: bool = True,
+          timeout_s: float = 5.0,
+          interval_s: float = 30.0,
+      ) -> None:
+          self._checks[name] = Check(
+              fn=fn, critical=critical, timeout_s=timeout_s, interval_s=interval_s
+          )
+
+      async def start(self) -> None:
+          for name, check in self._checks.items():
+              check._task = asyncio.create_task(self._run_loop(name, check))
+
+      async def stop(self) -> None:
+          for check in self._checks.values():
+              if check._task:
+                  check._task.cancel()
+
+      def mark_ready(self) -> None:
+          self._status = "ready"
+
+      def mark_not_ready(self, reason: str = "not_ready") -> None:
+          self._status = reason
+
+      async def _run_loop(self, name: str, check: Check) -> None:
+          while True:
+              await self._run_once(name, check)
+              await asyncio.sleep(check.interval_s)
+
+      async def _run_once(self, name: str, check: Check) -> None:
+          start = time.perf_counter()
+          try:
+              result = await asyncio.wait_for(check.fn(), timeout=check.timeout_s)
+              check.last_result = {
+                  "status": "healthy",
+                  "latency_ms": (time.perf_counter() - start) * 1000,
+                  **result,
+              }
+          except asyncio.TimeoutError:
+              check.last_result = {
+                  "status": "unhealthy",
+                  "error": "timeout",
+                  "latency_ms": (time.perf_counter() - start) * 1000,
+              }
+          except Exception as exc:
+              check.last_result = {
+                  "status": "unhealthy",
+                  "error": str(exc),
+                  "latency_ms": (time.perf_counter() - start) * 1000,
+              }
+          check.last_check_at = time.time()
+
+      def _overall_status(self) -> str:
+          has_critical_failure = any(
+              c.critical and (c.last_result or {}).get("status") == "unhealthy"
+              for c in self._checks.values()
+          )
+          has_any_failure = any(
+              (c.last_result or {}).get("status") == "unhealthy"
+              for c in self._checks.values()
+          )
+          if has_critical_failure:
+              return "unhealthy"
+          if has_any_failure:
+              return "degraded"
+          return "healthy"
+
+      def build_router(self) -> APIRouter:
+          router = APIRouter()
+
+          @router.get("/healthz")
+          async def liveness() -> dict[str, Any]:
+              # Shallow: if the ASGI event loop can serve this handler, the process is alive.
+              return {"status": "alive", "uptime_s": time.time() - self._start_time}
+
+          @router.get("/ready")
+          async def readiness() -> JSONResponse:
+              if self._status != "ready":
+                  return JSONResponse(
+                      {"status": self._status, "message": "service not ready"},
+                      status_code=503,
+                  )
+              critical = {
+                  name: check.last_result
+                  for name, check in self._checks.items()
+                  if check.critical
+              }
+              if any((r or {}).get("status") == "unhealthy" for r in critical.values()):
+                  return JSONResponse(
+                      {"status": "not_ready", "checks": critical},
+                      status_code=503,
+                  )
+              return JSONResponse({"status": "ready"}, status_code=200)
+
+          @router.get("/health")
+          async def deep() -> JSONResponse:
+              results = {name: c.last_result for name, c in self._checks.items()}
+              status = self._overall_status()
+              code = 200 if status != "unhealthy" else 503
+              return JSONResponse(
+                  {
+                      "status": status,
+                      "timestamp": time.time(),
+                      "uptime_s": time.time() - self._start_time,
+                      "version": os.environ.get("APP_VERSION", "unknown"),
+                      "checks": results,
+                  },
+                  status_code=code,
+              )
+
+          return router
+
+
+  # ---------- wiring into FastAPI ----------
+
+  async def check_database() -> dict[str, Any]:
+      # In real code: `async with pool.acquire() as conn: await conn.execute("SELECT 1")`
+      await asyncio.sleep(0.005)
+      return {}
+
+
+  async def check_redis() -> dict[str, Any]:
+      # await redis.ping()
+      await asyncio.sleep(0.002)
+      return {}
+
+
+  async def check_payment_api() -> dict[str, Any]:
+      # async with httpx.AsyncClient(timeout=5.0) as c:
+      #     r = await c.get("https://api.stripe.com/v1/health")
+      return {"reachable": True}
+
+
+  def build_app() -> FastAPI:
+      app = FastAPI()
+      health = HealthCheckService()
+      health.register("database", check_database, critical=True, interval_s=30)
+      health.register("redis", check_redis, critical=True, interval_s=30)
+      health.register("payment-api", check_payment_api, critical=False, interval_s=60)
+
+      @app.on_event("startup")
+      async def _startup() -> None:
+          await health.start()
+          # ... warm caches, open pools ...
+          health.mark_ready()
+
+      @app.on_event("shutdown")
+      async def _shutdown() -> None:
+          await health.stop()
+
+      app.include_router(health.build_router())
+      return app
+  ```
+  </Tab>
+</Tabs>
 
 ---
 

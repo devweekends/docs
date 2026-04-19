@@ -20,6 +20,14 @@ Kubernetes (K8s) is the industry standard for orchestrating containerized micros
 
 ## Kubernetes Architecture
 
+Before writing any YAML, it helps to understand what Kubernetes actually *is*. At its core, Kubernetes is a distributed control loop: you declare the desired state of your system (10 replicas of order-service, 3 replicas of payment-service), and Kubernetes continuously reconciles the actual state with that declaration. If a pod dies, Kubernetes starts a new one. If a node goes offline, Kubernetes reschedules its pods elsewhere. This reconciliation model is why Kubernetes is so resilient — you're not telling it "start these pods," you're telling it "maintain this state forever."
+
+The control plane is the brain. The API server is the only component that talks to etcd (the distributed key-value store holding all cluster state), and it's the only component the other components talk to. The scheduler decides which node each pod should run on. The controller manager runs the reconciliation loops for each resource type (Deployment controller, ReplicaSet controller, etc.). etcd holds the source of truth; if etcd dies, the cluster dies.
+
+The worker nodes are where your containers actually run. Each node runs `kubelet` (which talks to the API server and manages the container runtime) and `kube-proxy` (which programs iptables rules so that Service virtual IPs route to pod IPs). Your container runtime (containerd, CRI-O) is what actually launches containers.
+
+Why does any of this matter for microservices developers? Because understanding the control loop model explains Kubernetes's failure modes. When a deployment fails to roll out, it's because a controller cannot achieve the desired state. When pods are stuck in `Pending`, it's because the scheduler cannot find a node. When services cannot reach each other, it's usually a kube-proxy or DNS problem. The more your mental model matches the architecture, the faster you can debug.
+
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
 │                    KUBERNETES ARCHITECTURE                                   │
@@ -65,6 +73,10 @@ Kubernetes (K8s) is the industry standard for orchestrating containerized micros
 
 ### Namespace
 
+Namespaces are logical partitions within a Kubernetes cluster. Think of them as folders: they scope resource names (two services can both be called `api` if they're in different namespaces) and provide a boundary for RBAC, network policies, and resource quotas. In a microservices setup, you'll typically have namespaces per environment (dev, staging, production) or per team (platform, payments, search). Using the default namespace for everything is a mistake that hurts later — isolation is much harder to retrofit than to apply from day one.
+
+If you skip namespacing, your cluster becomes a flat soup of 200+ resources with colliding names and no way to apply per-team policies. With namespaces, you can say "team-payments can deploy only into the payments namespace" via RBAC, and "staging resources cannot exceed 20 CPUs total" via ResourceQuota.
+
 ```yaml
 # k8s/namespace.yaml
 apiVersion: v1
@@ -77,6 +89,29 @@ metadata:
 ```
 
 ### Deployment
+
+**Why Deployments exist.** Before Deployments, running a service on Kubernetes meant manually creating ReplicaSets and orchestrating updates yourself — tedious and error-prone. The Deployment resource exists to answer the most common production question: "how do I run N replicas of a stateless service and update them safely?" It wraps the lower-level ReplicaSet with a declarative rollout strategy, version history, and rollback support. Think of a Deployment as a thin supervisor that owns one or more ReplicaSets and shifts traffic between them during updates.
+
+**What Kubernetes does internally.** The Deployment controller continuously reconciles: it reads the current Deployment spec, compares it against existing ReplicaSets, and creates/scales ReplicaSets to match. When you change the pod template, the controller creates a *new* ReplicaSet with a hashed name suffix, then gradually scales it up while scaling the old ReplicaSet down, obeying your `maxSurge` and `maxUnavailable` settings. The old ReplicaSet is kept around (up to `revisionHistoryLimit`) so you can roll back without re-pulling old images.
+
+**Key fields you must set.** `replicas` (default 1 is never right for production), `selector.matchLabels` (must match `template.metadata.labels` exactly — mismatches are a classic "pod isn't owned by deployment" bug), `resources.requests` and `resources.limits` (omitting these leads to scheduler chaos and OOM kills), both probes (liveness and readiness — see below), and a `strategy` block for rolling updates. Without a proper strategy, the default `maxUnavailable: 25%` can take a surprising chunk of your capacity offline during a deploy.
+
+**Common beginner mistakes.** (1) Changing container image but not the tag (`:latest`) — Kubernetes doesn't pull a new image if the tag is the same, so nothing updates. Always use immutable tags. (2) Forgetting `imagePullPolicy: Always` for mutable tags during development. (3) Setting `maxUnavailable` and `maxSurge` both to 0, which deadlocks the rollout. (4) Not defining a readiness probe, so traffic is sent to pods that aren't ready, causing 502s during every rollout.
+
+The Deployment is the workhorse resource for stateless microservices. It declares: "I want N replicas of this pod template, and when the template changes, do a rolling update." Under the hood, a Deployment creates a ReplicaSet, which creates pods. When you update the image, Kubernetes creates a new ReplicaSet with the new template and scales it up while scaling down the old one — that's the rolling update.
+
+The Deployment below is a near-complete template for a production microservice. Each piece solves a specific failure mode:
+
+- **`replicas: 3`** — single replica is a single point of failure. Three replicas across three nodes survive one node failure.
+- **`maxSurge: 1, maxUnavailable: 0`** — during rolling updates, we add one new pod before removing an old one. Zero downtime. Setting `maxUnavailable: 1` would be faster but causes brief capacity drops under load.
+- **`resources.requests`** — used by the scheduler to find a node with enough free capacity. Without requests, the scheduler guesses, and you can end up with 20 pods crammed onto one node that's about to OOM.
+- **`resources.limits`** — hard ceiling. Memory limit exceeded = OOM kill. CPU limit exceeded = throttled (not killed). Without limits, a memory leak in one pod takes down the whole node.
+- **`livenessProbe`** — "is the process alive?" Failure triggers a pod restart.
+- **`readinessProbe`** — "can the process accept traffic?" Failure removes the pod from Service load balancing but keeps it running.
+- **`securityContext.runAsNonRoot`** — defense in depth. Blocks a whole class of container escape vulnerabilities.
+- **`podAntiAffinity`** — spreads replicas across nodes. Without it, all three pods could land on the same node, defeating the point of replication.
+
+If you omit any one of these, you will eventually be paged for an incident that was preventable. Ask me how I know.
 
 ```yaml
 # k8s/order-service/deployment.yaml
@@ -181,7 +216,119 @@ spec:
                 topologyKey: kubernetes.io/hostname
 ```
 
+#### Implementing Liveness and Readiness Probes in Your App
+
+The Deployment declares probes, but your application code must *implement* them. A liveness probe should be cheap and internal — just confirm the process is running and the event loop/worker threads are responsive. A readiness probe should verify dependencies: can you reach the database? Is the cache up? The split matters because failing a liveness probe restarts the pod (expensive, disruptive), while failing a readiness probe just drains traffic until the dependency recovers (safe).
+
+<Tabs>
+  <Tab title="Node.js">
+  ```javascript
+  // src/health.js (Express)
+  const express = require('express');
+  const router = express.Router();
+
+  let isShuttingDown = false;
+
+  // Liveness: only fails if the process itself is broken
+  router.get('/health/live', (req, res) => {
+    if (isShuttingDown) return res.status(503).send('shutting down');
+    res.status(200).json({ status: 'alive' });
+  });
+
+  // Readiness: fails if dependencies aren't healthy
+  router.get('/health/ready', async (req, res) => {
+    try {
+      await db.raw('SELECT 1');       // Postgres reachable
+      await redis.ping();             // Redis reachable
+      res.status(200).json({ status: 'ready' });
+    } catch (err) {
+      res.status(503).json({ status: 'not-ready', error: err.message });
+    }
+  });
+
+  process.on('SIGTERM', () => { isShuttingDown = true; });
+
+  module.exports = router;
+  ```
+  </Tab>
+  <Tab title="Python">
+  ```python
+  # src/health.py (FastAPI)
+  import asyncio
+  import signal
+  from fastapi import APIRouter, Response, status
+  import structlog
+  from sqlalchemy import text
+  from .db import engine
+  from .cache import redis_client
+
+  log = structlog.get_logger()
+  router = APIRouter()
+
+  # Mutable flag flipped on SIGTERM so readiness drains traffic
+  # before the process actually exits.
+  _shutting_down = False
+
+  def _mark_shutdown(*_):
+      global _shutting_down
+      _shutting_down = True
+      log.info("sigterm_received", action="drain")
+
+  signal.signal(signal.SIGTERM, _mark_shutdown)
+
+  @router.get("/health/live")
+  async def liveness() -> dict:
+      """Liveness: is the process alive and the event loop responsive?
+
+      Deliberately does NOT check dependencies — a flaky database
+      must not cause pod restarts.
+      """
+      if _shutting_down:
+          return Response(status_code=status.HTTP_503_SERVICE_UNAVAILABLE)
+      return {"status": "alive"}
+
+  @router.get("/health/ready")
+  async def readiness() -> dict:
+      """Readiness: should we receive traffic right now?"""
+      checks = {}
+      try:
+          async with engine.connect() as conn:
+              await conn.execute(text("SELECT 1"))
+          checks["database"] = "ok"
+      except Exception as exc:
+          log.warning("readiness_db_fail", error=str(exc))
+          checks["database"] = "fail"
+
+      try:
+          await redis_client.ping()
+          checks["redis"] = "ok"
+      except Exception as exc:
+          log.warning("readiness_redis_fail", error=str(exc))
+          checks["redis"] = "fail"
+
+      if any(v == "fail" for v in checks.values()) or _shutting_down:
+          return Response(
+              status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+              content=str(checks),
+          )
+      return {"status": "ready", "checks": checks}
+  ```
+  </Tab>
+</Tabs>
+
 ### Service
+
+**Why Services exist.** Pods are mortal — they die, get rescheduled, and come back with new IPs. If your API gateway hardcoded pod IPs, every deployment would break every caller. The Service resource exists to provide a *stable* addressing layer: a virtual IP and DNS name that abstracts over the ever-changing set of pods behind it. Clients talk to `http://order-service/`, and Kubernetes handles the rest.
+
+**What Kubernetes does internally.** When you create a Service, the endpoints controller watches for pods matching the selector and maintains an `EndpointSlice` resource listing their IPs. On every node, `kube-proxy` watches EndpointSlices and programs iptables (or IPVS, or eBPF in Cilium) rules that intercept traffic to the Service's ClusterIP and DNAT it to a random backing pod. CoreDNS publishes the Service's DNS name, so `order-service.microservices.svc.cluster.local` resolves to the ClusterIP.
+
+**Key fields you must set.** `selector` — must match the pod labels exactly, or the Service will have zero endpoints. `ports.port` is the Service port; `ports.targetPort` is the container port (they can differ). `type: ClusterIP` is the default and the right choice for internal services. For headless services (needed for StatefulSets and some discovery patterns), set `clusterIP: None`.
+
+**Common beginner mistakes.** (1) Mismatched labels between Service selector and Deployment pod template — the Service lists zero endpoints and requests hang forever. Always verify with `kubectl get endpoints <name>`. (2) Using `LoadBalancer` type for internal services, which provisions a paid cloud load balancer for traffic that never leaves the cluster. (3) Setting `targetPort` to the Service port instead of the container port — works in some cases because of Kubernetes's flexibility but is semantically confusing.
+
+ClusterIP is the default and most common type for microservices: a virtual IP that's only reachable from inside the cluster. This is what you use for service-to-service communication (order-service calling payment-service). External types (NodePort, LoadBalancer) expose services outside the cluster, but for east-west traffic (between microservices), ClusterIP is the right answer. Getting this wrong — for example, using LoadBalancer for internal services — means you pay for a cloud load balancer per service and route internal traffic through external infrastructure. That's both expensive and slower.
+
+The Service's label selector is what connects it to pods. If your pod labels and Service selector don't match, the Service has no endpoints and requests time out. This is one of the most common "why isn't my service working" causes, and `kubectl describe service <name>` (which shows the endpoints) is the diagnostic.
 
 ```yaml
 # k8s/order-service/service.yaml
@@ -204,6 +351,18 @@ spec:
 ```
 
 ### ConfigMap
+
+**Why ConfigMaps exist.** The 12-Factor App principle says "store config in the environment" — not in the binary, not in the image. If you bake `KAFKA_BROKERS=prod-kafka:9092` into your Docker image, you need a new image per environment, and the same artifact no longer promotes cleanly from dev to prod. ConfigMaps exist so one image can behave differently in different environments based on externally-injected values.
+
+**What Kubernetes does internally.** A ConfigMap is just a key-value map stored in etcd. When you reference it from a pod spec (via `envFrom`, `env.valueFrom`, or a volume mount), the kubelet reads it at pod startup and wires the values in. For volume mounts specifically, the kubelet periodically re-syncs the file contents (within seconds to a minute), so mounted ConfigMap files update live — but env vars are frozen at pod start.
+
+**Key fields you must set.** Just `data` for string values, or `binaryData` for non-UTF-8 content. Set `immutable: true` for ConfigMaps you never change — it improves API server performance at scale and prevents accidental edits. For large configs, prefer mounting as a file over env vars (Linux env block has size limits and Kubernetes imposes a 1 MiB ConfigMap ceiling).
+
+**Common beginner mistakes.** (1) Editing a ConfigMap and expecting pods to pick up new env values — they won't until restart. Use the checksum annotation pattern (shown later) to trigger rollouts. (2) Putting secrets in ConfigMaps because they "work the same way" — ConfigMaps have weaker RBAC defaults and often end up in shared Git repos. Use Secrets for anything sensitive. (3) Storing entire application binaries or large JSON blobs (>1 MiB) and hitting the size limit.
+
+ConfigMaps hold non-sensitive configuration data. The philosophy is 12-Factor: configuration lives outside the image, so the same image can run in dev, staging, and production with different configs. If you bake configuration into the image, you need a new image build (and a new deployment) for every config change — that's slow and couples unrelated concerns.
+
+ConfigMap values can be injected as environment variables (for simple key-value pairs), mounted as files (for config files that the app reads from disk), or consumed via the Kubernetes API (for apps that watch for config changes). The environment variable approach is simplest; the file approach is better for larger configs or when the app expects a specific file format. A common gotcha: changing a ConfigMap does *not* automatically restart pods. If you inject the ConfigMap as env vars, the pods keep their old values until they restart. The Helm "checksum annotation" pattern (shown later) solves this by triggering a rolling restart when the ConfigMap content changes.
 
 ```yaml
 # k8s/order-service/configmap.yaml
@@ -232,7 +391,84 @@ data:
     }
 ```
 
+#### Loading ConfigMap Values in Your App
+
+Because ConfigMap values arrive as environment variables, your app needs a typed way to read them. In Node.js people often reach for `process.env.X` directly, but that's fragile — one typo and you silently get `undefined`. In Python, `pydantic-settings` is the standard answer: define a settings class with types and defaults, and Pydantic validates the environment at startup. If something is missing or the wrong type, the process crashes immediately with a clear message instead of exploding later in a subtle way.
+
+<Tabs>
+  <Tab title="Node.js">
+  ```javascript
+  // src/config.js
+  const required = (name) => {
+    const v = process.env[name];
+    if (!v) throw new Error(`Missing required env var: ${name}`);
+    return v;
+  };
+
+  module.exports = {
+    port: parseInt(process.env.PORT || '3000', 10),
+    nodeEnv: process.env.NODE_ENV || 'development',
+    kafkaBrokers: required('KAFKA_BROKERS').split(','),
+    redisHost: required('REDIS_HOST'),
+    redisPort: parseInt(process.env.REDIS_PORT || '6379', 10),
+    logLevel: process.env.LOG_LEVEL || 'info',
+    databaseUrl: required('DATABASE_URL'),
+  };
+  ```
+  </Tab>
+  <Tab title="Python">
+  ```python
+  # src/config.py
+  from functools import lru_cache
+  from pydantic import Field, SecretStr
+  from pydantic_settings import BaseSettings, SettingsConfigDict
+
+  class Settings(BaseSettings):
+      """Application settings loaded from environment variables.
+
+      Pydantic validates at startup — the pod will fail fast (CrashLoopBackOff)
+      if a ConfigMap/Secret is missing or malformed, which is exactly what
+      we want. No silent `None` values sneaking into business logic.
+      """
+
+      model_config = SettingsConfigDict(
+          env_file=".env",          # convenient for local dev only
+          env_file_encoding="utf-8",
+          case_sensitive=False,
+      )
+
+      # From ConfigMap
+      port: int = 3000
+      node_env: str = "development"
+      kafka_brokers: list[str] = Field(..., alias="KAFKA_BROKERS")
+      redis_host: str = Field(..., alias="REDIS_HOST")
+      redis_port: int = 6379
+      log_level: str = "info"
+
+      # From Secret — SecretStr hides it in logs/tracebacks
+      database_url: SecretStr = Field(..., alias="DATABASE_URL")
+      jwt_secret: SecretStr = Field(..., alias="JWT_SECRET")
+
+  @lru_cache  # load once at startup
+  def get_settings() -> Settings:
+      return Settings()
+  ```
+  </Tab>
+</Tabs>
+
 ### Secret
+
+**Why Secrets exist.** Sensitive values — DB passwords, API keys, TLS private keys — need stricter handling than plain config. Secrets are a separate resource type so Kubernetes can apply different defaults: they can be mounted as tmpfs (never hit disk), they have their own RBAC verbs, they're kept out of many debug/log paths, and they integrate with external secret managers.
+
+**What Kubernetes does internally.** Secrets are stored in etcd, base64-encoded by default. With encryption-at-rest enabled (strongly recommended), the API server encrypts Secret values with a KMS key before writing to etcd — so dumping the etcd disk no longer exposes plaintext. When mounted into pods, Secrets live in a `tmpfs` volume so they never touch the node's persistent disk. Updates to Secrets propagate to mounted volumes the same way ConfigMaps do.
+
+**Key fields you must set.** `type` — `Opaque` for generic secrets, `kubernetes.io/tls` for TLS certs (enables cert-manager integration), `kubernetes.io/dockerconfigjson` for image pull secrets. Use `stringData` (plaintext in YAML, base64-encoded by Kubernetes) during authoring — the `data` field requires you to base64-encode yourself, which is error-prone. Mark long-lived Secrets as `immutable: true` once stable.
+
+**Common beginner mistakes.** (1) Confusing base64 for encryption and committing Secrets to Git — decoding is one `base64 -d` away. (2) Mounting a Secret as an env var and then logging `process.env` during debug, accidentally shipping the secret to your log aggregator. (3) Granting `list secrets` cluster-wide to a service that only needs one specific secret — compromising that service exposes everything. (4) Skipping etcd encryption-at-rest, thinking "Kubernetes Secrets are encrypted" (they're not, by default).
+
+Secrets are ConfigMaps for sensitive data — database passwords, API keys, TLS certificates. The name is misleading: by default, Kubernetes stores Secrets as base64-encoded values in etcd, which is *encoding*, not *encryption*. Anyone with read access to the Secret can decode it trivially. Real protection requires two additional layers: enable etcd encryption at rest (so the raw disk cannot be read without the KMS key), and restrict Secret read access via RBAC (so only the pods that need a Secret can read it).
+
+For serious production environments, Secrets stored directly in Kubernetes are usually not good enough. The pattern the industry has converged on: use an external secrets manager (HashiCorp Vault, AWS Secrets Manager, Azure Key Vault) as the source of truth, and sync Secrets into Kubernetes via the External Secrets Operator. This gives you versioning, audit logs, centralized rotation, and the ability to revoke a secret without redeploying pods. The Secret resource in Kubernetes becomes a mirror of the authoritative secret, not the primary store.
 
 ```yaml
 # k8s/order-service/secret.yaml
@@ -253,6 +489,12 @@ stringData:
 ```
 
 ### ServiceAccount with RBAC
+
+Every pod runs with an identity — a ServiceAccount — that determines what Kubernetes API calls it can make. By default, pods use the namespace's `default` ServiceAccount, which often has more permissions than it needs. The principle of least privilege says: each service should have its own ServiceAccount with the minimum RBAC permissions required.
+
+Why does this matter? If an attacker compromises a pod, they inherit the pod's ServiceAccount token and can call the Kubernetes API with those permissions. If that ServiceAccount has `list secrets` permission across the cluster, the attacker can now enumerate every secret your organization stores in Kubernetes. By scoping ServiceAccounts per service and granting only the specific permissions needed, you turn a potentially catastrophic breach into a localized one.
+
+The RBAC model has three parts: the ServiceAccount (identity), the Role (what actions are allowed on what resources in a namespace), and the RoleBinding (which identities get which roles). For cluster-wide permissions, ClusterRole and ClusterRoleBinding are the equivalents. The rule below grants `order-service` permission to read its own ConfigMaps and one specific Secret — nothing more.
 
 ```yaml
 # k8s/order-service/rbac.yaml
@@ -296,6 +538,20 @@ roleRef:
 ---
 
 ## Ingress Configuration
+
+**Why Ingress exists.** A Service of type `LoadBalancer` gives each microservice its own external IP, and on cloud providers that means one paid load balancer per service. With 50 services, that's 50 LBs, 50 DNS records, 50 TLS certs. Ingress solves this: one HTTP-aware gateway at the cluster edge that terminates TLS once, then routes to internal Services by host and path. You go from 50 LBs to 1.
+
+**What Kubernetes does internally.** The Ingress resource is *declarative only* — it does nothing on its own. You also install an *ingress controller* (NGINX, Traefik, HAProxy, AWS ALB controller). The controller watches Ingress resources and reconfigures its underlying proxy (e.g., rewrites `nginx.conf`) to match. Traffic flow: Internet → cloud LB → ingress controller pod → internal ClusterIP Service → backing pod.
+
+**Key fields you must set.** `ingressClassName` (which controller handles this — multiple controllers can coexist), `rules[].host` and `rules[].http.paths`, `pathType` (`Prefix` is what you almost always want; `Exact` matches only the exact string), and `tls` for HTTPS. Annotations vary per controller and do most of the heavy lifting for rate limiting, auth, redirects, and CORS.
+
+**Common beginner mistakes.** (1) Writing an Ingress resource with no controller installed — nothing works and the resource just sits there. (2) Forgetting `pathType: Prefix` and wondering why `/orders/123` doesn't match `/orders`. (3) Mixing annotations from different controllers (copying NGINX annotations into a Traefik setup). (4) TLS certificate issues because `cert-manager` isn't installed or the ClusterIssuer isn't configured.
+
+Services solve east-west traffic (pod-to-pod). Ingress solves north-south traffic (outside-the-cluster-to-pod). Without Ingress, exposing a service to the internet means creating a LoadBalancer Service for each one — a cloud load balancer per microservice, each costing money and each needing its own DNS entry. This gets absurd quickly.
+
+Ingress provides a single entry point that routes traffic to multiple services based on hostname and path. You pay for one load balancer (the ingress controller), and it routes internally to whichever service matches. This is how most production clusters expose APIs: one Ingress resource defines `/orders -> order-service`, `/payments -> payment-service`, `/inventory -> inventory-service`, and the ingress controller handles TLS termination, path rewriting, rate limiting, and routing.
+
+The ingress controller is a separate component (nginx-ingress, Traefik, HAProxy, AWS ALB controller) that implements the Ingress API. You install the controller once per cluster, then declare Ingress resources that configure it. Without the controller running, Ingress resources do nothing — they're declarations without an implementation.
 
 ### NGINX Ingress
 
@@ -347,6 +603,10 @@ spec:
 
 ### Rate Limiting with Ingress
 
+Rate limiting at the ingress layer is your first line of defense against abusive clients. Better to reject excess requests at the edge (cheap) than to let them hit your application pods (expensive). NGINX Ingress supports rate limiting via annotations: requests per second, concurrent connections, and bandwidth. Limits are applied per client IP, which is a reasonable default for most APIs.
+
+The tradeoff: IP-based limits don't work well when your clients are behind NAT (mobile carriers, corporate proxies) — all users from that network share one IP and one rate limit bucket. For fairness across users, you need application-level rate limiting (per-API-key or per-user-ID), which happens inside the service, not at the ingress. Both layers are useful: ingress protects against volumetric abuse, application-level protects against individual misuse.
+
 ```yaml
 # k8s/ingress-rate-limit.yaml
 apiVersion: networking.k8s.io/v1
@@ -375,6 +635,20 @@ spec:
 ---
 
 ## Horizontal Pod Autoscaler (HPA)
+
+**Why HPA exists.** Static replica counts are a trap. Set it too low and you can't handle traffic spikes; set it too high and you burn money running idle pods. HPA exists to let you pay for capacity proportional to actual load — the replica count follows the metric. On Black Friday, 20 pods; Wednesday at 3 AM, 3 pods.
+
+**What Kubernetes does internally.** Every 15 seconds (default), the HPA controller polls the metrics API (Metrics Server for CPU/memory, or a custom metrics adapter for Prometheus metrics). It runs the formula `desired = ceil(currentReplicas × currentMetric / targetMetric)`, applies stabilization windows and scaling policies, and updates the target Deployment's `replicas` field. Notice that the HPA controls `replicas` — if you also set `replicas` in your Deployment manifest and reapply, you fight the HPA and replicas flip-flop.
+
+**Key fields you must set.** `scaleTargetRef` (which Deployment), `minReplicas` (never below this — usually the floor for high availability), `maxReplicas` (protects you from a metric bug scaling to 10,000 pods), and at least one `metrics` entry. For the metrics, set a realistic `averageUtilization` — 70% CPU is a common default, but the right number depends on your service's headroom needs. The `behavior` block is where the nuance lives — without it, defaults are too aggressive on scale-down and too cautious on scale-up.
+
+**Common beginner mistakes.** (1) No resource requests on the target pods — HPA can't compute utilization without a baseline and does nothing. (2) Scaling on CPU for an I/O-bound service whose CPU never moves; you need custom metrics like requests-per-second or queue depth. (3) Leaving `replicas` set in the Deployment while HPA is active, causing replica flapping. (4) `maxReplicas` too close to `minReplicas`, so HPA has nothing useful to do during a spike.
+
+The whole point of deploying to Kubernetes is elastic capacity. HPA is the resource that turns that elasticity on: it watches a metric (CPU, memory, or custom) and adjusts the replica count to keep that metric near a target value. If CPU usage averages 90% across 3 replicas, HPA scales up to 5. If it drops to 20%, HPA scales down to 2 (respecting minReplicas).
+
+The subtle art of HPA is tuning the scaling behavior. Scale up too slowly and you miss the traffic spike. Scale down too aggressively and you add churn — pods constantly starting and stopping, which hurts cache hit rates and cold-start latency. The `behavior` block below tunes this carefully: scale up aggressively (no stabilization window, up to 100% growth in 15 seconds) but scale down cautiously (5-minute stabilization, max 10% reduction per minute). Traffic spikes are common; traffic drops are usually a brief lull, not a sustained decrease.
+
+CPU-based scaling is the default and works for CPU-bound services. For I/O-bound services (which is most microservices), CPU stays low even under heavy load — you need custom metrics like requests per second or queue depth. The Prometheus Adapter lets you expose any Prometheus metric to HPA, so you can scale on "in-flight HTTP requests" or "Kafka lag" or whatever actually correlates with load for your service.
 
 ```yaml
 # k8s/order-service/hpa.yaml
@@ -433,6 +707,18 @@ spec:
 
 ## Pod Disruption Budget
 
+**Why PDBs exist.** Kubernetes is designed to move pods around — that's the whole point. But during a routine cluster upgrade, if nothing stops it, Kubernetes could evict all your replicas of a service simultaneously and cause an outage. PDBs exist as a *contract* with the Kubernetes control plane: "when you're doing voluntary operations, respect this minimum availability."
+
+**What Kubernetes does internally.** When something calls the Eviction API (kubectl drain, cluster autoscaler scaling down a node, descheduler rebalancing workloads), Kubernetes checks all PDBs that select the target pod. If evicting it would violate any PDB, the eviction is denied with a 429 status. The caller retries with backoff until conditions allow the eviction. This is cooperative — it only protects against components that use the Eviction API, not against direct deletes or kernel panics.
+
+**Key fields you must set.** `selector` (matches the pods you're protecting — usually the same selector your Deployment uses), and exactly one of `minAvailable` or `maxUnavailable`. Use absolute numbers (`minAvailable: 2`) for small deployments and percentages (`maxUnavailable: 25%`) for larger ones.
+
+**Common beginner mistakes.** (1) Setting `minAvailable` equal to `replicas`, which means no pod can ever be evicted — node drains hang forever. (2) Forgetting a PDB exists and wondering why a cluster upgrade is stuck. (3) Thinking PDBs protect against node crashes — they don't. PDBs are only for *voluntary* disruptions. Node crashes are involuntary, and replication + anti-affinity + multi-zone is what protects you there.
+
+PodDisruptionBudget (PDB) is a seatbelt that protects your service from Kubernetes itself. Kubernetes voluntarily disrupts pods during node upgrades, cluster scaling, or manual drains. Without a PDB, a cluster operator running `kubectl drain node-3` could evict all three of your order-service pods simultaneously, taking the service down entirely. With a PDB declaring `minAvailable: 2`, Kubernetes refuses to evict the third pod until a replacement is running elsewhere, maintaining at least two healthy replicas throughout the operation.
+
+PDBs apply only to *voluntary* disruptions (drains, upgrades). Involuntary disruptions (node crashes, hardware failures) are not bound by PDBs — if a node dies, its pods die with it, PDB or not. The way to protect against involuntary disruptions is replication plus pod anti-affinity (spread replicas across nodes and zones).
+
 ```yaml
 # k8s/order-service/pdb.yaml
 apiVersion: policy/v1
@@ -451,6 +737,20 @@ spec:
 ---
 
 ## Network Policies
+
+**Why NetworkPolicies exist.** Kubernetes's default network model is a flat, promiscuous LAN — every pod can reach every other pod on every port. That's great for "it just works" in development and catastrophic for security in production. One compromised pod can scan the entire cluster. NetworkPolicies exist to let you declare "which pods can talk to which" and enforce segmentation at Layer 3/4.
+
+**What Kubernetes does internally.** NetworkPolicy is a spec that the CNI plugin enforces. Calico, Cilium, and Weave translate policies into iptables rules, eBPF programs, or OVS flows on each node. The rule engine is additive and default-deny: if *any* NetworkPolicy selects a pod, only explicitly allowed traffic is permitted; if no policy selects a pod, everything is allowed (backward compatibility default). So a namespace with zero policies is wide open.
+
+**Key fields you must set.** `podSelector` (which pods this policy applies to — empty selector `{}` means all pods in the namespace), `policyTypes` (`Ingress`, `Egress`, or both — you must list `Egress` for egress rules to take effect), and `ingress`/`egress` rules with `from`/`to` and `ports`. Always remember DNS egress (`kube-dns` in `kube-system`) or your apps will fail every hostname resolution.
+
+**Common beginner mistakes.** (1) Writing a policy without allowing DNS, so every hostname resolves to nothing. (2) Expecting policies to work when the CNI doesn't implement them (AWS VPC CNI without the separate Calico add-on doesn't enforce NetworkPolicy). (3) Using `podSelector: {}` thinking it matches nothing when it actually matches everything in the namespace. (4) Forgetting that policies are per-namespace — a cross-namespace allow needs `namespaceSelector`.
+
+By default, every pod in a Kubernetes cluster can talk to every other pod. No firewall, no segmentation. In a microservices architecture with 50 services, this means if an attacker compromises a low-privilege service (say, a marketing analytics dashboard), they can directly reach the payment database, the user service, and anything else on the cluster. NetworkPolicies fix this by declaring which pods are allowed to talk to which other pods.
+
+The model is default-deny once any NetworkPolicy applies to a pod: if a pod has any NetworkPolicy selecting it, only the explicitly allowed traffic is permitted; everything else is blocked. The policy below says: order-service accepts traffic only from the ingress-nginx namespace and from api-gateway pods, and can only make outbound connections to DNS, its database, Kafka, and two other specific services. Everything else is blocked.
+
+The catch: NetworkPolicies require a CNI plugin that implements them (Calico, Cilium, Weave). If your cluster's CNI doesn't support NetworkPolicies — or you've forgotten to enable them — you can write all the NetworkPolicy YAML you want and it will do absolutely nothing. Verify with `kubectl get networkpolicies` and test enforcement by trying a disallowed connection from inside a pod.
 
 ```yaml
 # k8s/network-policies.yaml
@@ -526,6 +826,20 @@ spec:
 
 ## Helm Charts
 
+**Why Helm exists.** Managing raw YAML for 50 microservices across 3 environments means 150 near-duplicate manifests, manual find-and-replace when things change, and no atomic rollback story. Helm exists to treat Kubernetes manifests as a *package* — a parameterized chart you install and upgrade as a single unit, with release history and rollback. It's the apt/npm of Kubernetes.
+
+**What Helm does internally.** A chart is a directory of Go-templated YAML files plus a `values.yaml` defaults file. When you run `helm install`, Helm renders the templates against your values (plus built-ins like `.Release.Name`), produces final YAML, and submits it to the API server. It also stores the release metadata (name, version, rendered manifest) as a Secret in the target namespace. `helm upgrade` re-renders and diffs; `helm rollback` reapplies a prior stored release.
+
+**Key fields you must set (per chart).** `Chart.yaml` (name, version, appVersion — remember `version` is the chart version and `appVersion` is the app version; they're independent). In `values.yaml`, every value that varies between environments should be parameterized; hardcode only truly universal defaults. In templates, use `{{ include "chart.fullname" . }}` helpers for consistent naming rather than hardcoding names.
+
+**Common beginner mistakes.** (1) Forgetting the `checksum/config` annotation, so ConfigMap changes don't trigger pod rollouts. (2) Putting secrets in `values.yaml` and checking them into Git — use `--set` at install time or a secrets plugin (helm-secrets, sops). (3) Upgrading with `--reuse-values` when you meant `--reset-values` (or vice versa) and losing configuration. (4) Chart-per-microservice explosion without a shared library chart, so every team reinvents the same patterns slightly differently.
+
+Writing raw Kubernetes YAML for 50 microservices is a nightmare. You end up with hundreds of YAML files that are 90% identical and 10% service-specific. The industry settled on Helm as the solution: a templating engine that lets you define one chart (a parameterized collection of Kubernetes manifests) and install it many times with different values. One chart, many releases — each with its own image tag, replica count, and environment-specific config.
+
+Helm also provides release management: a history of what was deployed when, with a `helm rollback` command that atomically reverts to a previous release. Compared to `kubectl apply`, which has no concept of a release, Helm gives you transactional deployments and rollbacks. For production microservices, this is a significant operational improvement.
+
+The downside is complexity. Helm templates are Go templates with a DSL of their own, and the error messages when a template is wrong are notoriously cryptic. Chart maintenance can become its own discipline. The alternatives are Kustomize (simpler, no templating, built into kubectl), Jsonnet, or pure code tools like CDK8s and Pulumi. My default is Helm for anything shared between teams (chart reuse is a killer feature) and Kustomize for team-internal variations.
+
 ### Chart Structure
 
 ```
@@ -549,6 +863,8 @@ order-service/
 
 ### Chart.yaml
 
+`Chart.yaml` is the metadata for the chart itself — its name, version, and dependencies. The `version` field is the chart's version (bumped when you change templates), while `appVersion` is the version of the application the chart deploys (the image tag). These are intentionally separate: you might ship chart v1.2.0 that deploys app v2.5.0. Dependencies let one chart pull in others (e.g., your service chart can depend on a Postgres chart), useful for development but often skipped in production where databases are managed separately.
+
 ```yaml
 # Chart.yaml
 apiVersion: v2
@@ -566,6 +882,10 @@ dependencies:
 ```
 
 ### values.yaml
+
+`values.yaml` is the default configuration for the chart. When you install the chart, these values fill in the templated placeholders. For per-environment differences, you override via `values-staging.yaml` or `--set image.tag=1.2.0` on the command line. The discipline here is to make every environment-specific concept parameterizable (replicas, resources, ingress hosts, feature flags) and hard-code only the truly universal defaults.
+
+A good rule of thumb: if you find yourself with `values-dev.yaml`, `values-staging.yaml`, `values-prod.yaml`, and they each override 40 fields, your `values.yaml` is probably wrong. The base should be reasonable defaults, and environment overrides should be minimal deltas (different image tags, different replica counts, different ingress hosts). If your environments differ structurally (staging has no ingress at all, production has three), you may need separate charts or a more sophisticated tool.
 
 ```yaml
 # values.yaml
@@ -628,6 +948,10 @@ postgresql:
 ```
 
 ### Deployment Template
+
+The template below shows several important Helm idioms. The `{{ include "order-service.fullname" . }}` pulls a name from a helper template (defined later), ensuring consistent naming across resources. The `{{- if not .Values.autoscaling.enabled }}` conditionally includes the `replicas` field — when HPA is enabled, you don't want the Deployment fighting the HPA over replica count.
+
+The `checksum/config` annotation is a clever trick: it hashes the rendered ConfigMap content and adds the hash as a pod annotation. When the ConfigMap changes, the hash changes, which means the pod spec changes, which triggers a rolling update. Without this annotation, changing a ConfigMap has no effect on running pods — they keep their old env vars until restart. This tiny line solves a very common bug.
 
 ```yaml
 # templates/deployment.yaml
@@ -694,6 +1018,10 @@ spec:
 
 ### Helpers Template
 
+Helper templates live in `_helpers.tpl` (the leading underscore tells Helm not to render them as Kubernetes resources) and define named templates you can reuse. The `order-service.labels` helper produces a consistent set of labels for every resource in the chart — name, version, chart, release. Consistency matters: selectors rely on exact label matches, and inconsistent labels are a classic source of "my Service has no endpoints" bugs.
+
+The labels here follow the Kubernetes recommended schema (`app.kubernetes.io/name`, `app.kubernetes.io/instance`, etc.). Adopting this schema means your resources work with standard tooling (monitoring dashboards, kubectl label selectors, `helm` itself) without custom configuration.
+
 ```yaml
 # templates/_helpers.tpl
 {{/*
@@ -754,6 +1082,427 @@ helm uninstall order-service -n microservices
 
 # Template (dry-run)
 helm template order-service ./order-service -n microservices
+```
+
+### Validating Helm Values from Code
+
+Before a chart ever hits the cluster, you want to catch misconfigurations — wrong types, missing required fields, production-only values left off. Helm has a `values.schema.json` mechanism for this, but it's often easier to write a small script that loads `values.yaml` (and any override file) and validates it against a real schema. In Python, Pydantic models shine here: you can model your chart's values exactly and get a rich error report when something's off.
+
+<Tabs>
+  <Tab title="Node.js">
+  ```javascript
+  // scripts/validate-values.js
+  const fs = require('fs');
+  const yaml = require('js-yaml');
+  const Ajv = require('ajv');
+
+  const schema = {
+    type: 'object',
+    required: ['image', 'replicaCount', 'resources'],
+    properties: {
+      replicaCount: { type: 'integer', minimum: 1, maximum: 100 },
+      image: {
+        type: 'object',
+        required: ['repository', 'tag'],
+        properties: {
+          repository: { type: 'string' },
+          tag: { type: 'string', pattern: '^v?\\d+\\.\\d+\\.\\d+' },
+          pullPolicy: { enum: ['Always', 'IfNotPresent', 'Never'] },
+        },
+      },
+      resources: {
+        type: 'object',
+        required: ['requests', 'limits'],
+      },
+    },
+  };
+
+  const file = process.argv[2] || 'values.yaml';
+  const values = yaml.load(fs.readFileSync(file, 'utf8'));
+
+  const ajv = new Ajv({ allErrors: true });
+  const valid = ajv.validate(schema, values);
+
+  if (!valid) {
+    console.error('Validation errors in', file);
+    console.error(ajv.errors);
+    process.exit(1);
+  }
+  console.log(`${file} is valid`);
+  ```
+  </Tab>
+  <Tab title="Python">
+  ```python
+  # scripts/validate_values.py
+  """Validate a Helm values.yaml against a strict Pydantic schema.
+
+  Catches bad image tags, missing resources, invalid replica counts,
+  etc. BEFORE the chart is ever rendered. Run in CI on every chart
+  change; a failure here is much cheaper than a CrashLoopBackOff.
+  """
+  import re
+  import sys
+  from pathlib import Path
+  from typing import Literal
+
+  import yaml
+  from pydantic import BaseModel, Field, field_validator, ValidationError
+
+  SEMVER = re.compile(r"^v?\d+\.\d+\.\d+")
+
+  class ImageConfig(BaseModel):
+      repository: str
+      tag: str
+      pullPolicy: Literal["Always", "IfNotPresent", "Never"] = "IfNotPresent"
+
+      @field_validator("tag")
+      @classmethod
+      def _tag_must_be_immutable(cls, v: str) -> str:
+          if v in {"latest", "main", "master"}:
+              raise ValueError(
+                  f"tag '{v}' is mutable — use immutable semver tags"
+              )
+          if not SEMVER.match(v):
+              raise ValueError(f"tag '{v}' is not semver")
+          return v
+
+  class ResourceSpec(BaseModel):
+      cpu: str
+      memory: str
+
+  class Resources(BaseModel):
+      requests: ResourceSpec
+      limits: ResourceSpec
+
+  class Autoscaling(BaseModel):
+      enabled: bool = False
+      minReplicas: int = Field(ge=1)
+      maxReplicas: int = Field(ge=1)
+      targetCPUUtilizationPercentage: int = Field(ge=1, le=100)
+
+  class HelmValues(BaseModel):
+      replicaCount: int = Field(ge=1, le=100)
+      image: ImageConfig
+      resources: Resources
+      autoscaling: Autoscaling | None = None
+
+  def main(path: str = "values.yaml") -> int:
+      data = yaml.safe_load(Path(path).read_text())
+      try:
+          HelmValues.model_validate(data)
+      except ValidationError as exc:
+          print(f"Validation failed for {path}:\n{exc}", file=sys.stderr)
+          return 1
+      print(f"{path} is valid")
+      return 0
+
+  if __name__ == "__main__":
+      sys.exit(main(sys.argv[1] if len(sys.argv) > 1 else "values.yaml"))
+  ```
+  </Tab>
+</Tabs>
+
+---
+
+## Programmatic Kubernetes Client
+
+Beyond kubectl, you'll often need to interact with Kubernetes from your own code — for custom operators, deployment automation, health dashboards, or CI/CD tooling. Both Node.js and Python have official Kubernetes clients. The API surface mirrors the REST API exactly: listing pods, watching for changes, creating resources, all of it. The pattern below shows a typical automation use case: listing pods in a namespace and reporting their status.
+
+For anything more sophisticated than simple scripts — custom controllers, webhooks, operators — the Kubernetes API's watch mechanism becomes important. Watches let you subscribe to resource changes (pod created, config updated) and react in real time, which is how the control plane itself works. If you're writing a controller in Python, `kopf` is a popular framework that wraps the low-level client with a clean decorator API. For Node.js, the `@kubernetes/client-node` package has watch support but you typically build the control loop yourself.
+
+<Tabs>
+  <Tab title="Node.js">
+  ```javascript
+  // scripts/pod-status.js
+  const k8s = require('@kubernetes/client-node');
+
+  const kc = new k8s.KubeConfig();
+  kc.loadFromDefault();  // Reads ~/.kube/config or in-cluster config
+
+  const coreApi = kc.makeApiClient(k8s.CoreV1Api);
+
+  async function listPods(namespace) {
+    const res = await coreApi.listNamespacedPod(namespace);
+    return res.body.items.map(pod => ({
+      name: pod.metadata.name,
+      status: pod.status.phase,
+      node: pod.spec.nodeName,
+      ready: pod.status.containerStatuses?.every(c => c.ready) ?? false,
+      restarts: pod.status.containerStatuses?.reduce(
+        (sum, c) => sum + c.restartCount, 0
+      ) ?? 0
+    }));
+  }
+
+  async function main() {
+    const pods = await listPods('microservices');
+    console.table(pods);
+
+    const unhealthy = pods.filter(p => !p.ready || p.restarts > 5);
+    if (unhealthy.length > 0) {
+      console.error(`Found ${unhealthy.length} unhealthy pods`);
+      process.exit(1);
+    }
+  }
+
+  main().catch(err => {
+    console.error(err);
+    process.exit(1);
+  });
+  ```
+  </Tab>
+  <Tab title="Python">
+  ```python
+  # scripts/pod_status.py
+  import sys
+  from kubernetes import client, config
+
+  # Reads ~/.kube/config or in-cluster config
+  try:
+      config.load_kube_config()
+  except config.ConfigException:
+      config.load_incluster_config()
+
+  core_api = client.CoreV1Api()
+
+  def list_pods(namespace: str) -> list[dict]:
+      pods = core_api.list_namespaced_pod(namespace)
+      results = []
+      for pod in pods.items:
+          statuses = pod.status.container_statuses or []
+          results.append({
+              "name": pod.metadata.name,
+              "status": pod.status.phase,
+              "node": pod.spec.node_name,
+              "ready": all(c.ready for c in statuses),
+              "restarts": sum(c.restart_count for c in statuses),
+          })
+      return results
+
+  def main() -> None:
+      pods = list_pods("microservices")
+      for p in pods:
+          print(p)
+
+      unhealthy = [p for p in pods if not p["ready"] or p["restarts"] > 5]
+      if unhealthy:
+          print(f"Found {len(unhealthy)} unhealthy pods", file=sys.stderr)
+          sys.exit(1)
+
+  if __name__ == "__main__":
+      main()
+  ```
+  </Tab>
+</Tabs>
+
+### Watching Deployment Rollouts
+
+A common automation pattern is waiting for a rollout to complete — for CI/CD to verify a deploy succeeded, or for dashboards to surface rollout progress. Both clients expose watch streams, but Python's `kubernetes.watch.Watch` API is particularly clean. The pattern: open a watch on the Deployment, stream `MODIFIED` events, and check `status.ready_replicas` against `spec.replicas` until they match. Add a timeout so you don't wait forever on a stuck rollout.
+
+<Tabs>
+  <Tab title="Node.js">
+  ```javascript
+  // scripts/wait-rollout.js
+  const k8s = require('@kubernetes/client-node');
+
+  const kc = new k8s.KubeConfig();
+  kc.loadFromDefault();
+
+  const appsApi = kc.makeApiClient(k8s.AppsV1Api);
+  const watch = new k8s.Watch(kc);
+
+  async function waitForRollout(namespace, name, timeoutMs = 300_000) {
+    const start = Date.now();
+
+    return new Promise((resolve, reject) => {
+      const req = watch.watch(
+        `/apis/apps/v1/namespaces/${namespace}/deployments`,
+        { fieldSelector: `metadata.name=${name}` },
+        (type, obj) => {
+          const d = obj;
+          const desired = d.spec.replicas;
+          const ready = d.status.readyReplicas || 0;
+          const updated = d.status.updatedReplicas || 0;
+          console.log(`${type} ${name}: ${ready}/${desired} ready, ${updated} updated`);
+
+          if (ready === desired && updated === desired) {
+            req.then(r => r.abort());
+            resolve();
+          }
+          if (Date.now() - start > timeoutMs) {
+            req.then(r => r.abort());
+            reject(new Error('rollout timed out'));
+          }
+        },
+        err => err && reject(err)
+      );
+    });
+  }
+
+  waitForRollout('microservices', 'order-service')
+    .then(() => console.log('rollout complete'))
+    .catch(err => { console.error(err); process.exit(1); });
+  ```
+  </Tab>
+  <Tab title="Python">
+  ```python
+  # scripts/wait_rollout.py
+  """Block until a Deployment rollout finishes (or timeout).
+
+  Streams MODIFIED events from the API server rather than polling —
+  cheaper for the control plane and faster to react. Intended for
+  use in CI after `kubectl apply` or `helm upgrade`.
+  """
+  import sys
+  import time
+  from kubernetes import client, config, watch
+  import structlog
+
+  log = structlog.get_logger()
+
+  def wait_for_rollout(
+      namespace: str,
+      name: str,
+      timeout_seconds: int = 300,
+  ) -> None:
+      try:
+          config.load_kube_config()
+      except config.ConfigException:
+          config.load_incluster_config()
+
+      apps = client.AppsV1Api()
+      w = watch.Watch()
+      deadline = time.time() + timeout_seconds
+
+      for event in w.stream(
+          apps.list_namespaced_deployment,
+          namespace=namespace,
+          field_selector=f"metadata.name={name}",
+          timeout_seconds=timeout_seconds,
+      ):
+          d = event["object"]
+          desired = d.spec.replicas or 0
+          ready = d.status.ready_replicas or 0
+          updated = d.status.updated_replicas or 0
+
+          log.info(
+              "rollout_event",
+              type=event["type"],
+              name=name,
+              ready=ready,
+              desired=desired,
+              updated=updated,
+          )
+
+          if ready == desired and updated == desired and desired > 0:
+              w.stop()
+              return
+
+          if time.time() > deadline:
+              w.stop()
+              raise TimeoutError(f"rollout of {name} timed out")
+
+      raise TimeoutError(f"watch stream ended before {name} became ready")
+
+  if __name__ == "__main__":
+      ns, name = sys.argv[1], sys.argv[2]
+      try:
+          wait_for_rollout(ns, name)
+          print(f"{ns}/{name} rollout complete")
+      except Exception as exc:
+          print(f"FAILED: {exc}", file=sys.stderr)
+          sys.exit(1)
+  ```
+  </Tab>
+</Tabs>
+
+### FastAPI Service Ready for Kubernetes
+
+Pulling the threads together, here's a minimal FastAPI service that's fully prepared for Kubernetes: structured logging with `structlog`, settings loaded from ConfigMap/Secret environment variables via `pydantic-settings`, proper `/health/live` and `/health/ready` endpoints, and graceful shutdown on SIGTERM. This is the kind of template you'd scaffold every new Python microservice from.
+
+```python
+# app/main.py
+"""Kubernetes-ready FastAPI microservice template.
+
+Wiring:
+- pydantic-settings reads env vars populated from ConfigMap & Secret
+- structlog emits JSON logs consumable by Fluent Bit / Loki
+- /health/live is a cheap liveness check (process-only)
+- /health/ready verifies dependencies before accepting traffic
+- SIGTERM handler flips readiness to 503 so the Service endpoint
+  is drained before the pod actually exits (preStop + terminationGracePeriodSeconds)
+"""
+import asyncio
+import signal
+from contextlib import asynccontextmanager
+
+import structlog
+from fastapi import FastAPI, Response, status
+from pydantic import Field, SecretStr
+from pydantic_settings import BaseSettings
+
+# ---------- Settings ----------
+class Settings(BaseSettings):
+    port: int = 3000
+    log_level: str = "info"
+    database_url: SecretStr = Field(..., alias="DATABASE_URL")
+    kafka_brokers: str = Field(..., alias="KAFKA_BROKERS")
+
+settings = Settings()
+
+# ---------- Logging ----------
+structlog.configure(
+    processors=[
+        structlog.contextvars.merge_contextvars,
+        structlog.processors.add_log_level,
+        structlog.processors.TimeStamper(fmt="iso"),
+        structlog.processors.JSONRenderer(),
+    ]
+)
+log = structlog.get_logger()
+
+# ---------- Lifecycle ----------
+_ready = False
+_shutting_down = False
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global _ready
+    log.info("startup", kafka=settings.kafka_brokers)
+    # TODO: open DB pool, Kafka producer, etc.
+    _ready = True
+    yield
+    log.info("shutdown")
+    _ready = False
+
+app = FastAPI(lifespan=lifespan)
+
+# ---------- Probes ----------
+@app.get("/health/live")
+async def liveness():
+    if _shutting_down:
+        return Response(status_code=status.HTTP_503_SERVICE_UNAVAILABLE)
+    return {"status": "alive"}
+
+@app.get("/health/ready")
+async def readiness():
+    if not _ready or _shutting_down:
+        return Response(status_code=status.HTTP_503_SERVICE_UNAVAILABLE)
+    return {"status": "ready"}
+
+# ---------- Business routes ----------
+@app.get("/orders/{order_id}")
+async def get_order(order_id: str):
+    log.info("get_order", order_id=order_id)
+    return {"id": order_id, "status": "confirmed"}
+
+# ---------- Graceful shutdown ----------
+def _handle_sigterm(*_):
+    global _shutting_down
+    _shutting_down = True
+    log.info("sigterm_received")
+
+signal.signal(signal.SIGTERM, _handle_sigterm)
 ```
 
 ---

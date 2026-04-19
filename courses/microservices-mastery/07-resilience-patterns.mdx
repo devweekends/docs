@@ -20,6 +20,10 @@ In distributed systems, **failure is inevitable**. Resilience patterns help your
 
 ## Why Resilience Matters
 
+In a monolith, a slow database query makes one request slow. In microservices, that same slow query can take down your entire platform. Here is why: when Service A calls Service B, it holds a connection, a thread, and memory while waiting. If B is slow, A's resources pile up. Soon A runs out of threads too. Then services calling A start piling up. Within seconds, a single weak link cascades into total platform failure. This is not theoretical -- it is the most common root cause of major outages at Netflix, Amazon, and every large distributed system.
+
+Resilience patterns exist because we cannot prevent downstream failures, but we *can* prevent them from becoming our failures. The core insight: fail fast, fail isolated, and have a plan B. Without these patterns, one sick service kills the whole fleet. With them, a sick service degrades one feature while the rest of the platform keeps serving users.
+
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
 │                         CASCADE FAILURE                                      │
@@ -56,7 +60,13 @@ In distributed systems, **failure is inevitable**. Resilience patterns help your
 
 Prevent cascade failures by "breaking the circuit" to failing services.
 
+**Why this pattern exists:** Imagine a light switch that trips when there is an electrical fault -- the circuit breaker in software does the same thing. When a downstream service starts failing consistently, every retry wastes resources (threads, sockets, memory) and piles latency onto already-struggling infrastructure. Worse, your callers are kept waiting for timeouts that take seconds each. Without a circuit breaker, every slow failure costs you the full timeout duration multiplied by every caller. The circuit breaker short-circuits this: after detecting N failures in a window, it stops even trying and fails instantly. The tradeoff is that you will occasionally reject requests that would have succeeded, but you exchange that minor loss for keeping your whole platform responsive.
+
+**What it prevents:** Cascade failures where one sick service exhausts its callers' thread/connection pools, which then exhaust *their* callers' resources. Within 30 seconds, an entire microservice fleet can be frozen because one obscure downstream dependency went sideways.
+
 ### State Machine
+
+The state machine is the heart of the pattern. Think of it as a three-position toggle: normal (CLOSED), tripped (OPEN), and tentatively-recovering (HALF-OPEN). The magic is in the transitions. CLOSED is the happy path: requests flow, failures are counted. When failures exceed the threshold, you flip to OPEN: every call fails instantly without even trying the downstream. After a reset timeout, you move to HALF-OPEN and let a few trial requests through. If they succeed, great -- back to CLOSED. If they fail, back to OPEN for another cooldown. This cautious probing is what allows the system to heal without slamming a recovering service with full traffic the instant it comes back.
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
@@ -98,260 +108,567 @@ Prevent cascade failures by "breaking the circuit" to failing services.
 
 ### Implementation from Scratch
 
-```javascript
-// resilience/CircuitBreaker.js
-class CircuitBreaker {
-  constructor(options = {}) {
-    this.name = options.name || 'default';
-    this.failureThreshold = options.failureThreshold || 5;
-    this.successThreshold = options.successThreshold || 2;
-    this.timeout = options.timeout || 10000;
-    this.resetTimeout = options.resetTimeout || 30000;
-    
-    this.state = 'CLOSED';
-    this.failureCount = 0;
-    this.successCount = 0;
-    this.lastFailureTime = null;
-    this.nextAttemptTime = null;
-    
-    this.metrics = {
-      totalCalls: 0,
-      successfulCalls: 0,
-      failedCalls: 0,
-      rejectedCalls: 0,
-      timeouts: 0
-    };
-    
-    this.listeners = {
-      stateChange: [],
-      success: [],
-      failure: [],
-      reject: []
-    };
-  }
+Building a circuit breaker from scratch is useful because the production libraries (opossum, resilience4j, pybreaker) have opinionated defaults that may not fit your workload. The key design choices: what counts as a "failure" (HTTP 5xx? timeouts? specific errors?), how you count failures (consecutive vs. rolling window), and how you handle the transition to HALF-OPEN (one test request, or a percentage of traffic). Without a circuit breaker, every caller waits the full timeout for every failing request -- 1000 concurrent users times 5 seconds per timeout equals 5000 wasted seconds across your fleet. The tradeoff is operational complexity: a misconfigured breaker (too sensitive) will trigger on benign spikes; too lenient and it will fail to protect you. The Python version below uses `pybreaker`, a battle-tested library with Redis-backed state so multiple service instances share the same breaker state.
 
-  async call(fn, fallback = null) {
-    this.metrics.totalCalls++;
-    
-    // Check if circuit is open
-    if (this.state === 'OPEN') {
-      if (Date.now() < this.nextAttemptTime) {
-        this.metrics.rejectedCalls++;
-        this.emit('reject', { reason: 'Circuit is open' });
-        
-        if (fallback) {
-          return fallback();
-        }
-        throw new CircuitOpenError(this.name);
-      }
+<Tabs>
+  <Tab title="Node.js">
+  ```javascript
+  // resilience/CircuitBreaker.js
+  class CircuitBreaker {
+    constructor(options = {}) {
+      this.name = options.name || 'default';
+      this.failureThreshold = options.failureThreshold || 5;
+      this.successThreshold = options.successThreshold || 2;
+      this.timeout = options.timeout || 10000;
+      this.resetTimeout = options.resetTimeout || 30000;
       
-      // Try half-open
-      this.transitionTo('HALF_OPEN');
-    }
-
-    try {
-      const result = await this.executeWithTimeout(fn);
-      this.onSuccess();
-      return result;
-    } catch (error) {
-      this.onFailure(error);
-      
-      if (fallback) {
-        return fallback(error);
-      }
-      throw error;
-    }
-  }
-
-  async executeWithTimeout(fn) {
-    return new Promise(async (resolve, reject) => {
-      const timer = setTimeout(() => {
-        this.metrics.timeouts++;
-        reject(new TimeoutError(`Operation timed out after ${this.timeout}ms`));
-      }, this.timeout);
-
-      try {
-        const result = await fn();
-        clearTimeout(timer);
-        resolve(result);
-      } catch (error) {
-        clearTimeout(timer);
-        reject(error);
-      }
-    });
-  }
-
-  onSuccess() {
-    this.metrics.successfulCalls++;
-    this.emit('success');
-    
-    if (this.state === 'HALF_OPEN') {
-      this.successCount++;
-      
-      if (this.successCount >= this.successThreshold) {
-        this.transitionTo('CLOSED');
-      }
-    }
-    
-    this.failureCount = 0;
-  }
-
-  onFailure(error) {
-    this.metrics.failedCalls++;
-    this.lastFailureTime = Date.now();
-    this.emit('failure', error);
-    
-    if (this.state === 'HALF_OPEN') {
-      this.transitionTo('OPEN');
-      return;
-    }
-    
-    this.failureCount++;
-    
-    if (this.failureCount >= this.failureThreshold) {
-      this.transitionTo('OPEN');
-    }
-  }
-
-  transitionTo(newState) {
-    const oldState = this.state;
-    this.state = newState;
-    
-    if (newState === 'OPEN') {
-      this.nextAttemptTime = Date.now() + this.resetTimeout;
-    }
-    
-    if (newState === 'CLOSED') {
+      this.state = 'CLOSED';
       this.failureCount = 0;
       this.successCount = 0;
+      this.lastFailureTime = null;
+      this.nextAttemptTime = null;
+      
+      this.metrics = {
+        totalCalls: 0,
+        successfulCalls: 0,
+        failedCalls: 0,
+        rejectedCalls: 0,
+        timeouts: 0
+      };
+      
+      this.listeners = {
+        stateChange: [],
+        success: [],
+        failure: [],
+        reject: []
+      };
     }
-    
-    if (newState === 'HALF_OPEN') {
-      this.successCount = 0;
+
+    async call(fn, fallback = null) {
+      this.metrics.totalCalls++;
+      
+      // Check if circuit is open
+      if (this.state === 'OPEN') {
+        if (Date.now() < this.nextAttemptTime) {
+          this.metrics.rejectedCalls++;
+          this.emit('reject', { reason: 'Circuit is open' });
+          
+          if (fallback) {
+            return fallback();
+          }
+          throw new CircuitOpenError(this.name);
+        }
+        
+        // Try half-open
+        this.transitionTo('HALF_OPEN');
+      }
+
+      try {
+        const result = await this.executeWithTimeout(fn);
+        this.onSuccess();
+        return result;
+      } catch (error) {
+        this.onFailure(error);
+        
+        if (fallback) {
+          return fallback(error);
+        }
+        throw error;
+      }
     }
-    
-    this.emit('stateChange', { from: oldState, to: newState });
-    console.log(`Circuit [${this.name}]: ${oldState} → ${newState}`);
+
+    async executeWithTimeout(fn) {
+      return new Promise(async (resolve, reject) => {
+        const timer = setTimeout(() => {
+          this.metrics.timeouts++;
+          reject(new TimeoutError(`Operation timed out after ${this.timeout}ms`));
+        }, this.timeout);
+
+        try {
+          const result = await fn();
+          clearTimeout(timer);
+          resolve(result);
+        } catch (error) {
+          clearTimeout(timer);
+          reject(error);
+        }
+      });
+    }
+
+    onSuccess() {
+      this.metrics.successfulCalls++;
+      this.emit('success');
+      
+      if (this.state === 'HALF_OPEN') {
+        this.successCount++;
+        
+        if (this.successCount >= this.successThreshold) {
+          this.transitionTo('CLOSED');
+        }
+      }
+      
+      this.failureCount = 0;
+    }
+
+    onFailure(error) {
+      this.metrics.failedCalls++;
+      this.lastFailureTime = Date.now();
+      this.emit('failure', error);
+      
+      if (this.state === 'HALF_OPEN') {
+        this.transitionTo('OPEN');
+        return;
+      }
+      
+      this.failureCount++;
+      
+      if (this.failureCount >= this.failureThreshold) {
+        this.transitionTo('OPEN');
+      }
+    }
+
+    transitionTo(newState) {
+      const oldState = this.state;
+      this.state = newState;
+      
+      if (newState === 'OPEN') {
+        this.nextAttemptTime = Date.now() + this.resetTimeout;
+      }
+      
+      if (newState === 'CLOSED') {
+        this.failureCount = 0;
+        this.successCount = 0;
+      }
+      
+      if (newState === 'HALF_OPEN') {
+        this.successCount = 0;
+      }
+      
+      this.emit('stateChange', { from: oldState, to: newState });
+      console.log(`Circuit [${this.name}]: ${oldState} → ${newState}`);
+    }
+
+    on(event, callback) {
+      this.listeners[event].push(callback);
+    }
+
+    emit(event, data) {
+      this.listeners[event]?.forEach(cb => cb(data));
+    }
+
+    getStatus() {
+      return {
+        name: this.name,
+        state: this.state,
+        failureCount: this.failureCount,
+        successCount: this.successCount,
+        metrics: this.metrics,
+        nextAttemptTime: this.nextAttemptTime
+      };
+    }
   }
 
-  on(event, callback) {
-    this.listeners[event].push(callback);
+  class CircuitOpenError extends Error {
+    constructor(circuitName) {
+      super(`Circuit breaker [${circuitName}] is open`);
+      this.name = 'CircuitOpenError';
+      this.circuitName = circuitName;
+    }
   }
 
-  emit(event, data) {
-    this.listeners[event]?.forEach(cb => cb(data));
+  class TimeoutError extends Error {
+    constructor(message) {
+      super(message);
+      this.name = 'TimeoutError';
+    }
   }
 
-  getStatus() {
-    return {
-      name: this.name,
-      state: this.state,
-      failureCount: this.failureCount,
-      successCount: this.successCount,
-      metrics: this.metrics,
-      nextAttemptTime: this.nextAttemptTime
-    };
-  }
-}
+  module.exports = { CircuitBreaker, CircuitOpenError, TimeoutError };
+  ```
+  </Tab>
+  <Tab title="Python">
+  ```python
+  # resilience/circuit_breaker.py
+  import asyncio
+  import logging
+  import time
+  from dataclasses import dataclass, field
+  from enum import Enum
+  from typing import Any, Awaitable, Callable, Optional
 
-class CircuitOpenError extends Error {
-  constructor(circuitName) {
-    super(`Circuit breaker [${circuitName}] is open`);
-    this.name = 'CircuitOpenError';
-    this.circuitName = circuitName;
-  }
-}
+  import pybreaker
+  from pydantic import BaseModel
 
-class TimeoutError extends Error {
-  constructor(message) {
-    super(message);
-    this.name = 'TimeoutError';
-  }
-}
+  logger = logging.getLogger(__name__)
 
-module.exports = { CircuitBreaker, CircuitOpenError, TimeoutError };
-```
+
+  class CircuitState(str, Enum):
+      CLOSED = "CLOSED"
+      OPEN = "OPEN"
+      HALF_OPEN = "HALF_OPEN"
+
+
+  class CircuitBreakerConfig(BaseModel):
+      name: str = "default"
+      failure_threshold: int = 5
+      success_threshold: int = 2
+      timeout_seconds: float = 10.0
+      reset_timeout_seconds: float = 30.0
+
+
+  @dataclass
+  class CircuitMetrics:
+      total_calls: int = 0
+      successful_calls: int = 0
+      failed_calls: int = 0
+      rejected_calls: int = 0
+      timeouts: int = 0
+
+
+  class CircuitOpenError(Exception):
+      """Raised when the circuit breaker is open and rejects a call."""
+
+      def __init__(self, circuit_name: str) -> None:
+          super().__init__(f"Circuit breaker [{circuit_name}] is open")
+          self.circuit_name = circuit_name
+
+
+  class CircuitTimeoutError(Exception):
+      """Raised when an operation exceeds the configured timeout."""
+
+
+  class CircuitBreaker:
+      """Async circuit breaker with CLOSED / OPEN / HALF_OPEN states."""
+
+      def __init__(self, config: CircuitBreakerConfig) -> None:
+          self.config = config
+          self.state: CircuitState = CircuitState.CLOSED
+          self.failure_count: int = 0
+          self.success_count: int = 0
+          self.last_failure_time: Optional[float] = None
+          self.next_attempt_time: Optional[float] = None
+          self.metrics = CircuitMetrics()
+          self._listeners: dict[str, list[Callable[..., None]]] = {
+              "state_change": [],
+              "success": [],
+              "failure": [],
+              "reject": [],
+          }
+
+      async def call(
+          self,
+          fn: Callable[[], Awaitable[Any]],
+          fallback: Optional[Callable[..., Awaitable[Any]]] = None,
+      ) -> Any:
+          self.metrics.total_calls += 1
+
+          if self.state == CircuitState.OPEN:
+              if self.next_attempt_time and time.time() < self.next_attempt_time:
+                  self.metrics.rejected_calls += 1
+                  self._emit("reject", {"reason": "Circuit is open"})
+                  if fallback is not None:
+                      return await fallback()
+                  raise CircuitOpenError(self.config.name)
+              # Probe recovery
+              self._transition_to(CircuitState.HALF_OPEN)
+
+          try:
+              result = await self._execute_with_timeout(fn)
+              self._on_success()
+              return result
+          except Exception as error:  # noqa: BLE001 - rethrown below
+              self._on_failure(error)
+              if fallback is not None:
+                  return await fallback(error)
+              raise
+
+      async def _execute_with_timeout(
+          self, fn: Callable[[], Awaitable[Any]]
+      ) -> Any:
+          try:
+              return await asyncio.wait_for(fn(), timeout=self.config.timeout_seconds)
+          except asyncio.TimeoutError as exc:
+              self.metrics.timeouts += 1
+              raise CircuitTimeoutError(
+                  f"Operation timed out after {self.config.timeout_seconds}s"
+              ) from exc
+
+      def _on_success(self) -> None:
+          self.metrics.successful_calls += 1
+          self._emit("success", None)
+
+          if self.state == CircuitState.HALF_OPEN:
+              self.success_count += 1
+              if self.success_count >= self.config.success_threshold:
+                  self._transition_to(CircuitState.CLOSED)
+
+          self.failure_count = 0
+
+      def _on_failure(self, error: BaseException) -> None:
+          self.metrics.failed_calls += 1
+          self.last_failure_time = time.time()
+          self._emit("failure", error)
+
+          if self.state == CircuitState.HALF_OPEN:
+              self._transition_to(CircuitState.OPEN)
+              return
+
+          self.failure_count += 1
+          if self.failure_count >= self.config.failure_threshold:
+              self._transition_to(CircuitState.OPEN)
+
+      def _transition_to(self, new_state: CircuitState) -> None:
+          old_state, self.state = self.state, new_state
+
+          if new_state == CircuitState.OPEN:
+              self.next_attempt_time = time.time() + self.config.reset_timeout_seconds
+          if new_state == CircuitState.CLOSED:
+              self.failure_count = 0
+              self.success_count = 0
+          if new_state == CircuitState.HALF_OPEN:
+              self.success_count = 0
+
+          self._emit("state_change", {"from": old_state, "to": new_state})
+          logger.info("Circuit [%s]: %s -> %s", self.config.name, old_state, new_state)
+
+      def on(self, event: str, callback: Callable[..., None]) -> None:
+          self._listeners.setdefault(event, []).append(callback)
+
+      def _emit(self, event: str, data: Any) -> None:
+          for cb in self._listeners.get(event, []):
+              try:
+                  cb(data)
+              except Exception:  # noqa: BLE001
+                  logger.exception("Listener for %s raised", event)
+
+      def get_status(self) -> dict[str, Any]:
+          return {
+              "name": self.config.name,
+              "state": self.state,
+              "failure_count": self.failure_count,
+              "success_count": self.success_count,
+              "metrics": self.metrics.__dict__,
+              "next_attempt_time": self.next_attempt_time,
+          }
+
+
+  # --- Production alternative: pybreaker with Redis-backed state ---
+  # Sharing breaker state across instances is critical in containerized
+  # deployments where each pod would otherwise have its own local state.
+  import redis
+
+  _redis_client = redis.Redis(host="redis", port=6379, decode_responses=False)
+
+  payment_breaker = pybreaker.CircuitBreaker(
+      fail_max=5,
+      reset_timeout=30,
+      state_storage=pybreaker.CircuitRedisStorage(
+          state=pybreaker.STATE_CLOSED,
+          redis_object=_redis_client,
+          namespace="cb:payment",
+      ),
+      name="payment-service",
+  )
+  ```
+  </Tab>
+</Tabs>
 
 ### Using with Service Clients
 
-```javascript
-// services/PaymentServiceClient.js
-const { CircuitBreaker } = require('../resilience/CircuitBreaker');
+A circuit breaker only adds value when wired into the code path that actually makes downstream calls. The pattern below wraps a service client so *every* call goes through the breaker. Critically, we provide a fallback function for each operation: when the breaker is open (or the call fails), the fallback runs instead of throwing. For writes (like `processPayment`), the fallback queues the work for later. For reads (like `getPaymentStatus`), the fallback returns cached data with a `_fromCache` flag so callers know it may be stale. Without this pattern, every place that calls the Payment Service would need to duplicate the try/catch/fallback logic -- and developers would forget half the time. Centralizing resilience in the client means one implementation, consistently applied.
 
-class PaymentServiceClient {
-  constructor(httpClient, cache) {
-    this.http = httpClient;
-    this.cache = cache;
-    
-    this.circuitBreaker = new CircuitBreaker({
-      name: 'payment-service',
-      failureThreshold: 5,
-      successThreshold: 2,
-      timeout: 5000,
-      resetTimeout: 30000
-    });
-    
-    // Listen to state changes
-    this.circuitBreaker.on('stateChange', ({ from, to }) => {
-      if (to === 'OPEN') {
-        this.alertOps(`Payment service circuit opened!`);
-      }
-    });
-  }
+<Tabs>
+  <Tab title="Node.js">
+  ```javascript
+  // services/PaymentServiceClient.js
+  const { CircuitBreaker } = require('../resilience/CircuitBreaker');
 
-  async processPayment(orderId, amount, paymentMethod) {
-    return this.circuitBreaker.call(
-      // Primary operation
-      async () => {
-        const response = await this.http.post('/payments', {
-          orderId,
-          amount,
-          paymentMethod
-        });
-        return response.data;
-      },
-      // Fallback
-      async (error) => {
-        console.log('Using payment fallback:', error.message);
-        
-        // Queue for later processing
-        await this.queuePaymentForRetry(orderId, amount, paymentMethod);
-        
-        return {
-          status: 'PENDING',
-          message: 'Payment queued for processing',
-          retryId: generateId()
-        };
-      }
-    );
-  }
-
-  async getPaymentStatus(paymentId) {
-    return this.circuitBreaker.call(
-      async () => {
-        const response = await this.http.get(`/payments/${paymentId}`);
-        // Cache successful responses
-        await this.cache.set(`payment:${paymentId}`, response.data, 60);
-        return response.data;
-      },
-      async () => {
-        // Return cached data as fallback
-        const cached = await this.cache.get(`payment:${paymentId}`);
-        if (cached) {
-          return { ...cached, _fromCache: true };
+  class PaymentServiceClient {
+    constructor(httpClient, cache) {
+      this.http = httpClient;
+      this.cache = cache;
+      
+      this.circuitBreaker = new CircuitBreaker({
+        name: 'payment-service',
+        failureThreshold: 5,
+        successThreshold: 2,
+        timeout: 5000,
+        resetTimeout: 30000
+      });
+      
+      // Listen to state changes
+      this.circuitBreaker.on('stateChange', ({ from, to }) => {
+        if (to === 'OPEN') {
+          this.alertOps(`Payment service circuit opened!`);
         }
-        throw new Error('Payment status unavailable');
-      }
-    );
+      });
+    }
+
+    async processPayment(orderId, amount, paymentMethod) {
+      return this.circuitBreaker.call(
+        // Primary operation
+        async () => {
+          const response = await this.http.post('/payments', {
+            orderId,
+            amount,
+            paymentMethod
+          });
+          return response.data;
+        },
+        // Fallback
+        async (error) => {
+          console.log('Using payment fallback:', error.message);
+          
+          // Queue for later processing
+          await this.queuePaymentForRetry(orderId, amount, paymentMethod);
+          
+          return {
+            status: 'PENDING',
+            message: 'Payment queued for processing',
+            retryId: generateId()
+          };
+        }
+      );
+    }
+
+    async getPaymentStatus(paymentId) {
+      return this.circuitBreaker.call(
+        async () => {
+          const response = await this.http.get(`/payments/${paymentId}`);
+          // Cache successful responses
+          await this.cache.set(`payment:${paymentId}`, response.data, 60);
+          return response.data;
+        },
+        async () => {
+          // Return cached data as fallback
+          const cached = await this.cache.get(`payment:${paymentId}`);
+          if (cached) {
+            return { ...cached, _fromCache: true };
+          }
+          throw new Error('Payment status unavailable');
+        }
+      );
+    }
   }
-}
-```
+  ```
+  </Tab>
+  <Tab title="Python">
+  ```python
+  # services/payment_service_client.py
+  import logging
+  import uuid
+  from typing import Any, Optional
+
+  import httpx
+  from pydantic import BaseModel
+
+  from resilience.circuit_breaker import CircuitBreaker, CircuitBreakerConfig, CircuitState
+
+  logger = logging.getLogger(__name__)
+
+
+  class PaymentRequest(BaseModel):
+      order_id: str
+      amount: float
+      payment_method: str
+
+
+  class PaymentResponse(BaseModel):
+      status: str
+      message: Optional[str] = None
+      retry_id: Optional[str] = None
+      from_cache: bool = False
+
+
+  class PaymentServiceClient:
+      def __init__(self, http_client: httpx.AsyncClient, cache: Any) -> None:
+          self.http = http_client
+          self.cache = cache
+
+          self.circuit_breaker = CircuitBreaker(
+              CircuitBreakerConfig(
+                  name="payment-service",
+                  failure_threshold=5,
+                  success_threshold=2,
+                  timeout_seconds=5.0,
+                  reset_timeout_seconds=30.0,
+              )
+          )
+
+          # Page on-call when the circuit opens
+          self.circuit_breaker.on("state_change", self._on_state_change)
+
+      def _on_state_change(self, data: dict[str, Any]) -> None:
+          if data["to"] == CircuitState.OPEN:
+              self._alert_ops("Payment service circuit opened!")
+
+      def _alert_ops(self, message: str) -> None:
+          logger.error("OPS ALERT: %s", message)
+
+      async def _queue_payment_for_retry(
+          self, order_id: str, amount: float, payment_method: str
+      ) -> None:
+          # In real code, publish to Kafka / SQS
+          logger.info("Queueing payment for retry: order=%s", order_id)
+
+      async def process_payment(
+          self, order_id: str, amount: float, payment_method: str
+      ) -> PaymentResponse:
+          async def primary() -> PaymentResponse:
+              response = await self.http.post(
+                  "/payments",
+                  json=PaymentRequest(
+                      order_id=order_id,
+                      amount=amount,
+                      payment_method=payment_method,
+                  ).model_dump(),
+              )
+              response.raise_for_status()
+              return PaymentResponse(**response.json())
+
+          async def fallback(error: Optional[BaseException] = None) -> PaymentResponse:
+              logger.warning(
+                  "Using payment fallback: %s", error if error else "circuit open"
+              )
+              await self._queue_payment_for_retry(order_id, amount, payment_method)
+              return PaymentResponse(
+                  status="PENDING",
+                  message="Payment queued for processing",
+                  retry_id=str(uuid.uuid4()),
+              )
+
+          return await self.circuit_breaker.call(primary, fallback)
+
+      async def get_payment_status(self, payment_id: str) -> PaymentResponse:
+          cache_key = f"payment:{payment_id}"
+
+          async def primary() -> PaymentResponse:
+              response = await self.http.get(f"/payments/{payment_id}")
+              response.raise_for_status()
+              data = response.json()
+              await self.cache.set(cache_key, data, ex=60)
+              return PaymentResponse(**data)
+
+          async def fallback(error: Optional[BaseException] = None) -> PaymentResponse:
+              cached = await self.cache.get(cache_key)
+              if cached:
+                  return PaymentResponse(**cached, from_cache=True)
+              raise RuntimeError("Payment status unavailable")
+
+          return await self.circuit_breaker.call(primary, fallback)
+  ```
+  </Tab>
+</Tabs>
 
 ---
 
 ## Retry Patterns
 
 ### Retry Strategies
+
+**Why retries exist:** Most failures in distributed systems are transient: a packet was dropped, a leader election was in progress, a GC pause happened, a connection was torn down by a load balancer. If you retry a second or two later, it just works. Without retries, every transient blip becomes a user-visible error. With naive retries, you create new problems: a "thundering herd" where thousands of clients hammer a recovering service simultaneously, pushing it back into failure. The solution is *exponential backoff with jitter*: wait longer between each attempt, and add randomness so callers spread out their retries instead of synchronizing.
+
+**Key tradeoff:** Retries amplify load. If a request normally takes 1 second and you allow 3 retries, a failing downstream can cost you 7+ seconds of user-facing latency and 4x the load on the struggling service. Always pair retries with a circuit breaker so that a truly broken service does not get retried into oblivion.
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
@@ -389,183 +706,390 @@ class PaymentServiceClient {
 
 ### Implementation
 
-```javascript
-// resilience/Retry.js
-class RetryPolicy {
-  constructor(options = {}) {
-    this.maxRetries = options.maxRetries || 3;
-    this.strategy = options.strategy || 'exponential';
-    this.baseDelay = options.baseDelay || 1000;
-    this.maxDelay = options.maxDelay || 30000;
-    this.jitterFactor = options.jitterFactor || 0.2;
-    this.retryableErrors = options.retryableErrors || this.defaultRetryableErrors();
-  }
+The retry policy below captures several important decisions beyond "just loop a few times." First, *what is retryable*: network errors and specific HTTP status codes (408, 429, 500, 502, 503, 504) are retryable; 4xx errors like 400 or 401 are not -- retrying them just wastes effort since the request is malformed. Second, *how to delay*: exponential backoff with a jitter factor prevents the thundering herd. Third, *respecting server hints*: if the server returns `Retry-After`, honor it rather than computing your own delay -- the server knows when it will be ready. In Python we use the `tenacity` library, which is the de facto standard. It provides decorators for retry logic, hooks to log before each retry (via `before_sleep`), and composable stop/wait conditions.
 
-  defaultRetryableErrors() {
-    return [
-      'ECONNRESET',
-      'ETIMEDOUT',
-      'ECONNREFUSED',
-      'NETWORK_ERROR'
-    ];
-  }
+<Tabs>
+  <Tab title="Node.js">
+  ```javascript
+  // resilience/Retry.js
+  class RetryPolicy {
+    constructor(options = {}) {
+      this.maxRetries = options.maxRetries || 3;
+      this.strategy = options.strategy || 'exponential';
+      this.baseDelay = options.baseDelay || 1000;
+      this.maxDelay = options.maxDelay || 30000;
+      this.jitterFactor = options.jitterFactor || 0.2;
+      this.retryableErrors = options.retryableErrors || this.defaultRetryableErrors();
+    }
 
-  async execute(operation) {
-    let lastError;
-    
-    for (let attempt = 0; attempt <= this.maxRetries; attempt++) {
-      try {
-        return await operation();
-      } catch (error) {
-        lastError = error;
-        
-        if (!this.isRetryable(error) || attempt === this.maxRetries) {
-          throw error;
+    defaultRetryableErrors() {
+      return [
+        'ECONNRESET',
+        'ETIMEDOUT',
+        'ECONNREFUSED',
+        'NETWORK_ERROR'
+      ];
+    }
+
+    async execute(operation) {
+      let lastError;
+      
+      for (let attempt = 0; attempt <= this.maxRetries; attempt++) {
+        try {
+          return await operation();
+        } catch (error) {
+          lastError = error;
+          
+          if (!this.isRetryable(error) || attempt === this.maxRetries) {
+            throw error;
+          }
+          
+          const delay = this.calculateDelay(attempt);
+          console.log(`Retry ${attempt + 1}/${this.maxRetries} after ${delay}ms`);
+          
+          await this.sleep(delay);
         }
-        
-        const delay = this.calculateDelay(attempt);
-        console.log(`Retry ${attempt + 1}/${this.maxRetries} after ${delay}ms`);
-        
-        await this.sleep(delay);
       }
+      
+      throw lastError;
     }
-    
-    throw lastError;
-  }
 
-  isRetryable(error) {
-    // Network errors
-    if (this.retryableErrors.includes(error.code)) {
-      return true;
-    }
-    
-    // HTTP status codes
-    const retryableStatusCodes = [408, 429, 500, 502, 503, 504];
-    if (retryableStatusCodes.includes(error.statusCode)) {
-      return true;
-    }
-    
-    // Circuit breaker open (will retry after reset)
-    if (error.name === 'CircuitOpenError') {
-      return false; // Don't retry, circuit breaker handles it
-    }
-    
-    return false;
-  }
-
-  calculateDelay(attempt) {
-    let delay;
-    
-    switch (this.strategy) {
-      case 'fixed':
-        delay = this.baseDelay;
-        break;
-        
-      case 'linear':
-        delay = this.baseDelay * (attempt + 1);
-        break;
-        
-      case 'exponential':
-        delay = this.baseDelay * Math.pow(2, attempt);
-        break;
-        
-      default:
-        delay = this.baseDelay;
-    }
-    
-    // Apply jitter
-    const jitter = delay * this.jitterFactor * Math.random();
-    delay = delay + jitter;
-    
-    // Cap at max delay
-    return Math.min(delay, this.maxDelay);
-  }
-
-  sleep(ms) {
-    return new Promise(resolve => setTimeout(resolve, ms));
-  }
-}
-
-// Retry with specific status code handling
-class HttpRetryPolicy extends RetryPolicy {
-  constructor(options = {}) {
-    super(options);
-    this.statusCodeHandlers = options.statusCodeHandlers || {};
-  }
-
-  isRetryable(error) {
-    if (error.statusCode === 429) {
-      // Rate limited - respect Retry-After header
-      return true;
-    }
-    
-    return super.isRetryable(error);
-  }
-
-  calculateDelay(attempt, error) {
-    // Respect Retry-After header
-    if (error?.headers?.['retry-after']) {
-      const retryAfter = parseInt(error.headers['retry-after']);
-      if (!isNaN(retryAfter)) {
-        return retryAfter * 1000;
+    isRetryable(error) {
+      // Network errors
+      if (this.retryableErrors.includes(error.code)) {
+        return true;
       }
+      
+      // HTTP status codes
+      const retryableStatusCodes = [408, 429, 500, 502, 503, 504];
+      if (retryableStatusCodes.includes(error.statusCode)) {
+        return true;
+      }
+      
+      // Circuit breaker open (will retry after reset)
+      if (error.name === 'CircuitOpenError') {
+        return false; // Don't retry, circuit breaker handles it
+      }
+      
+      return false;
     }
-    
-    return super.calculateDelay(attempt);
-  }
-}
 
-module.exports = { RetryPolicy, HttpRetryPolicy };
-```
+    calculateDelay(attempt) {
+      let delay;
+      
+      switch (this.strategy) {
+        case 'fixed':
+          delay = this.baseDelay;
+          break;
+          
+        case 'linear':
+          delay = this.baseDelay * (attempt + 1);
+          break;
+          
+        case 'exponential':
+          delay = this.baseDelay * Math.pow(2, attempt);
+          break;
+          
+        default:
+          delay = this.baseDelay;
+      }
+      
+      // Apply jitter
+      const jitter = delay * this.jitterFactor * Math.random();
+      delay = delay + jitter;
+      
+      // Cap at max delay
+      return Math.min(delay, this.maxDelay);
+    }
+
+    sleep(ms) {
+      return new Promise(resolve => setTimeout(resolve, ms));
+    }
+  }
+
+  // Retry with specific status code handling
+  class HttpRetryPolicy extends RetryPolicy {
+    constructor(options = {}) {
+      super(options);
+      this.statusCodeHandlers = options.statusCodeHandlers || {};
+    }
+
+    isRetryable(error) {
+      if (error.statusCode === 429) {
+        // Rate limited - respect Retry-After header
+        return true;
+      }
+      
+      return super.isRetryable(error);
+    }
+
+    calculateDelay(attempt, error) {
+      // Respect Retry-After header
+      if (error?.headers?.['retry-after']) {
+        const retryAfter = parseInt(error.headers['retry-after']);
+        if (!isNaN(retryAfter)) {
+          return retryAfter * 1000;
+        }
+      }
+      
+      return super.calculateDelay(attempt);
+    }
+  }
+
+  module.exports = { RetryPolicy, HttpRetryPolicy };
+  ```
+  </Tab>
+  <Tab title="Python">
+  ```python
+  # resilience/retry.py
+  import asyncio
+  import logging
+  import random
+  from typing import Any, Awaitable, Callable, Iterable, Optional
+
+  import httpx
+  from pydantic import BaseModel
+  from tenacity import (
+      AsyncRetrying,
+      RetryError,
+      retry,
+      retry_if_exception,
+      stop_after_attempt,
+      wait_exponential_jitter,
+      before_sleep_log,
+  )
+
+  logger = logging.getLogger(__name__)
+
+
+  RETRYABLE_STATUS_CODES = {408, 429, 500, 502, 503, 504}
+
+
+  class RetryConfig(BaseModel):
+      max_retries: int = 3
+      base_delay_seconds: float = 1.0
+      max_delay_seconds: float = 30.0
+      jitter_factor: float = 0.2
+
+
+  def _is_retryable(exc: BaseException) -> bool:
+      # Network transport errors
+      if isinstance(exc, (httpx.ConnectError, httpx.ReadTimeout, httpx.RemoteProtocolError)):
+          return True
+      # HTTP status codes
+      if isinstance(exc, httpx.HTTPStatusError):
+          return exc.response.status_code in RETRYABLE_STATUS_CODES
+      # Do NOT retry when circuit is open -- circuit breaker is handling it
+      if type(exc).__name__ == "CircuitOpenError":
+          return False
+      return False
+
+
+  class RetryPolicy:
+      """Reusable retry policy with exponential backoff + jitter."""
+
+      def __init__(self, config: Optional[RetryConfig] = None) -> None:
+          self.config = config or RetryConfig()
+
+      async def execute(
+          self, operation: Callable[[], Awaitable[Any]]
+      ) -> Any:
+          try:
+              async for attempt in AsyncRetrying(
+                  stop=stop_after_attempt(self.config.max_retries + 1),
+                  wait=wait_exponential_jitter(
+                      initial=self.config.base_delay_seconds,
+                      max=self.config.max_delay_seconds,
+                      jitter=self.config.jitter_factor,
+                  ),
+                  retry=retry_if_exception(_is_retryable),
+                  before_sleep=before_sleep_log(logger, logging.WARNING),
+                  reraise=True,
+              ):
+                  with attempt:
+                      return await operation()
+          except RetryError as exc:
+              raise exc.last_attempt.exception()  # type: ignore[misc]
+
+
+  # --- Decorator form for the common case ---
+  def retryable(max_retries: int = 3, base_delay: float = 1.0):
+      """Decorator: retry transient failures with exponential backoff + jitter."""
+      return retry(
+          stop=stop_after_attempt(max_retries + 1),
+          wait=wait_exponential_jitter(initial=base_delay, max=30.0, jitter=0.2),
+          retry=retry_if_exception(_is_retryable),
+          before_sleep=before_sleep_log(logger, logging.WARNING),
+          reraise=True,
+      )
+
+
+  # --- HTTP-aware variant that honors Retry-After ---
+  class HttpRetryPolicy(RetryPolicy):
+      async def execute(self, operation: Callable[[], Awaitable[Any]]) -> Any:
+          attempt = 0
+          last_exc: Optional[BaseException] = None
+          while attempt <= self.config.max_retries:
+              try:
+                  return await operation()
+              except httpx.HTTPStatusError as exc:
+                  last_exc = exc
+                  if not _is_retryable(exc) or attempt == self.config.max_retries:
+                      raise
+
+                  retry_after = exc.response.headers.get("retry-after")
+                  if retry_after:
+                      try:
+                          delay = float(retry_after)
+                      except ValueError:
+                          delay = self._backoff(attempt)
+                  else:
+                      delay = self._backoff(attempt)
+
+                  logger.warning(
+                      "HTTP %s -- retrying in %.2fs (attempt %d/%d)",
+                      exc.response.status_code,
+                      delay,
+                      attempt + 1,
+                      self.config.max_retries,
+                  )
+                  await asyncio.sleep(delay)
+                  attempt += 1
+              except Exception as exc:  # noqa: BLE001
+                  last_exc = exc
+                  if not _is_retryable(exc) or attempt == self.config.max_retries:
+                      raise
+                  await asyncio.sleep(self._backoff(attempt))
+                  attempt += 1
+
+          if last_exc:
+              raise last_exc
+          raise RuntimeError("Retry loop exited unexpectedly")
+
+      def _backoff(self, attempt: int) -> float:
+          base = self.config.base_delay_seconds * (2 ** attempt)
+          jitter = base * self.config.jitter_factor * random.random()
+          return min(base + jitter, self.config.max_delay_seconds)
+  ```
+  </Tab>
+</Tabs>
 
 ### Combining Circuit Breaker and Retry
 
-```javascript
-// resilience/ResilientClient.js
-class ResilientClient {
-  constructor(options = {}) {
-    this.circuitBreaker = new CircuitBreaker(options.circuitBreaker);
-    this.retryPolicy = new RetryPolicy(options.retry);
+**Why combine them:** Circuit breakers and retries handle different failure modes. Retries handle *transient* failures ("the packet dropped, try again"). Circuit breakers handle *systemic* failures ("this service is broken, stop trying"). Alone, retries can hammer a dying service into the ground; alone, a circuit breaker will fail requests that would have succeeded on a quick retry. Together, they cover both cases: the retry handles the blip, and if failures persist, the circuit breaker trips to stop the bleeding. The *order* matters: the circuit breaker must wrap the retry loop, not the other way around. Otherwise each retry opens and closes the circuit individually, defeating the purpose.
+
+<Tabs>
+  <Tab title="Node.js">
+  ```javascript
+  // resilience/ResilientClient.js
+  class ResilientClient {
+    constructor(options = {}) {
+      this.circuitBreaker = new CircuitBreaker(options.circuitBreaker);
+      this.retryPolicy = new RetryPolicy(options.retry);
+    }
+
+    async execute(operation, fallback = null) {
+      return this.circuitBreaker.call(
+        // Wrap operation with retry
+        () => this.retryPolicy.execute(operation),
+        fallback
+      );
+    }
   }
 
-  async execute(operation, fallback = null) {
-    return this.circuitBreaker.call(
-      // Wrap operation with retry
-      () => this.retryPolicy.execute(operation),
-      fallback
-    );
-  }
-}
+  // Usage
+  const resilientPaymentClient = new ResilientClient({
+    circuitBreaker: {
+      name: 'payment',
+      failureThreshold: 5,
+      resetTimeout: 30000
+    },
+    retry: {
+      maxRetries: 3,
+      strategy: 'exponential',
+      baseDelay: 1000
+    }
+  });
 
-// Usage
-const resilientPaymentClient = new ResilientClient({
-  circuitBreaker: {
-    name: 'payment',
-    failureThreshold: 5,
-    resetTimeout: 30000
-  },
-  retry: {
-    maxRetries: 3,
-    strategy: 'exponential',
-    baseDelay: 1000
-  }
-});
+  const result = await resilientPaymentClient.execute(
+    async () => {
+      return axios.post('http://payment-service/charge', { amount: 100 });
+    },
+    async () => {
+      return { status: 'PENDING', queued: true };
+    }
+  );
+  ```
+  </Tab>
+  <Tab title="Python">
+  ```python
+  # resilience/resilient_client.py
+  from typing import Any, Awaitable, Callable, Optional
 
-const result = await resilientPaymentClient.execute(
-  async () => {
-    return axios.post('http://payment-service/charge', { amount: 100 });
-  },
-  async () => {
-    return { status: 'PENDING', queued: true };
-  }
-);
-```
+  import httpx
+  from pydantic import BaseModel
+
+  from resilience.circuit_breaker import CircuitBreaker, CircuitBreakerConfig
+  from resilience.retry import RetryConfig, RetryPolicy
+
+
+  class ResilientClientOptions(BaseModel):
+      circuit_breaker: CircuitBreakerConfig = CircuitBreakerConfig()
+      retry: RetryConfig = RetryConfig()
+
+
+  class ResilientClient:
+      """Composes circuit breaker + retry. Order matters: CB wraps retry."""
+
+      def __init__(self, options: ResilientClientOptions) -> None:
+          self.circuit_breaker = CircuitBreaker(options.circuit_breaker)
+          self.retry_policy = RetryPolicy(options.retry)
+
+      async def execute(
+          self,
+          operation: Callable[[], Awaitable[Any]],
+          fallback: Optional[Callable[..., Awaitable[Any]]] = None,
+      ) -> Any:
+          async def retried() -> Any:
+              return await self.retry_policy.execute(operation)
+
+          return await self.circuit_breaker.call(retried, fallback)
+
+
+  # --- Usage ---
+  resilient_payment_client = ResilientClient(
+      ResilientClientOptions(
+          circuit_breaker=CircuitBreakerConfig(
+              name="payment", failure_threshold=5, reset_timeout_seconds=30.0
+          ),
+          retry=RetryConfig(max_retries=3, base_delay_seconds=1.0),
+      )
+  )
+
+
+  async def charge_payment(http: httpx.AsyncClient, amount: float) -> dict[str, Any]:
+      async def call() -> dict[str, Any]:
+          resp = await http.post("http://payment-service/charge", json={"amount": amount})
+          resp.raise_for_status()
+          return resp.json()
+
+      async def fallback(error: Optional[BaseException] = None) -> dict[str, Any]:
+          return {"status": "PENDING", "queued": True}
+
+      return await resilient_payment_client.execute(call, fallback)
+  ```
+  </Tab>
+</Tabs>
 
 ---
 
 ## Bulkhead Pattern
 
 Isolate failures to prevent them from affecting other parts of the system.
+
+**Why this pattern exists:** The name comes from ships: watertight compartments mean a hull breach floods one section, not the whole vessel. In software, your resources (threads, connections, memory, event-loop capacity) are shared by default. If one downstream dependency is slow, it can consume *all* of those resources, starving unrelated callers. The classic example: your notification service (non-critical) goes slow, eats all your HTTP connections, and now order checkout (critical) can't get a connection to the payment service -- a non-critical bug takes down your revenue flow.
+
+**What it prevents:** Cross-dependency contention. By partitioning resources per dependency (e.g., payment gets 50 concurrent slots, notifications gets 20), a slow notification service can only starve the notification pool, not the payment pool. The tradeoff is that you must size each bulkhead correctly -- too small, and you throttle normal traffic; too large, and you fail to isolate.
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
@@ -601,549 +1125,1168 @@ Isolate failures to prevent them from affecting other parts of the system.
 
 ### Implementation
 
-```javascript
-// resilience/Bulkhead.js
-class Bulkhead {
-  constructor(options = {}) {
-    this.name = options.name || 'default';
-    this.maxConcurrent = options.maxConcurrent || 10;
-    this.maxQueue = options.maxQueue || 100;
-    this.queueTimeout = options.queueTimeout || 30000;
-    
-    this.activeCount = 0;
-    this.queue = [];
-    
-    this.metrics = {
-      totalCalls: 0,
-      activeCalls: 0,
-      queuedCalls: 0,
-      rejectedCalls: 0,
-      completedCalls: 0,
-      timeoutCalls: 0
-    };
-  }
+A bulkhead has two knobs: `maxConcurrent` (how many in-flight calls allowed at once) and `maxQueue` (how many can wait). When `activeCount < maxConcurrent`, calls execute immediately. When it's saturated, calls queue up to `maxQueue`. Beyond that, we reject fast -- failing quickly is far better than queuing indefinitely and surprising callers with 30-second latency. The queue also has a timeout: if you've been waiting that long, the caller has likely given up, so don't bother running the work. In Python's single-threaded async world, `asyncio.Semaphore` is the idiomatic implementation -- it does exactly this counting semantics natively.
 
-  async execute(operation) {
-    this.metrics.totalCalls++;
-    
-    // If within limit, execute immediately
-    if (this.activeCount < this.maxConcurrent) {
-      return this.executeOperation(operation);
-    }
-    
-    // If queue is full, reject
-    if (this.queue.length >= this.maxQueue) {
-      this.metrics.rejectedCalls++;
-      throw new BulkheadFullError(this.name);
-    }
-    
-    // Queue the operation
-    return this.queueOperation(operation);
-  }
-
-  async executeOperation(operation) {
-    this.activeCount++;
-    this.metrics.activeCalls = this.activeCount;
-    
-    try {
-      const result = await operation();
-      this.metrics.completedCalls++;
-      return result;
-    } finally {
-      this.activeCount--;
-      this.metrics.activeCalls = this.activeCount;
-      this.processQueue();
-    }
-  }
-
-  queueOperation(operation) {
-    return new Promise((resolve, reject) => {
-      const queueItem = {
-        operation,
-        resolve,
-        reject,
-        timestamp: Date.now(),
-        timer: setTimeout(() => {
-          this.removeFromQueue(queueItem);
-          this.metrics.timeoutCalls++;
-          reject(new QueueTimeoutError(this.name, this.queueTimeout));
-        }, this.queueTimeout)
-      };
+<Tabs>
+  <Tab title="Node.js">
+  ```javascript
+  // resilience/Bulkhead.js
+  class Bulkhead {
+    constructor(options = {}) {
+      this.name = options.name || 'default';
+      this.maxConcurrent = options.maxConcurrent || 10;
+      this.maxQueue = options.maxQueue || 100;
+      this.queueTimeout = options.queueTimeout || 30000;
       
-      this.queue.push(queueItem);
-      this.metrics.queuedCalls = this.queue.length;
-    });
-  }
-
-  processQueue() {
-    if (this.queue.length === 0 || this.activeCount >= this.maxConcurrent) {
-      return;
+      this.activeCount = 0;
+      this.queue = [];
+      
+      this.metrics = {
+        totalCalls: 0,
+        activeCalls: 0,
+        queuedCalls: 0,
+        rejectedCalls: 0,
+        completedCalls: 0,
+        timeoutCalls: 0
+      };
     }
-    
-    const item = this.queue.shift();
-    clearTimeout(item.timer);
-    this.metrics.queuedCalls = this.queue.length;
-    
-    this.executeOperation(item.operation)
-      .then(item.resolve)
-      .catch(item.reject);
-  }
 
-  removeFromQueue(item) {
-    const index = this.queue.indexOf(item);
-    if (index > -1) {
-      this.queue.splice(index, 1);
+    async execute(operation) {
+      this.metrics.totalCalls++;
+      
+      // If within limit, execute immediately
+      if (this.activeCount < this.maxConcurrent) {
+        return this.executeOperation(operation);
+      }
+      
+      // If queue is full, reject
+      if (this.queue.length >= this.maxQueue) {
+        this.metrics.rejectedCalls++;
+        throw new BulkheadFullError(this.name);
+      }
+      
+      // Queue the operation
+      return this.queueOperation(operation);
+    }
+
+    async executeOperation(operation) {
+      this.activeCount++;
+      this.metrics.activeCalls = this.activeCount;
+      
+      try {
+        const result = await operation();
+        this.metrics.completedCalls++;
+        return result;
+      } finally {
+        this.activeCount--;
+        this.metrics.activeCalls = this.activeCount;
+        this.processQueue();
+      }
+    }
+
+    queueOperation(operation) {
+      return new Promise((resolve, reject) => {
+        const queueItem = {
+          operation,
+          resolve,
+          reject,
+          timestamp: Date.now(),
+          timer: setTimeout(() => {
+            this.removeFromQueue(queueItem);
+            this.metrics.timeoutCalls++;
+            reject(new QueueTimeoutError(this.name, this.queueTimeout));
+          }, this.queueTimeout)
+        };
+        
+        this.queue.push(queueItem);
+        this.metrics.queuedCalls = this.queue.length;
+      });
+    }
+
+    processQueue() {
+      if (this.queue.length === 0 || this.activeCount >= this.maxConcurrent) {
+        return;
+      }
+      
+      const item = this.queue.shift();
+      clearTimeout(item.timer);
       this.metrics.queuedCalls = this.queue.length;
+      
+      this.executeOperation(item.operation)
+        .then(item.resolve)
+        .catch(item.reject);
+    }
+
+    removeFromQueue(item) {
+      const index = this.queue.indexOf(item);
+      if (index > -1) {
+        this.queue.splice(index, 1);
+        this.metrics.queuedCalls = this.queue.length;
+      }
+    }
+
+    getStatus() {
+      return {
+        name: this.name,
+        activeCount: this.activeCount,
+        queueLength: this.queue.length,
+        metrics: this.metrics
+      };
     }
   }
 
-  getStatus() {
-    return {
-      name: this.name,
-      activeCount: this.activeCount,
-      queueLength: this.queue.length,
-      metrics: this.metrics
-    };
+  class BulkheadFullError extends Error {
+    constructor(name) {
+      super(`Bulkhead [${name}] is full`);
+      this.name = 'BulkheadFullError';
+    }
   }
-}
 
-class BulkheadFullError extends Error {
-  constructor(name) {
-    super(`Bulkhead [${name}] is full`);
-    this.name = 'BulkheadFullError';
+  class QueueTimeoutError extends Error {
+    constructor(name, timeout) {
+      super(`Queue timeout in bulkhead [${name}] after ${timeout}ms`);
+      this.name = 'QueueTimeoutError';
+    }
   }
-}
 
-class QueueTimeoutError extends Error {
-  constructor(name, timeout) {
-    super(`Queue timeout in bulkhead [${name}] after ${timeout}ms`);
-    this.name = 'QueueTimeoutError';
-  }
-}
+  module.exports = { Bulkhead, BulkheadFullError, QueueTimeoutError };
+  ```
+  </Tab>
+  <Tab title="Python">
+  ```python
+  # resilience/bulkhead.py
+  import asyncio
+  import logging
+  import time
+  from dataclasses import dataclass, field
+  from typing import Any, Awaitable, Callable
 
-module.exports = { Bulkhead, BulkheadFullError, QueueTimeoutError };
-```
+  from pydantic import BaseModel
+
+  logger = logging.getLogger(__name__)
+
+
+  class BulkheadConfig(BaseModel):
+      name: str = "default"
+      max_concurrent: int = 10
+      max_queue: int = 100
+      queue_timeout_seconds: float = 30.0
+
+
+  @dataclass
+  class BulkheadMetrics:
+      total_calls: int = 0
+      active_calls: int = 0
+      queued_calls: int = 0
+      rejected_calls: int = 0
+      completed_calls: int = 0
+      timeout_calls: int = 0
+
+
+  class BulkheadFullError(Exception):
+      def __init__(self, name: str) -> None:
+          super().__init__(f"Bulkhead [{name}] is full")
+          self.bulkhead_name = name
+
+
+  class QueueTimeoutError(Exception):
+      def __init__(self, name: str, timeout: float) -> None:
+          super().__init__(f"Queue timeout in bulkhead [{name}] after {timeout}s")
+
+
+  class Bulkhead:
+      """Limits concurrent in-flight calls; queues excess up to max_queue."""
+
+      def __init__(self, config: BulkheadConfig) -> None:
+          self.config = config
+          self._semaphore = asyncio.Semaphore(config.max_concurrent)
+          self._active = 0
+          self._queued = 0
+          self.metrics = BulkheadMetrics()
+
+      async def execute(self, operation: Callable[[], Awaitable[Any]]) -> Any:
+          self.metrics.total_calls += 1
+
+          # Fast-reject when the queue is saturated
+          if (
+              self._queued >= self.config.max_queue
+              and self._semaphore.locked()
+          ):
+              self.metrics.rejected_calls += 1
+              raise BulkheadFullError(self.config.name)
+
+          # Track queued state for observability
+          if self._semaphore.locked():
+              self._queued += 1
+              self.metrics.queued_calls = self._queued
+
+          try:
+              # Cap wait time in the queue
+              await asyncio.wait_for(
+                  self._semaphore.acquire(),
+                  timeout=self.config.queue_timeout_seconds,
+              )
+          except asyncio.TimeoutError as exc:
+              self.metrics.timeout_calls += 1
+              raise QueueTimeoutError(
+                  self.config.name, self.config.queue_timeout_seconds
+              ) from exc
+          finally:
+              if self._queued > 0:
+                  self._queued -= 1
+                  self.metrics.queued_calls = self._queued
+
+          self._active += 1
+          self.metrics.active_calls = self._active
+          try:
+              result = await operation()
+              self.metrics.completed_calls += 1
+              return result
+          finally:
+              self._active -= 1
+              self.metrics.active_calls = self._active
+              self._semaphore.release()
+
+      def get_status(self) -> dict[str, Any]:
+          return {
+              "name": self.config.name,
+              "active_count": self._active,
+              "queue_length": self._queued,
+              "metrics": self.metrics.__dict__,
+          }
+  ```
+  </Tab>
+</Tabs>
 
 ### Semaphore-Based Bulkhead
 
-```javascript
-// resilience/SemaphoreBulkhead.js
-class Semaphore {
-  constructor(maxConcurrent) {
-    this.maxConcurrent = maxConcurrent;
-    this.current = 0;
-    this.waiting = [];
-  }
+**Why a semaphore approach:** The queue-based bulkhead above gives you full control (metrics, queue timeouts, custom rejection). But often you just want "no more than N of these at a time." A semaphore is the textbook primitive for that. In Node.js, since there is no built-in async semaphore, you roll your own with a waiters array. In Python, `asyncio.Semaphore` is already part of the standard library -- no dependency needed. The `BulkheadManager` pattern lets you create and look up per-service bulkheads by name, which is exactly what you need when one service has many downstream dependencies each needing isolation.
 
-  async acquire() {
-    if (this.current < this.maxConcurrent) {
-      this.current++;
-      return;
+<Tabs>
+  <Tab title="Node.js">
+  ```javascript
+  // resilience/SemaphoreBulkhead.js
+  class Semaphore {
+    constructor(maxConcurrent) {
+      this.maxConcurrent = maxConcurrent;
+      this.current = 0;
+      this.waiting = [];
     }
 
-    await new Promise((resolve) => {
-      this.waiting.push(resolve);
-    });
-  }
+    async acquire() {
+      if (this.current < this.maxConcurrent) {
+        this.current++;
+        return;
+      }
 
-  release() {
-    this.current--;
-    
-    if (this.waiting.length > 0) {
-      const next = this.waiting.shift();
-      this.current++;
-      next();
+      await new Promise((resolve) => {
+        this.waiting.push(resolve);
+      });
+    }
+
+    release() {
+      this.current--;
+      
+      if (this.waiting.length > 0) {
+        const next = this.waiting.shift();
+        this.current++;
+        next();
+      }
+    }
+
+    async execute(fn) {
+      await this.acquire();
+      try {
+        return await fn();
+      } finally {
+        this.release();
+      }
     }
   }
 
-  async execute(fn) {
-    await this.acquire();
-    try {
-      return await fn();
-    } finally {
-      this.release();
+  // Usage with per-service bulkheads
+  class BulkheadManager {
+    constructor() {
+      this.bulkheads = new Map();
+    }
+
+    get(name, maxConcurrent = 10) {
+      if (!this.bulkheads.has(name)) {
+        this.bulkheads.set(name, new Semaphore(maxConcurrent));
+      }
+      return this.bulkheads.get(name);
+    }
+
+    async execute(name, maxConcurrent, fn) {
+      const bulkhead = this.get(name, maxConcurrent);
+      return bulkhead.execute(fn);
     }
   }
-}
 
-// Usage with per-service bulkheads
-class BulkheadManager {
-  constructor() {
-    this.bulkheads = new Map();
-  }
+  // Usage
+  const bulkheadManager = new BulkheadManager();
 
-  get(name, maxConcurrent = 10) {
-    if (!this.bulkheads.has(name)) {
-      this.bulkheads.set(name, new Semaphore(maxConcurrent));
-    }
-    return this.bulkheads.get(name);
-  }
+  // Payment operations limited to 20 concurrent
+  const paymentResult = await bulkheadManager.execute('payment', 20, async () => {
+    return paymentService.processPayment(orderId, amount);
+  });
 
-  async execute(name, maxConcurrent, fn) {
-    const bulkhead = this.get(name, maxConcurrent);
-    return bulkhead.execute(fn);
-  }
-}
+  // Inventory operations limited to 50 concurrent
+  const stockResult = await bulkheadManager.execute('inventory', 50, async () => {
+    return inventoryService.checkStock(productId);
+  });
+  ```
+  </Tab>
+  <Tab title="Python">
+  ```python
+  # resilience/semaphore_bulkhead.py
+  import asyncio
+  from typing import Any, Awaitable, Callable
 
-// Usage
-const bulkheadManager = new BulkheadManager();
 
-// Payment operations limited to 20 concurrent
-const paymentResult = await bulkheadManager.execute('payment', 20, async () => {
-  return paymentService.processPayment(orderId, amount);
-});
+  class SemaphoreBulkhead:
+      """Minimal per-service concurrency cap built on asyncio.Semaphore."""
 
-// Inventory operations limited to 50 concurrent
-const stockResult = await bulkheadManager.execute('inventory', 50, async () => {
-  return inventoryService.checkStock(productId);
-});
-```
+      def __init__(self, max_concurrent: int) -> None:
+          self._semaphore = asyncio.Semaphore(max_concurrent)
+
+      async def execute(self, fn: Callable[[], Awaitable[Any]]) -> Any:
+          async with self._semaphore:
+              return await fn()
+
+
+  class BulkheadManager:
+      """Registers and looks up per-dependency bulkheads by name."""
+
+      def __init__(self) -> None:
+          self._bulkheads: dict[str, SemaphoreBulkhead] = {}
+
+      def get(self, name: str, max_concurrent: int = 10) -> SemaphoreBulkhead:
+          if name not in self._bulkheads:
+              self._bulkheads[name] = SemaphoreBulkhead(max_concurrent)
+          return self._bulkheads[name]
+
+      async def execute(
+          self,
+          name: str,
+          max_concurrent: int,
+          fn: Callable[[], Awaitable[Any]],
+      ) -> Any:
+          return await self.get(name, max_concurrent).execute(fn)
+
+
+  # --- Usage ---
+  bulkhead_manager = BulkheadManager()
+
+
+  async def place_order(order_id: str, amount: float, product_id: str) -> None:
+      # Payment operations limited to 20 concurrent
+      payment_result = await bulkhead_manager.execute(
+          "payment",
+          20,
+          lambda: payment_service.process_payment(order_id, amount),
+      )
+
+      # Inventory operations limited to 50 concurrent
+      stock_result = await bulkhead_manager.execute(
+          "inventory",
+          50,
+          lambda: inventory_service.check_stock(product_id),
+      )
+  ```
+  </Tab>
+</Tabs>
 
 ---
 
 ## Timeout Patterns
 
-```javascript
-// resilience/Timeout.js
-class TimeoutPolicy {
-  constructor(timeoutMs) {
-    this.timeoutMs = timeoutMs;
+**Why timeouts exist:** Every network call must have a deadline, period. Without timeouts, a stuck downstream holds your thread or coroutine hostage forever. TCP itself may eventually give up (minutes), but your users gave up 30 seconds ago. Timeouts are the foundation that circuit breakers and retries build on: without an enforced upper bound on call duration, neither pattern can detect failure. The hard question is *what* timeout to use. Too short and you'll timeout healthy-but-slow requests; too long and you'll hold resources while users have already refreshed the page. The right number is usually 2-3x your p99 latency for that dependency, with adaptive adjustments if traffic patterns shift.
+
+**Cascading timeouts** are a related discipline: each layer of your call stack must have a *shorter* timeout than the layer above it. If the API gateway times out at 5s and calls Order Service with a 5s timeout, when Order Service finally returns an error, the gateway has already moved on. The gateway now returns a less useful timeout error instead of Order's real error. Shortening inner timeouts (4s, 3s, 2s going inward) leaves each layer time to handle failures gracefully.
+
+<Tabs>
+  <Tab title="Node.js">
+  ```javascript
+  // resilience/Timeout.js
+  class TimeoutPolicy {
+    constructor(timeoutMs) {
+      this.timeoutMs = timeoutMs;
+    }
+
+    async execute(operation, fallback = null) {
+      return new Promise(async (resolve, reject) => {
+        const timer = setTimeout(() => {
+          if (fallback) {
+            resolve(fallback());
+          } else {
+            reject(new TimeoutError(`Operation timed out after ${this.timeoutMs}ms`));
+          }
+        }, this.timeoutMs);
+
+        try {
+          const result = await operation();
+          clearTimeout(timer);
+          resolve(result);
+        } catch (error) {
+          clearTimeout(timer);
+          reject(error);
+        }
+      });
+    }
   }
 
-  async execute(operation, fallback = null) {
-    return new Promise(async (resolve, reject) => {
-      const timer = setTimeout(() => {
-        if (fallback) {
-          resolve(fallback());
-        } else {
-          reject(new TimeoutError(`Operation timed out after ${this.timeoutMs}ms`));
-        }
-      }, this.timeoutMs);
+  // Cascading timeouts
+  class CascadingTimeout {
+    // Outer service must have shorter timeout than inner
+    // to give time for error handling
+    
+    /*
+     API Gateway (5s) 
+         └── Order Service (4s)
+              └── Payment Service (3s)
+                   └── Bank API (2s)
+    */
+    
+    static forLayer(layer) {
+      const timeouts = {
+        gateway: 5000,
+        application: 4000,
+        integration: 3000,
+        external: 2000
+      };
+      return new TimeoutPolicy(timeouts[layer] || 5000);
+    }
+  }
+
+  // Adaptive timeout based on p99 latency
+  class AdaptiveTimeout {
+    constructor(options = {}) {
+      this.baseTimeout = options.baseTimeout || 1000;
+      this.multiplier = options.multiplier || 3;
+      this.minTimeout = options.minTimeout || 500;
+      this.maxTimeout = options.maxTimeout || 30000;
+      this.latencies = [];
+      this.windowSize = options.windowSize || 100;
+    }
+
+    recordLatency(latency) {
+      this.latencies.push(latency);
+      if (this.latencies.length > this.windowSize) {
+        this.latencies.shift();
+      }
+    }
+
+    getCurrentTimeout() {
+      if (this.latencies.length < 10) {
+        return this.baseTimeout;
+      }
+
+      // Calculate p99 latency
+      const sorted = [...this.latencies].sort((a, b) => a - b);
+      const p99Index = Math.floor(sorted.length * 0.99);
+      const p99 = sorted[p99Index];
+
+      // Timeout = p99 * multiplier
+      const timeout = p99 * this.multiplier;
+
+      return Math.max(this.minTimeout, Math.min(timeout, this.maxTimeout));
+    }
+
+    async execute(operation) {
+      const timeout = this.getCurrentTimeout();
+      const start = Date.now();
 
       try {
-        const result = await operation();
-        clearTimeout(timer);
-        resolve(result);
-      } catch (error) {
-        clearTimeout(timer);
-        reject(error);
-      }
-    });
-  }
-}
-
-// Cascading timeouts
-class CascadingTimeout {
-  // Outer service must have shorter timeout than inner
-  // to give time for error handling
-  
-  /*
-   API Gateway (5s) 
-       └── Order Service (4s)
-            └── Payment Service (3s)
-                 └── Bank API (2s)
-  */
-  
-  static forLayer(layer) {
-    const timeouts = {
-      gateway: 5000,
-      application: 4000,
-      integration: 3000,
-      external: 2000
-    };
-    return new TimeoutPolicy(timeouts[layer] || 5000);
-  }
-}
-
-// Adaptive timeout based on p99 latency
-class AdaptiveTimeout {
-  constructor(options = {}) {
-    this.baseTimeout = options.baseTimeout || 1000;
-    this.multiplier = options.multiplier || 3;
-    this.minTimeout = options.minTimeout || 500;
-    this.maxTimeout = options.maxTimeout || 30000;
-    this.latencies = [];
-    this.windowSize = options.windowSize || 100;
-  }
-
-  recordLatency(latency) {
-    this.latencies.push(latency);
-    if (this.latencies.length > this.windowSize) {
-      this.latencies.shift();
-    }
-  }
-
-  getCurrentTimeout() {
-    if (this.latencies.length < 10) {
-      return this.baseTimeout;
-    }
-
-    // Calculate p99 latency
-    const sorted = [...this.latencies].sort((a, b) => a - b);
-    const p99Index = Math.floor(sorted.length * 0.99);
-    const p99 = sorted[p99Index];
-
-    // Timeout = p99 * multiplier
-    const timeout = p99 * this.multiplier;
-
-    return Math.max(this.minTimeout, Math.min(timeout, this.maxTimeout));
-  }
-
-  async execute(operation) {
-    const timeout = this.getCurrentTimeout();
-    const start = Date.now();
-
-    try {
-      const result = await new TimeoutPolicy(timeout).execute(operation);
-      this.recordLatency(Date.now() - start);
-      return result;
-    } catch (error) {
-      if (!(error instanceof TimeoutError)) {
+        const result = await new TimeoutPolicy(timeout).execute(operation);
         this.recordLatency(Date.now() - start);
+        return result;
+      } catch (error) {
+        if (!(error instanceof TimeoutError)) {
+          this.recordLatency(Date.now() - start);
+        }
+        throw error;
       }
-      throw error;
     }
   }
-}
-```
+  ```
+  </Tab>
+  <Tab title="Python">
+  ```python
+  # resilience/timeout.py
+  import asyncio
+  import time
+  from collections import deque
+  from typing import Any, Awaitable, Callable, Optional
+
+  from pydantic import BaseModel
+
+
+  class TimeoutError(Exception):  # noqa: A001 - intentional shadow of builtin
+      pass
+
+
+  class TimeoutPolicy:
+      """Wrap an async operation in a hard deadline."""
+
+      def __init__(self, timeout_seconds: float) -> None:
+          self.timeout_seconds = timeout_seconds
+
+      async def execute(
+          self,
+          operation: Callable[[], Awaitable[Any]],
+          fallback: Optional[Callable[[], Awaitable[Any]]] = None,
+      ) -> Any:
+          try:
+              return await asyncio.wait_for(
+                  operation(), timeout=self.timeout_seconds
+              )
+          except asyncio.TimeoutError as exc:
+              if fallback is not None:
+                  return await fallback()
+              raise TimeoutError(
+                  f"Operation timed out after {self.timeout_seconds}s"
+              ) from exc
+
+
+  class CascadingTimeout:
+      """Each layer of the call chain gets a shorter timeout than its caller.
+
+      API Gateway (5s)
+          Order Service (4s)
+              Payment Service (3s)
+                  Bank API (2s)
+      """
+
+      _LAYER_TIMEOUTS: dict[str, float] = {
+          "gateway": 5.0,
+          "application": 4.0,
+          "integration": 3.0,
+          "external": 2.0,
+      }
+
+      @classmethod
+      def for_layer(cls, layer: str) -> TimeoutPolicy:
+          return TimeoutPolicy(cls._LAYER_TIMEOUTS.get(layer, 5.0))
+
+
+  class AdaptiveTimeoutConfig(BaseModel):
+      base_timeout_seconds: float = 1.0
+      multiplier: float = 3.0
+      min_timeout_seconds: float = 0.5
+      max_timeout_seconds: float = 30.0
+      window_size: int = 100
+
+
+  class AdaptiveTimeout:
+      """Adjusts timeout based on observed p99 latency in a rolling window."""
+
+      def __init__(self, config: Optional[AdaptiveTimeoutConfig] = None) -> None:
+          self.config = config or AdaptiveTimeoutConfig()
+          self._latencies: deque[float] = deque(maxlen=self.config.window_size)
+
+      def record_latency(self, latency_seconds: float) -> None:
+          self._latencies.append(latency_seconds)
+
+      def current_timeout(self) -> float:
+          if len(self._latencies) < 10:
+              return self.config.base_timeout_seconds
+
+          sorted_latencies = sorted(self._latencies)
+          p99_index = int(len(sorted_latencies) * 0.99)
+          p99 = sorted_latencies[min(p99_index, len(sorted_latencies) - 1)]
+
+          timeout = p99 * self.config.multiplier
+          return max(
+              self.config.min_timeout_seconds,
+              min(timeout, self.config.max_timeout_seconds),
+          )
+
+      async def execute(self, operation: Callable[[], Awaitable[Any]]) -> Any:
+          timeout = self.current_timeout()
+          start = time.monotonic()
+          try:
+              result = await TimeoutPolicy(timeout).execute(operation)
+              self.record_latency(time.monotonic() - start)
+              return result
+          except TimeoutError:
+              raise
+          except Exception:
+              # Record real-service latencies even on non-timeout failures
+              self.record_latency(time.monotonic() - start)
+              raise
+  ```
+  </Tab>
+</Tabs>
 
 ---
 
 ## Complete Resilience Stack
 
-```javascript
-// resilience/ResilientService.js
-class ResilientService {
-  constructor(name, options = {}) {
-    this.name = name;
-    
-    this.circuitBreaker = new CircuitBreaker({
-      name,
-      failureThreshold: options.circuitBreaker?.failureThreshold || 5,
-      resetTimeout: options.circuitBreaker?.resetTimeout || 30000,
-      timeout: options.timeout?.operation || 5000
-    });
-    
-    this.retryPolicy = new RetryPolicy({
-      maxRetries: options.retry?.maxRetries || 3,
-      strategy: options.retry?.strategy || 'exponential',
-      baseDelay: options.retry?.baseDelay || 1000
-    });
-    
-    this.bulkhead = new Bulkhead({
-      name,
-      maxConcurrent: options.bulkhead?.maxConcurrent || 10,
-      maxQueue: options.bulkhead?.maxQueue || 100
-    });
-    
-    this.cache = options.cache;
-    this.metrics = new ResilienceMetrics(name);
-  }
+**Why compose these patterns:** Each pattern alone is useful; together they form a defense in depth. Think of the layers as concentric shields: the bulkhead limits the *blast radius* ("only 10 in-flight payment calls at a time"), the circuit breaker provides *fast failure* ("if payments are broken, fail instantly"), the retry handles *transient noise* ("retry the occasional blip"), and the cache provides a *read-time fallback* ("if everything fails, return stale data"). Without this full stack, one layer can undo another: retries hammer a failing service without a breaker; a breaker trips too eagerly without retries to absorb blips; a service starves other callers without a bulkhead.
 
-  async execute(operationName, operation, options = {}) {
-    const { 
-      fallback = null,
-      cacheKey = null,
-      cacheTtl = 60
-    } = options;
+The key implementation detail is the *order* of wrapping:
 
-    const startTime = Date.now();
+1. Bulkhead (outermost) -- enforce concurrency before you even start the call
+2. Circuit breaker -- fail fast if we know the downstream is sick
+3. Retry -- handle transient failures within a successful bulkhead+breaker path
+4. The actual operation (innermost)
 
-    try {
-      // Layer 1: Bulkhead (limit concurrency)
-      return await this.bulkhead.execute(async () => {
-        
-        // Layer 2: Circuit Breaker (fail fast)
-        return await this.circuitBreaker.call(async () => {
-          
-          // Layer 3: Retry (handle transient failures)
-          return await this.retryPolicy.execute(async () => {
-            
-            const result = await operation();
-            
-            // Cache successful results
-            if (cacheKey && this.cache) {
-              await this.cache.set(cacheKey, result, cacheTtl);
-            }
-            
-            this.metrics.recordSuccess(operationName, Date.now() - startTime);
-            return result;
-          });
-          
-        }, async () => {
-          // Circuit breaker fallback
-          this.metrics.recordCircuitOpen(operationName);
-          
-          // Try cache
-          if (cacheKey && this.cache) {
-            const cached = await this.cache.get(cacheKey);
-            if (cached) {
-              this.metrics.recordCacheHit(operationName);
-              return { ...cached, _fromCache: true };
-            }
-          }
-          
-          // Use provided fallback
-          if (fallback) {
-            return fallback();
-          }
-          
-          throw new ServiceUnavailableError(this.name);
-        });
+Get the order wrong and you create pathologies: retries that bypass the breaker, a breaker that opens on queued-but-not-yet-started calls, or a bulkhead that holds a slot while retries eat seconds.
+
+<Tabs>
+  <Tab title="Node.js">
+  ```javascript
+  // resilience/ResilientService.js
+  class ResilientService {
+    constructor(name, options = {}) {
+      this.name = name;
+      
+      this.circuitBreaker = new CircuitBreaker({
+        name,
+        failureThreshold: options.circuitBreaker?.failureThreshold || 5,
+        resetTimeout: options.circuitBreaker?.resetTimeout || 30000,
+        timeout: options.timeout?.operation || 5000
       });
       
-    } catch (error) {
-      this.metrics.recordFailure(operationName, error, Date.now() - startTime);
-      throw error;
+      this.retryPolicy = new RetryPolicy({
+        maxRetries: options.retry?.maxRetries || 3,
+        strategy: options.retry?.strategy || 'exponential',
+        baseDelay: options.retry?.baseDelay || 1000
+      });
+      
+      this.bulkhead = new Bulkhead({
+        name,
+        maxConcurrent: options.bulkhead?.maxConcurrent || 10,
+        maxQueue: options.bulkhead?.maxQueue || 100
+      });
+      
+      this.cache = options.cache;
+      this.metrics = new ResilienceMetrics(name);
+    }
+
+    async execute(operationName, operation, options = {}) {
+      const { 
+        fallback = null,
+        cacheKey = null,
+        cacheTtl = 60
+      } = options;
+
+      const startTime = Date.now();
+
+      try {
+        // Layer 1: Bulkhead (limit concurrency)
+        return await this.bulkhead.execute(async () => {
+          
+          // Layer 2: Circuit Breaker (fail fast)
+          return await this.circuitBreaker.call(async () => {
+            
+            // Layer 3: Retry (handle transient failures)
+            return await this.retryPolicy.execute(async () => {
+              
+              const result = await operation();
+              
+              // Cache successful results
+              if (cacheKey && this.cache) {
+                await this.cache.set(cacheKey, result, cacheTtl);
+              }
+              
+              this.metrics.recordSuccess(operationName, Date.now() - startTime);
+              return result;
+            });
+            
+          }, async () => {
+            // Circuit breaker fallback
+            this.metrics.recordCircuitOpen(operationName);
+            
+            // Try cache
+            if (cacheKey && this.cache) {
+              const cached = await this.cache.get(cacheKey);
+              if (cached) {
+                this.metrics.recordCacheHit(operationName);
+                return { ...cached, _fromCache: true };
+              }
+            }
+            
+            // Use provided fallback
+            if (fallback) {
+              return fallback();
+            }
+            
+            throw new ServiceUnavailableError(this.name);
+          });
+        });
+        
+      } catch (error) {
+        this.metrics.recordFailure(operationName, error, Date.now() - startTime);
+        throw error;
+      }
+    }
+
+    getStatus() {
+      return {
+        service: this.name,
+        circuitBreaker: this.circuitBreaker.getStatus(),
+        bulkhead: this.bulkhead.getStatus(),
+        metrics: this.metrics.getSummary()
+      };
     }
   }
 
-  getStatus() {
-    return {
-      service: this.name,
-      circuitBreaker: this.circuitBreaker.getStatus(),
-      bulkhead: this.bulkhead.getStatus(),
-      metrics: this.metrics.getSummary()
-    };
-  }
-}
+  // Usage
+  const paymentService = new ResilientService('payment-service', {
+    circuitBreaker: {
+      failureThreshold: 5,
+      resetTimeout: 30000
+    },
+    retry: {
+      maxRetries: 3,
+      strategy: 'exponential'
+    },
+    bulkhead: {
+      maxConcurrent: 20,
+      maxQueue: 50
+    },
+    cache: redisCache
+  });
 
-// Usage
-const paymentService = new ResilientService('payment-service', {
-  circuitBreaker: {
-    failureThreshold: 5,
-    resetTimeout: 30000
-  },
-  retry: {
-    maxRetries: 3,
-    strategy: 'exponential'
-  },
-  bulkhead: {
-    maxConcurrent: 20,
-    maxQueue: 50
-  },
-  cache: redisCache
-});
+  const payment = await paymentService.execute(
+    'processPayment',
+    async () => {
+      return axios.post('http://payment-api/charge', { amount });
+    },
+    {
+      cacheKey: `payment:${orderId}`,
+      cacheTtl: 300,
+      fallback: () => ({
+        status: 'PENDING',
+        message: 'Payment will be processed shortly'
+      })
+    }
+  );
+  ```
+  </Tab>
+  <Tab title="Python">
+  ```python
+  # resilience/resilient_service.py
+  import logging
+  import time
+  from typing import Any, Awaitable, Callable, Optional
 
-const payment = await paymentService.execute(
-  'processPayment',
-  async () => {
-    return axios.post('http://payment-api/charge', { amount });
-  },
-  {
-    cacheKey: `payment:${orderId}`,
-    cacheTtl: 300,
-    fallback: () => ({
-      status: 'PENDING',
-      message: 'Payment will be processed shortly'
-    })
-  }
-);
-```
+  from pydantic import BaseModel
+
+  from resilience.bulkhead import Bulkhead, BulkheadConfig
+  from resilience.circuit_breaker import CircuitBreaker, CircuitBreakerConfig
+  from resilience.retry import RetryConfig, RetryPolicy
+
+  logger = logging.getLogger(__name__)
+
+
+  class ServiceUnavailableError(Exception):
+      def __init__(self, service_name: str) -> None:
+          super().__init__(f"Service [{service_name}] is unavailable")
+
+
+  class ResilientServiceOptions(BaseModel):
+      circuit_breaker: CircuitBreakerConfig = CircuitBreakerConfig()
+      retry: RetryConfig = RetryConfig()
+      bulkhead: BulkheadConfig = BulkheadConfig()
+
+
+  class ExecuteOptions(BaseModel):
+      cache_key: Optional[str] = None
+      cache_ttl_seconds: int = 60
+
+
+  class ResilientService:
+      """Composes bulkhead + circuit breaker + retry + cache fallback."""
+
+      def __init__(
+          self,
+          name: str,
+          options: Optional[ResilientServiceOptions] = None,
+          cache: Any = None,
+      ) -> None:
+          opts = options or ResilientServiceOptions()
+          opts.circuit_breaker.name = name
+          opts.bulkhead.name = name
+
+          self.name = name
+          self.circuit_breaker = CircuitBreaker(opts.circuit_breaker)
+          self.retry_policy = RetryPolicy(opts.retry)
+          self.bulkhead = Bulkhead(opts.bulkhead)
+          self.cache = cache
+
+      async def execute(
+          self,
+          operation_name: str,
+          operation: Callable[[], Awaitable[Any]],
+          fallback: Optional[Callable[[], Awaitable[Any]]] = None,
+          execute_options: Optional[ExecuteOptions] = None,
+      ) -> Any:
+          execute_options = execute_options or ExecuteOptions()
+          start_time = time.monotonic()
+
+          async def with_retry() -> Any:
+              async def do_work() -> Any:
+                  result = await operation()
+                  if execute_options.cache_key and self.cache is not None:
+                      await self.cache.set(
+                          execute_options.cache_key,
+                          result,
+                          ex=execute_options.cache_ttl_seconds,
+                      )
+                  logger.info(
+                      "%s.%s success in %.3fs",
+                      self.name,
+                      operation_name,
+                      time.monotonic() - start_time,
+                  )
+                  return result
+
+              return await self.retry_policy.execute(do_work)
+
+          async def circuit_fallback(
+              error: Optional[BaseException] = None,
+          ) -> Any:
+              logger.warning(
+                  "Circuit fallback for %s.%s (%s)",
+                  self.name,
+                  operation_name,
+                  error,
+              )
+              if execute_options.cache_key and self.cache is not None:
+                  cached = await self.cache.get(execute_options.cache_key)
+                  if cached is not None:
+                      return {**cached, "_from_cache": True}
+              if fallback is not None:
+                  return await fallback()
+              raise ServiceUnavailableError(self.name)
+
+          async def cb_wrapped() -> Any:
+              return await self.circuit_breaker.call(with_retry, circuit_fallback)
+
+          try:
+              # Outermost: bulkhead limits concurrency before any work starts
+              return await self.bulkhead.execute(cb_wrapped)
+          except Exception:
+              logger.exception(
+                  "%s.%s failed after %.3fs",
+                  self.name,
+                  operation_name,
+                  time.monotonic() - start_time,
+              )
+              raise
+
+      def get_status(self) -> dict[str, Any]:
+          return {
+              "service": self.name,
+              "circuit_breaker": self.circuit_breaker.get_status(),
+              "bulkhead": self.bulkhead.get_status(),
+          }
+
+
+  # --- Usage ---
+  import httpx
+  import redis.asyncio as redis_async
+
+  redis_cache = redis_async.Redis(host="redis", port=6379)
+
+  payment_service = ResilientService(
+      "payment-service",
+      ResilientServiceOptions(
+          circuit_breaker=CircuitBreakerConfig(
+              failure_threshold=5, reset_timeout_seconds=30.0
+          ),
+          retry=RetryConfig(max_retries=3),
+          bulkhead=BulkheadConfig(max_concurrent=20, max_queue=50),
+      ),
+      cache=redis_cache,
+  )
+
+
+  async def charge(http: httpx.AsyncClient, order_id: str, amount: float) -> Any:
+      async def call() -> dict[str, Any]:
+          resp = await http.post("http://payment-api/charge", json={"amount": amount})
+          resp.raise_for_status()
+          return resp.json()
+
+      async def fb() -> dict[str, Any]:
+          return {
+              "status": "PENDING",
+              "message": "Payment will be processed shortly",
+          }
+
+      return await payment_service.execute(
+          "process_payment",
+          call,
+          fallback=fb,
+          execute_options=ExecuteOptions(
+              cache_key=f"payment:{order_id}",
+              cache_ttl_seconds=300,
+          ),
+      )
+  ```
+  </Tab>
+</Tabs>
 
 ---
 
 ## Health Checks
 
-```javascript
-// health/HealthChecker.js
-class HealthChecker {
-  constructor() {
-    this.checks = new Map();
-  }
+**Why health checks matter:** Orchestrators (Kubernetes, ECS, Nomad) need to know whether your container is healthy so they can route traffic correctly. Without health checks, k8s will happily send requests to a pod whose database connection died three minutes ago, surfacing errors to users that should have been contained by removing the pod from the load balancer. Two distinct probes exist: *liveness* asks "is the process alive?" -- if it fails, k8s kills and restarts the pod. *Readiness* asks "can this pod serve traffic?" -- if it fails, k8s leaves the pod running but stops sending requests. They have different semantics on purpose: a pod warming its cache is alive but not ready; a deadlocked pod may be ready by the load balancer's view but not actually alive. Conflating them leads to either restart loops (liveness too strict) or serving broken pods (readiness too lenient).
 
-  register(name, checkFn, options = {}) {
-    this.checks.set(name, {
-      check: checkFn,
-      critical: options.critical !== false,
-      timeout: options.timeout || 5000
-    });
-  }
+The `HealthChecker` pattern below registers checks with a `critical` flag. A non-critical check failing (say, a nice-to-have recommendation service) degrades the overall status but does not mark the pod unhealthy. Critical checks (database, primary cache) being down means the pod is genuinely unable to serve traffic.
 
-  async runCheck(name) {
-    const config = this.checks.get(name);
-    if (!config) {
-      return { name, status: 'UNKNOWN', message: 'Check not found' };
+<Tabs>
+  <Tab title="Node.js">
+  ```javascript
+  // health/HealthChecker.js
+  class HealthChecker {
+    constructor() {
+      this.checks = new Map();
     }
 
-    try {
-      const result = await Promise.race([
-        config.check(),
-        new Promise((_, reject) => 
-          setTimeout(() => reject(new Error('Health check timeout')), config.timeout)
-        )
-      ]);
+    register(name, checkFn, options = {}) {
+      this.checks.set(name, {
+        check: checkFn,
+        critical: options.critical !== false,
+        timeout: options.timeout || 5000
+      });
+    }
+
+    async runCheck(name) {
+      const config = this.checks.get(name);
+      if (!config) {
+        return { name, status: 'UNKNOWN', message: 'Check not found' };
+      }
+
+      try {
+        const result = await Promise.race([
+          config.check(),
+          new Promise((_, reject) => 
+            setTimeout(() => reject(new Error('Health check timeout')), config.timeout)
+          )
+        ]);
+
+        return {
+          name,
+          status: 'HEALTHY',
+          critical: config.critical,
+          details: result
+        };
+      } catch (error) {
+        return {
+          name,
+          status: 'UNHEALTHY',
+          critical: config.critical,
+          error: error.message
+        };
+      }
+    }
+
+    async runAllChecks() {
+      const results = await Promise.all(
+        Array.from(this.checks.keys()).map(name => this.runCheck(name))
+      );
+
+      const unhealthyCritical = results.filter(
+        r => r.status === 'UNHEALTHY' && r.critical
+      );
 
       return {
-        name,
-        status: 'HEALTHY',
-        critical: config.critical,
-        details: result
-      };
-    } catch (error) {
-      return {
-        name,
-        status: 'UNHEALTHY',
-        critical: config.critical,
-        error: error.message
+        status: unhealthyCritical.length > 0 ? 'UNHEALTHY' : 'HEALTHY',
+        timestamp: new Date().toISOString(),
+        checks: results
       };
     }
   }
 
-  async runAllChecks() {
-    const results = await Promise.all(
-      Array.from(this.checks.keys()).map(name => this.runCheck(name))
-    );
+  // Setup health checks
+  const healthChecker = new HealthChecker();
 
-    const unhealthyCritical = results.filter(
-      r => r.status === 'UNHEALTHY' && r.critical
-    );
+  healthChecker.register('database', async () => {
+    await db.query('SELECT 1');
+    return { connected: true };
+  }, { critical: true });
 
-    return {
-      status: unhealthyCritical.length > 0 ? 'UNHEALTHY' : 'HEALTHY',
-      timestamp: new Date().toISOString(),
-      checks: results
-    };
-  }
-}
+  healthChecker.register('redis', async () => {
+    await redis.ping();
+    return { connected: true };
+  }, { critical: true });
 
-// Setup health checks
-const healthChecker = new HealthChecker();
+  healthChecker.register('payment-service', async () => {
+    const response = await axios.get('http://payment-service/health', { timeout: 2000 });
+    return response.data;
+  }, { critical: false });
 
-healthChecker.register('database', async () => {
-  await db.query('SELECT 1');
-  return { connected: true };
-}, { critical: true });
+  // Health endpoint
+  app.get('/health', async (req, res) => {
+    const health = await healthChecker.runAllChecks();
+    const statusCode = health.status === 'HEALTHY' ? 200 : 503;
+    res.status(statusCode).json(health);
+  });
 
-healthChecker.register('redis', async () => {
-  await redis.ping();
-  return { connected: true };
-}, { critical: true });
+  // Liveness probe (for Kubernetes)
+  app.get('/health/live', (req, res) => {
+    res.status(200).json({ status: 'UP' });
+  });
 
-healthChecker.register('payment-service', async () => {
-  const response = await axios.get('http://payment-service/health', { timeout: 2000 });
-  return response.data;
-}, { critical: false });
+  // Readiness probe (for Kubernetes)
+  app.get('/health/ready', async (req, res) => {
+    const health = await healthChecker.runAllChecks();
+    const statusCode = health.status === 'HEALTHY' ? 200 : 503;
+    res.status(statusCode).json(health);
+  });
+  ```
+  </Tab>
+  <Tab title="Python">
+  ```python
+  # health/health_checker.py
+  import asyncio
+  import logging
+  from dataclasses import dataclass
+  from datetime import datetime, timezone
+  from typing import Any, Awaitable, Callable, Optional
 
-// Health endpoint
-app.get('/health', async (req, res) => {
-  const health = await healthChecker.runAllChecks();
-  const statusCode = health.status === 'HEALTHY' ? 200 : 503;
-  res.status(statusCode).json(health);
-});
+  import httpx
+  from fastapi import FastAPI, Response
+  from pydantic import BaseModel
 
-// Liveness probe (for Kubernetes)
-app.get('/health/live', (req, res) => {
-  res.status(200).json({ status: 'UP' });
-});
+  logger = logging.getLogger(__name__)
 
-// Readiness probe (for Kubernetes)
-app.get('/health/ready', async (req, res) => {
-  const health = await healthChecker.runAllChecks();
-  const statusCode = health.status === 'HEALTHY' ? 200 : 503;
-  res.status(statusCode).json(health);
-});
-```
+
+  @dataclass
+  class _CheckConfig:
+      check: Callable[[], Awaitable[Any]]
+      critical: bool
+      timeout_seconds: float
+
+
+  class CheckResult(BaseModel):
+      name: str
+      status: str  # HEALTHY | UNHEALTHY | UNKNOWN
+      critical: bool = True
+      details: Optional[Any] = None
+      error: Optional[str] = None
+
+
+  class HealthReport(BaseModel):
+      status: str
+      timestamp: str
+      checks: list[CheckResult]
+
+
+  class HealthChecker:
+      def __init__(self) -> None:
+          self._checks: dict[str, _CheckConfig] = {}
+
+      def register(
+          self,
+          name: str,
+          check_fn: Callable[[], Awaitable[Any]],
+          critical: bool = True,
+          timeout_seconds: float = 5.0,
+      ) -> None:
+          self._checks[name] = _CheckConfig(
+              check=check_fn, critical=critical, timeout_seconds=timeout_seconds
+          )
+
+      async def run_check(self, name: str) -> CheckResult:
+          config = self._checks.get(name)
+          if config is None:
+              return CheckResult(name=name, status="UNKNOWN", critical=True)
+
+          try:
+              details = await asyncio.wait_for(
+                  config.check(), timeout=config.timeout_seconds
+              )
+              return CheckResult(
+                  name=name,
+                  status="HEALTHY",
+                  critical=config.critical,
+                  details=details,
+              )
+          except asyncio.TimeoutError:
+              return CheckResult(
+                  name=name,
+                  status="UNHEALTHY",
+                  critical=config.critical,
+                  error="Health check timeout",
+              )
+          except Exception as exc:  # noqa: BLE001
+              return CheckResult(
+                  name=name,
+                  status="UNHEALTHY",
+                  critical=config.critical,
+                  error=str(exc),
+              )
+
+      async def run_all_checks(self) -> HealthReport:
+          results = await asyncio.gather(
+              *(self.run_check(name) for name in self._checks.keys())
+          )
+          unhealthy_critical = [
+              r for r in results if r.status == "UNHEALTHY" and r.critical
+          ]
+          return HealthReport(
+              status="UNHEALTHY" if unhealthy_critical else "HEALTHY",
+              timestamp=datetime.now(timezone.utc).isoformat(),
+              checks=list(results),
+          )
+
+
+  # --- FastAPI wiring ---
+  app = FastAPI()
+  health_checker = HealthChecker()
+
+
+  async def check_database() -> dict[str, Any]:
+      # await db.execute("SELECT 1")
+      return {"connected": True}
+
+
+  async def check_redis() -> dict[str, Any]:
+      # await redis.ping()
+      return {"connected": True}
+
+
+  async def check_payment_service() -> dict[str, Any]:
+      async with httpx.AsyncClient(timeout=2.0) as client:
+          resp = await client.get("http://payment-service/health")
+          resp.raise_for_status()
+          return resp.json()
+
+
+  health_checker.register("database", check_database, critical=True)
+  health_checker.register("redis", check_redis, critical=True)
+  health_checker.register(
+      "payment-service", check_payment_service, critical=False
+  )
+
+
+  @app.get("/health")
+  async def health(response: Response) -> HealthReport:
+      report = await health_checker.run_all_checks()
+      response.status_code = 200 if report.status == "HEALTHY" else 503
+      return report
+
+
+  @app.get("/health/live")
+  async def liveness() -> dict[str, str]:
+      # Liveness: process is alive. Keep it cheap and dependency-free.
+      return {"status": "UP"}
+
+
+  @app.get("/health/ready")
+  async def readiness(response: Response) -> HealthReport:
+      # Readiness: all critical dependencies reachable.
+      report = await health_checker.run_all_checks()
+      response.status_code = 200 if report.status == "HEALTHY" else 503
+      return report
+  ```
+  </Tab>
+</Tabs>
 
 ---
 

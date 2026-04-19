@@ -20,9 +20,13 @@ A service mesh provides infrastructure-layer functionality for service-to-servic
 
 ## What is a Service Mesh?
 
+A service mesh solves a class of problems that simply cannot be solved cleanly inside application code, no matter how well-architected your libraries are. The core issue is that cross-cutting networking concerns -- retries, mTLS, observability, traffic shaping -- must behave identically across every service, in every language, at every version. Application-level libraries inevitably drift: Team A is on version 2.1 of the retry library while Team B is still on 1.3; the Java implementation interprets "timeout" differently from the Python one; a language you just adopted has no library at all. A service mesh moves these concerns out of application processes entirely and into a separate network layer, so the behavior is enforced once, uniformly, by operators rather than by dozens of developers. It is fundamentally a statement about where responsibility should live: infrastructure concerns belong in infrastructure, not sprinkled across product code.
+
+A service mesh is worth adopting when you have enough services, enough languages, and enough compliance pressure that fixing these problems at the library level has become a tax on every team. It is overkill when you have a handful of services in a single language and a small ops team -- the cognitive load of learning Envoy, xDS, and 100+ CRDs will exceed the benefit you get back.
+
 ### The Problem
 
-As microservices grow, managing cross-cutting concerns becomes complex:
+As microservices grow, cross-cutting concerns proliferate faster than features. A single service today needs retry logic, circuit breaking, load balancing, TLS, metrics, tracing, rate limiting, and service discovery -- and every other service in your cluster needs the exact same set. The natural first instinct is to build a shared library that each service imports, but that breaks the moment you have Java and Python services in the same cluster. Even within a single language, coordinating library upgrades across 20 teams is a nightmare. The deeper issue is a violation of separation of concerns: networking is infrastructure, but you have pushed it into application code where developers must reason about it on every pull request.
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
@@ -82,6 +86,12 @@ As microservices grow, managing cross-cutting concerns becomes complex:
 
 ### Service Mesh Architecture
 
+The sidecar proxy model is how a service mesh pulls off its transparency trick. When a pod starts in a mesh-enabled namespace, an init container rewrites the pod's iptables rules so that every byte of inbound and outbound TCP traffic is redirected through the sidecar Envoy before reaching the application (inbound) or the network (outbound). Your application makes a plain HTTP call to `http://inventory-service/items/42`, believing it is talking directly to the remote service. What actually happens: the syscall hits iptables, gets redirected to localhost:15001 where Envoy is listening, Envoy performs service discovery, load balancing, mTLS, retries, and metrics collection, then forwards the request to a remote pod's Envoy, which does its own checks before handing the request to the destination application. The application sees none of this machinery. This is the entire reason a service mesh needs no SDK -- the kernel's network stack does the interception.
+
+The control plane versus data plane distinction is the other foundational concept. Think of it like the difference between air traffic control and the planes themselves: controllers decide the routing rules, but the planes fly independently. In a mesh, the control plane (istiod for Istio) computes configuration from your CRDs and pushes it via the xDS protocol to every sidecar. The data plane (the Envoy sidecars) carries actual request traffic. Because the data plane caches configuration locally, a control plane outage is annoying but not catastrophic -- existing routing keeps working; you just lose the ability to change rules or issue new certificates. This decoupling is what makes the mesh operationally viable at scale.
+
+A service mesh splits into two logical planes, and understanding this split is essential for reasoning about failure modes. The **data plane** consists of the sidecar proxies (usually Envoy) that sit next to every pod and intercept all network traffic -- both inbound and outbound. These proxies carry actual request traffic and must stay up for your services to communicate. The **control plane** (istiod in Istio, the control components in Linkerd) pushes configuration and certificates to the data plane but does not touch live request traffic. This separation means a control plane outage does not immediately break request flow -- existing proxies keep running with their last-known config -- but you lose the ability to change routing rules, rotate certificates, or onboard new services until it recovers.
+
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
 │                     SERVICE MESH ARCHITECTURE                                │
@@ -129,6 +139,8 @@ As microservices grow, managing cross-cutting concerns becomes complex:
 
 ### Installing Istio
 
+Before you deploy Istio, understand what `istioctl install` actually does: it creates the istiod control plane deployment, installs the CRDs (VirtualService, DestinationRule, and 20+ others), and configures a mutating admission webhook that will inject Envoy sidecars into every pod in labeled namespaces. That webhook is where the "magic" happens -- any pod created in a namespace with the `istio-injection=enabled` label automatically gets a second container (the Envoy proxy) plus init containers that set up iptables rules to redirect traffic through the proxy. If you skip the label, your pods run as usual and are invisible to the mesh.
+
 ```bash
 # Download Istio
 curl -L https://istio.io/downloadIstio | sh -
@@ -146,6 +158,8 @@ kubectl get pods -n istio-system
 ```
 
 ### Deploying a Service with Istio
+
+The beauty of Istio sidecar injection is that your deployment YAML does not change. This is not an accident -- it is a design decision that lets you adopt Istio incrementally without forcing every team to rewrite their manifests. The `version: v1` label matters more than you might think: Istio's `DestinationRule` resources use this label to define traffic subsets (v1 vs v2), so your deployments should always include a `version` label even if you only have one version today. Leaving it off means you cannot do canary deployments later without editing every deployment.
 
 ```yaml
 # deployment.yaml - No changes needed, Istio injects sidecar automatically
@@ -199,9 +213,82 @@ spec:
     app: order-service
 ```
 
+### Reading Istio-Injected Environment Variables in Your Service
+
+When the Istio sidecar is injected into your pod, it also exposes useful metadata via environment variables and the downward API -- things like the pod's workload name, namespace, mesh ID, and trust domain. Application code can read these to enrich logs, construct SPIFFE identities in logs, or make mesh-aware configuration decisions (like whether to skip TLS because the mesh is already handling it). A typical pattern is to use `pydantic-settings` to load these variables into a strongly-typed config object that the rest of your application can depend on. This keeps mesh awareness confined to a single configuration module rather than scattered across the codebase.
+
+<Tabs>
+  <Tab title="Node.js">
+  ```javascript
+  // config/mesh-config.js - read Istio-injected env vars
+  const config = {
+    // Istio injects these via the downward API and sidecar-agent
+    podName: process.env.POD_NAME,
+    namespace: process.env.POD_NAMESPACE || 'default',
+    serviceAccount: process.env.SERVICE_ACCOUNT,
+    meshId: process.env.ISTIO_META_MESH_ID || 'mesh1',
+    trustDomain: process.env.TRUST_DOMAIN || 'cluster.local',
+    workloadName: process.env.ISTIO_META_WORKLOAD_NAME,
+    clusterId: process.env.ISTIO_META_CLUSTER_ID || 'Kubernetes',
+
+    // Convenience: full SPIFFE identity for this workload
+    get spiffeId() {
+      return `spiffe://${this.trustDomain}/ns/${this.namespace}/sa/${this.serviceAccount}`;
+    },
+  };
+
+  console.log('Mesh config loaded:', config);
+  module.exports = config;
+  ```
+  </Tab>
+  <Tab title="Python">
+  ```python
+  # config/mesh_config.py - read Istio-injected env vars via pydantic-settings
+  from functools import cached_property
+
+  from pydantic import Field
+  from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+  class MeshSettings(BaseSettings):
+      """Mesh-aware configuration populated from Istio-injected env vars."""
+
+      model_config = SettingsConfigDict(env_file=".env", extra="ignore")
+
+      # Downward API (set by the pod spec -- the sidecar injector adds these)
+      pod_name: str = Field(default="unknown", alias="POD_NAME")
+      namespace: str = Field(default="default", alias="POD_NAMESPACE")
+      service_account: str = Field(default="default", alias="SERVICE_ACCOUNT")
+
+      # Istio-specific metadata (injected by the sidecar agent)
+      mesh_id: str = Field(default="mesh1", alias="ISTIO_META_MESH_ID")
+      trust_domain: str = Field(default="cluster.local", alias="TRUST_DOMAIN")
+      workload_name: str | None = Field(default=None, alias="ISTIO_META_WORKLOAD_NAME")
+      cluster_id: str = Field(default="Kubernetes", alias="ISTIO_META_CLUSTER_ID")
+
+      @cached_property
+      def spiffe_id(self) -> str:
+          """Full SPIFFE identity for this workload."""
+          return (
+              f"spiffe://{self.trust_domain}/ns/{self.namespace}"
+              f"/sa/{self.service_account}"
+          )
+
+
+  mesh_settings = MeshSettings()
+  print(f"Mesh config loaded: {mesh_settings.model_dump()}")
+  print(f"SPIFFE ID: {mesh_settings.spiffe_id}")
+  ```
+  </Tab>
+</Tabs>
+
 ### Traffic Management
 
+Traffic management is where the sidecar model really earns its keep. In a meshless world, shaping traffic -- canary deployments, A/B tests, header-based routing, fault injection -- requires application code changes or bespoke ingress configuration for every service. In a mesh, these become declarative YAML applied at the control plane and propagated instantly to every sidecar. The crucial mental shift is that traffic policy is decoupled from deployment: you can deploy v2 to production and send it zero traffic, then gradually shift traffic in via `VirtualService` edits, without touching the deployment spec. This separation of "what runs" from "what gets traffic" is a genuine architectural superpower that Kubernetes alone cannot provide -- Kubernetes can only shape traffic by adjusting replica counts, which is coarse and conflates capacity with exposure.
+
 #### Virtual Services
+
+A `VirtualService` is Istio's way of answering "when traffic arrives for this hostname, where should it actually go?" It is fundamentally a routing table that sits in front of your Kubernetes Service. Without a VirtualService, Kubernetes uses round-robin load balancing across all pods backing a Service -- that is the limit of what it can express. With a VirtualService, you gain header-based routing, weighted traffic splits, timeouts, retries, fault injection, and traffic mirroring. The mental model: a Kubernetes Service defines the set of pods; a VirtualService defines the routing policy over that set.
 
 Control how requests are routed:
 
@@ -243,6 +330,8 @@ spec:
 
 #### Destination Rules
 
+If a VirtualService answers "where should traffic go," a `DestinationRule` answers "how should it be delivered once it arrives." This is where you define connection pooling, load balancing algorithms, and outlier detection (circuit breaking). The separation exists because routing (VirtualService) and delivery policy (DestinationRule) often change independently -- you might change traffic weights weekly while connection pool settings stay fixed for months. Subsets defined in DestinationRule are the "named versions" that VirtualServices route to; without a matching subset definition, a VirtualService referring to `subset: v2` simply fails to apply.
+
 Define subsets and policies:
 
 ```yaml
@@ -280,6 +369,80 @@ spec:
     labels:
       version: v2
 ```
+
+#### Building an httpx Client That Respects Mesh Timeouts and Retries
+
+When your service runs in a mesh, the sidecar already handles retries and timeouts for outbound traffic. But your HTTP client still needs to set a *client-side* timeout that is at least as long as the mesh's maximum total time budget; otherwise, your client cancels the request while Envoy is still retrying, and you miss the benefit. The rule of thumb: client timeout = mesh `timeout` + `perTryTimeout * attempts` + a small buffer. For the retries and circuit breaking, let Envoy handle them -- duplicating those at the application layer just multiplies latency with no added reliability. The Python example below uses `httpx` with a configured transport that propagates mesh headers automatically and sets timeouts aligned with the VirtualService.
+
+<Tabs>
+  <Tab title="Node.js">
+  ```javascript
+  // client/mesh-aware-http.js
+  const fetch = require('node-fetch');
+  const AbortController = require('abort-controller');
+
+  // Aligns with VirtualService: timeout: 10s, 3 attempts * 3s perTry = ~19s max
+  const MESH_MAX_BUDGET_MS = 20_000;
+
+  async function meshFetch(url, { headers = {}, method = 'GET', body } = {}) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), MESH_MAX_BUDGET_MS);
+
+    try {
+      const response = await fetch(url, {
+        method,
+        headers,
+        body,
+        signal: controller.signal,
+      });
+      if (!response.ok) {
+        // Let the mesh handle retries -- just surface the error
+        throw new Error(`Upstream ${response.status} from ${url}`);
+      }
+      return await response.json();
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  module.exports = { meshFetch };
+  ```
+  </Tab>
+  <Tab title="Python">
+  ```python
+  # client/mesh_aware_http.py
+  import httpx
+
+  # Aligns with VirtualService: timeout: 10s, 3 attempts * 3s perTry = ~19s max
+  # We add a small buffer and let Envoy handle retries; the client should NOT retry.
+  MESH_MAX_BUDGET_SECONDS = 20.0
+
+
+  def make_mesh_client() -> httpx.AsyncClient:
+      """
+      Build an httpx.AsyncClient that cooperates with the Istio sidecar.
+
+      - timeout matches the mesh's worst-case budget so we don't cancel mid-retry
+      - no client-side retries: Envoy already retries per the VirtualService
+      - HTTP/2 enabled so the sidecar can multiplex efficiently
+      """
+      timeout = httpx.Timeout(
+          connect=2.0,
+          read=MESH_MAX_BUDGET_SECONDS,
+          write=5.0,
+          pool=2.0,
+      )
+      limits = httpx.Limits(max_keepalive_connections=20, max_connections=100)
+      return httpx.AsyncClient(timeout=timeout, limits=limits, http2=True)
+
+
+  async def mesh_get(client: httpx.AsyncClient, url: str, headers: dict) -> dict:
+      response = await client.get(url, headers=headers)
+      response.raise_for_status()  # let mesh-level retries fire via Envoy on 5xx
+      return response.json()
+  ```
+  </Tab>
+</Tabs>
 
 ### Canary Deployments with Istio
 
@@ -332,139 +495,284 @@ spec:
 
 Progressive rollout script:
 
-```javascript
-// scripts/canary-rollout.js
-const k8s = require('@kubernetes/client-node');
+A canary rollout script automates the "deploy, wait, check metrics, promote or roll back" loop that would otherwise be done manually by an engineer watching Grafana at 2 AM. The key insight is that the script must do more than just change traffic weights -- it has to query your observability stack (Prometheus in this case) after each step to verify that error rates and latency remain within acceptable bounds before proceeding. If you only change weights without validation, you are just doing a blind progressive rollout, which defeats the point of a canary. The trade-off: the script becomes tightly coupled to your specific metric names and thresholds, which is why tools like Flagger (which we will mention later) generalize this pattern as a Kubernetes CRD.
 
-class CanaryRollout {
-  constructor(serviceName, namespace = 'default') {
-    this.serviceName = serviceName;
-    this.namespace = namespace;
-    
-    const kc = new k8s.KubeConfig();
-    kc.loadFromDefault();
-    this.customApi = kc.makeApiClient(k8s.CustomObjectsApi);
-  }
+<Tabs>
+  <Tab title="Node.js">
+  ```javascript
+  // scripts/canary-rollout.js
+  const k8s = require('@kubernetes/client-node');
 
-  async updateTrafficSplit(v1Weight, v2Weight) {
-    const virtualService = {
-      apiVersion: 'networking.istio.io/v1beta1',
-      kind: 'VirtualService',
-      metadata: {
-        name: `${this.serviceName}-canary`,
-        namespace: this.namespace
-      },
-      spec: {
-        hosts: [this.serviceName],
-        http: [{
-          route: [
-            {
-              destination: {
-                host: this.serviceName,
-                subset: 'v1'
-              },
-              weight: v1Weight
-            },
-            {
-              destination: {
-                host: this.serviceName,
-                subset: 'v2'
-              },
-              weight: v2Weight
-            }
-          ]
-        }]
-      }
-    };
-
-    try {
-      await this.customApi.patchNamespacedCustomObject(
-        'networking.istio.io',
-        'v1beta1',
-        this.namespace,
-        'virtualservices',
-        `${this.serviceName}-canary`,
-        virtualService,
-        undefined,
-        undefined,
-        undefined,
-        { headers: { 'Content-Type': 'application/merge-patch+json' } }
-      );
-      console.log(`Traffic split updated: v1=${v1Weight}%, v2=${v2Weight}%`);
-    } catch (error) {
-      console.error('Failed to update traffic split:', error);
-      throw error;
+  class CanaryRollout {
+    constructor(serviceName, namespace = 'default') {
+      this.serviceName = serviceName;
+      this.namespace = namespace;
+      
+      const kc = new k8s.KubeConfig();
+      kc.loadFromDefault();
+      this.customApi = kc.makeApiClient(k8s.CustomObjectsApi);
     }
-  }
 
-  async progressiveRollout(steps = [10, 25, 50, 75, 100], intervalMinutes = 5) {
-    for (const v2Percentage of steps) {
-      const v1Percentage = 100 - v2Percentage;
-      
-      console.log(`\n🚀 Rolling out: ${v2Percentage}% to v2`);
-      await this.updateTrafficSplit(v1Percentage, v2Percentage);
-      
-      // Wait and monitor
-      console.log(`⏳ Waiting ${intervalMinutes} minutes before next step...`);
-      console.log('📊 Monitor metrics at: http://localhost:3000/grafana');
-      
-      if (v2Percentage < 100) {
-        await this.waitAndMonitor(intervalMinutes);
+    async updateTrafficSplit(v1Weight, v2Weight) {
+      const virtualService = {
+        apiVersion: 'networking.istio.io/v1beta1',
+        kind: 'VirtualService',
+        metadata: {
+          name: `${this.serviceName}-canary`,
+          namespace: this.namespace
+        },
+        spec: {
+          hosts: [this.serviceName],
+          http: [{
+            route: [
+              {
+                destination: {
+                  host: this.serviceName,
+                  subset: 'v1'
+                },
+                weight: v1Weight
+              },
+              {
+                destination: {
+                  host: this.serviceName,
+                  subset: 'v2'
+                },
+                weight: v2Weight
+              }
+            ]
+          }]
+        }
+      };
+
+      try {
+        await this.customApi.patchNamespacedCustomObject(
+          'networking.istio.io',
+          'v1beta1',
+          this.namespace,
+          'virtualservices',
+          `${this.serviceName}-canary`,
+          virtualService,
+          undefined,
+          undefined,
+          undefined,
+          { headers: { 'Content-Type': 'application/merge-patch+json' } }
+        );
+        console.log(`Traffic split updated: v1=${v1Weight}%, v2=${v2Weight}%`);
+      } catch (error) {
+        console.error('Failed to update traffic split:', error);
+        throw error;
+      }
+    }
+
+    async progressiveRollout(steps = [10, 25, 50, 75, 100], intervalMinutes = 5) {
+      for (const v2Percentage of steps) {
+        const v1Percentage = 100 - v2Percentage;
         
-        // Check error rates before continuing
-        const healthy = await this.checkHealth();
-        if (!healthy) {
-          console.log('❌ Health check failed! Rolling back...');
-          await this.rollback();
-          return false;
+        console.log(`\n🚀 Rolling out: ${v2Percentage}% to v2`);
+        await this.updateTrafficSplit(v1Percentage, v2Percentage);
+        
+        // Wait and monitor
+        console.log(`⏳ Waiting ${intervalMinutes} minutes before next step...`);
+        console.log('📊 Monitor metrics at: http://localhost:3000/grafana');
+        
+        if (v2Percentage < 100) {
+          await this.waitAndMonitor(intervalMinutes);
+          
+          // Check error rates before continuing
+          const healthy = await this.checkHealth();
+          if (!healthy) {
+            console.log('❌ Health check failed! Rolling back...');
+            await this.rollback();
+            return false;
+          }
         }
       }
-    }
-    
-    console.log('\n✅ Canary rollout complete! v2 receiving 100% traffic');
-    return true;
-  }
-
-  async rollback() {
-    console.log('🔄 Rolling back to v1...');
-    await this.updateTrafficSplit(100, 0);
-    console.log('✅ Rollback complete. All traffic to v1');
-  }
-
-  async waitAndMonitor(minutes) {
-    const ms = minutes * 60 * 1000;
-    await new Promise(resolve => setTimeout(resolve, ms));
-  }
-
-  async checkHealth() {
-    // Query Prometheus for error rates
-    try {
-      const response = await fetch(
-        `http://prometheus:9090/api/v1/query?query=` +
-        `sum(rate(istio_requests_total{destination_service="${this.serviceName}",` +
-        `response_code=~"5.*",destination_version="v2"}[5m]))` +
-        `/ sum(rate(istio_requests_total{destination_service="${this.serviceName}",` +
-        `destination_version="v2"}[5m]))`
-      );
       
-      const data = await response.json();
-      const errorRate = parseFloat(data.data.result[0]?.value[1] || 0);
-      
-      console.log(`📈 v2 error rate: ${(errorRate * 100).toFixed(2)}%`);
-      return errorRate < 0.01; // Less than 1% error rate
-    } catch (error) {
-      console.log('⚠️ Could not fetch metrics, continuing...');
+      console.log('\n✅ Canary rollout complete! v2 receiving 100% traffic');
       return true;
     }
-  }
-}
 
-// Usage
-const canary = new CanaryRollout('order-service');
-canary.progressiveRollout([10, 25, 50, 75, 100], 5);
-```
+    async rollback() {
+      console.log('🔄 Rolling back to v1...');
+      await this.updateTrafficSplit(100, 0);
+      console.log('✅ Rollback complete. All traffic to v1');
+    }
+
+    async waitAndMonitor(minutes) {
+      const ms = minutes * 60 * 1000;
+      await new Promise(resolve => setTimeout(resolve, ms));
+    }
+
+    async checkHealth() {
+      // Query Prometheus for error rates
+      try {
+        const response = await fetch(
+          `http://prometheus:9090/api/v1/query?query=` +
+          `sum(rate(istio_requests_total{destination_service="${this.serviceName}",` +
+          `response_code=~"5.*",destination_version="v2"}[5m]))` +
+          `/ sum(rate(istio_requests_total{destination_service="${this.serviceName}",` +
+          `destination_version="v2"}[5m]))`
+        );
+        
+        const data = await response.json();
+        const errorRate = parseFloat(data.data.result[0]?.value[1] || 0);
+        
+        console.log(`📈 v2 error rate: ${(errorRate * 100).toFixed(2)}%`);
+        return errorRate < 0.01; // Less than 1% error rate
+      } catch (error) {
+        console.log('⚠️ Could not fetch metrics, continuing...');
+        return true;
+      }
+    }
+  }
+
+  // Usage
+  const canary = new CanaryRollout('order-service');
+  canary.progressiveRollout([10, 25, 50, 75, 100], 5);
+  ```
+  </Tab>
+  <Tab title="Python">
+  ```python
+  # scripts/canary_rollout.py
+  import asyncio
+  import logging
+  from typing import List
+
+  import httpx
+  from kubernetes import client, config
+
+  logger = logging.getLogger(__name__)
+
+
+  class CanaryRollout:
+      def __init__(self, service_name: str, namespace: str = "default") -> None:
+          self.service_name = service_name
+          self.namespace = namespace
+
+          # Load kubeconfig (in-cluster when running as a pod, local otherwise)
+          try:
+              config.load_incluster_config()
+          except config.ConfigException:
+              config.load_kube_config()
+
+          self.custom_api = client.CustomObjectsApi()
+
+      async def update_traffic_split(self, v1_weight: int, v2_weight: int) -> None:
+          virtual_service = {
+              "apiVersion": "networking.istio.io/v1beta1",
+              "kind": "VirtualService",
+              "metadata": {
+                  "name": f"{self.service_name}-canary",
+                  "namespace": self.namespace,
+              },
+              "spec": {
+                  "hosts": [self.service_name],
+                  "http": [
+                      {
+                          "route": [
+                              {
+                                  "destination": {
+                                      "host": self.service_name,
+                                      "subset": "v1",
+                                  },
+                                  "weight": v1_weight,
+                              },
+                              {
+                                  "destination": {
+                                      "host": self.service_name,
+                                      "subset": "v2",
+                                  },
+                                  "weight": v2_weight,
+                              },
+                          ]
+                      }
+                  ],
+              },
+          }
+
+          # Run the blocking kubernetes client call in a thread pool
+          await asyncio.to_thread(
+              self.custom_api.patch_namespaced_custom_object,
+              group="networking.istio.io",
+              version="v1beta1",
+              namespace=self.namespace,
+              plural="virtualservices",
+              name=f"{self.service_name}-canary",
+              body=virtual_service,
+          )
+          logger.info("Traffic split updated: v1=%d%%, v2=%d%%", v1_weight, v2_weight)
+
+      async def progressive_rollout(
+          self,
+          steps: List[int] | None = None,
+          interval_minutes: int = 5,
+      ) -> bool:
+          steps = steps or [10, 25, 50, 75, 100]
+
+          for v2_percentage in steps:
+              v1_percentage = 100 - v2_percentage
+
+              logger.info("Rolling out: %d%% to v2", v2_percentage)
+              await self.update_traffic_split(v1_percentage, v2_percentage)
+
+              if v2_percentage < 100:
+                  logger.info("Waiting %d minutes before next step...", interval_minutes)
+                  await asyncio.sleep(interval_minutes * 60)
+
+                  healthy = await self.check_health()
+                  if not healthy:
+                      logger.error("Health check failed! Rolling back...")
+                      await self.rollback()
+                      return False
+
+          logger.info("Canary rollout complete! v2 receiving 100%% traffic")
+          return True
+
+      async def rollback(self) -> None:
+          logger.info("Rolling back to v1...")
+          await self.update_traffic_split(100, 0)
+          logger.info("Rollback complete. All traffic to v1")
+
+      async def check_health(self) -> bool:
+          """Query Prometheus for v2 error rate."""
+          query = (
+              f'sum(rate(istio_requests_total{{destination_service="{self.service_name}",'
+              f'response_code=~"5.*",destination_version="v2"}}[5m]))'
+              f'/ sum(rate(istio_requests_total{{destination_service="{self.service_name}",'
+              f'destination_version="v2"}}[5m]))'
+          )
+
+          try:
+              async with httpx.AsyncClient(timeout=10) as http:
+                  response = await http.get(
+                      "http://prometheus:9090/api/v1/query",
+                      params={"query": query},
+                  )
+                  data = response.json()
+                  result = data.get("data", {}).get("result", [])
+                  error_rate = float(result[0]["value"][1]) if result else 0.0
+
+              logger.info("v2 error rate: %.2f%%", error_rate * 100)
+              return error_rate < 0.01  # Less than 1% error rate
+          except Exception as exc:  # pragma: no cover -- best-effort check
+              logger.warning("Could not fetch metrics, continuing: %s", exc)
+              return True
+
+
+  # Usage
+  if __name__ == "__main__":
+      logging.basicConfig(level=logging.INFO)
+      canary = CanaryRollout("order-service")
+      asyncio.run(canary.progressive_rollout([10, 25, 50, 75, 100], interval_minutes=5))
+  ```
+  </Tab>
+</Tabs>
 
 ### mTLS (Mutual TLS)
+
+mTLS in a service mesh is a genuine game-changer because it solves the two hardest parts of in-cluster encryption: certificate distribution and rotation. In a non-mesh world, rolling out mTLS means every team writes TLS code, manages key material, handles certificate expiration, and rebuilds images when certs change. With a mesh, the control plane issues short-lived X.509 certificates to each sidecar via the SDS (Secret Discovery Service) protocol, rotates them automatically every 24 hours, and your application never sees any of this. The SPIFFE identity baked into each certificate (`spiffe://cluster.local/ns/default/sa/payment-service`) becomes the basis for authorization policies -- you can write rules like "only the order-service workload may call /checkout," enforced by Envoy at the network layer rather than fought for in every microservice.
+
+The deeper shift: mTLS turns the network itself into a trust boundary. You can migrate from "trust the network" to "trust nothing on the network and verify cryptographic identity per request" without changing a line of application code. This is what makes zero-trust networking operationally feasible at scale.
 
 mTLS is arguably the single most compelling reason to adopt a service mesh. Without a mesh, implementing mutual TLS between services means every team needs to manage certificates, handle rotation, and write TLS code in their language of choice. With Istio, mTLS happens automatically in the sidecar proxy -- zero code changes, zero certificate management by developers. The control plane handles issuing, distributing, and rotating certificates. This turns what would be a multi-month security initiative into a single YAML configuration.
 
@@ -510,7 +818,219 @@ spec:
         paths: ["/metrics"]
 ```
 
+### Application Code That Works With a Service Mesh
+
+One of the most important things to internalize: when your service runs inside a mesh, your HTTP client code mostly stays the same, but you gain superpowers through headers. The mesh propagates tracing headers (`x-request-id`, `traceparent`, `x-b3-*`) that you should forward on outbound calls so that distributed traces stitch together across hops. If you do not forward these headers, each service call looks like a fresh request to the tracing system and you lose the end-to-end view. The mesh also respects custom headers for routing -- setting `x-user-type: premium` on a request lets Istio route it to a different backend subset without your application having to know anything about subsets.
+
+The tradeoff: if you forget to propagate headers, debugging becomes painful because traces break. Most frameworks offer middleware to handle this automatically, but always verify it is wired up.
+
+<Tabs>
+  <Tab title="Node.js">
+  ```javascript
+  // service-client.js - HTTP client that forwards mesh headers
+  const express = require('express');
+  const fetch = require('node-fetch');
+
+  const app = express();
+
+  // List of headers the mesh uses for tracing/routing
+  const MESH_HEADERS = [
+    'x-request-id',
+    'x-b3-traceid',
+    'x-b3-spanid',
+    'x-b3-parentspanid',
+    'x-b3-sampled',
+    'x-b3-flags',
+    'traceparent',
+    'tracestate',
+    'x-user-type',    // custom routing header
+  ];
+
+  function extractMeshHeaders(req) {
+    const headers = {};
+    for (const h of MESH_HEADERS) {
+      if (req.headers[h]) headers[h] = req.headers[h];
+    }
+    return headers;
+  }
+
+  app.get('/orders/:id', async (req, res) => {
+    // Forward mesh headers so traces/routing keep working across hops
+    const meshHeaders = extractMeshHeaders(req);
+
+    const inventoryRes = await fetch(
+      `http://inventory-service/items/${req.params.id}`,
+      { headers: meshHeaders }
+    );
+    const inventory = await inventoryRes.json();
+
+    res.json({ orderId: req.params.id, inventory });
+  });
+
+  app.listen(3000);
+  ```
+  </Tab>
+  <Tab title="Python">
+  ```python
+  # service_client.py - FastAPI service that forwards mesh headers
+  import httpx
+  from fastapi import FastAPI, Request
+
+  app = FastAPI()
+
+  # Headers the mesh uses for tracing/routing -- propagate these on outbound calls
+  MESH_HEADERS = (
+      "x-request-id",
+      "x-b3-traceid",
+      "x-b3-spanid",
+      "x-b3-parentspanid",
+      "x-b3-sampled",
+      "x-b3-flags",
+      "traceparent",
+      "tracestate",
+      "x-user-type",  # custom routing header
+  )
+
+
+  def extract_mesh_headers(request: Request) -> dict[str, str]:
+      return {
+          name: value
+          for name, value in request.headers.items()
+          if name.lower() in MESH_HEADERS
+      }
+
+
+  @app.get("/orders/{order_id}")
+  async def get_order(order_id: str, request: Request) -> dict:
+      # Forward mesh headers so distributed traces stay connected across hops
+      headers = extract_mesh_headers(request)
+
+      async with httpx.AsyncClient(timeout=5.0) as client:
+          response = await client.get(
+              f"http://inventory-service/items/{order_id}",
+              headers=headers,
+          )
+          inventory = response.json()
+
+      return {"order_id": order_id, "inventory": inventory}
+  ```
+  </Tab>
+</Tabs>
+
+#### FastAPI with OpenTelemetry: Mesh-Aware Distributed Tracing
+
+Manually extracting and forwarding tracing headers works, but it is fragile -- miss one header or one outbound call and the trace breaks. A better approach is to let the OpenTelemetry SDK handle propagation automatically. With `opentelemetry-instrumentation-fastapi` and `opentelemetry-instrumentation-httpx`, incoming B3/W3C TraceContext headers from Istio are parsed into a live span context on request entry, and every subsequent httpx call automatically injects the correct trace headers outbound. The OTLP exporter then ships spans to your collector (Jaeger, Tempo, Honeycomb, whatever), and the spans from your app seamlessly merge with the spans Envoy emits -- giving you a complete picture of each request across the mesh and inside each service. This is the gold-standard pattern for mesh-aware observability.
+
+<Tabs>
+  <Tab title="Node.js">
+  ```javascript
+  // tracing.js - OpenTelemetry setup for Node.js in a mesh
+  const { NodeSDK } = require('@opentelemetry/sdk-node');
+  const { OTLPTraceExporter } = require('@opentelemetry/exporter-trace-otlp-http');
+  const { getNodeAutoInstrumentations } = require('@opentelemetry/auto-instrumentations-node');
+  const { B3Propagator } = require('@opentelemetry/propagator-b3');
+  const { CompositePropagator, W3CTraceContextPropagator } = require('@opentelemetry/core');
+
+  const sdk = new NodeSDK({
+    serviceName: process.env.ISTIO_META_WORKLOAD_NAME || 'order-service',
+    traceExporter: new OTLPTraceExporter({
+      url: 'http://otel-collector.istio-system:4318/v1/traces',
+    }),
+    // Accept both B3 (Istio default) and W3C TraceContext headers
+    textMapPropagator: new CompositePropagator({
+      propagators: [new B3Propagator(), new W3CTraceContextPropagator()],
+    }),
+    instrumentations: [getNodeAutoInstrumentations()],
+  });
+
+  sdk.start();
+  console.log('OpenTelemetry tracing initialized');
+  ```
+  </Tab>
+  <Tab title="Python">
+  ```python
+  # tracing.py - OpenTelemetry setup for FastAPI in an Istio mesh
+  import os
+
+  from opentelemetry import trace
+  from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+  from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
+  from opentelemetry.instrumentation.httpx import HTTPXClientInstrumentor
+  from opentelemetry.propagate import set_global_textmap
+  from opentelemetry.propagators.b3 import B3MultiFormat
+  from opentelemetry.propagators.composite import CompositePropagator
+  from opentelemetry.sdk.resources import Resource
+  from opentelemetry.sdk.trace import TracerProvider
+  from opentelemetry.sdk.trace.export import BatchSpanProcessor
+  from opentelemetry.trace.propagation.tracecontext import TraceContextTextMapPropagator
+
+  from fastapi import FastAPI
+
+
+  def configure_tracing(app: FastAPI) -> None:
+      """
+      Wire OpenTelemetry into a FastAPI app running behind an Istio sidecar.
+
+      Istio/Envoy emits B3 headers by default (x-b3-traceid, x-b3-spanid, ...)
+      and also understands W3C TraceContext (traceparent). We accept both so
+      spans from our Python code slot cleanly into the mesh-wide trace.
+      """
+      service_name = os.getenv("ISTIO_META_WORKLOAD_NAME", "order-service")
+      namespace = os.getenv("POD_NAMESPACE", "default")
+
+      resource = Resource.create(
+          {
+              "service.name": service_name,
+              "service.namespace": namespace,
+              "service.instance.id": os.getenv("POD_NAME", "local"),
+          }
+      )
+
+      provider = TracerProvider(resource=resource)
+      exporter = OTLPSpanExporter(
+          endpoint="http://otel-collector.istio-system:4318/v1/traces",
+      )
+      provider.add_span_processor(BatchSpanProcessor(exporter))
+      trace.set_tracer_provider(provider)
+
+      # Accept both Istio's native B3 format and W3C TraceContext headers.
+      set_global_textmap(
+          CompositePropagator([B3MultiFormat(), TraceContextTextMapPropagator()])
+      )
+
+      # Auto-extract incoming trace context and create a server span per request
+      FastAPIInstrumentor.instrument_app(app)
+
+      # Auto-inject trace headers on every outbound httpx call -- no manual header copying
+      HTTPXClientInstrumentor().instrument()
+
+
+  # --- Usage in the app ---
+  app = FastAPI()
+  configure_tracing(app)
+
+
+  @app.get("/orders/{order_id}")
+  async def get_order(order_id: str) -> dict:
+      # No manual header forwarding: httpx instrumentation handles it automatically.
+      import httpx
+
+      async with httpx.AsyncClient(timeout=5.0) as client:
+          inventory = (
+              await client.get(f"http://inventory-service/items/{order_id}")
+          ).json()
+          pricing = (
+              await client.get(f"http://pricing-service/quotes/{order_id}")
+          ).json()
+
+      return {"order_id": order_id, "inventory": inventory, "pricing": pricing}
+  ```
+  </Tab>
+</Tabs>
+
 ### Circuit Breaking with Istio
+
+Circuit breaking in a service mesh works at the connection and request level, not at the application level. Envoy tracks how many consecutive 5xx responses it has seen from each upstream pod; once the threshold is breached, that pod is temporarily removed from the load balancing pool ("ejected"). This is a fundamentally different mental model from application-level circuit breakers (like Netflix Hystrix or Polly) -- the mesh sees per-pod health, while your app code traditionally sees per-service health. Doing both is fine, but the mesh-level breaker is strictly more granular and happens without any application awareness. The risk: set thresholds too aggressive and a few bad requests can eject half your healthy pods, causing cascading failure. Always configure `maxEjectionPercent` to cap how much of your fleet can be marked unhealthy simultaneously.
 
 ```yaml
 # circuit-breaker.yaml
@@ -540,6 +1060,8 @@ spec:
 ```
 
 ### Rate Limiting
+
+Rate limiting in Istio comes in two flavors: local (per-sidecar) and global (centralized counter via an external service). Local rate limiting is what you see below -- each Envoy tracks its own token bucket independently. This is fast and has no external dependencies, but it is inaccurate in aggregate: 10 sidecars with a local limit of 100 req/s each can collectively let through 1000 req/s, not 100. For strict cluster-wide limits you need global rate limiting with Envoy's rate limit service, which introduces a new dependency and a network hop per request. Pick local when approximate per-pod limits are good enough; pick global when a customer-tier quota must be enforced exactly across your entire cluster.
 
 ```yaml
 # rate-limit.yaml
@@ -657,7 +1179,13 @@ linkerd viz dashboard &
 
 ## Observability with Service Mesh
 
+Observability is the area where the service mesh delivers the most leverage per unit of effort. Because every request traverses a sidecar, the mesh can emit a uniform set of RED metrics (Rate, Errors, Duration) for every service-to-service edge without any instrumentation effort from application teams. The mental model: instead of each service being a black box that might or might not have metrics (depending on how the team instrumented it), the network itself becomes instrumented. You get a consistent baseline of observability across the entire fleet on day one, and application-level metrics become supplementary rather than foundational. The distinction matters: mesh metrics tell you *that* inventory-service is slow; application metrics tell you *why* (database wait time, cache miss rate, etc.). You need both, and the mesh gives you the first one for free.
+
+The same principle applies to distributed tracing. Envoy generates spans for every inbound and outbound request and propagates B3/W3C TraceContext headers automatically. The only work your application has to do is forward those headers on outbound calls -- or better, use an OpenTelemetry SDK that handles propagation transparently, as shown earlier.
+
 ### Automatic Metrics
+
+The single biggest "free" benefit of a service mesh is automatic, consistent metrics across every service. Because every request flows through Envoy, every request is counted, timed, and labeled identically -- regardless of whether the underlying service is Java, Python, Go, or Rust. This is transformative for an organization with polyglot services: you no longer have to convince (or coerce) every team to instrument their code consistently. The trade-off: you get what Envoy measures, which is request-level metrics. If you need business-level metrics (orders per minute, revenue per region), you still have to instrument those in application code.
 
 Istio automatically generates:
 

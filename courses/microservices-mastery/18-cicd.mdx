@@ -20,6 +20,10 @@ Microservices unlock the ability to deploy services independently, but this requ
 
 ## CI/CD Challenges in Microservices
 
+Before diving into pipeline code, it helps to understand WHY microservices CI/CD is so much harder than monolith CI/CD. In a monolith, you have one build, one test suite, one deploy target, and one rollback story. Every commit exercises the whole codebase, so the "blast radius" of a pipeline change is bounded. With microservices, you have N pipelines (one per service), plus shared pipelines for integration, contract testing, and orchestration. A single feature often spans 3-5 services, and each must deploy in the correct order without breaking compatibility.
+
+The temptation -- which almost every team falls into first -- is to build one "god pipeline" that knows about all services and deploys them together. This seems simpler but actively destroys the microservices value proposition: you end up with a distributed monolith where every deploy is a release train. The better path is harder up-front: invest in per-service pipelines, automated contract testing to catch cross-service breakage, and GitOps as the deployment substrate. The payoff is deploy frequency measured in hundreds per day rather than weekly release windows.
+
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
 │                    MONOLITH vs MICROSERVICES CI/CD                          │
@@ -77,7 +81,19 @@ Microservices unlock the ability to deploy services independently, but this requ
 
 ## Pipeline Architecture
 
+### CI Pipeline Stages: Why They Exist and What They Replace
+
+Before the era of CI, "integration" meant a developer manually pulling everyone's changes onto their laptop at the end of a sprint, spending two days reconciling conflicts, and then praying the resulting build worked in production. Integration bugs surfaced weeks after the code was written, long after the author had context-switched to something else. The classic failure mode was the "integration week" -- a scheduled period where the team did nothing but fix merge conflicts and environment-specific bugs. CI replaces this with continuous, automated integration on every commit: small changes, tested in isolation, merged frequently. The eight-stage pipeline (build, unit test, security scan, integration test, contract test, push, deploy staging, E2E, deploy prod) exists because each stage catches a specific class of bug earlier and cheaper than the stage after it.
+
+What goes wrong without it? Real story: a fintech team skipped contract testing because "our services rarely change their APIs." Three months later, a senior engineer renamed a field from `userId` to `user_id` in the auth service, ran the auth service's unit tests (they passed), deployed to production, and took down payments, notifications, and order history simultaneously -- all consumers broke at once because none of them had been rebuilt against the new contract. Contract testing would have caught this at PR review. The general pattern: every stage you skip in CI is a bug class you are deferring to production incidents.
+
+The key decision is **when to block vs warn**. A failed unit test should block the pipeline -- there is no ambiguity, the code is broken. A security scan finding a HIGH severity vulnerability should block. But a MEDIUM severity vulnerability or a code coverage drop of 2% should warn, not block, or you will train the team to bypass the pipeline. The rule of thumb: block on things that would cause a production incident; warn on things that are quality signals. If you block on everything, engineers learn to hate CI and find ways around it. If you block on nothing, the pipeline is theater.
+
 ### Service-Specific Pipelines
+
+Every service gets its own pipeline, triggered only by changes to its own directory (or to shared dependencies it relies on). This path-filtering is the single most important optimization -- without it, a change to Service A triggers rebuilds and redeploys across all services, collapsing the independence you paid so much architectural complexity to gain. If you skipped this and used one global pipeline, you would reintroduce the monolithic deployment problem: every commit takes the slowest service's build time, and a flaky test in Service B blocks Service A's release.
+
+The pipeline below has eight stages arranged in a DAG: build and unit test, security scan, integration tests, contract tests (run in parallel with integration), push to registry, deploy to staging, E2E tests against staging, and finally deploy to production gated by human approval. Each stage is a gate -- failing any stage stops the pipeline. The critical architectural decision here is that the artifact (the Docker image) is built exactly once in the build stage and passed through the rest of the pipeline. Rebuilding in each stage would waste compute and, worse, create the possibility that "the image we tested" is not "the image we deployed."
 
 ```yaml
 # .github/workflows/service-pipeline.yml
@@ -360,11 +376,202 @@ jobs:
           git push
 ```
 
+### Writing Integration Tests for the Pipeline
+
+Integration tests verify that your service works end-to-end against real infrastructure (a real database, a real cache, a real message queue). Unit tests can lie -- they use mocks that can drift from reality -- but integration tests tell you whether the deployed artifact actually functions. The CI pipeline above spins up ephemeral Postgres and Redis containers specifically so integration tests have real dependencies. A common mistake is to write integration tests that just mock more layers; if you mock the database in integration tests, you have a slower unit test.
+
+<Tabs>
+  <Tab title="Node.js">
+  ```javascript
+  // services/order-service/tests/integration/orders.test.js
+  const request = require('supertest');
+  const { Pool } = require('pg');
+  const { createApp } = require('../../src/app');
+
+  describe('Orders API (integration)', () => {
+    let app;
+    let db;
+
+    beforeAll(async () => {
+      db = new Pool({ connectionString: process.env.DATABASE_URL });
+      await db.query('CREATE TABLE IF NOT EXISTS orders (id SERIAL PRIMARY KEY, user_id TEXT, total NUMERIC)');
+      app = createApp({ db });
+    });
+
+    afterAll(async () => {
+      await db.query('DROP TABLE orders');
+      await db.end();
+    });
+
+    beforeEach(async () => {
+      await db.query('TRUNCATE orders');
+    });
+
+    it('creates an order and persists it', async () => {
+      const response = await request(app)
+        .post('/orders')
+        .send({ userId: 'u-123', total: 49.99 })
+        .expect(201);
+
+      expect(response.body).toMatchObject({ userId: 'u-123', total: 49.99 });
+
+      const { rows } = await db.query('SELECT * FROM orders WHERE id = $1', [response.body.id]);
+      expect(rows).toHaveLength(1);
+    });
+
+    it('returns 404 for missing orders', async () => {
+      await request(app).get('/orders/99999').expect(404);
+    });
+  });
+  ```
+  </Tab>
+  <Tab title="Python">
+  ```python
+  # services/order-service/tests/integration/test_orders.py
+  import os
+  import pytest
+  import pytest_asyncio
+  from httpx import AsyncClient, ASGITransport
+  from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
+  from sqlalchemy.orm import sessionmaker
+
+  from app.main import create_app
+  from app.db import Base
+
+
+  @pytest_asyncio.fixture
+  async def engine():
+      """Real Postgres — the CI workflow spins up a postgres service container."""
+      engine = create_async_engine(os.environ["DATABASE_URL"], echo=False)
+      async with engine.begin() as conn:
+          await conn.run_sync(Base.metadata.create_all)
+      yield engine
+      async with engine.begin() as conn:
+          await conn.run_sync(Base.metadata.drop_all)
+      await engine.dispose()
+
+
+  @pytest_asyncio.fixture
+  async def client(engine):
+      session_factory = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+      app = create_app(session_factory=session_factory)
+      transport = ASGITransport(app=app)
+      async with AsyncClient(transport=transport, base_url="http://test") as ac:
+          yield ac
+
+
+  @pytest.mark.asyncio
+  async def test_create_order_persists(client, engine):
+      response = await client.post("/orders", json={"user_id": "u-123", "total": 49.99})
+      assert response.status_code == 201
+      body = response.json()
+      assert body["user_id"] == "u-123"
+      assert body["total"] == 49.99
+
+      # Verify persistence by round-tripping through a fresh read
+      fetched = await client.get(f"/orders/{body['id']}")
+      assert fetched.status_code == 200
+
+
+  @pytest.mark.asyncio
+  async def test_missing_order_returns_404(client):
+      response = await client.get("/orders/99999")
+      assert response.status_code == 404
+  ```
+  </Tab>
+</Tabs>
+
+### Database Migrations in the Pipeline
+
+Migrations are the most dangerous part of any deploy. A broken migration can corrupt production data in seconds and take hours to roll back. The pipeline needs to run migrations automatically (manual migrations are an incident waiting to happen), but also safely -- which means running them against a disposable test database first, running them with a timeout, and structuring them to be backward compatible so a rollback does not leave the schema in a broken state. The Alembic snippet below is the migration runner CI should invoke before deploying new application code.
+
+<Tabs>
+  <Tab title="Node.js">
+  ```javascript
+  // services/order-service/scripts/run-migrations.js
+  const { execSync } = require('child_process');
+
+  const DB_URL = process.env.DATABASE_URL;
+  if (!DB_URL) throw new Error('DATABASE_URL is required');
+
+  try {
+    console.log('Running migrations via knex...');
+    execSync(`npx knex migrate:latest --env production`, { stdio: 'inherit' });
+    console.log('Migrations complete');
+  } catch (err) {
+    console.error('Migration failed, attempting rollback');
+    execSync(`npx knex migrate:rollback --env production`, { stdio: 'inherit' });
+    process.exit(1);
+  }
+  ```
+  </Tab>
+  <Tab title="Python">
+  ```python
+  # services/order-service/scripts/run_migrations.py
+  """CI-safe Alembic migration runner.
+
+  Runs pending migrations with a global timeout. If anything fails, we
+  exit non-zero so the pipeline stops BEFORE new application code is deployed.
+  """
+  from __future__ import annotations
+
+  import os
+  import sys
+  import signal
+  from alembic import command
+  from alembic.config import Config
+  import structlog
+
+  log = structlog.get_logger()
+
+  MIGRATION_TIMEOUT_SECONDS = 300  # 5 minutes; anything longer is suspicious
+
+
+  def _timeout_handler(signum, frame):
+      raise TimeoutError("Migrations exceeded MIGRATION_TIMEOUT_SECONDS")
+
+
+  def run_migrations() -> None:
+      db_url = os.environ.get("DATABASE_URL")
+      if not db_url:
+          log.error("missing_database_url")
+          sys.exit(2)
+
+      cfg = Config("alembic.ini")
+      cfg.set_main_option("sqlalchemy.url", db_url)
+
+      signal.signal(signal.SIGALRM, _timeout_handler)
+      signal.alarm(MIGRATION_TIMEOUT_SECONDS)
+
+      try:
+          log.info("migrations_starting", db=db_url.split("@")[-1])
+          command.upgrade(cfg, "head")
+          log.info("migrations_complete")
+      except TimeoutError:
+          log.error("migrations_timed_out")
+          sys.exit(1)
+      except Exception as exc:  # noqa: BLE001 — we want broad catch in a CI script
+          log.error("migrations_failed", error=str(exc))
+          sys.exit(1)
+      finally:
+          signal.alarm(0)
+
+
+  if __name__ == "__main__":
+      run_migrations()
+  ```
+  </Tab>
+</Tabs>
+
 ---
 
 ## Deployment Strategies
 
 ### Blue-Green Deployment
+
+Blue-green deployment is the "belt-and-suspenders" approach to zero-downtime deploys: run two full copies of your service (blue and green), keep all traffic on one while you deploy to the other, then flip traffic over in one atomic step. The beauty is the instant rollback -- if v2 misbehaves, flip the traffic back to blue and you are back on v1 in milliseconds. The cost is infrastructure: you pay for 2x capacity during the transition.
+
+The alternative -- rolling updates where pods are replaced one at a time -- is cheaper but exposes you to mixed-version states for several minutes. During a rolling update, some requests hit v1 and others hit v2 simultaneously. If v1 and v2 have any API incompatibility (even subtle ones like a renamed field or a changed default), you get intermittent errors that are brutal to debug. Blue-green eliminates this class of bug entirely because v1 and v2 never serve traffic at the same moment. The tradeoff: a Kubernetes service selector flip is still not truly atomic at the edge (in-flight requests to old pods complete, new requests go to new pods), so you still need drain periods and connection-level graceful shutdowns for true zero downtime.
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
@@ -420,6 +627,8 @@ jobs:
 │                                                                              │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
+
+The Kubernetes manifests below implement blue-green with two Deployments (one for each slot) and a Service selector that picks one slot. To "flip" traffic, you patch the Service's selector from `slot: blue` to `slot: green`. It is that simple mechanically -- the hard parts are schema compatibility and readiness probes. Without readiness probes, Kubernetes would send traffic to green pods before they finish warming up (JIT compilation, cache priming, connection pool establishment), and your "instant cutover" becomes "instant brownout." Always configure readiness probes that actually verify the service can handle work, not just that the process is alive.
 
 ```yaml
 # blue-green/deployment.yaml
@@ -479,183 +688,449 @@ spec:
 
 Blue-Green deployment script:
 
-```javascript
-// scripts/blue-green-deploy.js
-const k8s = require('@kubernetes/client-node');
+The script below automates the four steps of a blue-green deploy: detect which slot is currently active, patch the inactive slot's Deployment with the new image, wait for its pods to become Ready, then flip the Service selector. Everything is driven through the Kubernetes API -- no `kubectl` shell-outs, no imperative config edits. This is important because it makes the deploy idempotent and auditable: if the script crashes mid-flight, you can re-run it and it will pick up from wherever the cluster state is. The rollback method is symmetric: it just flips the selector back to the previous slot, which is why rollback is measured in milliseconds rather than minutes.
 
-class BlueGreenDeployer {
-  constructor(serviceName, namespace = 'default') {
-    this.serviceName = serviceName;
-    this.namespace = namespace;
-    
-    const kc = new k8s.KubeConfig();
-    kc.loadFromDefault();
-    this.appsApi = kc.makeApiClient(k8s.AppsV1Api);
-    this.coreApi = kc.makeApiClient(k8s.CoreV1Api);
-  }
+<Tabs>
+  <Tab title="Node.js">
+  ```javascript
+  // scripts/blue-green-deploy.js
+  const k8s = require('@kubernetes/client-node');
 
-  async getCurrentSlot() {
-    const service = await this.coreApi.readNamespacedService(
-      this.serviceName, 
-      this.namespace
-    );
-    return service.body.spec.selector.slot;
-  }
+  class BlueGreenDeployer {
+    constructor(serviceName, namespace = 'default') {
+      this.serviceName = serviceName;
+      this.namespace = namespace;
+      
+      const kc = new k8s.KubeConfig();
+      kc.loadFromDefault();
+      this.appsApi = kc.makeApiClient(k8s.AppsV1Api);
+      this.coreApi = kc.makeApiClient(k8s.CoreV1Api);
+    }
 
-  async getInactiveSlot() {
-    const current = await this.getCurrentSlot();
-    return current === 'blue' ? 'green' : 'blue';
-  }
-
-  async deployToInactive(imageTag) {
-    const inactiveSlot = await this.getInactiveSlot();
-    const deploymentName = `${this.serviceName}-${inactiveSlot}`;
-    
-    console.log(`Deploying ${imageTag} to ${inactiveSlot} slot...`);
-    
-    // Update deployment
-    const patch = {
-      spec: {
-        template: {
-          spec: {
-            containers: [{
-              name: this.serviceName,
-              image: `myregistry/${this.serviceName}:${imageTag}`
-            }]
-          }
-        }
-      }
-    };
-    
-    await this.appsApi.patchNamespacedDeployment(
-      deploymentName,
-      this.namespace,
-      patch,
-      undefined,
-      undefined,
-      undefined,
-      undefined,
-      undefined,
-      { headers: { 'Content-Type': 'application/strategic-merge-patch+json' } }
-    );
-    
-    // Wait for rollout
-    await this.waitForRollout(deploymentName);
-    
-    return inactiveSlot;
-  }
-
-  async waitForRollout(deploymentName, timeout = 300) {
-    const start = Date.now();
-    
-    while (Date.now() - start < timeout * 1000) {
-      const deployment = await this.appsApi.readNamespacedDeployment(
-        deploymentName,
+    async getCurrentSlot() {
+      const service = await this.coreApi.readNamespacedService(
+        this.serviceName, 
         this.namespace
       );
+      return service.body.spec.selector.slot;
+    }
+
+    async getInactiveSlot() {
+      const current = await this.getCurrentSlot();
+      return current === 'blue' ? 'green' : 'blue';
+    }
+
+    async deployToInactive(imageTag) {
+      const inactiveSlot = await this.getInactiveSlot();
+      const deploymentName = `${this.serviceName}-${inactiveSlot}`;
       
-      const status = deployment.body.status;
-      if (status.readyReplicas === status.replicas &&
-          status.updatedReplicas === status.replicas) {
-        console.log(`✅ Deployment ${deploymentName} is ready`);
-        return;
+      console.log(`Deploying ${imageTag} to ${inactiveSlot} slot...`);
+      
+      // Update deployment
+      const patch = {
+        spec: {
+          template: {
+            spec: {
+              containers: [{
+                name: this.serviceName,
+                image: `myregistry/${this.serviceName}:${imageTag}`
+              }]
+            }
+          }
+        }
+      };
+      
+      await this.appsApi.patchNamespacedDeployment(
+        deploymentName,
+        this.namespace,
+        patch,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        { headers: { 'Content-Type': 'application/strategic-merge-patch+json' } }
+      );
+      
+      // Wait for rollout
+      await this.waitForRollout(deploymentName);
+      
+      return inactiveSlot;
+    }
+
+    async waitForRollout(deploymentName, timeout = 300) {
+      const start = Date.now();
+      
+      while (Date.now() - start < timeout * 1000) {
+        const deployment = await this.appsApi.readNamespacedDeployment(
+          deploymentName,
+          this.namespace
+        );
+        
+        const status = deployment.body.status;
+        if (status.readyReplicas === status.replicas &&
+            status.updatedReplicas === status.replicas) {
+          console.log(`✅ Deployment ${deploymentName} is ready`);
+          return;
+        }
+        
+        console.log(`⏳ Waiting... (${status.readyReplicas}/${status.replicas} ready)`);
+        await new Promise(r => setTimeout(r, 5000));
       }
       
-      console.log(`⏳ Waiting... (${status.readyReplicas}/${status.replicas} ready)`);
-      await new Promise(r => setTimeout(r, 5000));
+      throw new Error(`Deployment ${deploymentName} timed out`);
     }
-    
-    throw new Error(`Deployment ${deploymentName} timed out`);
-  }
 
-  async runHealthChecks(slot) {
-    console.log(`Running health checks on ${slot}...`);
-    
-    // Get pods in the slot
-    const pods = await this.coreApi.listNamespacedPod(
-      this.namespace,
-      undefined,
-      undefined,
-      undefined,
-      undefined,
-      `app=${this.serviceName},slot=${slot}`
-    );
-    
-    for (const pod of pods.body.items) {
-      const ready = pod.status.conditions?.find(c => c.type === 'Ready');
-      if (!ready || ready.status !== 'True') {
-        throw new Error(`Pod ${pod.metadata.name} is not ready`);
-      }
-    }
-    
-    console.log(`✅ All pods healthy in ${slot}`);
-  }
-
-  async switchTraffic(newSlot) {
-    console.log(`Switching traffic to ${newSlot}...`);
-    
-    const patch = {
-      spec: {
-        selector: {
-          app: this.serviceName,
-          slot: newSlot
+    async runHealthChecks(slot) {
+      console.log(`Running health checks on ${slot}...`);
+      
+      // Get pods in the slot
+      const pods = await this.coreApi.listNamespacedPod(
+        this.namespace,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        `app=${this.serviceName},slot=${slot}`
+      );
+      
+      for (const pod of pods.body.items) {
+        const ready = pod.status.conditions?.find(c => c.type === 'Ready');
+        if (!ready || ready.status !== 'True') {
+          throw new Error(`Pod ${pod.metadata.name} is not ready`);
         }
       }
-    };
-    
-    await this.coreApi.patchNamespacedService(
-      this.serviceName,
-      this.namespace,
-      patch,
-      undefined,
-      undefined,
-      undefined,
-      undefined,
-      undefined,
-      { headers: { 'Content-Type': 'application/strategic-merge-patch+json' } }
-    );
-    
-    console.log(`✅ Traffic switched to ${newSlot}`);
-  }
+      
+      console.log(`✅ All pods healthy in ${slot}`);
+    }
 
-  async rollback() {
-    const currentSlot = await this.getCurrentSlot();
-    const previousSlot = currentSlot === 'blue' ? 'green' : 'blue';
-    
-    console.log(`🔄 Rolling back from ${currentSlot} to ${previousSlot}...`);
-    await this.switchTraffic(previousSlot);
-    console.log(`✅ Rollback complete`);
-  }
+    async switchTraffic(newSlot) {
+      console.log(`Switching traffic to ${newSlot}...`);
+      
+      const patch = {
+        spec: {
+          selector: {
+            app: this.serviceName,
+            slot: newSlot
+          }
+        }
+      };
+      
+      await this.coreApi.patchNamespacedService(
+        this.serviceName,
+        this.namespace,
+        patch,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        { headers: { 'Content-Type': 'application/strategic-merge-patch+json' } }
+      );
+      
+      console.log(`✅ Traffic switched to ${newSlot}`);
+    }
 
-  async deploy(imageTag) {
-    try {
-      // Deploy to inactive slot
-      const newSlot = await this.deployToInactive(imageTag);
+    async rollback() {
+      const currentSlot = await this.getCurrentSlot();
+      const previousSlot = currentSlot === 'blue' ? 'green' : 'blue';
       
-      // Run health checks
-      await this.runHealthChecks(newSlot);
-      
-      // Switch traffic
-      await this.switchTraffic(newSlot);
-      
-      console.log(`\n✅ Blue-green deployment complete!`);
-      console.log(`   Active slot: ${newSlot}`);
-      console.log(`   Image: ${imageTag}`);
-      
-    } catch (error) {
-      console.error('Deployment failed:', error.message);
-      console.log('Run rollback to switch back to previous version');
-      throw error;
+      console.log(`🔄 Rolling back from ${currentSlot} to ${previousSlot}...`);
+      await this.switchTraffic(previousSlot);
+      console.log(`✅ Rollback complete`);
+    }
+
+    async deploy(imageTag) {
+      try {
+        // Deploy to inactive slot
+        const newSlot = await this.deployToInactive(imageTag);
+        
+        // Run health checks
+        await this.runHealthChecks(newSlot);
+        
+        // Switch traffic
+        await this.switchTraffic(newSlot);
+        
+        console.log(`\n✅ Blue-green deployment complete!`);
+        console.log(`   Active slot: ${newSlot}`);
+        console.log(`   Image: ${imageTag}`);
+        
+      } catch (error) {
+        console.error('Deployment failed:', error.message);
+        console.log('Run rollback to switch back to previous version');
+        throw error;
+      }
     }
   }
-}
 
-// Usage
-const deployer = new BlueGreenDeployer('order-service');
-deployer.deploy('v2.0.0');
-```
+  // Usage
+  const deployer = new BlueGreenDeployer('order-service');
+  deployer.deploy('v2.0.0');
+  ```
+  </Tab>
+  <Tab title="Python">
+  ```python
+  # scripts/blue_green_deploy.py
+  import asyncio
+  import logging
+  from typing import Literal
+
+  from kubernetes import client, config
+  from kubernetes.client.rest import ApiException
+
+  logger = logging.getLogger(__name__)
+  Slot = Literal["blue", "green"]
+
+
+  class BlueGreenDeployer:
+      def __init__(self, service_name: str, namespace: str = "default") -> None:
+          self.service_name = service_name
+          self.namespace = namespace
+
+          # Load in-cluster config if running in a pod, else local kubeconfig
+          try:
+              config.load_incluster_config()
+          except config.ConfigException:
+              config.load_kube_config()
+
+          self.apps_api = client.AppsV1Api()
+          self.core_api = client.CoreV1Api()
+
+      def get_current_slot(self) -> Slot:
+          service = self.core_api.read_namespaced_service(
+              name=self.service_name, namespace=self.namespace
+          )
+          return service.spec.selector["slot"]
+
+      def get_inactive_slot(self) -> Slot:
+          return "green" if self.get_current_slot() == "blue" else "blue"
+
+      async def deploy_to_inactive(self, image_tag: str) -> Slot:
+          inactive_slot = self.get_inactive_slot()
+          deployment_name = f"{self.service_name}-{inactive_slot}"
+
+          logger.info("Deploying %s to %s slot", image_tag, inactive_slot)
+
+          # Strategic merge patch — only the container image changes
+          patch = {
+              "spec": {
+                  "template": {
+                      "spec": {
+                          "containers": [
+                              {
+                                  "name": self.service_name,
+                                  "image": f"myregistry/{self.service_name}:{image_tag}",
+                              }
+                          ]
+                      }
+                  }
+              }
+          }
+
+          self.apps_api.patch_namespaced_deployment(
+              name=deployment_name,
+              namespace=self.namespace,
+              body=patch,
+          )
+
+          await self.wait_for_rollout(deployment_name)
+          return inactive_slot
+
+      async def wait_for_rollout(
+          self, deployment_name: str, timeout_seconds: int = 300
+      ) -> None:
+          deadline = asyncio.get_event_loop().time() + timeout_seconds
+
+          while asyncio.get_event_loop().time() < deadline:
+              deployment = self.apps_api.read_namespaced_deployment(
+                  name=deployment_name, namespace=self.namespace
+              )
+              status = deployment.status
+
+              if (
+                  status.ready_replicas == status.replicas
+                  and status.updated_replicas == status.replicas
+              ):
+                  logger.info("Deployment %s is ready", deployment_name)
+                  return
+
+              logger.info(
+                  "Waiting... (%s/%s ready)",
+                  status.ready_replicas or 0,
+                  status.replicas,
+              )
+              await asyncio.sleep(5)
+
+          raise TimeoutError(f"Deployment {deployment_name} timed out")
+
+      async def run_health_checks(self, slot: Slot) -> None:
+          logger.info("Running health checks on %s", slot)
+
+          pods = self.core_api.list_namespaced_pod(
+              namespace=self.namespace,
+              label_selector=f"app={self.service_name},slot={slot}",
+          )
+
+          for pod in pods.items:
+              ready = next(
+                  (c for c in (pod.status.conditions or []) if c.type == "Ready"),
+                  None,
+              )
+              if not ready or ready.status != "True":
+                  raise RuntimeError(f"Pod {pod.metadata.name} is not ready")
+
+          logger.info("All pods healthy in %s", slot)
+
+      def switch_traffic(self, new_slot: Slot) -> None:
+          logger.info("Switching traffic to %s", new_slot)
+
+          patch = {"spec": {"selector": {"app": self.service_name, "slot": new_slot}}}
+          self.core_api.patch_namespaced_service(
+              name=self.service_name,
+              namespace=self.namespace,
+              body=patch,
+          )
+          logger.info("Traffic switched to %s", new_slot)
+
+      def rollback(self) -> None:
+          current = self.get_current_slot()
+          previous: Slot = "green" if current == "blue" else "blue"
+          logger.info("Rolling back from %s to %s", current, previous)
+          self.switch_traffic(previous)
+
+      async def deploy(self, image_tag: str) -> None:
+          try:
+              new_slot = await self.deploy_to_inactive(image_tag)
+              await self.run_health_checks(new_slot)
+              self.switch_traffic(new_slot)
+              logger.info(
+                  "Blue-green deployment complete. Active slot: %s, image: %s",
+                  new_slot,
+                  image_tag,
+              )
+          except (ApiException, RuntimeError, TimeoutError) as exc:
+              logger.exception("Deployment failed: %s", exc)
+              raise
+
+
+  if __name__ == "__main__":
+      logging.basicConfig(level=logging.INFO)
+      deployer = BlueGreenDeployer("order-service")
+      asyncio.run(deployer.deploy("v2.0.0"))
+  ```
+  </Tab>
+</Tabs>
+
+### Post-Deploy Validation with Health Checks
+
+The moment after a deploy completes, you want automated confirmation that the new pods are not just "Ready" from Kubernetes' perspective but actually serving real traffic correctly. A pod can be Ready and still be broken if, for example, it connects to the database at startup (passing the readiness probe) but returns 500 on every request because a config flag is missing. The script below runs a burst of real HTTP requests against the service right after deploy, measures error rates, and fails the deploy if errors exceed a threshold.
+
+<Tabs>
+  <Tab title="Node.js">
+  ```javascript
+  // scripts/post-deploy-validate.js
+  const axios = require('axios');
+
+  async function validate({ baseUrl, durationSec = 60, threshold = 0.01 }) {
+    const end = Date.now() + durationSec * 1000;
+    let total = 0, failed = 0;
+
+    while (Date.now() < end) {
+      total += 1;
+      try {
+        const resp = await axios.get(`${baseUrl}/health/ready`, { timeout: 2000 });
+        if (resp.status >= 500) failed += 1;
+      } catch (err) {
+        failed += 1;
+      }
+      await new Promise(r => setTimeout(r, 500));
+    }
+
+    const errorRate = failed / total;
+    console.log(`Checked ${total} requests, ${failed} errors (${(errorRate * 100).toFixed(2)}%)`);
+    if (errorRate > threshold) {
+      throw new Error(`Error rate ${errorRate} exceeds threshold ${threshold}`);
+    }
+  }
+
+  validate({ baseUrl: process.env.SERVICE_URL }).catch(err => {
+    console.error(err.message);
+    process.exit(1);
+  });
+  ```
+  </Tab>
+  <Tab title="Python">
+  ```python
+  # scripts/post_deploy_validate.py
+  """Burst-test a freshly-deployed service and fail if error rate > threshold."""
+  from __future__ import annotations
+
+  import asyncio
+  import os
+  import sys
+  import time
+
+  import httpx
+  import structlog
+
+  log = structlog.get_logger()
+
+
+  async def validate(
+      base_url: str,
+      duration_seconds: int = 60,
+      error_rate_threshold: float = 0.01,
+      request_interval: float = 0.5,
+      request_timeout: float = 2.0,
+  ) -> None:
+      total = 0
+      failed = 0
+      deadline = time.monotonic() + duration_seconds
+
+      # Connection pooling — re-use sockets across probes
+      async with httpx.AsyncClient(timeout=request_timeout) as client:
+          while time.monotonic() < deadline:
+              total += 1
+              try:
+                  resp = await client.get(f"{base_url}/health/ready")
+                  if resp.status_code >= 500:
+                      failed += 1
+                      log.warning("probe_5xx", status=resp.status_code)
+              except httpx.RequestError as exc:
+                  failed += 1
+                  log.warning("probe_error", error=str(exc))
+              await asyncio.sleep(request_interval)
+
+      error_rate = failed / total if total else 0.0
+      log.info(
+          "validation_complete",
+          total=total,
+          failed=failed,
+          error_rate=f"{error_rate:.4f}",
+          threshold=error_rate_threshold,
+      )
+
+      if error_rate > error_rate_threshold:
+          log.error("validation_failed")
+          sys.exit(1)
+
+
+  if __name__ == "__main__":
+      base_url = os.environ["SERVICE_URL"]
+      asyncio.run(validate(base_url))
+  ```
+  </Tab>
+</Tabs>
 
 ### Canary Deployment
+
+Canary deployment takes a different philosophy: instead of flipping all traffic at once, send a tiny slice (5%) to v2 while 95% stays on v1. Watch the metrics. If the canary misbehaves, only 5% of users are affected and you roll back. If it looks healthy, increase to 10%, then 25%, then 50%, then 100%. You are essentially A/B-testing your release in production, with live users as the judges. This is the gold standard for high-traffic services where even a small regression would cost real money or reputation.
+
+Why does canary deployment exist? It replaces the traditional "big bang" release where a team shipped on a Friday at 5pm, went home, and got paged at 8pm when 100% of users hit the new bug. That pattern is where the phrase "read-only Friday" came from -- teams learned to stop deploying on Fridays because every deploy was a coin flip. Canary turns the coin flip into a graduated bet: the bug still exists, but only 5% of users meet it, and the automation aborts the deploy before it spreads. What goes wrong without canary: Knight Capital's 2012 incident, where a bad deploy pushed to 8 servers simultaneously cost them $440M in 45 minutes. A canary with even a 1-minute bake time would have caught the faulty trading logic at $5M of losses, not $440M.
+
+Why not just use blue-green everywhere? Because blue-green gives you an all-or-nothing bet. If v2 has a subtle bug that only shows up under real production load (a race condition at 10,000 QPS, a memory leak that manifests after 30 minutes), blue-green will hit 100% of users with that bug the instant you flip traffic. Canary lets you discover the bug at 5% and bail out. The cost is complexity: canary requires traffic-splitting infrastructure (Istio, Linkerd, or a smart load balancer) and automated analysis (is the error rate in the canary statistically higher than stable?). The naive version -- "deploy one canary pod alongside nine stable pods and let Kubernetes' round-robin split traffic" -- works but gives you no control over percentages or header-based routing.
+
+The key decision for canary: what metric do you use to decide success? Error rate alone is not enough -- a service can have identical error rates between v1 and v2 but v2 takes 5x longer to respond, silently degrading user experience. Production canary analysis compares error rate, latency percentiles (p50, p95, p99), and business metrics (order completion rate, checkout success) between canary and stable. If any metric diverges by more than a threshold, auto-rollback. The temptation is to use too many metrics; the failure mode is that one noisy metric causes constant aborts and the team disables canary analysis entirely.
 
 ```yaml
 # canary/deployment.yaml
@@ -716,6 +1191,8 @@ spec:
 ```
 
 Progressive Canary with Argo Rollouts:
+
+Argo Rollouts takes the canary concept and makes it declarative and fully automated. Instead of manually setting weights and watching Grafana, you describe the canary steps (5% → 10% → 25% → 50% → 75% → 100%) and the analysis rules ("success rate must be >= 99%"). Argo Rollouts orchestrates the traffic shifting through your service mesh (Istio here) and automatically pauses, aborts, or promotes based on the metrics. If the analysis fails, traffic is rolled back automatically. This turns canary deployment from "senior engineer babysits Grafana for 40 minutes" into "push a commit and go get coffee." The tradeoff is setup cost: you need a service mesh, a metrics provider (Prometheus), and analysis templates tuned to your service's actual behavior -- which means you need good observability before you can automate progressive delivery.
 
 ```yaml
 # argo-rollout.yaml
@@ -811,6 +1288,126 @@ spec:
           ))
 ```
 
+### Canary Validation: Comparing Error Rates Between Versions
+
+Argo Rollouts handles the automated case, but many teams start with a simpler approach: a validation script that queries Prometheus, compares the error rate of the canary pods to the stable pods, and exits non-zero if the canary is worse by more than a threshold. The CI pipeline calls this script after bumping canary weight; if it fails, the pipeline auto-rolls back. The script below is the minimum viable version.
+
+<Tabs>
+  <Tab title="Node.js">
+  ```javascript
+  // scripts/canary-validate.js
+  const axios = require('axios');
+
+  const PROM = process.env.PROMETHEUS_URL;
+  const SERVICE = process.env.SERVICE_NAME;
+  const THRESHOLD = Number(process.env.ERROR_DELTA_THRESHOLD || 0.01);
+
+  async function errorRate(track) {
+    const query = `
+      sum(rate(http_requests_total{service="${SERVICE}",track="${track}",status=~"5.."}[5m]))
+      /
+      sum(rate(http_requests_total{service="${SERVICE}",track="${track}"}[5m]))
+    `;
+    const resp = await axios.get(`${PROM}/api/v1/query`, { params: { query } });
+    const value = resp.data.data.result?.[0]?.value?.[1];
+    return Number(value || 0);
+  }
+
+  (async () => {
+    const [stable, canary] = await Promise.all([errorRate('stable'), errorRate('canary')]);
+    const delta = canary - stable;
+    console.log(`stable=${stable} canary=${canary} delta=${delta}`);
+    if (delta > THRESHOLD) {
+      console.error(`Canary error rate exceeds stable by ${delta}, aborting`);
+      process.exit(1);
+    }
+  })();
+  ```
+  </Tab>
+  <Tab title="Python">
+  ```python
+  # scripts/canary_validate.py
+  """Compare error rates between canary and stable tracks.
+
+  Called by CI after each canary weight bump. Exits non-zero if the canary
+  track is materially worse than stable, which signals the pipeline to
+  auto-rollback.
+  """
+  from __future__ import annotations
+
+  import asyncio
+  import os
+  import sys
+  from typing import Literal
+
+  import httpx
+  import structlog
+
+  log = structlog.get_logger()
+
+  Track = Literal["stable", "canary"]
+
+
+  async def query_error_rate(
+      client: httpx.AsyncClient,
+      prometheus_url: str,
+      service: str,
+      track: Track,
+  ) -> float:
+      query = (
+          f'sum(rate(http_requests_total{{service="{service}",track="{track}",'
+          f'status=~"5.."}}[5m])) / '
+          f'sum(rate(http_requests_total{{service="{service}",track="{track}"}}[5m]))'
+      )
+      resp = await client.get(f"{prometheus_url}/api/v1/query", params={"query": query})
+      resp.raise_for_status()
+      result = resp.json()["data"]["result"]
+      if not result:
+          return 0.0
+      return float(result[0]["value"][1])
+
+
+  async def main() -> None:
+      prometheus_url = os.environ["PROMETHEUS_URL"]
+      service = os.environ["SERVICE_NAME"]
+      threshold = float(os.environ.get("ERROR_DELTA_THRESHOLD", "0.01"))
+
+      async with httpx.AsyncClient(timeout=10.0) as client:
+          stable, canary = await asyncio.gather(
+              query_error_rate(client, prometheus_url, service, "stable"),
+              query_error_rate(client, prometheus_url, service, "canary"),
+          )
+
+      delta = canary - stable
+      log.info(
+          "canary_comparison",
+          stable_error_rate=f"{stable:.4f}",
+          canary_error_rate=f"{canary:.4f}",
+          delta=f"{delta:.4f}",
+          threshold=threshold,
+      )
+
+      if delta > threshold:
+          log.error("canary_rejected", reason="error_rate_regression")
+          sys.exit(1)
+
+      log.info("canary_accepted")
+
+
+  if __name__ == "__main__":
+      asyncio.run(main())
+  ```
+  </Tab>
+</Tabs>
+
+### Rollback Strategies: The Forgotten Half of Deployment
+
+Most teams spend 90% of their deployment thinking on "how do we deploy v2?" and 10% on "how do we roll back?" This is backwards. The moment production breaks, rollback speed is the only thing that matters -- every minute of downtime costs revenue, users, and trust. A mature deployment strategy treats rollback as a first-class operation, tested regularly (monthly rollback drills are a good practice), with clear triggers for when to invoke it. The three rollback strategies are: infrastructure rollback (revert the image tag, redeploy the old version), traffic rollback (flip the router back to the old version, which is faster but assumes the old version is still running), and data rollback (restore from backup, which is the last resort and usually involves data loss).
+
+Without a tested rollback story, teams fall into a failure mode called "rolling forward" -- when v2 is broken, they try to push v3 to fix it, then v4 to fix v3, compounding the incident. I have seen incidents where a 5-minute rollback would have restored service, but the team spent 3 hours trying to patch forward because they had never practiced rollback and were afraid of it. The rule: if you cannot restore service in under 10 minutes, you do not have a rollback strategy -- you have wishful thinking.
+
+The key decision for rollback: **automatic vs manual**. Automatic rollback (Argo Rollouts aborts on analysis failure) is fast but can thrash during transient issues (a brief Prometheus outage triggers rollback of a healthy deploy). Manual rollback requires a human in the loop, which is slower but more deliberate. The right answer depends on blast radius: for a low-risk service, automatic rollback saves human time; for a mission-critical service (payments, auth), you want a human to confirm the rollback because a false positive is more costly than an extra 60 seconds of incident time.
+
 ---
 
 ## Deployment Strategy Decision Framework
@@ -837,7 +1434,19 @@ Choosing the wrong deployment strategy for a given service can range from "annoy
 
 ## GitOps with ArgoCD
 
+### GitOps Principles: Why Pull Beats Push
+
+GitOps exists because push-based CI/CD has fundamental security and auditability problems. In push-based CI/CD, your CI system (GitHub Actions, Jenkins, CircleCI) has long-lived credentials that let it write to every Kubernetes cluster you deploy to. If an attacker compromises your CI -- through a malicious dependency, a leaked token, or a poisoned PR -- they have direct access to production. This has happened in real breaches: the Codecov bash uploader incident (2021) exfiltrated credentials from thousands of CI pipelines worldwide because those credentials had too much power.
+
+GitOps flips the model: the cluster polls a Git repo for changes (pull) rather than the CI pushing changes into the cluster (push). CI's only job is to update manifests in Git; it has no cluster credentials. A GitOps agent inside the cluster (ArgoCD, Flux) is the only actor with write access, and it only applies what is in Git. Two key consequences: (1) you can revoke all CI's cluster access without breaking deploys, which massively reduces blast radius of a CI compromise; (2) the Git repo becomes the audit log -- every deploy is a signed commit, traceable to a human and a PR. What goes wrong without this: traditional push pipelines leave no durable record of who deployed what when, because the pipeline logs expire and `kubectl apply` does not leave a commit trail.
+
+The key decision in GitOps: **strict reconciliation vs advisory mode**. Strict reconciliation (`selfHeal: true`) means the cluster is forced to exactly match Git -- any manual `kubectl edit` is reverted within seconds. Advisory mode means drift is reported but not corrected, giving operators an escape valve for emergencies. Strict is the right default because it prevents configuration drift; advisory is sometimes used during the initial GitOps adoption phase when teams are learning the workflow and need room to experiment. Once your team is fluent, strict reconciliation is mandatory -- without it, GitOps becomes "Git is one source of truth among several," which is no source of truth at all.
+
 ### ArgoCD Architecture
+
+GitOps inverts the traditional CI/CD model. In the old way, your CI pipeline had write credentials to the cluster and ran `kubectl apply` to push changes in. That is a security nightmare (your CI system effectively has admin on prod) and an auditability nightmare (to know what is running, you have to query the cluster, not read a file). GitOps flips this: the cluster has a pull-based agent (ArgoCD) that watches a Git repo and syncs the cluster to match whatever is in Git. Git becomes the single source of truth; the cluster is a derived, reproducible projection of it.
+
+Why this matters for microservices specifically: with 20+ services, you need a clean answer to "what version of every service is running in every environment, and how do I roll any of them back?" The Git-repo-of-manifests answer is: look at the file, run `git log` for history, run `git revert` to roll back. The imperative answer is: run `kubectl get` across dozens of namespaces and hope nobody made a manual change. The tradeoff is operational: you now manage a second repo (the manifests repo) in addition to your application code, and you need discipline to never `kubectl edit` directly in production. Every team that adopts GitOps discovers that the hardest part is not the tooling -- it is teaching engineers to resist the temptation to hot-patch production.
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
@@ -877,6 +1486,14 @@ Choosing the wrong deployment strategy for a given service can range from "annoy
 ```
 
 ### ArgoCD Application Configuration
+
+ArgoCD deserves its own section because it is the most common GitOps operator and its configuration model repeats concepts you will see across the ecosystem. The `Application` CRD is ArgoCD's core abstraction: one Application represents one deployed workload, bound to one Git source. The critical decision is granularity -- one Application per service, or one Application per "bounded context" (group of services that deploy together). Per-service Applications give you the finest-grained control (each service can sync independently, rollback independently), but you end up with hundreds of Application manifests to manage. The ApplicationSet pattern below solves this by generating Applications from a template.
+
+Why does ArgoCD exist when `kubectl apply -f` has existed forever? Because `kubectl apply` is stateless -- once you run it, there is no ongoing reconciliation. If someone edits the resource afterwards, your apply is forgotten. ArgoCD maintains an ongoing reconciliation loop: it knows what Git says the state should be, it observes what the cluster actually is, and it continuously drives the cluster toward the desired state. This is the same pattern Kubernetes itself uses for Deployments reconciling Pods. ArgoCD extends that pattern from "pods match deployment" to "cluster matches Git."
+
+An ArgoCD `Application` is the atomic unit of GitOps deployment: it binds a Git source (repo + path + revision) to a Kubernetes destination (cluster + namespace). The `syncPolicy.automated.selfHeal: true` flag is what makes GitOps different from "CI that runs kubectl" -- it means ArgoCD continuously reconciles cluster state against Git state, so manual `kubectl` changes get reverted within seconds. The `prune: true` flag means if you delete a file from Git, ArgoCD deletes the corresponding resource in the cluster. Without these flags, ArgoCD is just a fancy deployment tool; with them, Git is truly the source of truth.
+
+The `ApplicationSet` below is how you avoid defining the same Application manifest twelve times for twelve environments. It generates one Application per entry in the `elements` list, templating the environment name, namespace, and cluster URL. This keeps your GitOps config DRY and prevents drift between environment definitions -- a common bug is "staging and prod diverged because someone updated one but not the other." ApplicationSets make the divergence impossible by construction.
 
 ```yaml
 # argocd/applications/order-service.yaml
@@ -970,6 +1587,8 @@ spec:
 
 ### Kustomize Structure
 
+Kustomize lets you maintain one set of "base" Kubernetes manifests and "overlay" environment-specific patches on top. Without it, you end up with three copies of nearly-identical deployment YAML (dev, staging, prod) and they slowly drift apart as people fix bugs in one but not the others. The Kustomize base/overlay pattern below keeps the shared 90% in one place and isolates the 10% that actually differs per environment (replica counts, resource limits, config values). This is mechanically similar to CSS inheritance -- define defaults in the base, override selectively in the overlay.
+
 ```
 k8s-manifests/
 └── services/
@@ -1043,6 +1662,10 @@ configMapGenerator:
 
 ### Monorepo Strategy
 
+A monorepo (one Git repo, many services) sounds like it should be easier than polyrepo (one Git repo per service), but the CI complexity is substantial. The naive implementation -- "run all service pipelines on every commit" -- means a one-line change to `services/billing/README.md` triggers a 45-minute pipeline across every service. The fix is change detection: determine which services were actually affected by a commit and only build those. Shared libraries are the gotcha: if `libs/common` changes, every service that depends on it must be rebuilt.
+
+The `dorny/paths-filter` action below is one way to implement this cleanly. It parses the changed files against a set of filter patterns and emits a list of affected services. The `matrix` strategy then spawns a parallel job per affected service. The `shared-libs` filter handles the dependency case: if shared libs change, we rebuild all dependent services. The alternative (Nx, Turborepo, Bazel) does this with actual dependency graphs parsed from your code, which is more accurate but adds tooling complexity.
+
 ```yaml
 # .github/workflows/monorepo-ci.yml
 name: Monorepo CI
@@ -1105,6 +1728,8 @@ jobs:
 
 ### Polyrepo Strategy
 
+Polyrepo (one repo per service) inverts the tradeoffs. Each repo's CI is simple -- there is only one service, so "what changed?" is always "this service." No path filtering needed, no dependency graph. But cross-service coordination gets harder: a feature that spans three services requires three PRs in three repos, and keeping them in sync is manual. Large refactors that touch many services become painful. The polyrepo workflow below is dead simple, which is its main virtue. It pushes the image and then triggers a `repository-dispatch` event in a separate k8s-manifests repo, which is where ArgoCD picks it up. This separation means the application repo has no write access to the k8s cluster, only the manifests repo does.
+
 ```yaml
 # Each service has its own repo
 # order-service/.github/workflows/ci.yml
@@ -1141,6 +1766,138 @@ jobs:
           event-type: deploy-order-service
           client-payload: '{"image": "myregistry/order-service:${{ github.sha }}"}'
 ```
+
+---
+
+## Deployment Helper Scripts
+
+Pipelines do the heavy lifting, but you will also need ad-hoc deployment scripts -- for manual cutovers, for emergency rollbacks, for triggering builds across multiple services during a coordinated release, and for querying the state of the deployment fleet. These scripts are typically written in whatever language your platform team is most comfortable with. Below is a Python helper that combines GitPython (for commit-driven deploys), boto3 (for AWS ECR pushes), and subprocess (for invoking kubectl/kustomize). The structure maps 1:1 to what you would write in Node.js, so if your team is Python-first for tooling, this is the pattern to use.
+
+<Tabs>
+  <Tab title="Node.js">
+  ```javascript
+  // scripts/deploy-helper.js
+  const { execSync } = require('child_process');
+  const simpleGit = require('simple-git');
+
+  class DeploymentHelper {
+    constructor(serviceName, manifestsRepoPath) {
+      this.serviceName = serviceName;
+      this.manifestsRepo = simpleGit(manifestsRepoPath);
+      this.manifestsPath = manifestsRepoPath;
+    }
+
+    getImageTag() {
+      const sha = execSync('git rev-parse --short HEAD').toString().trim();
+      const timestamp = new Date().toISOString().slice(0, 10).replace(/-/g, '');
+      return `${timestamp}-${sha}`;
+    }
+
+    async updateManifest(environment, imageTag) {
+      const overlayPath = `services/${this.serviceName}/overlays/${environment}`;
+      execSync(
+        `cd ${this.manifestsPath}/${overlayPath} && ` +
+        `kustomize edit set image myregistry/${this.serviceName}=myregistry/${this.serviceName}:${imageTag}`
+      );
+
+      await this.manifestsRepo.add('.');
+      await this.manifestsRepo.commit(
+        `Deploy ${this.serviceName}:${imageTag} to ${environment}`
+      );
+      await this.manifestsRepo.push('origin', 'main');
+
+      console.log(`✅ Updated ${environment} manifest to ${imageTag}`);
+    }
+
+    async deploy(environment) {
+      const imageTag = this.getImageTag();
+      console.log(`Deploying ${this.serviceName}:${imageTag} to ${environment}...`);
+      await this.updateManifest(environment, imageTag);
+    }
+  }
+
+  const helper = new DeploymentHelper('order-service', '/path/to/k8s-manifests');
+  helper.deploy('staging');
+  ```
+  </Tab>
+  <Tab title="Python">
+  ```python
+  # scripts/deploy_helper.py
+  import subprocess
+  from datetime import datetime, timezone
+  from pathlib import Path
+
+  import boto3
+  from git import Repo
+
+
+  class DeploymentHelper:
+      """Coordinate image tagging and GitOps manifest updates."""
+
+      def __init__(self, service_name: str, manifests_repo_path: Path) -> None:
+          self.service_name = service_name
+          self.manifests_path = manifests_repo_path
+          self.manifests_repo = Repo(manifests_repo_path)
+          self.ecr = boto3.client("ecr")
+
+      def get_image_tag(self) -> str:
+          sha = subprocess.check_output(
+              ["git", "rev-parse", "--short", "HEAD"], text=True
+          ).strip()
+          timestamp = datetime.now(timezone.utc).strftime("%Y%m%d")
+          return f"{timestamp}-{sha}"
+
+      def verify_image_exists(self, image_tag: str) -> None:
+          """Check ECR for the image before updating the manifest.
+
+          Prevents a broken manifest pointing at a non-existent image.
+          """
+          try:
+              self.ecr.describe_images(
+                  repositoryName=self.service_name,
+                  imageIds=[{"imageTag": image_tag}],
+              )
+          except self.ecr.exceptions.ImageNotFoundException as exc:
+              raise RuntimeError(
+                  f"Image {self.service_name}:{image_tag} not found in ECR"
+              ) from exc
+
+      def update_manifest(self, environment: str, image_tag: str) -> None:
+          overlay = self.manifests_path / "services" / self.service_name / "overlays" / environment
+
+          subprocess.run(
+              [
+                  "kustomize", "edit", "set", "image",
+                  f"myregistry/{self.service_name}=myregistry/{self.service_name}:{image_tag}",
+              ],
+              cwd=overlay,
+              check=True,
+          )
+
+          self.manifests_repo.git.add(A=True)
+          self.manifests_repo.index.commit(
+              f"Deploy {self.service_name}:{image_tag} to {environment}"
+          )
+          self.manifests_repo.remote("origin").push()
+          print(f"Updated {environment} manifest to {image_tag}")
+
+      def deploy(self, environment: str) -> None:
+          image_tag = self.get_image_tag()
+          print(f"Deploying {self.service_name}:{image_tag} to {environment}")
+
+          self.verify_image_exists(image_tag)
+          self.update_manifest(environment, image_tag)
+
+
+  if __name__ == "__main__":
+      helper = DeploymentHelper(
+          service_name="order-service",
+          manifests_repo_path=Path("/path/to/k8s-manifests"),
+      )
+      helper.deploy("staging")
+  ```
+  </Tab>
+</Tabs>
 
 ---
 
