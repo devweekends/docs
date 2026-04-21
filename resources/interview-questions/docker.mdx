@@ -539,9 +539,29 @@ docker run --rm -v myvolume:/data -v $(pwd):/backup alpine \
 
 **Red flag answer:** Only saying "use alpine" without discussing multi-stage builds or the layer deletion trap. Not understanding that `RUN rm` in a separate layer does not reduce image size.
 
-**Follow-up questions:**
-- *"You have a Python ML service with a 3GB image due to PyTorch. How do you reduce it?"* (Multi-stage: copy only needed `.so` files. Use `pytorch/pytorch:*-runtime`. Store model weights in a volume or S3 instead of baking into image.)
-- *"What is the difference between `docker image ls` reported size and actual disk usage?"* (Shared layers are counted once on disk but shown fully per image. `docker system df` shows true usage.)
+<Note>
+**Senior vs Staff perspective**
+- **Senior**: Writes multi-stage Dockerfiles, uses `.dockerignore`, picks slim/alpine base images, and knows about the same-layer delete trick.
+- **Staff**: Designs the org-wide image strategy -- curated golden base images with security patches, automated size regression checks in CI that fail builds over a threshold, image scanning gates (Trivy/Snyk), signed base images (cosign), and a policy that sets image size SLOs per runtime (&lt;100MB for Go, &lt;300MB for Node, &lt;500MB for Python). Also thinks about registry cost: 10K images x 500MB = 5TB storage billed monthly.
+</Note>
+
+**Follow-up chain:**
+1. "You have a Python ML service with a 3GB image due to PyTorch. How do you reduce it?" -- Multi-stage: copy only needed `.so` files. Use `pytorch/pytorch:*-runtime`. Store model weights in a volume or S3 instead of baking into image. Switch to `python:3.11-slim` base. Use BuildKit cache mounts for pip to avoid re-downloading wheels.
+2. "What is the difference between `docker image ls` reported size and actual disk usage?" -- Shared layers are counted once on disk but shown fully per image. `docker system df` shows true usage. Registries (ECR/GCR) also deduplicate layers, so pushing 10 images that share a 500MB base layer only costs 500MB once.
+3. "Alpine images broke your production app because of `musl` vs `glibc`. How do you handle this?" -- (a) Switch to `debian:bookworm-slim` or `gcr.io/distroless/base-debian12` -- similar size, glibc-compatible. (b) Rebuild the problematic dependency for musl (often impractical for ML libs). (c) Use distroless which keeps glibc but strips the shell/package manager. Common culprits: `requests`+`certifi`, `numpy`/`scipy` wheels, DNS resolution differences.
+4. "At 10x scale (10,000 services), what operational problems emerge from image size?" -- Registry storage cost, node disk pressure (Docker's overlay2 graph driver caps at ~80% of disk), pull bandwidth during a stampede (e.g., Kubernetes scale-out pulling 10GB from 500 nodes = registry overload), and image GC latency. Mitigations: image pre-pulling via DaemonSet, registry mirrors per region, aggressive image garbage collection, and signed base image policies.
+
+**Work-sample scenario:** Your team's Node.js service Docker image is 2GB. Walk through reducing it to under 200MB.
+- Step 1: `docker history <image>` -- identify the fat layers. Usually `COPY . .` pulling in `node_modules` (1GB+) or base image (`node:18` = 900MB).
+- Step 2: Switch base to `node:18-alpine` (180MB) or `gcr.io/distroless/nodejs18` (120MB).
+- Step 3: Multi-stage build -- first stage installs `devDependencies` and builds; second stage copies only `dist/` and runs `npm ci --omit=dev`.
+- Step 4: Add `.dockerignore` excluding `node_modules`, `.git`, tests, docs, `.env*`.
+- Step 5: Use BuildKit cache mount for `npm`: `RUN --mount=type=cache,target=/root/.npm npm ci`.
+- Step 6: Verify with `docker image inspect` that the final image is &lt;200MB and contains only runtime artifacts.
+
+**What weak candidates say:** "Just use alpine" -- ignores multi-stage, `.dockerignore`, layer ordering, and the trap of deleting in a later layer.
+
+**What strong candidates say:** "Image size is a symptom of Dockerfile discipline. I treat every `COPY` and `RUN` as a layer that lives forever -- there is no 'undoing' in a later layer. I start with distroless or alpine, multi-stage everything, and measure image size in CI as a first-class metric. Small images are cheaper, faster to pull, and have a smaller attack surface -- three wins from one discipline."
 </Accordion>
 
 <Accordion title="22. Layer Caching">
@@ -977,19 +997,48 @@ rails server -b 0.0.0.0
 This catches experienced developers too -- frameworks like Rails and Django often default to `127.0.0.1` in development mode.
 </Accordion>
 
-<Accordion title="36. OOMKilled">
-**Answer**:
+<Accordion title="36. OOMKilled (Exit Code 137)">
+**What interviewers are really testing:** Can you distinguish between the container-level OOM (cgroup hit limit) and the node-level OOM (host out of memory), and do you know how to debug a real memory leak through layered observability?
 
-Exit code **137** typically indicates the container was killed by the kernel's OOM (Out of Memory) killer because it exceeded its memory limit (set via `--memory` flag or Kubernetes resource limits).
+**Answer:**
+Exit code **137** = 128 + 9 (SIGKILL), signalling that the kernel OOM killer (or its cgroup-aware cousin, `memory.oom_control`) terminated the process. Inside Docker, this almost always means the container hit its memory cgroup limit; occasionally it means the whole host is OOM and the kernel picked your container as a victim based on `oom_score_adj`.
 
-**Diagnosis workflow**:
-1. `docker inspect -f '{{.State.OOMKilled}}' <id>` -- confirms OOM kill.
-2. `docker stats` -- shows real-time memory usage per container.
-3. `docker logs <id>` -- check if the application logged memory warnings before death.
+**Diagnosis workflow:**
+1. `docker inspect -f '&#123;&#123;.State.OOMKilled&#125;&#125;' <id>` -- returns `true` if the cgroup killed it. If `false` but exit code is 137, it was host-level OOM or an external `kill -9`.
+2. `docker stats --no-stream <id>` (while running) or `docker events --filter container=<id>` -- real-time memory and OOM events.
+3. Inside Kubernetes: `kubectl describe pod <pod>` -> `Last State: Terminated, Reason: OOMKilled, Exit Code: 137`.
+4. `dmesg | grep -i "killed process"` on the node -- kernel log of which PID was killed and why.
+5. Check cgroup memory stats: `cat /sys/fs/cgroup/memory/docker/<id>/memory.max_usage_in_bytes` (cgroup v1) or `memory.peak` (v2).
 
-**Common causes**: Memory leak in application code, loading large files entirely into memory, unbounded caching, or simply setting the limit too low for the workload. In JVM-based containers, the heap size must be set lower than the container memory limit to leave room for off-heap memory (thread stacks, native allocations, metaspace).
+**Common causes, in order of frequency:**
+1. **Memory leak in app code** -- heap grows unboundedly. Fix: heap profiling (pprof, jemalloc, memray for Python).
+2. **JVM heap not sized for container** -- `-Xmx` was set without considering off-heap (metaspace, threads, direct buffers, JIT code cache). Rule of thumb: `-Xmx` should be ~70-75% of container limit. Use `-XX:MaxRAMPercentage=75.0` so the JVM auto-detects container limits.
+3. **Loading large files into memory** -- reading a 2GB CSV with pandas, not streaming. Fix: chunked iteration.
+4. **Unbounded caches** -- in-process LRU with no size cap, or Redis without `maxmemory`.
+5. **Page cache pressure** -- a file-heavy workload on a tight container can cause the working set to exceed the limit. `memory.oom.group` may kill the whole cgroup.
 
-**Fix**: Either increase the memory limit, fix the leak, or use streaming I/O instead of loading entire datasets into memory.
+<Note>
+**Senior vs Staff perspective**
+- **Senior**: Identifies the cause through `docker stats` and logs, fixes the leak or raises the limit.
+- **Staff**: Designs the memory management strategy -- mandatory memory requests/limits in CI, JVM Kubernetes-aware flags templated into base images, Prometheus alerts on `container_memory_working_set_bytes / container_spec_memory_limit_bytes &gt; 0.85`, a runbook linking exit 137 -> heap dump collection, and a post-incident process where "OOMKilled in prod" auto-creates a Jira with the heap dump attached.
+</Note>
+
+**Follow-up chain:**
+1. "Your container was killed with exit 137 but `docker stats` shows memory was well under the limit at the time of death. What is happening?" -- `docker stats` samples every few seconds; a momentary spike can kill the container between samples. Or the kill came from host-level OOM (check `/var/log/kern.log`). Or a subprocess forked and its RSS counted against the cgroup briefly.
+2. "How is Java's 'Container-aware JVM' different in Java 10+ vs older versions?" -- Pre-Java 10, the JVM read `/proc/meminfo` directly, seeing the host's memory, and would set heap to a fraction of host RAM -- blowing past the container limit. Java 10+ respects cgroup limits by default; flags like `-XX:MaxRAMPercentage` target container RAM. Upgrading old JVMs is often the fastest OOM fix.
+3. "What is the difference between `memory` and `memory.swap` limits in Docker?" -- `--memory=512m` caps RAM. `--memory-swap=1g` caps RAM+swap total (so 512MB swap allowed). `--memory-swappiness=0` disables swap. Most container platforms disable swap entirely because swap defeats the point of memory limits -- you just degrade into thrashing before OOM.
+4. "How do you capture a heap dump from a container that is OOMKilling in a loop?" -- Add a preStop or automatic dump on OOM: JVM `-XX:+HeapDumpOnOutOfMemoryError -XX:HeapDumpPath=/tmp/heap` with a PVC mounted at `/tmp`. For Python, use `faulthandler` + `tracemalloc` snapshots on SIGUSR1. For Go, `pprof.WriteHeapProfile` on SIGUSR1. The key is dumping *before* the kill, since SIGKILL is non-catchable.
+
+**Work-sample scenario:** Your Node.js API is OOMKilled every ~3 hours in production. Memory limit is 1GB. Walk through your diagnosis.
+- Step 1: `kubectl top pod` over time -- is memory growing linearly (leak) or spiking (load-related)?
+- Step 2: If linear, classic leak. Take a heap snapshot: `kill -SIGUSR2 <pid>` with Node `--heapsnapshot-signal=SIGUSR2`, then `chrome://inspect` to analyze.
+- Step 3: Common Node leaks: unbounded event listeners (`emitter.on` in a hot path without `off`), closures capturing large scope, global `Map` or `Set` used as cache, promise chains retaining references.
+- Step 4: Short-term: raise the limit to 2GB and add autoscaling to reduce per-pod pressure. Medium-term: fix the leak identified in heap diff.
+- Step 5: Guardrail: add `--max-old-space-size=768` (75% of 1GB) to Node so V8 does GC pressure before cgroup kills.
+
+**What weak candidates say:** "Increase the memory limit." -- Treats the symptom. If it is a leak, the container will just take longer to die.
+
+**What strong candidates say:** "Exit 137 is the container saying 'I hit my memory limit.' My first question is: was this a leak, a spike, or a mis-sized limit? Each has a different fix. I use metrics to distinguish -- linear growth = leak, sawtooth pattern = GC doing its job, sudden spike = load issue. I never just raise the limit without knowing which category it falls in."
 </Accordion>
 
 <Accordion title="37. Pruning">
@@ -1490,6 +1539,21 @@ RUN --mount=type=ssh git clone git@github.com:private/repo.git
 1. *"How do you enable BuildKit in CI if the runner has an older Docker version?"* (Set `DOCKER_BUILDKIT=1` environment variable before Docker 23.0. On 23.0+, it is the default. In GitHub Actions, the `docker/build-push-action` uses BuildKit by default.)
 2. *"What is the difference between `--mount=type=cache` and `--cache-from`?"* (Cache mounts persist build-time dependencies (npm cache, apt cache) across builds locally. `--cache-from` imports layer cache from a remote registry image, enabling cache sharing across CI runners. They solve different problems -- use both together for maximum speed.)
 3. *"A developer adds `RUN --mount=type=secret` but forgets to pass `--secret` at build time. What happens?"* (The build fails with an error about missing secret. This is the safe behavior -- builds fail closed, not open. You can make secrets optional with `RUN --mount=type=secret,id=token,required=false`.)
+4. *"Your CI builds still take 8 minutes after enabling BuildKit. What are the likely remaining issues?"* -- Cache mounts not configured for npm/pip/go modules. `--cache-from`/`--cache-to` not pointing at a registry mirror. Sequential stages that could be parallel (missing independent `FROM` lines). Large `COPY . .` before dependency install. Fix each: `docker buildx bake` with a BuildKit registry cache backend usually shaves 60-80% off CI build time.
+
+<Note>
+**Senior vs Staff perspective**
+- **Senior**: Uses BuildKit cache mounts, secret mounts, and `--cache-from` appropriately. Knows BuildKit is the default on modern Docker.
+- **Staff**: Designs the build cache topology for the org -- regional registry mirrors for cache, CI-wide cache-key conventions (git SHA vs semver vs branch), build-time attestations (SBOM, provenance via `--provenance=mode=max`), and a multi-arch build strategy (QEMU vs native ARM runners). Also enforces: no secrets in Dockerfile (pre-commit + PR checks), SBOM attached to every pushed image, and parallel builds with `buildx bake` for monorepos. Tracks build-time SLO as a team metric.
+</Note>
+
+**Work-sample scenario:** Your monorepo has 30 services. Each CI build takes 10-15 minutes. Walk through the optimization plan.
+- Measure: identify the bottleneck. Usually: (a) no layer cache reuse across CI runs, (b) sequential builds where parallelism is possible, (c) repeated downloads of the same dependencies.
+- Fix 1: BuildKit + `--cache-from type=registry,ref=ghcr.io/org/service:buildcache`. CI pulls the previous layers before build. First-time cold: 12 min; warm: 90 seconds.
+- Fix 2: Cache mounts for package managers (`npm`, `pip`, `go mod`). Saves 1-3 minutes per service.
+- Fix 3: `docker buildx bake` with a `docker-bake.hcl` file -- parallelizes up to N builds across CI runners.
+- Fix 4: only build services whose code changed (`git diff --name-only` -> map to service directories). Unchanged services skip entirely.
+- Expected outcome: per-service build time ~60s warm, and only rebuild affected services. CI wall-clock for typical PR: 2-3 minutes.
 </Accordion>
 
 <Accordion title="53. Image Signing — Content Trust, Cosign, and Notation">
@@ -1738,6 +1802,24 @@ FROM gcr.io/distroless/static:debug   # Includes busybox shell
 **What interviewers are really testing:** Whether you understand the full trade-off spectrum from Debian to Alpine to distroless, and can make the right choice for each service type. Staff candidates also explain how they enforce distroless as an org-wide standard via base image policies.
 
 **Red flag answer:** "Distroless is always better." It is not -- some applications need a shell for health checks (`curl`), runtime configuration (`sed`/`envsubst`), or debugging. The right answer is "distroless for production, debug variant for staging, and Alpine as a pragmatic middle ground."
+
+<Note>
+**Senior vs Staff perspective**
+- **Senior**: Uses distroless for Go/Rust services, understands the debug container pattern, picks `:nonroot` variants.
+- **Staff**: Mandates distroless (or Chainguard) as the org default via base image policy, builds a curated internal registry of approved base images with CVE SLAs, wires cosign signature verification into admission control, tracks SBOM diff between image versions for supply-chain auditing, and owns the migration plan from Debian-based base images to distroless fleet-wide. Also makes the build-vs-buy call on Chainguard vs maintaining internal distroless images.
+</Note>
+
+**Follow-up chain:**
+1. "Your app needs to run `curl` for health checks. Can you still use distroless?" -- Replace `curl`-based health checks with in-app HTTP endpoints (`/health`). Or use Kubernetes `httpGet` probes which call from outside the container. Distroless forces you to do this correctly; "I need curl inside the container" is usually a sign of a fragile health check pattern.
+2. "How do you scan distroless images for vulnerabilities when they have no package manager?" -- Trivy and Grype scan based on the SBOM and binary manifests, not the package manager. They still find CVEs in Go/Rust binaries (by analyzing the Go module versions compiled in) and in any OS-level libraries. Chainguard images ship SBOMs via cosign attestations -- even better.
+3. "What breaks when you go from Alpine to distroless for a Node.js service?" -- (a) Entrypoints that rely on shell features (`$VAR` expansion) -- rewrite to use Node-native arg parsing. (b) `npm` not available at runtime -- ensure `npm install` happens in the build stage. (c) Native modules may need `distroless/nodejs18` (glibc) not `-alpine` variants because glibc vs musl differ.
+
+**Work-sample scenario:** Mandate: every production image in the org must be vulnerability-free (no high/critical CVEs) and signed. Walk through the rollout plan.
+- Phase 1: Pick the base image library. Chainguard for paid, distroless + hardened internal variants for free.
+- Phase 2: Build CI template (Docker, Buildx, cosign sign) that any team can adopt. Provide golden Dockerfile examples per language.
+- Phase 3: Admission control -- Kyverno or Gatekeeper policies in Kubernetes that reject unsigned images or images with critical CVEs (via Trivy operator scan results).
+- Phase 4: Migration -- start with non-prod clusters, allow images to remain Debian with warnings for 30 days, then fail CI builds that don't use the approved bases.
+- Phase 5: SLO -- "time to patch a critical CVE in all production images" as a team KPI. Use Trivy daily scans feeding into a ticketing pipeline.
 </Accordion>
 
 <Accordion title="60. Docker Socket Security">
