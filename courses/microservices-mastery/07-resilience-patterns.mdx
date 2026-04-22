@@ -1120,6 +1120,42 @@ The retry policy below captures several important decisions beyond "just loop a 
 
 Isolate failures to prevent them from affecting other parts of the system.
 
+### The Story: Why the Titanic Really Sank
+
+Everyone remembers the iceberg. Almost nobody remembers the real reason the Titanic went under.
+
+The Titanic's hull was divided into 16 watertight compartments. The ship was designed to stay afloat with up to 4 of them flooded. The iceberg tore a 300-foot gash that breached 5 or 6 compartments -- bad, but here is the uncomfortable truth that emerged from the inquiry: the bulkheads between compartments only extended up to E Deck, roughly 10 feet above the waterline. They did not reach the ceiling of the hull. So when the forward compartments flooded, the bow dipped down, water spilled *over the top* of the bulkheads into adjacent compartments, which then flooded, which dipped the bow further, which caused more spillover. Each compartment that flooded made the next one easier to flood. The bulkheads were real. They just were not high enough to actually isolate.
+
+Your thread pools and connection pools are the bulkheads of your service. If Payment Service uses the same 200-thread pool for calls to its internal database, calls to the fraud-detection service, and calls to a flaky 3rd-party tax API, then when that tax API gets slow, one flaky dependency can consume the entire pool. Database queries queue. Fraud checks queue. The pool fills with tax calls waiting for an 8-second p99. The other dependencies that were perfectly healthy get starved of threads. One sick dependency sinks the whole service -- not because the dependency was critical, but because all your compartments were connected at the top.
+
+The bulkhead pattern is the fix: give each downstream dependency its own isolated thread pool (or semaphore, or connection pool). Tax service gets 30 threads. Fraud service gets 50. Database gets 100. Something else gets the rest. When the tax API goes sideways, only the tax pool saturates -- Payment Service keeps answering database and fraud calls without a hiccup. The flaky dependency is isolated to its own compartment, and the breach cannot spread.
+
+<Warning>
+The subtlety most engineers miss: bulkheads protect you from *shared-fate* failures, not from individual dependency failures. If the tax API is down, your tax calls will still fail -- the bulkhead does nothing about that. What it prevents is the tax failures stealing resources that Payment needs for everything *else*. You are not saving the tax calls. You are saving every other call in the service from the tax calls.
+</Warning>
+
+```
++-----------------------------------------------------------------------------+
+|                    BULKHEAD: ISOLATED THREAD POOLS                           |
++-----------------------------------------------------------------------------+
+|                                                                              |
+|   Payment Service (single process)                                           |
+|                                                                              |
+|   +------------------+  +------------------+  +------------------+           |
+|   | Pool: database   |  | Pool: fraud      |  | Pool: tax (3rd)  |           |
+|   | size: 100        |  | size: 50         |  | size: 30         |           |
+|   | state: HEALTHY   |  | state: HEALTHY   |  | state: SATURATED |           |
+|   |                  |  |                  |  | (all waiting on  |           |
+|   | [thread] [thread]|  | [thread] [thread]|  |  slow tax API)   |           |
+|   | [thread] [thread]|  | [thread] [thread]|  | [blocked x 30]   |           |
+|   +------------------+  +------------------+  +------------------+           |
+|                                                                              |
+|   Result: database and fraud calls keep flowing.                             |
+|   Only tax calls are affected by the tax API outage.                         |
+|                                                                              |
++-----------------------------------------------------------------------------+
+```
+
 **Why this pattern exists:** The name comes from ships: watertight compartments mean a hull breach floods one section, not the whole vessel. In software, your resources (threads, connections, memory, event-loop capacity) are shared by default. If one downstream dependency is slow, it can consume *all* of those resources, starving unrelated callers. The classic example: your notification service (non-critical) goes slow, eats all your HTTP connections, and now order checkout (critical) can't get a connection to the payment service -- a non-critical bug takes down your revenue flow.
 
 **What it prevents:** Cross-dependency contention. By partitioning resources per dependency (e.g., payment gets 50 concurrent slots, notifications gets 20), a slow notification service can only starve the notification pool, not the payment pool. The tradeoff is that you must size each bulkhead correctly -- too small, and you throttle normal traffic; too large, and you fail to isolate.
@@ -1529,6 +1565,486 @@ A bulkhead has two knobs: `maxConcurrent` (how many in-flight calls allowed at o
   ```
   </Tab>
 </Tabs>
+
+### Per-Dependency Bulkheads: The Real Win
+
+Most engineers discover bulkheads as "limit concurrency." The deeper insight is *one bulkhead per downstream dependency*. Below is the pattern applied to the Titanic scenario: Payment Service has three downstreams, each with its own pool size chosen to match that dependency's expected throughput and latency profile.
+
+<Tabs>
+  <Tab title="Node.js">
+  ```javascript
+  // resilience/PerDependencyBulkheads.js
+  const { BulkheadManager } = require('./SemaphoreBulkhead');
+
+  const pools = new BulkheadManager();
+
+  // Pool sizes chosen from production data:
+  //   database p99 = 5ms,   capacity needed = 100 concurrent
+  //   fraud p99 = 80ms,     capacity needed = 50 concurrent
+  //   tax (3rd party) p99 = 8s when degraded, cap = 30 to contain blast radius
+  async function processPayment(order) {
+    // Each call goes through ITS OWN bulkhead.
+    // If tax API saturates its 30-slot pool, db and fraud keep flowing.
+    const [account, fraudScore, taxInfo] = await Promise.all([
+      pools.execute('db',    100, () => db.loadAccount(order.userId)),
+      pools.execute('fraud',  50, () => fraudSvc.score(order)),
+      pools.execute('tax',    30, () => taxSvc.calculate(order)),
+    ]);
+
+    return {
+      amount: order.amount + taxInfo.amount,
+      riskApproved: fraudScore < 0.8,
+      accountId: account.id,
+    };
+  }
+  ```
+  </Tab>
+  <Tab title="Python">
+  ```python
+  # resilience/per_dependency_bulkheads.py
+  import asyncio
+  from resilience.semaphore_bulkhead import BulkheadManager
+
+  pools = BulkheadManager()
+
+  # Pool sizes chosen from production data:
+  #   database p99 = 5ms,   capacity needed = 100 concurrent
+  #   fraud p99 = 80ms,     capacity needed = 50 concurrent
+  #   tax (3rd party) p99 = 8s when degraded, cap = 30 to contain blast radius
+  async def process_payment(order) -> dict:
+      # Each call goes through ITS OWN bulkhead.
+      # If tax API saturates its 30-slot pool, db and fraud keep flowing.
+      account, fraud_score, tax_info = await asyncio.gather(
+          pools.execute("db",    100, lambda: db.load_account(order.user_id)),
+          pools.execute("fraud",  50, lambda: fraud_svc.score(order)),
+          pools.execute("tax",    30, lambda: tax_svc.calculate(order)),
+      )
+
+      return {
+          "amount": order.amount + tax_info.amount,
+          "risk_approved": fraud_score < 0.8,
+          "account_id": account.id,
+      }
+  ```
+  </Tab>
+</Tabs>
+
+<Tip>
+Size bulkheads from data, not intuition. Pull your p99 latency and peak RPS for each dependency for the past 30 days. Bulkhead size = peak concurrent in-flight requests needed + 30% headroom. Review quarterly. A bulkhead that never rejects anything during an outage is too large; one that rejects during normal peak is too small.
+</Tip>
+
+---
+
+## Retry with Exponential Backoff and Jitter
+
+### The Story: The 2:01 PM Thundering Herd
+
+Picture this. It is 2:00 PM on a Tuesday. Your Search Service crashes -- a single bad deploy, caught within 60 seconds. At 2:01 PM exactly, the deploy is rolled back. Search is healthy again. Total downtime: one minute.
+
+But now watch what happens to the 10,000 mobile clients that were using Search during those 60 seconds. Every one of them hit an error. Every one of them has retry logic: "on failure, wait 60 seconds and try again." Their retry timers are triggered by the *failure time*, which clustered tightly around 2:00 PM give or take a few seconds. At 2:01 PM, all 10,000 clients' retry timers expire within the same second. All 10,000 clients fire their retry at the same instant. Your Search Service, which just came back up, now receives 10,000 requests in one second when it normally handles 200.
+
+The Search Service falls over again. Now those 10,000 clients fail a second time. Their second retry is scheduled for 2:02 PM -- again, 60 seconds after failure, again clustered within a second of each other. At 2:02, another 10,000 requests arrive simultaneously. Search dies again. You are now in a resonance loop where your own retry logic is killing the service every 60 seconds. The iceberg damaged the hull for 60 seconds, but your retry pattern is keeping the water pouring in.
+
+This is the **thundering herd** problem. Naive retries synchronize clients in time, so every retry wave is more concentrated than the traffic that caused the original failure. Your retry logic, intended to heal outages, *causes* them.
+
+<Warning>
+The thundering herd is not a theoretical risk. AWS DynamoDB's 2015 outage was amplified by client retry storms. GitHub's 2020 API outage was prolonged by retries. Stripe publishes explicit guidance against fixed-delay retries for exactly this reason. If you take one thing from this chapter: never, ever retry with a fixed delay.
+</Warning>
+
+### Why Exponential Backoff Alone Is Not Enough
+
+The first fix that comes to mind is exponential backoff: wait 1s, then 2s, then 4s, then 8s. This helps -- retry attempts spread out over time instead of piling on immediately. But it does not fully solve the herd problem, because every client is still using the *same* schedule. At 2:01 all clients fire their first retry simultaneously. At 2:03 all clients fire their second retry simultaneously. The waves are further apart, but each wave is still synchronized. A big service with 10,000 clients still gets a 10,000-request spike every wave.
+
+The actual fix is **jitter**: add randomness to each delay so that clients desynchronize. Instead of every client waiting exactly 2s, each client waits somewhere between 0s and 2s (full jitter), or 1s + a random fraction of 2s (equal jitter). Over a small number of retries, the retry load gets smeared across a window instead of landing as a spike. 10,000 retries spread over a 2-second window is 5,000 requests per second -- often survivable where an instantaneous 10,000-request spike is not.
+
+### The Formula
+
+The AWS Architecture Blog recommends **full jitter**, which has held up best in practice:
+
+```
+delay = random(0, min(cap, base * 2^attempt))
+```
+
+- `base` = initial delay (e.g., 1 second)
+- `cap` = maximum delay ceiling (e.g., 30 seconds) so clients do not wait forever
+- `attempt` = 0, 1, 2, ... retry count
+- `random(0, X)` = uniform random between 0 and X
+
+At attempt 3, naive exponential gives exactly 8s. Full jitter gives a random value between 0 and 8s -- each client picks independently. Spread out, not synchronized.
+
+```
+WITHOUT JITTER (synchronized waves)              WITH FULL JITTER (smeared)
+     |                                               |
+     |   *                                           |  *   *
+     |   *                                           |   *    *
+#req |   *                                        #req | *  *   *
+     |   *      *                                    |  *  *   *  *
+     |   *      *       *                            |   * *  *    *   *
+     +------------------------------->               +----------------------->
+         2:01    2:03     2:05                           2:01 - 2:03
+```
+
+### Implementation
+
+Below, every retry picks its own jittered delay. Node.js uses `Math.random()`. Python uses `random.uniform()`. Both respect a `max_delay` cap so no single retry waits absurdly long.
+
+<Tabs>
+  <Tab title="Node.js">
+  ```javascript
+  // resilience/JitteredRetry.js
+  //
+  // Full-jitter exponential backoff.
+  // Formula: delay = random(0, min(cap, base * 2^attempt))
+  class JitteredRetry {
+    constructor({ maxRetries = 5, baseDelayMs = 1000, capMs = 30000 } = {}) {
+      this.maxRetries = maxRetries;
+      this.baseDelayMs = baseDelayMs;
+      this.capMs = capMs;
+    }
+
+    delayForAttempt(attempt) {
+      const exponential = this.baseDelayMs * Math.pow(2, attempt);
+      const capped = Math.min(this.capMs, exponential);
+      // Full jitter: uniform random in [0, capped].
+      // This is what desynchronizes clients and kills the thundering herd.
+      return Math.random() * capped;
+    }
+
+    async execute(operation, isRetryable = () => true) {
+      let lastError;
+      for (let attempt = 0; attempt <= this.maxRetries; attempt++) {
+        try {
+          return await operation();
+        } catch (err) {
+          lastError = err;
+          if (attempt === this.maxRetries || !isRetryable(err)) throw err;
+
+          const delay = this.delayForAttempt(attempt);
+          console.log(
+            `attempt ${attempt + 1} failed, retrying in ${delay.toFixed(0)}ms`
+          );
+          await new Promise((r) => setTimeout(r, delay));
+        }
+      }
+      throw lastError;
+    }
+  }
+
+  // Usage
+  const retry = new JitteredRetry({ maxRetries: 4, baseDelayMs: 500, capMs: 10_000 });
+  const result = await retry.execute(
+    () => http.get('/search?q=' + encodeURIComponent(q)),
+    (err) => [429, 500, 502, 503, 504].includes(err.statusCode)
+  );
+  ```
+  </Tab>
+  <Tab title="Python">
+  ```python
+  # resilience/jittered_retry.py
+  #
+  # Full-jitter exponential backoff.
+  # Formula: delay = random(0, min(cap, base * 2^attempt))
+  import asyncio
+  import logging
+  import random
+  from typing import Any, Awaitable, Callable
+
+  logger = logging.getLogger(__name__)
+
+
+  class JitteredRetry:
+      def __init__(
+          self,
+          max_retries: int = 5,
+          base_delay_seconds: float = 1.0,
+          cap_seconds: float = 30.0,
+      ) -> None:
+          self.max_retries = max_retries
+          self.base_delay_seconds = base_delay_seconds
+          self.cap_seconds = cap_seconds
+
+      def delay_for_attempt(self, attempt: int) -> float:
+          exponential = self.base_delay_seconds * (2 ** attempt)
+          capped = min(self.cap_seconds, exponential)
+          # Full jitter: uniform in [0, capped].
+          # This is what desynchronizes clients and kills the thundering herd.
+          return random.uniform(0, capped)
+
+      async def execute(
+          self,
+          operation: Callable[[], Awaitable[Any]],
+          is_retryable: Callable[[BaseException], bool] = lambda e: True,
+      ) -> Any:
+          last_exc: BaseException | None = None
+          for attempt in range(self.max_retries + 1):
+              try:
+                  return await operation()
+              except Exception as exc:  # noqa: BLE001
+                  last_exc = exc
+                  if attempt == self.max_retries or not is_retryable(exc):
+                      raise
+                  delay = self.delay_for_attempt(attempt)
+                  logger.warning(
+                      "attempt %d failed (%s) -- retrying in %.2fs",
+                      attempt + 1,
+                      exc,
+                      delay,
+                  )
+                  await asyncio.sleep(delay)
+          assert last_exc is not None
+          raise last_exc
+  ```
+  </Tab>
+</Tabs>
+
+<Tip>
+If you are building a client library that millions of devices will run, add a *client identifier hash* to your jitter seed. Devices whose IDs happen to produce similar random numbers will still cluster. Using a per-device hash ensures the retry distribution is genuinely independent across the fleet.
+</Tip>
+
+---
+
+## Intent Parity Under Failure
+
+### The Story: "Add to Cart" Does Not Mean "Maybe Add to Cart"
+
+You are shopping on a Tuesday evening. You have 6 items in your cart. You tap "Add to Cart" on a seventh. Somewhere in the backend, the Cart Service is having a rough minute -- GC pause, database blip, it does not matter. The request to add the item times out.
+
+Here is what bad apps do: they show you "Oops, something went wrong" in a red toast. Your item is not added. Your intent -- "I want this in my cart" -- was received by the system and then silently dropped. You tap again. Same error. You give up. The shop loses the sale. Worse, you suspect the whole app of being flaky, and you remember that feeling the next time you open it.
+
+Here is what good apps do: they show you "Added -- we'll sync shortly." The item appears in your cart in the UI. Behind the scenes, the intent was captured durably (in a local queue, in a durable event log, in an outbox table) and will be replayed to the Cart Service once it recovers. From your perspective, the shop never broke. From the system's perspective, the Cart Service was briefly degraded but no intent was lost.
+
+This is **intent parity under failure**: the user's original request -- their *intent* -- is preserved and eventually fulfilled, even when the system cannot execute it immediately. Not "we tried and failed." Not "please try again later." The intent is captured, acknowledged, and durably stored, then fulfilled when conditions allow. Intent parity is not just UX polish -- it is an architectural commitment. It says: we will honor what the user asked for, and we will not hide our degradations by silently dropping their requests.
+
+<Note>
+**Intent Parity:** The architectural property that a user's original intent -- captured at the moment of their action -- is preserved durably and eventually fulfilled, even when the serving system is temporarily unable to execute it. The *outcome* may be delayed, but the *intent* is never lost.
+</Note>
+
+### The Three-Step Pattern
+
+Every intent-parity implementation has the same shape:
+
+1. **Capture intent durably** -- at the edge (client-side IndexedDB, service-local outbox table, or event log), write a record of what the user wanted. This write must be durable and must happen *before* you try the real operation. If the capture fails, only then do you tell the user no.
+2. **Return an optimistic response** -- acknowledge to the user that their intent is accepted. Optionally surface the pending state ("Added -- syncing"). Do not wait for the downstream to succeed before responding.
+3. **Process the intent when service recovers** -- a background worker drains the queue, calling the real service. Failed attempts are retried with backoff. Permanently failed intents are moved to a dead-letter queue for human review.
+
+The critical boundary: step 1 must succeed or you do not acknowledge the user. Step 2 acknowledges the captured intent, not the executed outcome. Step 3 runs async and is where retries, idempotency keys, and compensation logic live.
+
+```
++-----------------------------------------------------------------------------+
+|                       INTENT PARITY FLOW                                     |
++-----------------------------------------------------------------------------+
+|                                                                              |
+|   User clicks "Add to Cart"                                                  |
+|        |                                                                     |
+|        v                                                                     |
+|   +--------------------------+                                               |
+|   | 1. Capture intent in     |  <-- durable write: outbox table,             |
+|   |    durable queue/outbox  |      event log, or local storage              |
+|   +-----------+--------------+                                               |
+|               |                                                              |
+|               v                                                              |
+|   +--------------------------+                                               |
+|   | 2. Return optimistic OK  |  <-- user sees: "Added, syncing"              |
+|   |    ("Added, syncing")    |      app updates UI immediately               |
+|   +-----------+--------------+                                               |
+|               |                                                              |
+|               v   (async, out of user's request path)                        |
+|   +--------------------------+                                               |
+|   | 3. Background worker     |  <-- retries with backoff,                    |
+|   |    drains intent queue   |      uses idempotency keys,                   |
+|   |    and calls real svc    |      DLQ on permanent failure                 |
+|   +--------------------------+                                               |
+|                                                                              |
++-----------------------------------------------------------------------------+
+```
+
+### Implementation
+
+Below, the `CartService` captures every add-to-cart intent into a durable outbox first, then attempts the synchronous call. If the sync call fails or the Cart Service is circuit-open, the user gets an optimistic `PENDING` response -- they never see an error. A separate worker drains the outbox when the Cart Service recovers.
+
+<Tabs>
+  <Tab title="Node.js">
+  ```javascript
+  // intent/CartIntentCapture.js
+  //
+  // Pattern: capture intent durably, respond optimistically,
+  // drain asynchronously. The user never sees "something went wrong"
+  // for a transient cart-service outage -- they see "Added, syncing".
+  class CartIntentService {
+    constructor({ outbox, cartClient, logger }) {
+      this.outbox = outbox;          // durable store (DB table or queue)
+      this.cartClient = cartClient;  // resilient HTTP client w/ circuit breaker
+      this.logger = logger;
+    }
+
+    async addToCart({ userId, itemId, quantity }) {
+      const intentId = crypto.randomUUID();
+      const intent = {
+        intentId,
+        type: 'ADD_TO_CART',
+        userId,
+        itemId,
+        quantity,
+        capturedAt: new Date().toISOString(),
+        status: 'PENDING',
+      };
+
+      // STEP 1: capture intent durably BEFORE trying the real call.
+      // If this write fails, we tell the user no -- but we will NOT
+      // tell the user no just because Cart Service is flaky.
+      await this.outbox.insert(intent);
+
+      // STEP 2: try the real call, but treat failure as "deferred",
+      // not as an error to propagate back to the user.
+      try {
+        await this.cartClient.add({ userId, itemId, quantity, intentId });
+        await this.outbox.markCompleted(intentId);
+        return { status: 'ADDED', intentId };
+      } catch (err) {
+        this.logger.warn(
+          { err, intentId },
+          'cart add deferred to async worker'
+        );
+        // Intent is safe in outbox; background worker will drain it.
+        return { status: 'PENDING', intentId, message: 'Added, syncing shortly' };
+      }
+    }
+  }
+
+  // Background drainer (runs as separate worker/cron)
+  async function drainCartOutbox({ outbox, cartClient, logger }) {
+    const pending = await outbox.fetchPending({ limit: 100 });
+    for (const intent of pending) {
+      try {
+        // Idempotency key = intentId. Cart service MUST dedupe on this.
+        await cartClient.add({
+          userId: intent.userId,
+          itemId: intent.itemId,
+          quantity: intent.quantity,
+          intentId: intent.intentId,
+        });
+        await outbox.markCompleted(intent.intentId);
+      } catch (err) {
+        const attempts = await outbox.incrementAttempts(intent.intentId);
+        if (attempts >= 10) {
+          await outbox.moveToDeadLetter(intent.intentId, err.message);
+          logger.error({ intent, err }, 'cart intent sent to DLQ');
+        }
+      }
+    }
+  }
+  ```
+  </Tab>
+  <Tab title="Python">
+  ```python
+  # intent/cart_intent_capture.py
+  #
+  # Pattern: capture intent durably, respond optimistically,
+  # drain asynchronously. The user never sees "something went wrong"
+  # for a transient cart-service outage -- they see "Added, syncing".
+  import logging
+  import uuid
+  from datetime import datetime, timezone
+  from typing import Any, Protocol
+
+  logger = logging.getLogger(__name__)
+
+
+  class Outbox(Protocol):
+      async def insert(self, intent: dict) -> None: ...
+      async def mark_completed(self, intent_id: str) -> None: ...
+      async def fetch_pending(self, limit: int) -> list[dict]: ...
+      async def increment_attempts(self, intent_id: str) -> int: ...
+      async def move_to_dead_letter(self, intent_id: str, reason: str) -> None: ...
+
+
+  class CartClient(Protocol):
+      async def add(
+          self, *, user_id: str, item_id: str, quantity: int, intent_id: str
+      ) -> None: ...
+
+
+  class CartIntentService:
+      def __init__(self, outbox: Outbox, cart_client: CartClient) -> None:
+          self.outbox = outbox
+          self.cart_client = cart_client
+
+      async def add_to_cart(
+          self, user_id: str, item_id: str, quantity: int
+      ) -> dict[str, Any]:
+          intent_id = str(uuid.uuid4())
+          intent = {
+              "intent_id": intent_id,
+              "type": "ADD_TO_CART",
+              "user_id": user_id,
+              "item_id": item_id,
+              "quantity": quantity,
+              "captured_at": datetime.now(timezone.utc).isoformat(),
+              "status": "PENDING",
+          }
+
+          # STEP 1: durably capture the intent BEFORE trying the real call.
+          await self.outbox.insert(intent)
+
+          # STEP 2: try the real call. Failure means "deferred",
+          # not "tell the user no".
+          try:
+              await self.cart_client.add(
+                  user_id=user_id,
+                  item_id=item_id,
+                  quantity=quantity,
+                  intent_id=intent_id,
+              )
+              await self.outbox.mark_completed(intent_id)
+              return {"status": "ADDED", "intent_id": intent_id}
+          except Exception as exc:  # noqa: BLE001
+              logger.warning(
+                  "cart add deferred to async worker: intent_id=%s err=%s",
+                  intent_id,
+                  exc,
+              )
+              return {
+                  "status": "PENDING",
+                  "intent_id": intent_id,
+                  "message": "Added, syncing shortly",
+              }
+
+
+  # Background drainer (runs as separate worker/cron)
+  async def drain_cart_outbox(outbox: Outbox, cart_client: CartClient) -> None:
+      pending = await outbox.fetch_pending(limit=100)
+      for intent in pending:
+          try:
+              # Idempotency key = intent_id. Cart service MUST dedupe on this.
+              await cart_client.add(
+                  user_id=intent["user_id"],
+                  item_id=intent["item_id"],
+                  quantity=intent["quantity"],
+                  intent_id=intent["intent_id"],
+              )
+              await outbox.mark_completed(intent["intent_id"])
+          except Exception as exc:  # noqa: BLE001
+              attempts = await outbox.increment_attempts(intent["intent_id"])
+              if attempts >= 10:
+                  await outbox.move_to_dead_letter(
+                      intent["intent_id"], str(exc)
+                  )
+                  logger.error(
+                      "cart intent sent to DLQ: intent_id=%s err=%s",
+                      intent["intent_id"],
+                      exc,
+                  )
+  ```
+  </Tab>
+</Tabs>
+
+<Warning>
+Intent parity requires **idempotency** on the downstream service. If the background drainer retries an intent that silently succeeded on a previous attempt, you will double-add the item. Always pass a stable `intent_id` and require the downstream to dedupe on it. Without idempotency, intent parity creates duplicate work instead of healing it.
+</Warning>
+
+<Tip>
+Intent parity is strongest when paired with *optimistic UI*. Show the user their intent as though it succeeded (the item in the cart, the message in the thread, the like on the post) and reconcile silently in the background. When reconciliation fails, a small banner ("couldn't sync -- we'll retry") beats a hard error. Slack, Google Docs, and Instagram all run this playbook.
+</Tip>
 
 ---
 
