@@ -693,6 +693,90 @@ A circuit breaker only adds value when wired into the code path that actually ma
   </Tab>
 </Tabs>
 
+### Circuit Breaker Caveats and Interview Deep-Dive
+
+<Warning>
+**Circuit breaker traps practitioners fall into:**
+
+1. **Threshold too low, causing flapping.** Set `failureThreshold=2` and a single blip trips the breaker. Traffic that would have succeeded gets short-circuited. Worse, the breaker oscillates between OPEN and HALF-OPEN every reset window, creating a pattern where 40 percent of requests fail by policy instead of by reality.
+2. **Counting the wrong failures.** Timeouts, 5xx, and connection errors are failures. But 404s, 400s, and 401s are often treated as failures by naive implementations. They are *client* errors -- retrying them will not help and counting them toward the breaker trips it on valid-but-rejected traffic.
+3. **Per-instance breakers with no shared state.** Each pod has its own in-memory breaker. One pod sees 5 failures and trips; the other 19 pods see nothing and keep sending traffic. The sick downstream gets slightly less load but nowhere near the "stop all traffic" effect the pattern is supposed to provide.
+4. **No fallback wired up.** A tripped breaker throws `CircuitOpenError` instead of returning degraded-but-useful data. User-facing behavior: error page. Correct behavior: cached response, queued write, or "we will retry shortly" UI.
+</Warning>
+
+<Tip>
+**Solutions and patterns:**
+
+- **Set threshold based on real traffic.** For a service with a steady 1 percent error rate, `failureThreshold=5` trips too often. Use a percentage-based rolling window: "trip when error rate exceeds 50 percent over the last 20 requests or 10 seconds, whichever is larger." Hystrix and resilience4j both support this.
+- **Classify errors before counting.** Only count errors that indicate the downstream is unhealthy: 5xx, timeouts, connection errors. Exclude 4xx, explicit rate-limit responses (429), and business-logic errors. This prevents false trips.
+- **Shared breaker state for fleet-wide coordination.** Use Redis-backed breakers (pybreaker supports this) so all pods see the same state. Tradeoff: adds a Redis dependency to the hot path, but the alternative is uncoordinated per-pod decisions that do not actually protect the downstream.
+- **Always pair with a fallback.** For reads: serve cached data. For writes: queue the intent for later. An open circuit should degrade gracefully, not crash.
+- **Distinct breakers per downstream.** Payment Service and Recommendations Service should have separate breakers. One flaky dependency should not trip the other.
+</Tip>
+
+<AccordionGroup>
+  <Accordion title="Your circuit breaker is open 40 percent of the time. What does that tell you and what do you do?">
+    **Strong Answer Framework:**
+
+    1. **This is not a configuration issue -- it is a real problem.** Forty percent open means the downstream is genuinely failing a meaningful fraction of the time. First step: verify. Pull downstream error-rate metrics. If they confirm 30-plus percent actual failure, the breaker is doing its job.
+    2. **Check whether the threshold is too aggressive.** If the downstream's true error rate is 5 percent but the breaker trips on 3 consecutive failures, you are tripping on random clustering. Switch to percentage-based thresholds over a time window.
+    3. **Check the classification of "failure".** Are 4xx errors being counted? Are timeouts for healthy-but-slow responses being counted? The "failures" may not be what you think.
+    4. **Look at the blast radius.** Is the breaker scoped per-instance or per-endpoint? One flaky instance in a fleet of 20 should not trip a fleet-wide breaker. Consider per-host breakers inside a service mesh (Envoy outlier detection).
+    5. **Talk to the downstream team.** A 30-plus percent error rate on a production service is an incident. The breaker is masking the symptom; the root cause needs ownership. The circuit breaker is a shock absorber, not a fix.
+    6. **Improve the fallback.** If the downstream is genuinely unreliable and cannot be fixed short-term, invest in better fallbacks: richer cache, queued writes, alternate provider. The breaker protects you; the fallback preserves the user experience.
+
+    **Real-World Example:** In 2019, a major airline's booking system had a circuit breaker on their fare-calculation service open 35 percent of the time during peak hours. Investigation revealed the downstream was not actually unhealthy -- it was slow, exceeding the 500 ms timeout on the breaker. The real fix: raised the timeout to 2 seconds (matching p99 latency), added caching for common routes, and pre-warmed the cache for top 100 destinations. Breaker open-rate dropped to under 2 percent. The breaker was lying; the latency was the real issue.
+
+    **Senior Follow-up Questions:**
+
+    1. **"How do you tell a breaker tripping on real failures apart from one tripping on misconfiguration?"** Correlate with downstream success-rate metrics. If downstream reports 99.9 percent availability but your breaker trips 40 percent of the time, the mismatch says your threshold is wrong or you are counting wrong things. If downstream confirms real outages, your breaker is telling the truth.
+
+    2. **"Should the breaker ever trip permanently?"** No. Always have an automatic reset window (HALF-OPEN probe). A permanently-open breaker means a human must intervene, which does not scale and does not handle the common case where the downstream recovers. The safety property you want is "probe and close if healthy, re-open if still sick."
+
+    3. **"What if the breaker is open across all your callers and now the downstream has zero traffic to probe against?"** This is the "self-fulfilling prophecy" problem. HALF-OPEN lets through a small probe load -- enough to detect recovery. For a service with no natural baseline traffic, add synthetic health checks the breaker can use as probes. AWS App Mesh and Istio both support this.
+
+    **Common Wrong Answers:**
+
+    1. *"Disable the breaker or raise the threshold way up."* Treats the symptom, not the cause. If the breaker is open 40 percent, something real is broken. Disabling protection does not fix it; it just makes the user experience worse.
+    2. *"Retry more aggressively to mask the failures."* Piling retries on top of an already-failing downstream creates a retry storm that makes things worse. Never solve a "high error rate" problem with "try harder." Fix the root cause.
+
+    **Further Reading:**
+    - Michael Nygard, *Release It!* -- the canonical text on stability patterns; chapters on circuit breaker and bulkhead.
+    - Netflix Tech Blog, "Making the Netflix API More Resilient" (Hystrix origins).
+    - Envoy outlier detection documentation -- per-host breaker semantics.
+  </Accordion>
+
+  <Accordion title="Walk me through designing a circuit breaker for a downstream that has 99.95 percent availability but 5 percent of requests are naturally slow (latency outliers).">
+    **Strong Answer Framework:**
+
+    1. **Separate "slow" from "failed".** Slow is latency; failed is error. Do not conflate them. If a request succeeds in 3 seconds, it succeeded. You handle it with a timeout, not a breaker.
+    2. **Set the timeout above the p99, below user patience.** If p99 is 2 seconds, timeout at 3 seconds. Below p99 and you will timeout healthy-but-slow requests. Above user patience (say, 10 seconds) and you waste resources.
+    3. **Use percentage-based failure thresholds.** For a 99.95 percent service, a 2-of-3 threshold will trip on natural variance. Switch to "trip if error rate exceeds 20 percent over 20 requests in a 30-second window."
+    4. **Distinguish timeouts from connect errors.** Connect errors usually mean the downstream is down or unreachable. Timeouts mean it responded slowly. Both should count toward the breaker, but consider weighting them differently; connect errors are stronger signals.
+    5. **Monitor the breaker itself.** Dashboards for trip rate, HALF-OPEN probe count, and time-in-OPEN. If the breaker is tripping more than a few times a week, either the downstream or the config needs work.
+
+    **Real-World Example:** Netflix's Hystrix was explicitly designed around "percentage of failures in a rolling window" rather than consecutive failures, precisely because the consecutive-failures model produces too many false positives at Netflix's scale. Their default threshold: 50 percent failures in a 10-second rolling window, minimum 20 requests.
+
+    **Senior Follow-up Questions:**
+
+    1. **"How do you tune the reset timeout?"** Start at 30 seconds. Too short and you probe a still-sick downstream too often. Too long and you keep traffic off an already-recovered downstream. Watch the recovery pattern: if the downstream typically recovers in 60 seconds, 30-second reset is fine (you probe at 30, possibly fail, reset, probe at 60, succeed). If recovery takes 5 minutes, longer reset windows make sense.
+
+    2. **"What about circuit breakers that use response-time percentiles to trip?"** Advanced pattern: trip when p99 latency exceeds some multiple of baseline. Catches "brown-outs" where the service is up but struggling. Hard to tune correctly. Starts making sense when you have a large, well-instrumented fleet.
+
+    3. **"How does a service mesh change the picture?"** Mesh (Envoy) moves breakers out of app code into the sidecar. Benefits: consistent behavior across languages, centralized config, global view. Costs: one more moving piece, extra latency (sub-millisecond), sidecar upgrade pain. Good default for orgs already committed to a mesh; overkill for small teams.
+
+    **Common Wrong Answers:**
+
+    1. *"Retry on every failure to smooth over the 5 percent outliers."* Retries a slow request -- which then also runs slowly -- doubling the latency budget. Worse, if the downstream is overloaded, retries add load that makes it more overloaded.
+    2. *"Set the timeout very high to avoid false positives."* High timeouts hold resources during real outages, creating cascade failure. Timeout should bound the worst acceptable latency, not the best-case success window.
+
+    **Further Reading:**
+    - Hystrix wiki, "How Hystrix Measures Success / Failure."
+    - Google SRE Book, chapter on handling overload.
+    - Brendan Gregg, "Latency Heatmaps" -- for understanding latency distributions before tuning timeouts.
+  </Accordion>
+</AccordionGroup>
+
 ---
 
 ## Retry Patterns
@@ -1113,6 +1197,60 @@ The retry policy below captures several important decisions beyond "just loop a 
   ```
   </Tab>
 </Tabs>
+
+### Retry Caveats and Interview Deep-Dive
+
+<Warning>
+**Retry traps practitioners fall into:**
+
+1. **Retry storms (thundering herd) after an outage.** A downstream service recovers after a 30-second outage. Every caller that was in retry mode fires all their queued retries at the exact moment of recovery. The downstream gets slammed with 10x normal load and collapses again. Rinse, repeat.
+2. **Retrying non-idempotent operations.** "Charge this credit card" gets retried because the response was lost, and the customer is charged twice. Retries are safe only on idempotent operations or with idempotency keys.
+3. **Retrying 4xx errors.** The downstream says "bad request" or "unauthorized." A retry will get the same answer. Retrying 4xx wastes resources and pads latency for no possible success.
+4. **No overall retry budget.** A request takes 1 second normally. With 3 retries at exponential backoff (1s, 2s, 4s), worst case the user waits 10 seconds before seeing an error. And upstream services are all timing out on their own timers, producing misleading error messages.
+</Warning>
+
+<Tip>
+**Solutions and patterns:**
+
+- **Exponential backoff with jitter.** Randomize each retry delay within a window (e.g., `delay = base * 2^attempt * (0.5 + random(0, 0.5))`). This spreads the retry herd across time and prevents synchronized slam.
+- **Retry budgets with a global cap.** Retries consume no more than X percent of total request volume. When budget is exhausted, new failures are returned as-is rather than retried. Envoy and Finagle both implement this.
+- **Only retry retryable errors.** Network timeouts, 5xx, 408, 429, 503 are retryable. 4xx (400, 401, 403, 404, 422) are not. Be explicit about the list.
+- **Idempotency keys on all mutating retries.** The caller generates a UUID for the operation and includes it in every attempt. The downstream deduplicates server-side. This turns at-least-once delivery into effectively-once effect.
+- **Retry only at one layer.** If the client retries 3 times and the service mesh retries 3 times and the internal library retries 3 times, a single call becomes 27 attempts. Pick one layer (usually the outermost) and disable retries everywhere else.
+</Tip>
+
+<AccordionGroup>
+  <Accordion title="After an outage, your downstream comes back up and immediately crashes again. Why, and how do you prevent it?">
+    **Strong Answer Framework:**
+
+    1. **Diagnose first.** The downstream survived the original failure cause but is now being killed by load. Check the load at the moment of crash -- if it is 5-10x normal, that is a retry storm.
+    2. **Identify the retry herd.** During the outage, N callers queued retries. At recovery, all N retries fire simultaneously. Downstream capacity is designed for steady state, not for 10 seconds of 10x load.
+    3. **Apply jitter.** Add random delay to every retry so the herd spreads across time. `delay = base * (1 + random(0, 1))` is the simplest version; AWS's "full jitter" algorithm (`delay = random(0, base * 2^attempt)`) is even better for very-high-fan-out scenarios.
+    4. **Apply backoff caps.** Maximum retry delay of, say, 30 seconds. Without a cap, exponential backoff sends some retries minutes or hours later, creating a long tail of load surprise.
+    5. **Gradual recovery with circuit breakers.** When a circuit transitions from OPEN to HALF-OPEN, only allow a small percentage of traffic through. If probes succeed, gradually increase. If they fail, reopen. Avoids slamming a recovering service.
+    6. **Protect the downstream with rate limiting.** The downstream itself should reject traffic above its capacity rather than trying to serve it and dying. Token bucket at the ingress is a cheap insurance policy.
+
+    **Real-World Example:** In 2016, AWS DynamoDB had a famous cascading failure caused by retry storms during an internal rollout. Their post-mortem led to a wider industry awareness of jitter's importance; the AWS Architecture Blog post "Exponential Backoff and Jitter" from the Amazon Builders' Library is the canonical reference. Every retry policy in AWS SDKs now includes jitter by default.
+
+    **Senior Follow-up Questions:**
+
+    1. **"What's the difference between equal jitter, full jitter, and decorrelated jitter?"** Equal jitter adds a random fraction up to the base delay (`delay = base/2 + random(0, base/2)`). Full jitter randomizes the entire window (`delay = random(0, base * 2^attempt)`). Decorrelated jitter uses the previous delay as a seed for the next (`delay = min(cap, random(base, prev * 3))`). Full jitter is simpler and usually best for high-fan-out systems; decorrelated is better when you want smoother retry distributions.
+
+    2. **"When does retry budget kick in vs circuit breaker?"** Retry budget limits how much retrying the client fleet can collectively do. Circuit breaker limits whether any retry happens at all when the target is clearly down. Together: budget is "slow down retries when load is high"; breaker is "stop entirely when the target is dead." Neither replaces the other.
+
+    3. **"How do you roll out jitter to a production system that does not have it?"** Start by adding jitter on the outermost retry layer only. Measure the effect on downstream load spikes during rollouts and deployments -- the typical smoothing effect is visible within a week. Then push jitter into inner layers one at a time, verifying each does not create new coordination problems.
+
+    **Common Wrong Answers:**
+
+    1. *"Add more capacity to the downstream so it can handle the spike."* Treats the symptom. A 10x retry spike on recovery means you need 10x capacity for 1 percent of the time. Jitter costs nothing.
+    2. *"Disable retries to prevent storms."* Goes too far. Retries are valuable for transient failures. Disabling loses that value. Jitter and budgets preserve the value while fixing the storm.
+
+    **Further Reading:**
+    - Amazon Builders' Library, "Timeouts, retries, and backoff with jitter."
+    - Google SRE Workbook, Chapter 9, "Addressing Cascading Failures."
+    - Marc Brooker's blog posts on retry and backoff mathematics.
+  </Accordion>
+</AccordionGroup>
 
 ---
 
@@ -1632,6 +1770,60 @@ Most engineers discover bulkheads as "limit concurrency." The deeper insight is 
 <Tip>
 Size bulkheads from data, not intuition. Pull your p99 latency and peak RPS for each dependency for the past 30 days. Bulkhead size = peak concurrent in-flight requests needed + 30% headroom. Review quarterly. A bulkhead that never rejects anything during an outage is too large; one that rejects during normal peak is too small.
 </Tip>
+
+### Bulkhead Caveats and Interview Deep-Dive
+
+<Warning>
+**Bulkhead traps practitioners fall into:**
+
+1. **Bulkhead thread pool starvation from misconfigured sizing.** Pool too small, and steady-state traffic is rejected because there is no room for normal concurrency. Users see errors under normal load, not just outages. Pool too large, and the bulkhead does not actually isolate -- one dependency can still consume most of the process's resources.
+2. **Shared queues across bulkheads.** Two "isolated" bulkheads feed a single downstream HTTP connection pool. When one gets slow, it saturates the shared pool, and the isolation is an illusion. True isolation requires separate pools all the way down.
+3. **Bulkheads around fan-out without a total cap.** You have 20 bulkheads, each sized 50. Under stress, all 20 saturate at once, giving you 1000 concurrent requests when your process can only handle 400. Individual bulkheads prevent one dependency from monopolizing resources, but you still need a total process-level cap.
+4. **No rejection metrics.** Bulkhead rejects a request and the caller sees a generic 503. You cannot tell from logs whether the problem was a downstream issue, a bulkhead rejection, or something else. Emit a distinct metric and log reason for every rejection -- "bulkhead_rejection" vs "circuit_open" vs "downstream_500".
+</Warning>
+
+<Tip>
+**Solutions and patterns:**
+
+- **Size by measurement, not guess.** Bulkhead size = max-acceptable-concurrency-for-this-dependency. That is peak concurrent in-flight (observed) + 20-30 percent headroom. Don't pull numbers from thin air.
+- **Separate pools at every layer.** Thread pool, HTTP connection pool, database connection pool -- all partitioned per dependency. Shared pools anywhere in the chain break isolation.
+- **Process-level concurrency cap.** Sum of all bulkhead sizes <= total concurrency the process can safely handle. Otherwise the bulkheads provide per-dependency isolation but not overall protection.
+- **Fast rejection with clear error codes.** When bulkhead rejects, return HTTP 503 with a specific header (`x-reason: bulkhead-full`). Callers can distinguish "try later" from "downstream sick" and react appropriately.
+- **Tune the queue, not just the pool.** `maxConcurrent` and `maxQueue` are separate knobs. Queue too large = requests sit for minutes then time out; queue too small = rejections under normal bursts. Typical ratio: `maxQueue = maxConcurrent * 2 to 5`.
+</Tip>
+
+<AccordionGroup>
+  <Accordion title="Your bulkhead for the fraud-detection service has max=30. During a traffic spike, it saturates and rejects 8 percent of requests. What do you do?">
+    **Strong Answer Framework:**
+
+    1. **Verify the bulkhead is the bottleneck, not the downstream.** Pull metrics: if fraud-detection is responding in 150 ms but your bulkhead is full, the bulkhead is undersized for current load. If fraud-detection p99 is 2 seconds, the real issue is downstream latency; more concurrency will not help, it will just create a bigger backlog.
+    2. **Compute the right size.** Little's Law: `concurrency = throughput * latency`. If you need 500 RPS at 200 ms per call, required concurrency = 100. Current bulkhead of 30 is too small by 3x.
+    3. **Resize with caution.** Raise the bulkhead gradually (e.g., 30 -> 50 -> 80) and observe downstream latency. Doubling concurrency can sometimes cause the downstream's latency to spike, negating the gains.
+    4. **Check the downstream's capacity.** If fraud-detection can only handle 400 RPS total across all callers, raising your bulkhead beyond that fraction pushes the limit onto them. Coordinate with that team.
+    5. **Add queuing if bursts are the issue.** Steady load needs concurrency; bursts may tolerate queuing. `maxQueue = maxConcurrent * 3` with a 500 ms queue timeout lets you absorb short bursts without rejecting.
+    6. **If the dependency is truly not critical, consider non-blocking fallback.** If fraud-detection being saturated is not an outage (you can approve with a default score), return the fallback faster rather than queuing.
+
+    **Real-World Example:** Netflix's classic "Hystrix dashboard" from 2012-2015 made bulkhead rejection rates front-and-center for every service dependency. Teams watching the dashboard noticed that their "isolation" was not really isolating because pool sizes were guessed, not measured. The cultural shift to "size bulkheads from real data" drove a significant reduction in cascading failures across Netflix.
+
+    **Senior Follow-up Questions:**
+
+    1. **"How do you handle a dependency that has unpredictable latency? Sometimes 100 ms, sometimes 3 seconds."** Bulkhead size based on p99 latency, not average. If latency is highly variable, add a tight timeout so slow requests fail fast and free the slot. Bulkhead of 50 with 1-second timeout can handle much more throughput than bulkhead of 50 with 10-second timeout.
+
+    2. **"Is a bulkhead sufficient, or do you also need a circuit breaker?"** Both, for different jobs. Bulkhead caps concurrent calls (prevents resource exhaustion). Circuit breaker skips calls entirely when downstream is known-bad (prevents wasted attempts). You want both: bulkhead contains the damage, breaker eliminates it when the downstream is down.
+
+    3. **"What happens during a pod restart? Does the bulkhead reset?"** In-memory bulkhead state is lost on restart, so yes. This is usually fine (a restarted pod is fresh and can accept traffic), but it means a rolling restart during a degraded downstream can cause waves of "first N requests succeed while state is empty." Observe for this; use stickier state (Redis-backed) if it is a problem.
+
+    **Common Wrong Answers:**
+
+    1. *"Remove the bulkhead; it is blocking legitimate traffic."* Misses the point. The bulkhead is doing its job -- exposing that steady-state load exceeds the configured capacity. Remove it and the next outage will cascade.
+    2. *"Set bulkhead to unlimited to prevent rejections."* Equivalent to removing the bulkhead. Now one slow dependency can consume all resources, which is exactly what bulkheads prevent.
+
+    **Further Reading:**
+    - Michael Nygard, *Release It!*, chapter on Bulkheads.
+    - Netflix Hystrix documentation, "How it Works," section on thread pools.
+    - Envoy documentation on circuit breakers (which in Envoy terminology includes concurrency limits, i.e., bulkheads).
+  </Accordion>
+</AccordionGroup>
 
 ---
 
@@ -2267,6 +2459,59 @@ Intent parity is strongest when paired with *optimistic UI*. Show the user their
   ```
   </Tab>
 </Tabs>
+
+### Timeout Caveats and Interview Deep-Dive
+
+<Warning>
+**Timeout traps practitioners fall into:**
+
+1. **Timeout values mismatched across service chain.** The API gateway times out at 3 seconds. It calls Order Service with a 5-second timeout. When Order's downstream is slow, Order times out at 5 seconds -- but the gateway gave up at 3 seconds. The client sees a generic gateway timeout with no useful information about which downstream failed. Correct pattern: inner timeouts strictly shorter than outer.
+2. **Timeout set below p99.** Timeout of 500 ms when p99 is 800 ms means 1 percent of legitimate requests fail with timeout. On a service doing 10K RPS, that is 100 false timeouts per second.
+3. **No connect timeout separate from read timeout.** A misconfigured HTTP client uses a single "timeout" that covers DNS + TCP connect + TLS + request + response. If the downstream's TCP listener is broken, you wait the full read timeout. Separate them: connect timeout should be under 1 second; read timeout matches request latency.
+4. **Context timeout not propagated.** Your Go service receives a request with a 2-second context deadline. It makes three sequential downstream calls, each with its own 5-second timeout. If the first call takes 1.5 seconds, you have 500 ms left -- but the second call's 5-second timeout does not know that and may try to wait way past the caller's deadline.
+</Warning>
+
+<Tip>
+**Solutions and patterns:**
+
+- **Cascading timeouts: inner shorter than outer.** Gateway 5s -> application 4s -> integration 3s -> external 2s. Each layer has room to handle the inner failure and return a meaningful error.
+- **Propagate deadlines, not timeouts.** Pass the *deadline* (absolute time) through the call chain, not the *duration*. Every downstream knows the absolute time by which it must return. gRPC and Go `context.Context` both do this natively.
+- **Set timeouts from actual latency data.** Timeout = max(p99.9 + buffer, user patience bound). Not guessed. Not copied from a tutorial. Measured.
+- **Differentiate connect, read, and total timeouts.** HTTP clients expose these separately; use them. A broken TCP listener should fail fast; a slow response should wait up to the read budget.
+- **Timeouts at every network call, without exception.** If you see `await client.get(...)` with no timeout, that's a latent production incident waiting to happen. Default-deny style: configure a short default timeout at the HTTP client factory so forgotten-timeout code paths are impossible.
+</Tip>
+
+<AccordionGroup>
+  <Accordion title="Your API gateway times out at 3s, Order Service times out at 5s. What goes wrong, and how do you fix it?">
+    **Strong Answer Framework:**
+
+    1. **Name the bug.** Gateway abandons the request after 3 seconds and returns a generic 504. Order Service still has 2 seconds of work in flight, consuming resources. The caller sees no information about which downstream was slow.
+    2. **Apply cascading timeouts.** Inner must be shorter than outer. Gateway 3s -> Order Service 2.5s -> any downstream of Order 2s. This gives each layer time to handle failure and return a meaningful response.
+    3. **Propagate deadlines.** Even better: the gateway forwards the absolute deadline to Order Service (via `grpc-timeout` header or `X-Request-Deadline`). Order Service computes remaining budget = deadline - now, and uses that as its own timeout. This prevents any downstream from waiting past the original deadline.
+    4. **Add deadline awareness in application code.** Every cross-service call takes a `context` or `deadline` parameter. The HTTP client respects it. Code that ignores deadlines is a bug.
+    5. **Monitor for "wasted work" after the caller gave up.** Metrics like "request completed after upstream timeout" help identify where deadline propagation is broken.
+
+    **Real-World Example:** Google's Borg and gRPC architecture explicitly propagates deadlines across every service boundary. A request entering the load balancer with a 1-second deadline will still have a 1-second deadline (minus network time) when it reaches the innermost backend. This is described in the Google SRE book and is a major reason gRPC's `context` has first-class deadline support.
+
+    **Senior Follow-up Questions:**
+
+    1. **"What about retries within the timeout budget?"** Retries eat into the total deadline. If your outer deadline is 3 seconds and your per-attempt timeout is 1 second, you can do at most 3 attempts before the deadline. Retry logic must check remaining time before each attempt -- don't retry if less than one attempt's worth of budget remains.
+
+    2. **"How do you set the right timeout when you don't know the downstream's p99?"** Start conservative: 2x your SLO target for the overall request. Measure real latency. Tighten over time based on data. Do not launch with a 30-second default "just in case" -- that creates cascade failure conditions.
+
+    3. **"What if a service intentionally takes longer than the deadline (e.g., a long-running report)?"** Long-running operations should not run synchronously inside a request/response cycle. Change the contract: the request kicks off the job and returns a job ID; clients poll for completion or subscribe to a webhook. Synchronous "wait 30 seconds" APIs are a design smell that the entire call chain will have to work around.
+
+    **Common Wrong Answers:**
+
+    1. *"Raise the gateway timeout to 10 seconds so Order Service has time to finish."* Creates worse problems: users wait longer; gateway threads / connection pool fill up; upstream callers time out on the gateway. Raising timeouts is almost never the right fix.
+    2. *"Lower Order Service's timeout to 3 seconds (same as gateway)."* Still broken. If Order Service takes its full 3 seconds, the gateway has no time to process the response or return to the client. Inner must be *strictly* shorter than outer.
+
+    **Further Reading:**
+    - Amazon Builders' Library, "Timeouts, retries, and backoff with jitter."
+    - Google gRPC documentation, "Deadlines."
+    - Google SRE Book, chapter on handling overload (deadline propagation).
+  </Accordion>
+</AccordionGroup>
 
 ---
 

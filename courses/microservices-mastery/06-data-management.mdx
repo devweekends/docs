@@ -1170,6 +1170,89 @@ Pay attention to the `executeStep` helper: it persists the current step and the 
   </Tab>
 </Tabs>
 
+### Saga Caveats and Interview Deep-Dive
+
+<Warning>
+**Saga pattern traps practitioners fall into:**
+
+1. **Compensating transactions are not idempotent.** The most common bug: your saga retries a compensation after a transient network error, and the second call double-refunds the customer or releases stock twice. Compensations get executed more than once in production -- plan for it from day one.
+2. **Compensation order matters and is often wrong.** If steps were A, B, C, compensations must run C-reverse, then B-reverse, then A-reverse. Running them in any other order can leave data in an invalid state (e.g., releasing inventory before cancelling the payment reservation leaves a "paid order with no items").
+3. **No timeout on saga execution.** A saga step that never responds leaves the saga stuck in PENDING forever. Without a saga-level deadline plus automatic compensation on timeout, you accumulate zombie sagas that require manual cleanup.
+4. **No visibility into in-flight sagas.** When the payment step of 10,000 sagas is stuck waiting on a slow downstream, nobody knows until customer support starts getting calls. Build a saga dashboard that shows state distribution, average age per state, and stuck sagas. This is not optional in production.
+</Warning>
+
+<Tip>
+**Solutions and patterns:**
+
+- **Idempotency keys on every step and every compensation.** Pass a stable `saga_id + step_id` on each call; the receiving service stores a short-lived record (Redis with a 7-day TTL works) and rejects duplicates with "already processed." This turns at-least-once delivery into effectively exactly-once business effect.
+- **Explicit saga state machine, persisted after every transition.** Model the saga as rows in an `orders_saga` table with columns `saga_state`, `last_event`, `retries`, `next_deadline`. Every state transition is a DB UPDATE that must succeed before the next event is emitted. Crash in the middle? On restart, the recovery worker reads rows where `next_deadline < NOW()` and resumes.
+- **Fail-forward vs fail-back.** Not every failure needs to compensate. Some steps (sending a confirmation email, updating analytics) should be retried indefinitely rather than rolled back -- the business cost of "we cancelled the order because the email didn't send" is far worse than "we sent a duplicate email." Classify each step as *rollback-on-failure* or *retry-forever* during design.
+- **Correlation IDs propagated end-to-end.** Every log line, event, and HTTP header carries the same `saga_id`. When a saga goes wrong at 3 AM, a single Kibana search finds all 17 related log lines in 5 seconds instead of 45 minutes.
+</Tip>
+
+<AccordionGroup>
+  <Accordion title="Your distributed transaction across 3 services fails halfway -- you have no 2PC -- how do you recover?">
+    **Strong Answer Framework:**
+
+    1. **Stop and diagnose before acting.** First question: did the partial state happen because a service call failed, or because a service succeeded but the response was lost? These look identical but have different fixes. Check idempotency: if the downstream stored an `idempotency_key`, was it stored? If yes, the call succeeded -- you just lost the response.
+    2. **Read the persisted saga state.** Your saga row tells you exactly which step was last committed. If state is `INVENTORY_RESERVED` but `PAYMENT_CHARGED` never got written, you know payment is the uncertain step.
+    3. **Query downstreams by business key, not saga memory.** Ask the Payment service "do you have a charge for order X?" using the order ID as the idempotency key. If yes, advance the saga. If no, retry the payment step.
+    4. **Trigger compensation only after confirming failure.** Never compensate on timeout alone -- query first. Compensating a step that actually succeeded doubles the damage.
+    5. **Emit the new saga state and continue.** Either roll forward (retry the failed step) or roll backward (compensate prior steps). Log the decision and the evidence that led to it.
+    6. **Surface the incident.** Any saga that requires recovery should page a human after N retries. Silent self-healing is good; silent self-failing is a disaster.
+
+    **Real-World Example:** In 2022, a well-known fintech had a saga that charged the card, failed to create the ledger entry due to a DB timeout, and triggered compensation. The compensation refunded the card. But the ledger entry had actually been written -- the timeout was on the *response*. Net result: customer was debited, refunded, but also credited with the product. Post-incident fix: every saga step now queries the downstream by `idempotency_key` before deciding to compensate.
+
+    **Senior Follow-up Questions:**
+
+    1. **"What if the saga state store itself is down when you try to recover?"** The saga state must be persisted in the same transaction as the business operation -- this is the Outbox pattern. If the state store is part of the primary DB (same Postgres as orders), it is either up together or down together, which simplifies reasoning. If the state store is external, you need an escape hatch: dump saga rows to a file log every N seconds, and recover from the file if DB is gone.
+
+    2. **"How do you test compensation code? It only runs on failure."** Build a chaos-testing harness that randomly aborts saga steps in a staging environment. Also: every compensation must be callable from a CLI tool that operators can invoke manually in an incident. Write integration tests that drive the saga to each state and then kill it, verifying compensation runs correctly. Teams that skip this discover compensation bugs during real outages -- the worst possible time.
+
+    3. **"What's your policy for compensations that fail?"** Retry with exponential backoff for N attempts. After that, move the saga to a `MANUAL_INTERVENTION` state and alert. Compensation failures are rare but real (what if the refund API is down for 6 hours?) -- the system needs a path where a human acknowledges and resolves. Pretending compensations always succeed is how teams end up with billions in stuck funds.
+
+    **Common Wrong Answers:**
+
+    1. *"I'd wrap the whole saga in a try/catch and roll back on exception."* This reveals the candidate does not understand distributed transactions. You cannot roll back a remote service with a try/catch -- the database on the other side has already committed. This is exactly the problem that sagas exist to solve.
+    2. *"Use 2PC/XA transactions instead."* Shows lack of production experience. 2PC requires distributed locks held across network round-trips, kills throughput, and is not supported by most modern data stores (DynamoDB, Cassandra, most SaaS APIs). Nobody runs 2PC in production microservices for a reason.
+
+    **Further Reading:**
+    - Chris Richardson, *Microservices Patterns* -- chapters on Saga and Outbox patterns.
+    - Caitie McCaffrey, "Distributed Sagas" talk (QCon) -- the foundational modern treatment.
+    - AWS Step Functions documentation -- a production-grade saga orchestrator you can learn from.
+  </Accordion>
+
+  <Accordion title="How do you make compensating transactions safe when they might run twice?">
+    **Strong Answer Framework:**
+
+    1. **Idempotency key per compensation call.** The key is typically `{saga_id}:{step_id}:compensate` so replays are recognized.
+    2. **Store the effect, not just the intent.** Before executing, write a record saying "compensation X is being applied." If you crash and retry, the retry checks the record and either completes or skips based on what was already done.
+    3. **Use database constraints to prevent double-effect.** A unique index on `(saga_id, step_id, direction='compensate')` in the audit table makes a second insert fail cleanly rather than running the compensation logic twice.
+    4. **Design compensations as state-setting, not delta-applying.** Instead of "subtract 1 from inventory" (dangerous if replayed), write "set inventory reservation status = RELEASED" (safe, same result on replay).
+    5. **Acknowledge the edge case where compensation cannot be made idempotent.** Some external APIs (email sends, SMS, legacy ERPs) are inherently non-idempotent. For these, accept that double-compensation may happen and either (a) add a human-approval gate or (b) log the double-effect explicitly so support can follow up.
+
+    **Real-World Example:** Stripe's API enforces idempotency keys on every mutating call for exactly this reason. A retry with the same key returns the original response rather than charging twice. When you build compensations, mirror this contract: every compensation call accepts and honors an idempotency key.
+
+    **Senior Follow-up Questions:**
+
+    1. **"How do you garbage-collect idempotency records?"** TTL of 7-14 days is typical. Long enough to catch all realistic retries, short enough that the table does not grow unbounded. Use a separate partitioned table with time-based partitions and drop old partitions rather than deleting rows -- much faster.
+
+    2. **"What if the downstream service doesn't support idempotency keys?"** Wrap the call in an idempotency proxy: a small stateful layer that you own, which stores the key and the response, and only calls the downstream on first attempt. This is the same pattern API gateways use for exactly-once semantics on non-idempotent backends.
+
+    3. **"Idempotency sounds expensive -- every call now has a DB lookup. How much does it cost?"** With proper indexing, the lookup is under 1ms on Postgres or Redis. For a service doing 10K RPS, that's less than 1% of CPU. Real cost is developer discipline: getting idempotency right requires every endpoint author to remember to check the key. Use middleware or decorators to make it automatic.
+
+    **Common Wrong Answers:**
+
+    1. *"Our message broker guarantees exactly-once delivery, so we don't need idempotency."* Dangerous misconception. Even Kafka's "exactly-once semantics" only applies within Kafka -- the moment you call an external service or DB, you are back to at-least-once. Idempotency is required regardless of broker.
+    2. *"We use SERIALIZABLE isolation to prevent double-apply."* Confuses local transaction isolation with distributed effects. SERIALIZABLE protects one database, not the remote service you're compensating.
+
+    **Further Reading:**
+    - Stripe Engineering Blog, "Designing robust and predictable APIs with idempotency."
+    - Martin Kleppmann, *Designing Data-Intensive Applications*, Chapter 8 (The Trouble with Distributed Systems).
+    - AWS Well-Architected: Reliability Pillar, idempotency patterns.
+  </Accordion>
+</AccordionGroup>
+
 ---
 
 ## Event Sourcing
@@ -1961,6 +2044,89 @@ The tradeoff: snapshots introduce a new failure mode. If your aggregate logic ch
   </Tab>
 </Tabs>
 
+### Event Sourcing Caveats and Interview Deep-Dive
+
+<Warning>
+**Event sourcing traps practitioners fall into:**
+
+1. **Event store unbounded growth.** Teams adopt event sourcing without a retention or archival strategy. Two years later, the event store is 4 TB, rebuilding an aggregate takes 45 seconds, and every query hits storage cost pain. You need snapshots (covered above) plus cold-tier archival (move events older than N days to S3 Glacier or equivalent).
+2. **Breaking schema changes to events.** Events are immutable -- the ones on disk stay forever in the shape they were written. A junior engineer "fixes" the `OrderCreated` event schema by renaming `total` to `total_amount` and the next replay of old data crashes because the new aggregate expects a field that does not exist in 2022's events. You need **upcasters**: version-aware transforms that translate old event shapes into the current model at replay time.
+3. **Using event sourcing for the wrong domain.** CRUD apps do not benefit from event sourcing. If your "events" are all `EntityUpdated` with no real business semantics, you have built a glorified audit log with 10x the complexity. Event sourcing earns its keep only when you have rich state transitions the business actually cares about (legal workflows, finance, insurance claims, shipping).
+4. **Projections and aggregates drifting out of sync.** The read model (projection) is eventually consistent with the event stream. If a projection bug silently corrupts a read row, nobody notices until a user complains months later. You need projection checksums and periodic "rebuild and compare" jobs that verify the read model still matches a fresh replay.
+</Warning>
+
+<Tip>
+**Solutions and patterns:**
+
+- **Event versioning from day one.** Every event carries a `version` field. Never mutate an existing event type -- create `OrderCreatedV2` with the new schema and write upcasters that read V1 events and produce V2 in memory. Greg Young's "Versioning in an Event Sourced System" is the definitive reference.
+- **Snapshot strategy per aggregate type.** Snapshot frequency depends on event rate. A shopping cart with an average 8 events per aggregate does not need snapshots. An insurance policy with 5,000 events over its lifetime must snapshot every 100-500 events.
+- **Replayable projections with checkpointing.** Projections store the last-processed event offset so they can resume after a crash. Rebuilding a projection from scratch must be a routine operation, not a panic button -- practice it monthly.
+- **Subscribe-and-catch-up on new read models.** When adding a new projection, the consumer starts at offset 0 and reads the full history. This is the magic of event sourcing: new views can be built from historical data without needing "recent snapshot" plumbing.
+</Tip>
+
+<AccordionGroup>
+  <Accordion title="Your event store has grown to 3 TB. Queries are slow. What do you do?">
+    **Strong Answer Framework:**
+
+    1. **Measure first, cut second.** Which aggregates dominate the storage? Which events are rarely replayed? Put numbers on it before touching anything.
+    2. **Introduce snapshotting if not already present.** Snapshots cap replay cost. If you have 1M events per aggregate but a snapshot every 1K events, you replay at most 1K events to rebuild state. That is 1000x faster.
+    3. **Tier storage by age.** Events older than 90 days move to cheap object storage (S3 Glacier, GCS Coldline). Online queries go against the hot tier. Regulatory or audit queries go against the cold tier (slower, fine).
+    4. **Partition by aggregate ID.** Events for aggregate A never need to touch aggregate B's partition. Sharding by aggregate key reduces the per-query working set dramatically.
+    5. **Consider projections as the primary read path.** Direct event-store queries should be rare -- most reads should hit denormalized projections. If you are hitting the event store for user-facing reads, that is the problem, not the size.
+    6. **Archive dead aggregates.** Orders completed 5 years ago do not need online access. Migrate them out with a verified archive and restore process.
+
+    **Real-World Example:** In 2020, a large European bank using EventStoreDB hit 40 TB of events across their account-processing domain. Their fix: (a) snapshots every 500 events, (b) monthly rollover to S3 for events older than 12 months, and (c) a separate query path that reads from projections for anything user-facing. Replay times dropped from minutes to sub-second.
+
+    **Senior Follow-up Questions:**
+
+    1. **"How do you handle snapshot corruption?"** Every snapshot stores the event version it represents. On load, you rebuild from the snapshot, then replay events after that version. If the rebuilt state from the snapshot does not match a fresh replay from event 0 (checked periodically), the snapshot is corrupt -- delete it and regenerate. Snapshots are cache, not truth. The event stream is truth.
+
+    2. **"What if you need to query events by business attribute (e.g., find all orders with total over $1K)?"** Do not query the event store for this -- it is not indexed by business fields and scanning is O(N). Build a projection indexed by the attribute you need. The event store answers "give me events for this aggregate"; projections answer everything else.
+
+    3. **"How do you delete personal data for GDPR compliance if events are immutable?"** Two options. Option A: crypto-shredding -- each user's events are encrypted with a user-specific key stored separately. To "delete" the user, destroy the key; events become unreadable noise. Option B: a pseudonymization projection that replaces personal fields with hashes during replay. Both keep the event store immutable while making the data effectively unavailable.
+
+    **Common Wrong Answers:**
+
+    1. *"Delete old events."* Event sourcing's core invariant is immutability. Deleting events destroys the audit trail, breaks replay, and means projections can never be rebuilt. This answer disqualifies the candidate for any serious event-sourcing role.
+    2. *"Just add more storage."* Misses the point. Storage is cheap, query latency is not. The problem is working-set size, not disk capacity.
+
+    **Further Reading:**
+    - Greg Young, "Versioning in an Event Sourced System" (free PDF) -- the canonical reference.
+    - EventStoreDB documentation, projections chapter.
+    - "Event Sourcing and CQRS with Axon Framework" -- deep dive on snapshotting patterns.
+  </Accordion>
+
+  <Accordion title="How do you evolve an event schema without breaking historical replay?">
+    **Strong Answer Framework:**
+
+    1. **Never mutate existing event types.** Old events on disk are frozen. If you need a new shape, introduce `EventTypeV2`.
+    2. **Write upcasters.** A function that takes a V1 event and returns a V2 event in memory. The disk stays V1 forever; the aggregate always sees V2. This is the single most important pattern in event schema evolution.
+    3. **Treat schema changes as additive when possible.** New optional fields with defaults are backward-compatible. Renames, removals, and type changes require upcasters.
+    4. **Version the event envelope, not just the payload.** The envelope carries `event_type`, `event_version`, `timestamp`, `correlation_id`. Upcasters key off `event_version` to decide how to translate.
+    5. **Test upcasters against real historical data.** A synthetic test is not enough. Replay a recent production event stream through the new upcaster chain before deploying.
+
+    **Real-World Example:** Adobe's Document Cloud event-sourced system processes billions of events across years of PDF lifecycle data. Their schema has evolved roughly 40 times since launch. Their rule: every event type has an explicit migration chain (V1 -> V2 -> V3), stored as code, runs at every load. No event ever gets "rewritten on disk."
+
+    **Senior Follow-up Questions:**
+
+    1. **"What if the upcaster chain is slow? Every replay runs all upcasters."** True, but the cost is usually small (tens of nanoseconds per event). If measurements show otherwise, collapse the chain: at snapshot time, store the snapshot in the current format, so only events since the snapshot need upcasting. This amortizes the upcaster cost.
+
+    2. **"How do you handle event deletion requirements (GDPR, regulation)?"** Covered above -- crypto-shredding or pseudonymization projections. The key insight: event sourcing does not conflict with GDPR, it just requires intentional design. Most teams bolt this on late and regret it.
+
+    3. **"What if you need to merge two event streams (e.g., after an account merge)?"** Introduce a `StreamMerged` event in the target stream that references the source. Do not copy events -- copying loses identity and breaks idempotency. The target projection reads both streams and reconciles, or you build a merged projection from both sources.
+
+    **Common Wrong Answers:**
+
+    1. *"I'd run a migration script to rewrite old events."* This breaks the immutability contract and makes audit impossible. A regulator or auditor asking "what did the system record on this date?" would get a different answer depending on when you ask, which is exactly the problem event sourcing is supposed to solve.
+    2. *"Use schema registry like Avro/Protobuf."* Schema registries help with wire format but do not solve semantic evolution. Renaming `customer_name` to `buyer_name` requires reinterpreting the field, not just reformatting it. Upcasters are what do that.
+
+    **Further Reading:**
+    - Greg Young, "Versioning in an Event Sourced System."
+    - Martin Kleppmann, *Designing Data-Intensive Applications*, Chapter 4 (Encoding and Evolution).
+    - "Practical Event Sourcing" blog series from the EventStore team.
+  </Accordion>
+</AccordionGroup>
+
 ---
 
 ## CQRS Pattern
@@ -2369,6 +2535,90 @@ The alternative -- trying to answer "show me all shipped orders in the last 30 d
   ```
   </Tab>
 </Tabs>
+
+### CQRS Caveats and Interview Deep-Dive
+
+<Warning>
+**CQRS traps practitioners fall into:**
+
+1. **Read model staleness surprising users.** A user edits their profile, navigates to their profile page, and sees the old name. They think the save failed and click Save again. You now have duplicate events, duplicate emails, and a support ticket. Read-model lag of even 200 ms can destroy user trust in the app.
+2. **Projection lag invisible until production.** Developers test in an environment where the projection updates in under 5 ms because the load is tiny. In production with real traffic, the projection queue backs up to 30 seconds during bursts. Nobody sees this until customers start complaining.
+3. **Projection crashes that require manual rebuild.** An unhandled exception in the projection handler poisons the queue. Every retry fails on the same event. The projection falls further and further behind. Without a poison-pill queue and dead-letter handling, a single bad event can wedge the entire read side.
+4. **Two-way sync between write and read models.** Teams sometimes "helpfully" update the read model directly during a write transaction to reduce lag. This defeats the entire point of CQRS -- now the read model is no longer derived purely from events, and a replay from events would produce a different result. Always rebuild the read model from the event stream, never from direct writes.
+</Warning>
+
+<Tip>
+**Solutions and patterns:**
+
+- **Read-your-writes consistency where it matters.** For queries like "my own profile" or "the order I just placed," read from the write side directly or include the expected event offset in the query. The client holds the offset from the last write and the query waits (up to a short bound) for the projection to catch up.
+- **Projection lag monitoring with SLO alarms.** Every projection exposes a "lag in seconds" metric. SLO is "p99 lag under 5 seconds." Page on-call when breached. This single metric catches 80% of projection problems before users see them.
+- **Idempotent projection handlers.** Event replay must produce the same result whether run once or 100 times. Use `INSERT ... ON CONFLICT DO UPDATE` semantics or version-based optimistic writes. This means a handler crash followed by retry cannot corrupt the read model.
+- **Separate hot and cold projections.** Not every read path needs the same projection. Search uses Elasticsearch, user profile lookup uses Redis, analytics uses BigQuery. Each projection can run at its own freshness budget.
+- **Communicate eventual consistency in the UI.** If a save is in flight, show a "syncing..." indicator. This manages user expectation and prevents the "save twice" problem above.
+</Tip>
+
+<AccordionGroup>
+  <Accordion title="A user updates their profile but sees old data when they navigate to the profile page. How do you handle this?">
+    **Strong Answer Framework:**
+
+    1. **Quantify the lag.** Measure projection lag p50 and p99. If p99 is 2 seconds, users will often see stale data. If it is 50 ms, mostly they will not.
+    2. **Route the specific query to the write side.** "My own profile" reads directly from the write model, bypassing the projection. Other users' profiles still read from the projection (where staleness is acceptable). This is the "read-your-writes" pattern.
+    3. **Or: return the updated row from the write endpoint.** When the profile-update API returns, include the new profile state in the response. The client caches it and displays it until the next fetch. No projection round-trip needed.
+    4. **Or: token-based consistency.** The write returns a version token. Subsequent reads pass the token; the query layer waits (up to a short bound, say 500 ms) for the projection to reach that version before responding. If the projection is still behind after the bound, read from the write side as fallback.
+    5. **Communicate in the UI.** If none of the above fully eliminate lag, show a "saving..." indicator until the write is confirmed. This is user-experience work, not just backend work.
+
+    **Real-World Example:** Facebook encountered this in 2013 with their news feed projections. Their fix: every post you create is added to your *own* feed synchronously from the write-side, while feeds of other users are updated asynchronously. When you refresh, you see your own post immediately. Friends see it within a second or two. This is the read-your-writes pattern at massive scale.
+
+    **Senior Follow-up Questions:**
+
+    1. **"What if the write side cannot serve the read efficiently? It is normalized and the read needs denormalized data."** Cache the denormalized view in-process on the write side, invalidated on every write. Or materialize a "hot" projection that is synchronous within the same transaction as the write. The tradeoff: synchronous projection adds write latency but eliminates read lag. Pick based on which matters more for this query.
+
+    2. **"How do you handle projection rebuilds without downtime?"** Build the new projection alongside the old, with both consuming events. Dual-write from events, single-read from the old projection. Once the new projection catches up and passes integrity checks, flip the read path to the new projection. Delete the old projection after a safety window. This is the same pattern as online schema migrations.
+
+    3. **"What is the correct way to version a read model schema?"** Include the schema version in the projection table name or an index name (`users_profile_v3`). Projections are cheap to rebuild, so create a new projection for a new schema, dual-write for a migration window, then switch readers. This avoids in-place ALTERs on multi-terabyte projections.
+
+    **Common Wrong Answers:**
+
+    1. *"Just update the read model synchronously inside the write transaction."* Defeats the scalability benefits of CQRS and couples the write path to the read storage's availability. If the read store is down, writes fail. You might as well not split them.
+    2. *"Poll the API from the client until the data appears."* Wastes bandwidth, puts load on the projection, and creates a race with user interactions. Token-based consistency or read-your-writes are better.
+
+    **Further Reading:**
+    - Martin Kleppmann, *Designing Data-Intensive Applications*, Chapter 5 (Replication).
+    - Pat Helland, "Immutability Changes Everything" (paper).
+    - Netflix Tech Blog posts on read-model projections and freshness SLOs.
+  </Accordion>
+
+  <Accordion title="Your projection handler crashes on a bad event and the read model falls 10 minutes behind. How do you recover?">
+    **Strong Answer Framework:**
+
+    1. **Stop the bleeding first.** Pause the projection so it is not retrying the poison event 10 times per second and flooding logs.
+    2. **Route the offending event to a dead-letter queue.** The projection skips it and advances to the next event. The DLQ preserves the event for investigation without blocking the stream.
+    3. **Alert the on-call.** A DLQ'd event means either a projection bug or an unexpected event shape. Both require human attention.
+    4. **Investigate and fix.** Either patch the projection handler to handle the event, or produce a correction event that supersedes the bad one.
+    5. **Replay from the DLQ.** Once the fix is deployed, re-queue the DLQ'd events and let the projection process them.
+    6. **Verify projection integrity.** After catch-up, run a reconciliation job: rebuild a sample of projection rows from the event stream and compare to the live projection. Any discrepancy is a latent bug.
+
+    **Real-World Example:** Uber's dispatch system uses Kafka projections heavily. In a 2018 incident, a malformed driver-location event (negative speed value) crashed their ETA projection. Their recovery: DLQ the event, patch the handler to validate and clamp values, replay the DLQ, and add input validation on all event-producing services. Post-mortem: added pre-deployment schema compatibility tests to catch this class of bug before it reaches production.
+
+    **Senior Follow-up Questions:**
+
+    1. **"How do you design a handler so it does not crash on unexpected data?"** Treat events like untrusted input. Validate with Pydantic / JSON Schema at ingress. If validation fails, emit a metric and skip -- do not throw. Log the full event payload for forensics. The projection should be resilient by default; crashing is a last resort.
+
+    2. **"What if the projection falls behind because of a traffic spike, not a bug?"** Separate problem, separate fix. Scale out the projection workers (partition by aggregate key so ordering is preserved within a partition). Monitor consumer lag per partition. If a single partition is hot, consider repartitioning with a better key.
+
+    3. **"How do you test projection recovery?"** Game-day exercises. Once a quarter, intentionally break a projection in staging (corrupt an event, kill the worker, block the DB write) and time the recovery. Teams that do not practice this are surprised by how long it takes in production -- when a projection 10 minutes behind snowballs into customer-facing incidents.
+
+    **Common Wrong Answers:**
+
+    1. *"Delete the bad event from Kafka."* Kafka events are immutable once committed. Even if you could delete, you'd break replay for any future projection or any existing consumer. DLQ is the right answer.
+    2. *"Rebuild the entire projection from scratch."* Works but takes hours to days for a multi-billion-event stream. DLQ + patch + replay is faster and less disruptive. Full rebuild is the last resort, not the first.
+
+    **Further Reading:**
+    - Confluent Blog, "Handling Bad Data in Kafka with Dead Letter Queues."
+    - Jay Kreps, "The Log: What every software engineer should know about real-time data's unifying abstraction."
+    - Uber Engineering Blog, post-mortems on streaming pipeline incidents.
+  </Accordion>
+</AccordionGroup>
 
 ---
 

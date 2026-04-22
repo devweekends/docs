@@ -62,6 +62,25 @@ In a monolith, you had one front door to lock. In microservices, every service i
 
 JWTs (JSON Web Tokens) solve a core distributed-systems problem: how do services verify a user's identity without every service calling back to a central auth service on every request? By cryptographically signing a token once at login time, any downstream service can verify the signature locally using a shared secret or public key. This prevents the "auth service becomes a bottleneck and single point of failure" attack pattern, and enables stateless authentication that scales horizontally. The tradeoff is revocation -- because tokens are self-contained, you cannot instantly invalidate them without a blacklist (which reintroduces the centralized check you were trying to avoid). In zero-trust terms, JWTs carry identity claims across trust boundaries so each service can independently verify "who is this, and what are they allowed to do?"
 
+<Warning>
+**Caveats & Common Pitfalls with JWTs**
+
+- **JWT secret rotation causes downtime.** A team rotates the signing secret during a maintenance window; all existing tokens immediately fail verification; every logged-in user is kicked out at once; the support inbox fills up in 5 minutes. This is the most common JWT operational incident.
+- **`alg: none` and algorithm confusion.** If your verifier trusts the `alg` claim in the token header (instead of enforcing one server-side), an attacker can send a token with `alg: none` and no signature, or swap `alg: HS256` against your RSA public key — the public key is now used as an HMAC secret, and any attacker with the public key forges tokens freely. This CVE class has been hitting JWT libraries since 2015.
+- **Tokens in localStorage.** XSS-vulnerable — any injected script can read and exfiltrate the token. Same goes for logging tokens in error responses or stack traces.
+- **Long-lived tokens with no revocation path.** A 24-hour access token stolen at hour 1 gives the attacker 23 free hours regardless of what you do.
+</Warning>
+
+<Tip>
+**Solutions & Patterns**
+
+- **Rotate with overlapping keys (JWKS).** Publish a JWKS endpoint (`/.well-known/jwks.json`) with multiple active public keys identified by `kid` (key ID) in the token header. When rotating, add the new key first, sign new tokens with it, let the old key stay valid until all tokens signed with it have expired (so, 15 min for short-lived tokens), then remove the old key. Zero downtime. This is how Auth0, Okta, and AWS Cognito handle it.
+- **Pin the algorithm server-side.** Explicitly pass `algorithms=["RS256"]` to `jwt.decode` — never trust the token's `alg` header. Use RS256 or ES256 in production (asymmetric, so verifiers only need the public key); HS256 only when the issuer and verifier are the same process.
+- **Short-lived access tokens (5-15 min) + long-lived refresh tokens** stored server-side (so they are revocable). This bounds stolen-token damage to minutes.
+- **Store access tokens in `HttpOnly` cookies**, not localStorage, so JavaScript cannot read them and XSS cannot exfiltrate. Pair with `SameSite=Lax` or `Strict` for CSRF protection.
+- Keep a **short-TTL Redis blacklist** for force-logout scenarios (e.g., "user reported compromise"). The blacklist is small (only revoked tokens), so the Redis check is microseconds.
+</Tip>
+
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
 │                    JWT AUTHENTICATION FLOW                                   │
@@ -984,6 +1003,118 @@ ABAC is the most expressive authorization model -- decisions are made based on a
 
 When services call each other, you cannot rely on user JWTs -- many service-to-service calls happen in background jobs or system flows where no user is present. HMAC-signed requests solve this by giving each service a shared secret and requiring it to sign every request with a timestamp. This defends against two critical attacks: impersonation (an attacker cannot forge requests without the secret) and replay (the timestamp prevents replaying captured requests after five minutes). In zero-trust, this is "machine identity" -- services prove who they are just as users do. Compared to mTLS, HMAC is easier to deploy (no certificate infrastructure) but weaker (the secret is only as safe as your secrets manager, and there is no transport-layer mutual authentication).
 
+<Warning>
+**Caveats & Common Pitfalls in Service-to-Service Auth**
+
+- **"The network is secure" fallacy.** Teams put all services in a VPC, assume the perimeter is enough, and skip per-call authentication. One compromised pod (SSRF, exposed dashboard, leaked credential) and the attacker now has full lateral access — because every internal service trusts every caller by IP.
+- **Over-privileged service accounts.** The `order-service` account has `DROP TABLE` rights on the users DB "because we might need it someday." When the service is compromised, the blast radius is the entire company's user data.
+- **Shared HMAC secret distributed by email / Slack / config file.** It leaks into Git history, CI logs, screenshots, and build artifacts within weeks. Rotation requires coordinated change across every consumer — which nobody does, so the original secret lives forever.
+- **No clock-skew tolerance on timestamp validation.** NTP drift of a few seconds across pods causes legitimate requests to be rejected as replay attempts. On-call gets paged at 2am and cannot figure out why only some instances fail.
+</Warning>
+
+<Tip>
+**Solutions & Patterns**
+
+- **Authenticate every call, including internal.** Zero-trust means no implicit trust from network location. Use mTLS in production (via a service mesh) so every hop is cryptographically authenticated — a compromised pod cannot simply call `http://payments-svc/charge`.
+- **One service, one identity, minimum privileges.** Each service has its own IAM / SPIFFE identity, its own DB user with row-level scoping, and only the specific permissions it needs. When `order-service` is compromised, the attacker gets what the order-service account can do, nothing more.
+- **Use short-lived, issuer-rotated credentials** (Vault dynamic DB creds, AWS STS AssumeRole, SPIFFE SVIDs with 1-hour TTL) so a leaked credential expires before exploitation.
+- **Allow ±5 minutes clock skew** on HMAC timestamp validation and keep NTP synced via `chrony` / `systemd-timesyncd`.
+- Prefer **SPIFFE/SPIRE or a service mesh (Istio, Linkerd)** over hand-rolled HMAC — they give you automatic rotation, cryptographic identity, and audit logs.
+</Tip>
+
+<AccordionGroup>
+  <Accordion title="Scenario: During a security audit you discover the fraud-detection service talks directly to the payments database instead of going through the payment service API. The fraud team says it is for performance. What do you do?">
+    **Strong Answer Framework:**
+
+    1. **Do not flip the table on day one.** This pattern exists because it shipped and the fraud team has real performance constraints. Punishing a team for shortcuts they had to take closes the door on future cooperation. Frame it as a shared architectural fix, not a blame assignment.
+    2. **Quantify the actual risk.** The payments DB has the canonical card-on-file data and transaction history. A compromise of fraud-detection — which has attacker-facing inputs (webhooks, ML model scoring, third-party signals) — now becomes a direct breach of payment data. This is a bounded-context violation and also likely a PCI-DSS scope expansion, which has real compliance and audit implications.
+    3. **Immediate mitigation (this week).** Lock down the credentials: the fraud service gets a read-only DB user scoped to only the columns/tables it actually reads. Remove write access. Add row-level security if the DB supports it. This shrinks blast radius without breaking the fraud team.
+    4. **Short-term fix (this quarter).** Work with the payment service owners to expose the exact data the fraud team needs as a read-only internal API — probably a gRPC endpoint that returns a narrow DTO. Benchmark it against the direct-DB path; if the fraud team's concern was latency, a well-designed gRPC call + Redis cache is usually within 2-5 ms of a direct query and well inside their budget.
+    5. **Long-term (quarterly).** Move to event-driven: payment service emits `PaymentProcessed`, `ChargebackFlagged` events to Kafka; fraud service consumes and maintains its own read model. Now there is no synchronous coupling at all, and each service owns its data.
+    6. **Prevent recurrence.** Add a CI check / network policy that denies outbound connections from services to databases they do not own (easy to enforce with Kubernetes NetworkPolicy or service mesh authorization). "Each service owns its DB" becomes a structurally enforced invariant, not a nice-to-have.
+
+    **Real-World Example:** Monzo published a detailed 2019 post-incident blog about exactly this pattern — a cross-service DB access shortcut that, when one of the consumer services had a bug, caused an outage for the owner service. Their fix was strict per-service DBs with API-only access, which is now a foundational rule in their platform.
+
+    **Senior Follow-up Questions:**
+
+    - *"What if the fraud team pushes back hard on latency?"* Instrument both paths end-to-end. Usually the difference is 1-3 ms of network hop plus JSON/gRPC serialization. If that genuinely matters, use gRPC + connection pooling, or push the fraud check into the payment service itself via a sidecar. Almost never is direct DB access the right answer — it is the path of least design effort, not least latency.
+    - *"How does this interact with PCI-DSS?"* Direct DB access likely puts fraud-detection fully in PCI scope (it touches cardholder data). Going through a narrow API keeps it in scope only for the narrow DTO it receives — shrinking audit surface and cost significantly.
+    - *"What is your enforcement mechanism so someone does not re-add this in 6 months?"* NetworkPolicy in Kubernetes + IAM-at-the-database (services authenticate to RDS / Spanner with their own IAM role), plus a `service_dependencies.yaml` that is code-reviewed on every PR. Three layers: platform, identity, review.
+
+    **Common Wrong Answers:**
+
+    - "Tell them to fix it by next sprint or block the deploy." Adversarial; does not solve the underlying design problem and breeds workarounds.
+    - "Just rotate the credential." Does nothing — the architecture is still cross-boundary DB access, just with a fresh password.
+
+    **Further Reading:**
+
+    - Monzo Engineering: ["How our network policies evolved"](https://monzo.com/blog/2019/08/26/how-our-security-team-handle-secrets)
+    - Sam Newman, *Building Microservices* (2nd ed., 2021), Chapter 4 — "Integration Styles" and the "shared database" anti-pattern
+    - Google Cloud: ["Zero Trust data protection"](https://cloud.google.com/architecture/security-foundations/zero-trust)
+  </Accordion>
+
+  <Accordion title="Scenario: You inherited a system where every service reads its JWT signing secret from an environment variable baked into the container image. How do you migrate to safe secret management without downtime?">
+    **Strong Answer Framework:**
+
+    1. **Name the concrete threats.** Env vars in images show up in: `docker inspect`, `kubectl describe pod`, core dumps, crash reports, logs if someone does `console.log(process.env)`, CI build logs, registry layer dumps. The secret leaks in a dozen ways and rotation requires rebuilding and redeploying every image.
+    2. **Introduce a secrets manager without breaking anything.** Deploy Vault / AWS Secrets Manager / GCP Secret Manager. Give every service a new Kubernetes ServiceAccount bound to a Vault role via the Kubernetes auth method. The service authenticates to Vault with its pod identity (no bootstrap credential problem).
+    3. **Dual-read phase (week 1-2).** Update each service to read the secret from Vault if available, fall back to env var if not. Deploy this version everywhere. Nothing has changed operationally yet.
+    4. **Flip the switch (week 3).** Populate Vault with the current secret. Services now read from Vault. Env var stays as fallback in case of Vault outage.
+    5. **Rotation test (week 4).** Rotate the secret in Vault with overlap (new `kid` added, old kept for 1 hour). Services pick up the new one within their cache TTL. Validate zero-downtime rotation works end-to-end.
+    6. **Remove env var (week 5+).** Rebuild images without the env var. Now the secret lives only in Vault with audit logs, TTL, and rotation — and the image is safe to leak to a public registry.
+    7. **Prevent regression.** Add a CI check that fails the build if any env var matches a secret-like name pattern (`*_SECRET`, `*_KEY`, `*_PASSWORD`, `*_TOKEN`).
+
+    **Real-World Example:** Uber's security team published (around 2018-2019) a detailed post on migrating from static env-var secrets to Vault dynamic secrets, specifically calling out that they found leaked database credentials in a decommissioned internal wiki that had been copied from image env vars — the migration was partly triggered by that finding.
+
+    **Senior Follow-up Questions:**
+
+    - *"What if Vault is down? Is your service dead?"* In-memory secret cache with a TTL longer than typical Vault outages (e.g., 15-30 min cache, 5-min refresh). Vault HA with Raft cluster. For truly critical paths, secrets are fetched at startup and refreshed in the background — a Vault outage does not affect already-running pods.
+    - *"How do you rotate a JWT signing secret without logging everyone out?"* JWKS with multiple active `kid`s. Add the new key first, sign new tokens with the new `kid`, let old tokens (signed with old `kid`) expire naturally. Remove the old key only after the longest token TTL has passed. Zero-downtime rotation.
+    - *"How do you ensure a rogue or compromised service cannot read another service's secrets?"* Vault policies scoped per role. `order-service` role has `read` access to `secret/order-service/*` only. If compromised, it cannot read `secret/payment-service/*`. Audit log every read so you can detect anomalous access.
+
+    **Common Wrong Answers:**
+
+    - "Put secrets in Kubernetes Secrets." Kubernetes Secrets are base64-encoded, not encrypted at rest by default, and anyone with `get secrets` RBAC can read them in plaintext. Better than env-vars-in-image but still weak — enable KMS encryption at rest and restrict RBAC, or use a real secrets manager.
+    - "Rotate the JWT secret at 2am during the maintenance window." Every logged-in user is logged out. Works once; the team never rotates again because it was painful. Do it right with overlapping keys.
+
+    **Further Reading:**
+
+    - HashiCorp: [Vault Kubernetes Auth](https://developer.hashicorp.com/vault/docs/auth/kubernetes)
+    - OWASP: [Secrets Management Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Secrets_Management_Cheat_Sheet.html)
+    - AWS: [Rotating secrets with AWS Secrets Manager](https://docs.aws.amazon.com/secretsmanager/latest/userguide/rotating-secrets.html)
+  </Accordion>
+
+  <Accordion title="Scenario: A pentester demonstrates that they can impersonate your order-service to the payment-service by stealing a Kubernetes Secret and calling the payment endpoint directly. The only auth between services is a shared API key. How do you redesign?">
+    **Strong Answer Framework:**
+
+    1. **Acknowledge the fundamental issue.** A shared API key provides knowledge-based auth — anyone who has it is trusted. There is no cryptographic binding between "this request" and "the real order-service identity." Stealing the secret is equivalent to being the service.
+    2. **Move to mTLS with per-service certificates.** Every service gets its own certificate signed by an internal CA. The payment service verifies the client cert on every connection; a stolen cert alone is not enough because it is bound to a specific workload identity and has a short TTL.
+    3. **Automate cert issuance and rotation via a service mesh.** Istio, Linkerd, or Consul Connect issue and rotate short-lived certs (1-24 hour TTL) to every pod automatically via SPIFFE SVIDs. The app code does not handle certificates at all — the sidecar proxy does. This removes the operational burden that makes teams avoid mTLS.
+    4. **Add authorization on top of authentication.** mTLS proves identity; authorization policies enforce "who can call what." In Istio: `AuthorizationPolicy` that says "only workloads with SPIFFE identity `spiffe://cluster/ns/default/sa/order-service` can call POST `/charge` on payment-service." Identity + action policy, both enforced at the mesh sidecar.
+    5. **Add audit logging.** Every inter-service call logs the client identity (from cert CN or SPIFFE ID), endpoint, and timestamp. After a breach, you can trace exactly what moved laterally.
+    6. **Defense in depth: network policies.** Kubernetes NetworkPolicy or Cilium restricts which pods can reach which pods at L4. Even if auth is bypassed, the network layer denies the connection.
+
+    **Real-World Example:** Netflix's Application Security team published (2019) a post describing their adoption of SPIFFE for internal mTLS specifically because shared API keys "fail open" — stolen keys give full access with no cryptographic binding. They moved to per-workload cert-bound identities with hour-scale TTLs.
+
+    **Senior Follow-up Questions:**
+
+    - *"What is the operational cost of running a service mesh?"* Non-trivial — you are adding a sidecar to every pod (roughly 100 MB RAM, 1-5 ms added latency). For organizations with 50+ services, the amortized security benefit is worth it; for a 5-service startup, a simpler per-service JWT pattern with rotating keys might suffice until you scale.
+    - *"What happens if the mesh control plane goes down?"* Data plane (sidecars) keeps working with the last cert they received. Istio recommends cert TTLs longer than any realistic control-plane outage (e.g., 24-hour certs with 12-hour rotation). You get graceful degradation, not instant failure.
+    - *"How do you handle cross-cluster / cross-cloud service calls?"* Federated trust: the CA of cluster A is trusted by cluster B. SPIFFE Federation or Istio's multi-cluster mode makes this explicit. Without it, each cluster is an identity silo.
+
+    **Common Wrong Answers:**
+
+    - "Just rotate the API key more frequently." A 1-hour rotation does not help if the attacker steals the freshly-rotated key in the first minute. The knowledge-based auth model is the problem.
+    - "Use a VPN between services." Perimeter thinking — once inside the VPN, everyone is trusted again. Zero-trust requires per-call authentication.
+
+    **Further Reading:**
+
+    - SPIFFE: [spiffe.io docs](https://spiffe.io/docs/latest/spiffe-about/overview/)
+    - Istio: [Security overview](https://istio.io/latest/docs/concepts/security/)
+    - NIST SP 800-207: [Zero Trust Architecture](https://nvlpubs.nist.gov/nistpubs/SpecialPublications/NIST.SP.800-207.pdf)
+  </Accordion>
+</AccordionGroup>
+
 <Tabs>
   <Tab title="Node.js">
   ```javascript
@@ -1199,6 +1330,25 @@ When services call each other, you cannot rely on user JWTs -- many service-to-s
 ## Mutual TLS (mTLS)
 
 Standard TLS proves the server's identity to the client ("yes, this really is bank.com"), but the server trusts anyone who connects. mTLS flips this: both sides present certificates, so the server also verifies the client. In microservices, this means the Order Service can prove "I am really the Order Service" cryptographically, not just by claiming so in a header. This defeats an entire class of attacks -- a compromised pod in the cluster cannot talk to other services because it lacks a valid certificate signed by your internal CA. mTLS is the transport-layer backbone of zero-trust: identity is verified on every connection, not inferred from network location. The tradeoff is heavy operational complexity -- you need a certificate authority, issuance pipeline, rotation policy, and a way to handle expired certs gracefully. This is why service meshes like Istio exist: they automate the whole lifecycle.
+
+<Warning>
+**Caveats & Common Pitfalls with mTLS**
+
+- **Expired certificates = instant outage.** A 1-year cert silently ticks down; someone forgets the rotation; every service stops accepting connections at midnight on the expiry date. Entire production environments have gone down this way (including a famous Microsoft Teams outage in 2020).
+- **Trust store drift.** Not every pod has the current CA bundle; some trust the old CA, some the new, and connections fail intermittently. Debugging "works from pod A, fails from pod B" at 3am is miserable.
+- **Relying on the network perimeter instead of mTLS.** "We are inside the VPC so we trust everything." One compromised pod (exposed admin dashboard, SSRF, prototype pollution) and the attacker now speaks to every service with full trust.
+- **Hand-rolled cert management.** A bash script that generates certs once and hopes for the best. Rotation never happens. Certs outlive the people who issued them.
+</Warning>
+
+<Tip>
+**Solutions & Patterns**
+
+- **Short-lived certs with automated rotation** — 24-hour TTL certs issued by a mesh (Istio, Linkerd, Consul Connect) or SPIRE. Rotation happens continuously in the background; a missed rotation window is one day of downtime, not one year.
+- **Monitor certificate expiry.** A Prometheus alert on `probe_ssl_earliest_cert_expiry - time() under 7*86400` warns when any cert expires in the next 7 days. This catches anything the automation misses.
+- **Use cert-manager in Kubernetes** for service certs — it handles issuance, renewal, and Kubernetes Secret updates automatically. Pair with Let's Encrypt for public-facing, or an internal CA (step-ca, HashiCorp Vault PKI) for service-to-service.
+- **Pin SPIFFE IDs, not IPs or DNS.** The mesh verifies `spiffe://cluster/ns/default/sa/order-service`, which is cryptographically bound to the pod identity — no DNS spoofing, no IP tricks.
+- Keep **sane failure modes**: during cert rotation, accept both old and new CA for an overlap window so an in-flight rotation cannot cause an outage.
+</Tip>
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
@@ -1460,6 +1610,26 @@ generate_service_cert "inventory-service"
 ### HashiCorp Vault Integration
 
 Secrets management is where most teams have the worst security posture -- database passwords in env vars, API keys in CI configs, encryption keys in Git history. Vault solves this by centralizing secret storage with encryption at rest, audit logging, and (critically) dynamic secret generation. Instead of a long-lived database password shared by every instance, Vault issues a unique PostgreSQL user for each service request with a short TTL. This limits blast radius: if a service is compromised, the attacker gets one service's credentials for one hour, not the master password forever. Kubernetes auth means services authenticate using their pod identity (no bootstrap credential problem), and leases auto-renew so secrets stay fresh. In zero-trust, Vault is the "dynamic identity for machines" layer -- short-lived, verifiable, revocable.
+
+<Warning>
+**Caveats & Common Pitfalls with Secrets Management**
+
+- **Secrets in environment variables.** Visible to `ps`, `docker inspect`, `kubectl describe pod`, crash dumps, core files, and anything that logs `process.env` by accident. A single `console.log(process.env)` in a dev build and your secrets are in CloudWatch.
+- **Secrets in Git.** Even after `git rm --cached` the secret lives in history forever. Scanners like truffleHog pick it up within days. Every secret committed must be treated as compromised and rotated.
+- **Kubernetes Secrets without encryption at rest.** Default Kubernetes Secrets are base64-encoded (not encrypted) and stored in etcd. Anyone with etcd access — including a backup copy — reads them plaintext.
+- **Over-broad Vault policies.** `order-service` has read access to `secret/*` because "simpler to set up." When compromised, the attacker reads every secret in the organization.
+- **Single master key with no rotation path.** Envelope encryption saves you only if the master key itself rotates. Most teams never rotate it.
+</Warning>
+
+<Tip>
+**Solutions & Patterns**
+
+- **Never env vars for production secrets.** Either mount them as files from a secrets manager (Vault agent, `CSI Secret Store`, AWS Secrets Manager CSI driver) or fetch at startup from Vault. Files can at least be permission-scoped to the app user (0400).
+- **Dynamic secrets whenever possible.** Vault can issue per-request DB credentials with a 1-hour TTL. A leaked credential expires before it is useful. Works for Postgres, MySQL, MongoDB, AWS IAM, and more.
+- **Enable encryption at rest for Kubernetes etcd** via the `EncryptionConfiguration` resource using a KMS provider (AWS KMS, GCP Cloud KMS, HashiCorp Vault). This is non-default and must be explicitly enabled.
+- **Fine-grained Vault policies per service.** Each service sees only its own secret paths. `order-service` role reads `secret/order-service/*` and nothing else. Audit log every read.
+- **Regular rotation is automated, not manual.** Schedule rotation jobs (Vault's built-in rotation, AWS Secrets Manager rotation Lambdas) so secrets rotate on a cadence without human involvement. The only secret a human should type is the initial root token.
+</Tip>
 
 <Tabs>
   <Tab title="Node.js">

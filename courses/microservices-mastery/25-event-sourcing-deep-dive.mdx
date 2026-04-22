@@ -519,6 +519,167 @@ A second implementation detail worth dwelling on: the event store emits events a
   </Tab>
 </Tabs>
 
+<Warning>
+**Caveats and Common Pitfalls for Event Stores**
+
+1. **The event store becomes unbounded because snapshotting was never implemented.** Everyone agrees snapshots are important, then ships the MVP without them, then five years later the events table has 2 billion rows and a single aggregate takes 40 seconds to rehydrate. The insidious part: the system feels fast for the first 18 months when most aggregates have under 100 events, so nobody prioritizes snapshot work -- until a hot aggregate (a long-lived corporate account, a popular product) starts timing out under production load.
+2. **Emitting events before the transaction commits.** Tempting for "lower latency," but if the transaction rolls back, subscribers have already acted on events that never happened. You will discover this the first time a projection shows data your event store does not have.
+3. **Skipping the `(stream_id, version)` uniqueness constraint** because "we never have concurrent writes." You do -- retries, duplicate HTTP requests, and multi-instance deployments all create concurrent write attempts. Without the constraint, two writers both append at version N+1 and one silently loses.
+4. **Storing mutable data in events** (references to current config, user-agent strings that get "normalized" later). Events are supposed to be immutable facts; if they reference values that change, replay produces different results on different days. Bake the values into the event payload at write time.
+</Warning>
+
+<Tip>
+**Solutions and Patterns**
+
+- **Snapshot from day one, even if frequency is wrong.** A snapshot every 1,000 events that you tune down later is infinitely better than adding snapshot support to a system with 500M events already in the store. Make the frequency a config flag, not a constant.
+- **Use a transactional outbox for cross-process subscribers.** In-process EventEmitter is fine for projections colocated with the store. For anything else (Kafka publishers, external webhooks), write the event and the outbox row in the same transaction, then have a relay process tail the outbox. Chapter 17 covers this pattern in depth.
+- **Add a `global_position` or `log_position` column** (a monotonically increasing BIGSERIAL across all streams). Projections subscribe by position, not by timestamp -- timestamps can be equal or go backwards under clock skew, positions cannot.
+- **Version every event payload from day one.** Add `schema_version: 1` in metadata on the very first event. Adding versioning later means the upcaster has to guess which old events are "v1 implied" versus "v1 explicit," and that guess is always wrong somewhere.
+</Tip>
+
+<AccordionGroup>
+  <Accordion title="Scenario: Your event store table has 2 billion events and rebuilding a projection takes 6 hours during a full deploy. How do you reduce the rebuild time without dropping data?">
+    **Strong Answer Framework**
+
+    1. **Measure first.** Profile one rebuild to find the actual bottleneck: is it event read throughput (IO-bound), projection logic CPU (compute-bound), or write amplification on the projection side (index contention)? Guessing wastes weeks.
+    2. **Parallelize by stream partition, not by row.** Events in one stream must apply in order; events across streams can process concurrently. Shard the rebuild by `hash(stream_id) % N_workers` so each worker owns a disjoint set of streams and order within a stream is preserved.
+    3. **Add a checkpointed resume.** Long rebuilds that fail at hour 5 and restart from zero are the worst failure mode. Persist the last processed `global_position` per partition every few thousand events; on restart, resume from there.
+    4. **Pre-aggregate with snapshots.** If the projection depends mostly on recent state (current balance) rather than full history (every transaction), build a periodic snapshot projection that other projections can start from. This is a "derived event stream" -- snapshot events every million raw events.
+    5. **Use bulk inserts and disable indexes during replay.** Drop non-primary indexes on the projection table before rebuild, bulk-copy events in batches of 10k-50k, then recreate indexes at the end. This alone often takes a rebuild from 6 hours to 40 minutes on PostgreSQL.
+    6. **Split hot from cold.** If the projection only needs recent data (last 90 days), introduce a "cold" archive of older events and a warm partition the rebuild actually scans. Store older events compressed in object storage with a pointer kept in the primary table.
+    7. **Blue-green the projection.** Build the new projection into a new table while the old one serves traffic, then atomically swap names. This means you never stop serving reads during rebuild.
+
+    **Real-World Example**
+
+    In 2018, EventStoreDB's Alexey Zimarev documented a case at a European fintech where a balances projection over ~1.8 billion events rebuilt in 7 hours. Partitioning the rebuild across 16 workers keyed on account-id hash, disabling non-primary indexes during load, and swapping to blue/green projection tables brought it down to 34 minutes. The team also introduced an "aggregated snapshot stream" emitted nightly, so ad-hoc projections could initialize from the snapshot instead of replaying from zero.
+
+    **Senior Follow-up Questions**
+
+    <Note>
+    **Follow-up 1: What if two projections disagree on a value during the rebuild -- for example, the old projection shows balance $500 and the new one shows $480?**
+
+    **Strong Answer:** That is a signal the projection logic changed, or an event was historically replayed incorrectly. Do not switch traffic until you have reconciled. Run the rebuild in shadow mode: write to the new table but keep reading from the old one, then run a diff job that compares every row and emits mismatches. Categorize mismatches: if all mismatches are explained by the intentional logic change (say, a new rounding rule), ship it with a changelog note. If mismatches are unexplained, the old projection has silent bugs and you need to investigate before swapping.
+    </Note>
+
+    <Note>
+    **Follow-up 2: How do you handle projection rebuilds for a projection that feeds an external system (say, a Kafka topic)?**
+
+    **Strong Answer:** Never re-emit to the external system during rebuild. External consumers will see duplicates or reprocess events that already triggered side effects (emails, charges). Split the projection into two concerns: a deterministic local table (safe to rebuild) and an external-emission ledger that records "we already sent event X downstream." Rebuilds repopulate the local table only; the emission ledger is append-only and never replayed. If the external system genuinely needs a replay, coordinate it as an explicit "full resync" operation with downstream consent.
+    </Note>
+
+    <Note>
+    **Follow-up 3: What if the event schema evolved during the 6-hour rebuild window and new events are being written in v4 while the rebuild is processing v1 events?**
+
+    **Strong Answer:** This is exactly why upcasting on read exists. The rebuild pipeline runs the upcaster chain on every event it reads, so v1 events become v4-shaped before they hit the projection logic. The projection code only knows v4. Verify the upcaster is idempotent (running it twice produces the same result) and unit-test it against sample v1, v2, v3 events before the rebuild starts. If the upcaster is buggy, you will rebuild into a broken projection that looks plausible, which is the worst outcome.
+    </Note>
+
+    **Common Wrong Answers**
+
+    - *"Just buy a bigger database."* Scaling up hides the problem for 6 months until you hit the next wall. The issue is architectural (no partitioning, no snapshots, indexed writes during bulk load), not hardware.
+    - *"Stop the world and rebuild overnight."* A 6-hour maintenance window is unacceptable for anything customer-facing, and the rebuild will eventually grow beyond the window. Blue-green swap solves this without downtime.
+
+    **Further Reading**
+
+    - Greg Young, "Building an Event Storage" -- the original rationale for stream-partitioned event stores.
+    - Martin Kleppmann, *Designing Data-Intensive Applications*, Chapter 11 (Stream Processing) -- covers projection rebuild strategies generically.
+    - Apache Kafka documentation on "log compaction" -- the same idea applied to message logs.
+  </Accordion>
+
+  <Accordion title="Scenario: A user reports their account balance is wrong by $47.23. You have 8 years of events for this account. Walk through how you'd debug it in an event-sourced system.">
+    **Strong Answer Framework**
+
+    1. **Start with the projection, not the events.** Query the balance projection for this account to see what the system currently shows. Compare with what the user says it should be. Confirm the delta is $47.23 and note whether it's positive (system says too much) or negative (system says too little).
+    2. **Sum the raw events as a sanity check.** Run `SELECT SUM(CASE WHEN type='MoneyDeposited' THEN amount ELSE -amount END) FROM events WHERE stream_id = 'BankAccount-X'`. If this matches the projection, the bug is in how events were recorded (the write path). If it differs from the projection, the bug is in the projection logic or a missed event.
+    3. **Scan for suspicious events.** Look for events with unusually large amounts, duplicate timestamps, or events just before/after a known system incident. Temporal correlation is often the smoking gun -- "this balance went wrong at 02:14 AM on March 3rd, what was happening then?"
+    4. **Replay the aggregate to the suspected bad point.** Load events in order up to just before the suspected event and inspect the computed state. Then apply one more event at a time. This is where event sourcing shines: you can reconstruct state at any point in history without log grepping.
+    5. **Check for compensating events that never fired.** If there was a failed external transaction that should have been compensated (refund, reversal) but the compensating event was never emitted, the balance drifts. Common root cause when the issue involves integrations with payment processors.
+    6. **Check projection checkpoint and duplicate application.** If the projection crashed mid-batch and the checkpoint save was not transactional with the row update, some events may have been applied twice. Query for telltale signs (repeated exact amounts within the same second).
+    7. **Fix with a compensating event, not a direct write.** Never `UPDATE account_balances SET balance = correct_value`. Append a `BalanceAdjusted` event with reason and operator, rebuild the projection, verify. The audit trail stays intact.
+
+    **Real-World Example**
+
+    In 2020, a well-known US-regional bank (publicly discussed at QCon San Francisco by an engineering manager from their core banking team) had a balance discrepancy case where $23,000 was missing from a corporate account. The team used event replay to reconstruct the state at 15-minute intervals over the disputed 3-day window. They located a `WithdrawalRequested` event for which no corresponding `WithdrawalSettled` or `WithdrawalCancelled` ever arrived due to a message bus partition during a network incident. The fix was a `WithdrawalCancelled` compensating event plus a monitor for unresolved pending transactions older than 24 hours. The whole investigation took under two hours; in a CRUD system, the equivalent forensic work would have required database backups and audit-log correlation across services.
+
+    **Senior Follow-up Questions**
+
+    <Note>
+    **Follow-up 1: What if the events table itself has been tampered with -- say, a rogue operator ran an UPDATE?**
+
+    **Strong Answer:** This is why production event stores should be append-only at the permission level (`GRANT INSERT, SELECT ON events` with no UPDATE/DELETE for application roles) and should include a hash chain: every event's metadata contains `hash(prev_event_hash + this_event_payload)`. A scan that recomputes hashes and compares them to stored ones reveals tampering. Some teams go further and anchor the hash chain to an external signed timestamp service so tampering is legally detectable. For the case where tampering is discovered, you replay from a known-good backup and coordinate compensating events for any real activity that occurred after the tampering.
+    </Note>
+
+    <Note>
+    **Follow-up 2: The user insists the balance was wrong 6 months ago too, but your projection was rebuilt 2 months ago. How do you answer "what was the balance on October 15th at 3 PM?"**
+
+    **Strong Answer:** This is event sourcing's superpower -- temporal queries. Replay the aggregate's events filtered by `created_at <= '2024-10-15 15:00:00'` and compute the balance. That is the definitive answer, independent of whatever the projection said at the time. If the projection was wrong historically, you can now prove the user right (or wrong) from the canonical event log. In a CRUD system this question is unanswerable without a separate audit table that may itself have drifted.
+    </Note>
+
+    <Note>
+    **Follow-up 3: Event sourcing debugging works for this bank account, but our ops team keeps saying "eventual consistency is confusing product managers -- they deposit money and it doesn't show up immediately." How do you reconcile the benefits for engineers with the friction for PMs?**
+
+    **Strong Answer:** Two mitigations. First, make the write-side response authoritative: when a user deposits $100, return the updated balance from the aggregate's in-memory state (which is strongly consistent by definition), not from the projection. The UI shows the correct balance immediately because it came from the command response, not a follow-up query. Second, for internal tools and dashboards, expose the projection staleness explicitly -- show "last updated 350ms ago" next to the balance so PMs see the lag is measured in hundreds of milliseconds, not hours. Third, educate the product org once: explain that "eventual" in practice is sub-second for healthy systems, and only becomes visible during incidents -- at which point you have bigger problems than stale projections.
+    </Note>
+
+    **Common Wrong Answers**
+
+    - *"I'd check the database directly and fix the balance."* This is the CRUD mindset. In event sourcing, the database (projection) is derived -- fixing it without fixing the underlying events means the projection will drift again on the next rebuild. The root cause is always in the event stream.
+    - *"I'd add a log statement and wait for it to happen again."* In an event-sourced system, you already have the log -- it's the event store. You don't need to reproduce the bug because you have the full history of what happened.
+
+    **Further Reading**
+
+    - Martin Fowler, "Event Sourcing" -- original articulation of temporal queries as a first-class capability.
+    - Greg Young, "CQRS Documents" -- detailed treatment of debugging via event replay.
+    - Adam Dymitruk, "Event Modeling" -- workshops teach the exact debugging workflow above.
+  </Accordion>
+
+  <Accordion title="Scenario: Your team is about to launch an event-sourced trading system and the CTO is nervous about the event store becoming a single point of failure. How do you design for availability?">
+    **Strong Answer Framework**
+
+    1. **Separate write availability from read availability.** The event store write path must be strongly consistent (you cannot lose a trade), but read models can be stale or locally replicated. Design them differently: write side is synchronously replicated (PostgreSQL with synchronous_commit=on, or a managed multi-AZ setup). Read side runs regionally with async replication of the event stream.
+    2. **Use a proven log-structured store if scale demands it.** For anything past 50k events/sec sustained, move the event log to Kafka (with `acks=all` and `min.insync.replicas=2`) and keep PostgreSQL only for aggregate-level streams. Kafka's replication protocol is designed for exactly this.
+    3. **Snapshot aggressively so you can survive store unavailability for reads.** If every aggregate has a snapshot within the last 100 events, you can serve reads from snapshot + in-memory cache if the event store is degraded.
+    4. **Adopt a transactional outbox** if you're using PostgreSQL and need downstream propagation. Outbox + relay to Kafka gives you "write durably to Postgres, propagate reliably to anywhere."
+    5. **Design aggregates to be idempotent on retry.** Every command should include an idempotency key stored on the event. If a client retries a deposit after a network failure and the command is applied twice, the second write detects the duplicate key and returns success without double-charging.
+    6. **Regional failover is driven by the event log, not the projections.** In a DR scenario, the secondary region replays the replicated event log into fresh projections. The projections in the dead region are not part of the recovery -- they are regenerated.
+    7. **Write runbooks for projection corruption separately from write-side failure.** The two failure modes require different responses and the team must practice both.
+
+    **Real-World Example**
+
+    The LMAX exchange, an early high-performance event-sourced trading platform, documented their design in 2010 via Martin Fowler's "LMAX Architecture" article. Their event log (the "input disruptor") was triple-replicated to disk with strict ordering; reads came from in-memory projections replayed on startup from the log. Failure modes were categorized as "log unavailable" (halt new trades, serve stale reads) and "projection corrupt" (rebuild from log, trades continue). This separation is why LMAX sustained over 6 million orders per second on 2010 hardware -- the write path's rigor was not compromised by read-side convenience.
+
+    **Senior Follow-up Questions**
+
+    <Note>
+    **Follow-up 1: How do you handle the case where an event write succeeds but the response to the client is lost (network blip)?**
+
+    **Strong Answer:** Idempotency keys. Every incoming command carries a client-generated UUID. The first time the server sees the UUID, it writes the event with that UUID embedded in metadata. If the client retries with the same UUID, the server queries the event store for any event with that UUID and, if found, returns the same response as before without re-applying. This is the standard pattern for "exactly-once semantics" at the API boundary.
+    </Note>
+
+    <Note>
+    **Follow-up 2: You described synchronous replication for durability. What's the latency cost and when would you relax it?**
+
+    **Strong Answer:** Synchronous replication to a replica in the same AZ adds roughly 1-3ms; across AZs typically 5-15ms; across regions often 50-100ms+. For a trading system, across-AZ sync is mandatory (AZ-level failure is a real risk), cross-region sync is usually too slow and you fall back to async with RPO measured in seconds. The trade-off is explicit: a cross-region async replication means you may lose the last few seconds of trades in a regional disaster. That's an acceptable risk for most systems; if it isn't, you need a true globally-synchronous store like Spanner or CockroachDB and you budget for the latency.
+    </Note>
+
+    <Note>
+    **Follow-up 3: If projections are regenerable from the log, why should I monitor projection correctness at all?**
+
+    **Strong Answer:** Because you want to know *before* a user notices. A projection can silently diverge from the event log due to a resolver bug, a schema migration that misapplied defaults, or an accidental direct write from a debugging session. Nightly audits compute a checksum on the projection table and compare against a fresh replay of the log for a small sample of streams. Mismatches trigger alerts. Without this, you eventually get a support ticket for a wrong balance and your only clue is "we don't know when this started going wrong."
+    </Note>
+
+    **Common Wrong Answers**
+
+    - *"We'll use an active-active multi-master event store."* Active-active writes to an event log destroy ordering guarantees and create merge conflicts that are unresolvable at the event level. Event stores are single-leader by design. Availability comes from fast failover, not concurrent writes.
+    - *"We'll cache aggregates in Redis so we never hit the event store for reads."* Cache coherence with an event-sourced aggregate is subtle. If you rehydrate from cache and miss events that landed after the cache fill, you will emit commands based on stale state and hit ConcurrencyErrors on save. Caches must be invalidated by the event stream, which is more work than it's worth for most aggregates.
+
+    **Further Reading**
+
+    - Martin Fowler, "The LMAX Architecture" (2011) -- the canonical write-up on high-availability event-sourced trading.
+    - Confluent, "Exactly-Once Semantics in Kafka" -- details the idempotent producer pattern used in step 5 above.
+    - Google's Spanner paper (2012) -- for context on the cost of true global consistency when you do need it.
+  </Accordion>
+</AccordionGroup>
+
 ---
 
 ## Aggregate Pattern
@@ -1707,6 +1868,119 @@ A common mistake is making the checkpoint update and the projection update separ
   </Tab>
 </Tabs>
 
+<Warning>
+**Caveats and Common Pitfalls for Projections**
+
+1. **Projection rebuild time explodes at scale.** A projection that rebuilds in 20 minutes at launch takes 6 hours three years later. Teams discover this during an emergency projection fix and realize they cannot afford to rebuild during a critical incident. Rebuild time is not linear -- index maintenance and write amplification make it superlinear in many databases.
+2. **Non-idempotent projection handlers.** A handler that does `UPDATE balances SET balance = balance + amount` will double-apply if the checkpoint isn't saved transactionally with the update. Result: balances drift silently, and the drift is proportional to crash frequency.
+3. **Projection checkpoints saved outside the projection transaction.** This is the specific mistake that produces the non-idempotent symptom above. Checkpoint and write must be one atomic unit, or the write must be idempotent on event ID.
+4. **Treating projections as the source of truth** for business logic. A developer writes `if account_balances.balance < 0 then reject` instead of loading the aggregate. The projection is stale by hundreds of milliseconds, so under high contention the check passes but the aggregate has already been overdrafted. Reads for decisions must come from the aggregate; the projection is only for display.
+</Warning>
+
+<Tip>
+**Solutions and Patterns**
+
+- **Make every handler idempotent** by including the event ID in an upsert-with-unique-constraint. `INSERT INTO projection_applied_events(event_id) ... ON CONFLICT DO NOTHING` before the update, or embed the event ID in a uniqueness constraint on the projection row. Double applications become no-ops.
+- **Put checkpoint and write in the same transaction.** For PostgreSQL projections, a single transaction that updates the projection row and bumps the checkpoint row makes crash-safety trivial.
+- **Partition projections by stream hash** during rebuild so you can parallelize. A single-threaded rebuild of a billion-event projection will take 24+ hours; 16 workers bring it to 90 minutes.
+- **Keep separate "hot" and "cold" projections.** The hot projection serves live reads and only tracks the last 90 days; the cold projection is for historical reports and is rebuilt weekly. This bounds rebuild time for the critical path.
+- **Run shadow rebuilds regularly** (weekly or monthly) to validate that projections still match the event log. A silent projection bug that drifts by a cent per thousand events is invisible until it's not.
+</Tip>
+
+<AccordionGroup>
+  <Accordion title="Scenario: A product manager deposits $500 via the UI, watches the balance stay at its old value for 2 seconds, and files a Sev-2 bug about 'the money disappeared'. How do you design around this complaint without losing the benefits of eventual consistency?">
+    **Strong Answer Framework**
+
+    1. **Return write-side state from command responses.** The deposit endpoint should return the updated balance from the aggregate's in-memory state directly, not query the projection afterward. This makes the user-visible behavior strongly consistent for the user's own actions.
+    2. **Distinguish "read my own writes" from "read what others have done."** The PM's complaint is specifically about their own write. That is the easy case. Other users seeing your deposit can be eventually consistent; it's invisible to them.
+    3. **Use versioned responses for polled updates.** If the UI polls the projection afterward (say, showing a transaction list), include the aggregate version in the command response and have the UI query `WHERE version >= X` so it knows when the projection has caught up.
+    4. **Add read-your-writes caching with explicit invalidation.** The command response populates a short-lived per-user cache (30 seconds) with the new state. Reads check the cache first. This layer is local to the user's session and does not require distributed consistency.
+    5. **Measure projection lag and alert on anomalies.** Healthy lag is under 500ms. If the 99th-percentile lag crosses 2 seconds, you have an infrastructure problem, not an eventual-consistency problem, and you should page on it.
+    6. **Educate the product org with a 5-minute demo.** Show the PM: the balance updates immediately in the UI because the command response is authoritative, the projection catches up in 200ms for others, and the audit trail is bit-exact. The answer to the Sev-2 is a UX bug (UI should refresh from command response), not an architecture change.
+
+    **Real-World Example**
+
+    Shopify's engineering team published their approach to this in a 2021 engineering blog post about their CQRS usage on the checkout path. They returned the computed order total in the checkout command response, not from the projection, specifically because the 200-800ms projection lag was producing "I paid and it says I haven't" complaints at high-velocity flash sales. The fix added roughly 40 lines of code across the checkout service and eliminated the support ticket category entirely.
+
+    **Senior Follow-up Questions**
+
+    <Note>
+    **Follow-up 1: What if the PM then asks 'why can't we just make projections synchronous so this never happens?'**
+
+    **Strong Answer:** Synchronous projections defeat the point of CQRS. The write path now blocks on every downstream read model being updated -- adding a new projection means the write path gets slower. Failure of any one projection means writes fail. A single hot read model becomes a chokepoint for every write. The "eventually consistent, but consistent for my own writes" model gives 99% of the benefit at 10% of the cost. Synchronous would be a regression to the 2005 architecture you moved away from.
+    </Note>
+
+    <Note>
+    **Follow-up 2: How does this interact with a mobile client that might be offline when the deposit happens?**
+
+    **Strong Answer:** Offline-first design. The client queues the command locally and applies an optimistic event to its local projection immediately. When connectivity returns, the client replays the command, reconciles with the server response (which may reject, succeed, or conflict), and rolls forward or back. This is harder than a purely online UI, but it's a pure client-side concern -- the server's event sourcing architecture is agnostic to it. Libraries like Replicache or TinyBase implement the pattern.
+    </Note>
+
+    <Note>
+    **Follow-up 3: If the projection takes 2 seconds to catch up, isn't that a bug regardless of UX?**
+
+    **Strong Answer:** It might be, depending on load. A single projection worker processing a peak of 50k events/sec with complex handlers will lag during bursts. Solutions: parallelize the projection by stream hash, simplify handler logic (push complex derivations to a downstream projection), or scale the worker pool. Measure the 99th percentile lag under realistic load; if it's over 1 second sustained, you have a scalability problem and the UX fix is a workaround, not a solution. Fix the root cause too.
+    </Note>
+
+    **Common Wrong Answers**
+
+    - *"Just read from the aggregate every time."* You've now reinvented a CRUD system -- the projection exists because querying the aggregate for read-heavy operations is expensive and doesn't support ad-hoc queries.
+    - *"Add a polling loop in the UI that refreshes every 500ms."* Works until you have 100k concurrent users, at which point you've created a self-DDoS of your projection endpoint.
+
+    **Further Reading**
+
+    - Shopify Engineering, "Building Resilient GraphQL APIs" (2021) -- read-your-writes patterns used at scale.
+    - Pat Helland, "Data on the Outside vs Data on the Inside" -- foundational paper on this exact tension.
+    - Martin Kleppmann, *Designing Data-Intensive Applications*, Chapter 5 (Replication) -- covers read-your-writes and monotonic read consistency in detail.
+  </Accordion>
+
+  <Accordion title="Scenario: You want to introduce a new 'user_activity_by_region' projection that requires joining events from 4 aggregates. How do you design it to avoid coupling the projector to internal aggregate shapes?">
+    **Strong Answer Framework**
+
+    1. **Subscribe to events, not aggregates.** The projector registers for the specific event types it cares about (`UserLoggedIn`, `UserPurchased`, `UserReferralSubmitted`, `UserProfileUpdated`). It never loads the aggregate; it only reacts to events.
+    2. **Define a public event contract.** Every event type has a stable schema, versioned and documented. The projector depends on the contract, not the aggregate's internal representation. If the aggregate refactors its private fields, the projector is unaffected as long as the events stay compatible.
+    3. **Use correlation IDs in metadata.** When the projector joins events across aggregates (this purchase is from this login session), the events share a correlation ID in metadata set by the command path. The projector correlates on metadata, not by rebuilding aggregate state.
+    4. **Keep the projection schema denormalized.** Don't store foreign keys back to aggregates. Store whatever denormalized data the queries need. If the underlying aggregate changes, the denormalized snapshot in the projection is a point-in-time record, not a live reference.
+    5. **Make the projection rebuildable.** A new projection starts from global position zero and processes the entire log. This must be feasible -- hence the rebuild performance work covered earlier. If the log is 2 billion events, partitioning the rebuild across workers is mandatory.
+    6. **Version the projection schema.** The projection table has a `schema_version` column. When the schema changes, the rebuild writes new rows with the new version and an atomic swap updates readers.
+
+    **Real-World Example**
+
+    Walmart's e-commerce team, in their 2019 QCon talk on CQRS at scale, described adding a "search-ready product projection" that joined `ProductCreated`, `PriceAdjusted`, `InventoryUpdated`, and `ReviewPosted` events across four different aggregates. They consumed only the public events (documented in an internal schema registry) and populated an Elasticsearch-backed projection. Crucially, the projector did not call back to the aggregates' services; it only ran from the event log, which meant search performance was independent of the write-side's load.
+
+    **Senior Follow-up Questions**
+
+    <Note>
+    **Follow-up 1: What if one of the four event types was designed before you had a correlation ID standard and doesn't carry one?**
+
+    **Strong Answer:** Upcast. Add a metadata-only upcaster that infers the correlation ID from other fields (timestamp proximity, user ID, session ID from a lookup table) and injects it at read time. The stored event is unchanged; the projector sees events that appear to have always had the correlation ID. This is a legitimate use of the upcaster pattern -- evolving not just the payload but the metadata surface over time.
+    </Note>
+
+    <Note>
+    **Follow-up 2: The projection table is in PostgreSQL but a new use case wants to run complex text search across the same data. Do you build a second projection or extend the first?**
+
+    **Strong Answer:** Second projection, always. Different read models need different storage engines (Elasticsearch for search, Redis for hot lookups, ClickHouse for analytics). A single PostgreSQL projection trying to serve all three will fail at one of them. The cost of an additional projection is a projector process and some storage; the benefit is each projection uses the right tool for its queries. CQRS at its best.
+    </Note>
+
+    <Note>
+    **Follow-up 3: How do you handle the case where two events in different aggregates have the same `correlation_id` but arrive in the projector out of order (event B from aggregate 2 arrives before event A from aggregate 1)?**
+
+    **Strong Answer:** Projections must be tolerant of out-of-order arrival across streams -- you only get ordering guarantees within a single stream. Design the projection handlers so that late-arriving events can update rows already present, or use a "waiting" table for partial correlations that complete later. For strict cross-stream ordering requirements, serialize the events you care about into a single "causal stream" via an upstream orchestrator; this is rare and expensive, so avoid it when possible.
+    </Note>
+
+    **Common Wrong Answers**
+
+    - *"The projector should call the aggregates' query APIs to enrich events."* This couples the projector to the aggregates' runtime availability and re-introduces the N+1 problem you were trying to avoid with event sourcing.
+    - *"Store the full aggregate snapshot in each event."* Events balloon in size, storage costs explode, and the aggregate's internal shape becomes baked into the event -- the opposite of decoupling.
+
+    **Further Reading**
+
+    - Greg Young, "CQRS and Event Sourcing" (Code on the Beach 2014) -- projections as first-class citizens.
+    - Walmart Labs, "CQRS on a 100-Service Platform" QCon 2019 talk -- real-world multi-aggregate projections.
+    - Confluent, "Streaming Joins with Kafka Streams" -- the exact problem solved in a Kafka-native style.
+  </Accordion>
+</AccordionGroup>
+
 ---
 
 ## Event Versioning & Schema Evolution
@@ -2006,6 +2280,121 @@ The right solution is **upcasting**: store events exactly as they were written, 
   ```
   </Tab>
 </Tabs>
+
+<Warning>
+**Caveats and Common Pitfalls for Schema Evolution**
+
+1. **Schema changes break old consumers silently.** A subgraph or projection was deployed three years ago and nobody remembers it exists. You rename a field, the upcaster handles the new code, but that forgotten consumer reads events directly and now breaks in a way that only appears at 3 AM on a quarterly batch run.
+2. **The upcaster chain becomes a graveyard of obsolete transformations.** After five years, you have a 17-step upcaster chain where steps 3, 7, 9, and 14 handle events nobody has produced in years. Applied to every event read, this is CPU waste and a debugging nightmare.
+3. **Branching domain logic on event version.** Instead of upcasting once on read, you litter the aggregate with `if event.version === 1 do X else do Y`. Within a year, the aggregate is 60% historical version handling.
+4. **Forgetting to unit-test upcasters against real old events.** The upcaster works on synthetic v1 events in tests. In production, a v1 event from 2019 has a field nobody remembered (set by a code path that was deleted), and the upcaster crashes on it. You discover this during projection rebuild.
+5. **Treating a semantic change as a cosmetic one.** Renaming `amount` to `amount_cents` and multiplying by 100 in the upcaster is a behavior change disguised as a schema change. If any downstream consumer was interpreting the old field differently, you have silently corrupted data.
+</Warning>
+
+<Tip>
+**Solutions and Patterns**
+
+- **Prefer additive changes.** Adding a new nullable field is backward-compatible -- old consumers ignore it, new consumers handle it with defaults. Removing or renaming is breaking. Design your events to minimize removals.
+- **Upcast once, at the edge.** The repository/read layer upcasts events before handing them to domain code. The domain code only sees the latest version. No conditionals in the aggregate.
+- **Retire upcasters by squashing.** Every few years, run a batch job that reads all events through the current upcaster chain and writes them back as v-latest to a new event store. Delete the old upcasters. This is operationally expensive; plan it during a scheduled maintenance.
+- **Test upcasters against production event samples.** Pull 10k random events from production, run them through the upcaster, verify the output matches the latest schema. This catches the "forgotten field" class of bugs.
+- **Version the aggregate's expected schema, not just the event.** Record in metadata "this event was produced by aggregate-schema-v5" so the upcaster can find the right starting point after refactors.
+</Tip>
+
+<AccordionGroup>
+  <Accordion title="Scenario: You need to rename `OrderPlaced.total` to `OrderPlaced.total_cents` and change its unit from dollars to cents (so $10.00 becomes 1000). 180 million old events exist. How do you ship this safely?">
+    **Strong Answer Framework**
+
+    1. **Stop and confirm this is the right design.** Renaming and changing semantics in one step is asking for trouble. Two separate changes are safer: first rename the field, then later change the unit. Ship them weeks apart so any wrong assumptions surface in the first rollout rather than compounding in the second.
+    2. **Freeze the v1 schema in writing.** Document that all old events are "v1: total in dollars as decimal." This is the ground truth the upcaster will transform from.
+    3. **Introduce `OrderPlaced_v2` with `total_cents: integer`.** New events are written in v2. The upcaster converts v1 `total` (dollars, decimal) to v2 `total_cents` (integer, cents) by multiplying by 100 and rounding. Rounding choice is explicit and documented.
+    4. **Stage the rollout.** Deploy the upcaster to read paths first; verify rebuild of one small projection produces correct values (spot-check 100 events manually). Then deploy the write-path change so new events are v2.
+    5. **Run both in parallel for a week.** Two projections -- one reading v1-shaped events (legacy), one reading v2-shaped events (new). Diff their outputs on the same stream. Any discrepancy indicates an upcaster bug.
+    6. **Notify downstream consumers.** If Kafka or a webhook publishes these events, consumers need to know about the schema change. Preferably dual-publish for a transition period: send both v1 and v2 on the bus, consumers migrate at their own pace, v1 is retired when usage drops to zero.
+    7. **Only after verification, flip read-side defaults.** New code reads v2-shape only. The upcaster is doing its job. Old code paths that read v1 directly are found via grep and fixed.
+
+    **Real-World Example**
+
+    In 2017, Stripe documented their approach to an amount/currency refactor in a blog post about API versioning. They moved from "amount in a currency-implicit unit" to "amount in smallest currency unit" (cents for USD, yen for JPY) across their webhook event history. The rollout was API-versioned: consumers subscribing as `v1` saw events in the old shape, `v2` subscribers saw the new shape, and both shapes were served from the same underlying events via transformation at the edge. The transformation logic was ~150 lines, had a 98% unit test coverage, and was left in place for 3 years until the last v1 subscriber migrated.
+
+    **Senior Follow-up Questions**
+
+    <Note>
+    **Follow-up 1: What if during the dual-publishing period, a consumer processes both v1 and v2 and double-charges a customer?**
+
+    **Strong Answer:** The dual-publish must include an event identity -- same UUID in v1 and v2 representations. Consumers that might process both must dedupe on event UUID before applying. Alternatively, route v1 and v2 to different topics so consumers subscribe to exactly one. This is a coordination problem with downstreams; plan the communication as carefully as the code.
+    </Note>
+
+    <Note>
+    **Follow-up 2: Your rounding (multiply by 100) introduces floating-point error for some legacy values. How do you handle a $10.005 that becomes 1001 instead of 1000?**
+
+    **Strong Answer:** This is exactly why the separate-rename-before-unit-change advice matters -- surfaces the issue earlier. For the rounding choice, document the rule (banker's rounding, floor, ceiling) and apply consistently. For any ambiguous values, emit a one-time migration event (`TotalConverted {from_dollars: 10.005, to_cents: 1001, reason: "half-up"}`) as an audit trail. Rounding is a business decision, not a technical one -- get finance sign-off before shipping.
+    </Note>
+
+    <Note>
+    **Follow-up 3: The upcaster is now 50ms per event on cold reads. Rebuilding a projection is 10x slower than it used to be. What do you do?**
+
+    **Strong Answer:** Two options. First, squash old events into their v-latest form via a one-time migration: rewrite the physical event store with the upcasted payloads stored directly, retire the upcaster. This is expensive and loses the "events are immutable" property mildly (the original bytes are gone), but it's operationally clean. Second, cache upcaster outputs in a side table keyed by event ID so repeat reads skip the transformation. This preserves immutability but doubles storage for hot events.
+    </Note>
+
+    **Common Wrong Answers**
+
+    - *"We'll update all the old events in place with an UPDATE statement."* This destroys the immutability guarantee. Every subscriber that checked checksums, every hash chain, every offline backup now disagrees with production.
+    - *"We'll write a new service that owns the new schema and deprecate the old one."* Creates two sources of truth, doubles operational cost, and migration becomes a multi-year project. Upcasting in-place is the pattern for a reason.
+
+    **Further Reading**
+
+    - Stripe Engineering, "API Upgrades" (2017) -- the exact pattern applied to webhook schemas.
+    - Greg Young, "Versioning in an Event Sourced System" (2017 PDF book) -- book-length treatment of this problem.
+    - Martin Fowler, "Event Interception" -- taxonomy of where to place transformations in the event pipeline.
+  </Accordion>
+
+  <Accordion title="Scenario: You inherited an event-sourced system that has 9 event types, each with between 2 and 5 schema versions, and no documentation. The upcaster is a 400-line function. How do you get it under control?">
+    **Strong Answer Framework**
+
+    1. **Reverse-engineer the schemas from production samples.** For each event type, pull 1000 events spanning the lifetime of the system. Extract the distinct JSON schemas (via tools like `quicktype` or a simple field-presence analyzer). You now have a map of what "v1" actually looks like in production versus what the code assumes.
+    2. **Document the upcaster chain.** For each upcaster step, write a paragraph: what changed, why, when. If the reason is "the product team renamed the field," note the PR that did it. If the reason is lost, mark it "unknown origin -- do not remove without investigation." This is 80% of the value, generated in a few afternoons.
+    3. **Add contract tests.** For each event type at each version, add a test that produces a canonical sample event, runs it through the upcaster, and asserts the output matches the current domain type. Break any upcaster that fails -- you now have a regression safety net.
+    4. **Identify "dead" upcasters.** An upcaster handling v1 → v2 of an event type that hasn't been produced since 2019 -- check whether any v1 events still exist in the store. If not, the upcaster is dead code and can be removed (with a note in the commit that says so).
+    5. **Plan a compaction window.** Schedule a migration to rewrite ancient events in their v-latest shape so upcasters for the oldest versions can retire. Do this only after contract tests are in place and only during low-traffic windows.
+    6. **Institutionalize the discipline.** Every new event version gets its own migration function with a clear name (`money_deposited_v2_to_v3_add_currency`), a documented reason, and a test. The 400-line function becomes a directory of small, testable functions.
+
+    **Real-World Example**
+
+    An engineering manager at Klarna gave a talk at DomainDrivenDesignEurope 2022 describing inheriting exactly this scenario: an event-sourced payment system with 12 event types, 37 schema versions, and no docs. Over 6 months, her team extracted 400 lines of upcasting into 37 named functions, added a contract test suite that ran against a production event sample, and retired 9 upcasters by compacting old events. Key insight from the talk: the hardest part was not the code but documenting why each transformation existed -- that required interviewing former team members and reconstructing intent from commit messages.
+
+    **Senior Follow-up Questions**
+
+    <Note>
+    **Follow-up 1: You find two upcaster steps for the same version transition, both active, doing subtly different things. Which one is right?**
+
+    **Strong Answer:** Neither, probably. Load a sample event, run both, compare outputs on a representative set. If they agree, pick the one that's clearer and delete the other. If they disagree, a production projection is already using one of them -- trace which and reason about whether the behavior is business-correct. This is exactly why contract tests are step 3 of the framework: they surface these conflicts before you touch the code.
+    </Note>
+
+    <Note>
+    **Follow-up 2: A team member wants to delete an "obviously dead" upcaster. How do you decide whether it's safe?**
+
+    **Strong Answer:** Query the event store: `SELECT COUNT(*) FROM events WHERE event_type = 'OrderPlaced' AND metadata->>'schema_version' = '1'`. If the count is zero, the upcaster is dead. If it's nonzero, the upcaster is live and removal would break reads of those events. For borderline cases (100 events still v1), you either migrate those 100 events to v-latest explicitly or keep the upcaster. Don't ever delete an upcaster without that query.
+    </Note>
+
+    <Note>
+    **Follow-up 3: The upcaster has a bug that's been shipping wrong values for a year. Fixing it changes every historical projection rebuild. How do you deploy the fix?**
+
+    **Strong Answer:** Staged. First, fix the upcaster on a feature branch. Second, build a new projection in staging using the fixed upcaster and diff it against production. Quantify the drift: how many rows change, by how much, for which accounts. Third, decide if the drift is acceptable to deploy silently (usually not, because finance teams notice) or requires a formal disclosure. Fourth, if disclosure is needed, coordinate with legal/finance/comms before deployment. Fifth, ship the fix and rebuild all dependent projections. Sixth, issue any required user-facing corrections. Rollback plan: keep the old upcaster in a feature flag for 30 days so you can revert if a worse bug surfaces.
+    </Note>
+
+    **Common Wrong Answers**
+
+    - *"Rewrite the whole upcaster from scratch."* Dangerous without contract tests; you will lose subtle business logic encoded in the current one.
+    - *"Leave it alone, it works."* Technical debt compounds. The next schema change will be twice as hard.
+
+    **Further Reading**
+
+    - Vaughn Vernon, *Implementing Domain-Driven Design*, Chapter 8 (Domain Events) -- event evolution principles.
+    - Klarna Engineering Blog, "Taming the Event Store" (2022) -- the real inherited-codebase war story.
+    - Eric Evans, "Domain-Driven Design Reference" -- vocabulary for discussing event schemas with business stakeholders.
+  </Accordion>
+</AccordionGroup>
 
 ---
 
@@ -2495,6 +2884,25 @@ A critical design choice here: commands return "acknowledgement that the command
   ```
   </Tab>
 </Tabs>
+
+<Warning>
+**Caveats and Common Pitfalls for CQRS + Event Sourcing**
+
+1. **Eventual consistency surprises product managers** who learned databases in a CRUD world. They write data, immediately query it, see the old value, and declare the system broken. This is the single most common reason teams abandon CQRS.
+2. **Temporal query complexity is often underestimated.** "What was the balance on March 15 at 3 PM?" sounds easy. In practice, you need the right snapshot (or replay from scratch), you need to handle events in-flight at that instant, and you need to explain to legal which wall-clock definition you used. The tooling rarely exists out of the box.
+3. **Commands returning projection state.** The deposit endpoint reads the balance from the projection after the write; under load the projection hasn't caught up, so the response shows the old balance. This creates a "read your writes" bug that only surfaces in production.
+4. **Not designing for projection rebuild during incidents.** A bug in the projection logic is discovered in production. The fix requires a rebuild. The rebuild takes 4 hours. Your ops team has no pre-built runbook for this and the rebuild runs in a side project, not production, because nobody knew how to do it safely.
+</Warning>
+
+<Tip>
+**Solutions and Patterns**
+
+- **Command responses return aggregate state**, not projection state. The aggregate's in-memory state after applying the command is strongly consistent with the write; returning it avoids the read-your-writes race.
+- **Expose projection staleness in internal tools.** Show "last synced 350ms ago" on dashboards so ops and PMs internalize that staleness exists and is small.
+- **Build a temporal query helper** that takes an aggregate ID and timestamp, replays events up to that time, and returns the reconstructed state. Ship it behind an admin API and use it regularly -- if it only comes out during incidents, it will be broken when you need it.
+- **Runbook every projection rebuild.** Document the command, the expected duration, how to verify correctness, and how to rollback. Run the runbook quarterly as a fire drill.
+- **Keep the write side small and the read side wide.** One aggregate class, many projections. Resist the urge to put aggregate-level query logic in the write side; it's a sign you need a new projection.
+</Tip>
 
 ---
 

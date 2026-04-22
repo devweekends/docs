@@ -136,6 +136,65 @@ Each message is delivered to ALL subscribers.
 Used for: Event broadcasting, notifications
 ```
 
+<Warning>
+**Caveats & Common Pitfalls: Queue vs topic selection**
+
+- **Using a topic where you needed a queue.** Three instances of the same service all subscribe to `order.placed` and each sends the confirmation email. Customer gets three emails, you get three charges on your email provider, and the bug looks like "random duplicates" because scaling the consumer made it worse.
+- **Using a queue where you needed a topic.** Analytics and notifications both read from one queue; whichever pulls the message first wins and the other never sees it. Events go missing depending on race conditions.
+- **Forgetting that "consumer" and "service instance" are not the same.** In Kafka, a consumer group with N instances is one logical consumer. In RabbitMQ, N processes reading the same queue is one logical consumer. In RabbitMQ, N processes bound to the same exchange with their own queues is N consumers. Getting this distinction wrong costs weeks.
+- **Ordering assumptions that do not hold.** FIFO is per-queue in RabbitMQ and per-partition in Kafka. The moment you scale consumers, ordering inside a partition is preserved but ordering across partitions is not.
+</Warning>
+
+<Tip>
+**Solutions & Patterns: "Work vs news" plus partition keys**
+
+The decision rule is the "work or news" test. Work (should happen exactly once across the organization) goes to a queue or a Kafka consumer group. News (everyone interested should hear about it) goes to a topic with one consumer group per consumer domain. If you want both -- one team's work AND broadcast to many teams -- use Kafka with one consumer group per team (each team behaves like a queue consumer within their group, and the topic broadcasts across groups).
+
+Decision rule for ordering: ordering requirements define partitioning. If all events for order 123 must be processed in order, the partition key is `order_id = 123`. All events for that order land in one partition, so one consumer processes them serially. Events for different orders can process in parallel across partitions.
+
+Before: `notifications` team subscribes to `order.placed` queue. `analytics` team subscribes to the same queue. Both teams see roughly half the events because they are racing on the same queue.
+After: `order.placed` is a Kafka topic. `notifications-svc` consumer group reads independently; `analytics-svc` consumer group reads independently. Each team sees every event and commits its own offsets.
+</Tip>
+
+<AccordionGroup>
+  <Accordion title="Your team just migrated from RabbitMQ to Kafka. A week later, downstream teams complain that some events appear to arrive in the wrong order. Walk through the diagnosis and fix.">
+    **Strong Answer Framework:**
+
+    1. Clarify the ordering guarantee. Kafka guarantees order per partition, not per topic. If the producer is not specifying a partition key, messages hash to arbitrary partitions and cross-partition ordering is lost.
+    2. Identify the "same entity" dimension. For order events, that is `order_id`. For user events, that is `user_id`. All events about the same entity must share a partition key.
+    3. Audit the producer: is `ProducerRecord` being constructed with a key? If the key is null, Kafka round-robins across partitions and order is lost by design.
+    4. Fix the producer to set the partition key. For in-flight events that are already mis-ordered, you typically accept the one-time disruption or replay from a snapshot.
+    5. Document the partition-key strategy in the event catalog so new events get it right from day one.
+
+    **Real-World Example:** LinkedIn, where Kafka was born, publishes a case study on their "Brooklin" cross-cluster replication framework that spent significant design effort on per-entity ordering via partition keys. Pinterest's 2017 outage writeup "Helix-based master-slave handoff" explicitly cited partition-key misuse as a source of duplicate and out-of-order processing.
+
+    **Senior Follow-up Questions:**
+
+    <Note>
+    **Follow-up 1: "What if two events for the same entity must be ordered, but the entity changes over time (e.g., a user changes their phone number)?"**
+
+    The partition key should be stable for the life of the ordering requirement. Usually that is a primary identifier like `user_id`, not a mutable field like `phone`. If ordering must hold across identity changes, use the earliest stable identifier.
+
+    **Follow-up 2: "How do you repartition a topic without losing ordering?"**
+
+    You cannot, cleanly. Repartitioning reshuffles events across partitions and breaks in-flight ordering. The standard playbook is: freeze producers, drain consumers to zero lag, rebuild a new topic with new partitioning, replay history if needed, cut over, resume producers.
+
+    **Follow-up 3: "What is the cost of using a high-cardinality partition key?"**
+
+    Each partition has bookkeeping cost (a file handle, a controller entry, broker memory). Thousands of partitions per broker is fine; tens of thousands starts to hurt. Use `user_id` not `session_id` when possible, because sessions are higher cardinality.
+    </Note>
+
+    **Common Wrong Answers:**
+    - "Kafka guarantees ordering by default, so the producer must be broken." Fails because Kafka only guarantees per-partition ordering; a null key intentionally spreads across partitions.
+    - "Add a single-threaded consumer to preserve order." Fails because even a single consumer reads from multiple partitions concurrently; the fix is at produce time, not consume time.
+
+    **Further Reading:**
+    - Kafka documentation on partition keys and ordering semantics.
+    - Jay Kreps's "The Log: What every software engineer should know about real-time data's unifying abstraction."
+    - Gwen Shapira's *Kafka: The Definitive Guide*, chapter on producers.
+  </Accordion>
+</AccordionGroup>
+
 ---
 
 ## RabbitMQ Implementation
@@ -941,6 +1000,65 @@ This is the payoff of async: you can add new consumers (analytics, fraud detecti
   </Tab>
 </Tabs>
 
+<Warning>
+**Caveats & Common Pitfalls: RabbitMQ in production**
+
+- **Connection-per-publish.** Tens of milliseconds of AMQP handshake per message plus a hard node-level connection limit means moderate load exhausts the broker. Use one long-lived connection per process with many channels.
+- **Unbounded queue growth.** When consumers fall behind and you have no `x-max-length` or TTL, queues grow until memory or disk runs out and the broker refuses new publishes. The correct answer is queue length bounds with overflow to a DLQ, not infinite growth.
+- **Auto-ack equals data loss.** `autoAck: true` acknowledges on delivery, not on successful processing. A consumer crash mid-processing drops the message. Always use manual acks in production.
+- **Publisher confirms off by default.** Without publisher confirms, a broker restart between the `basic.publish` and the broker's disk fsync silently loses messages. Turn on confirms for any publish that must not be lost.
+</Warning>
+
+<Tip>
+**Solutions & Patterns: Bounded queues, manual acks, publisher confirms**
+
+The production-ready pattern: one connection per process, channels pooled per thread. Queues declared with `x-max-length` (or bytes) and `x-overflow = reject-publish-dlx` so overflow routes to a DLQ instead of silently dropping. Consumers use manual acks and only ack after the business logic succeeds. Publishers use publisher confirms with a handler that retries on nack. Monitor queue depth, unacked message count, and connection count on every node.
+
+Decision rule for prefetch: set `prefetch` to roughly the number of concurrent tasks the consumer can handle, not infinity. A prefetch of 1000 on a consumer that processes one at a time means one slow consumer hogs 1000 messages while other consumers starve.
+
+Before: One consumer with default prefetch pulls 10,000 messages from a shared queue. All other consumers sit idle. One crash loses all 10,000.
+After: Prefetch of 50 per consumer; manual ack on each message; publisher confirms on the producer side. Work is spread evenly, a crash loses at most 50 messages, and those messages are redelivered to other consumers.
+</Tip>
+
+<AccordionGroup>
+  <Accordion title="Your RabbitMQ cluster is healthy but one queue has 4 million unacked messages and publishers are being throttled. What is happening and what do you do in the next hour?">
+    **Strong Answer Framework:**
+
+    1. Identify the pattern: unacked messages are delivered but not yet acknowledged. A huge unacked count means either consumers are stuck processing, consumers are crashed and messages will redeliver on timeout, or prefetch is set too high and messages are buffered but not being worked on.
+    2. Check consumer health: are the consumer processes running, are they CPU-bound, are they deadlocked on a downstream? `rabbitmqctl list_consumers` plus service logs.
+    3. If consumers are stuck: kill them so messages redeliver, and fix the underlying cause (often a downstream call without a timeout).
+    4. If prefetch is too high: reduce it in code and restart. A prefetch of 1 is safest during triage; raise later.
+    5. Publishers being throttled means the broker is applying flow control because memory is above the high-watermark. Once consumers drain, flow control releases automatically.
+
+    **Real-World Example:** Instagram's 2019 feed service degradation, described by their engineering team in internal talks, involved exactly this pattern -- prefetch of 10,000 on a consumer that deadlocked on a downstream database query. The fix was to cut prefetch and add a strict timeout on the downstream call.
+
+    **Senior Follow-up Questions:**
+
+    <Note>
+    **Follow-up 1: "What is flow control in RabbitMQ?"**
+
+    When broker memory crosses a high-watermark (default 40% of system memory), RabbitMQ pauses publishers by not sending TCP ACKs. Publishers block on the socket. This is intentional backpressure; the broker is protecting itself from OOM. The fix is to drain consumers, not to raise the watermark.
+
+    **Follow-up 2: "How do you diagnose a stuck consumer?"**
+
+    Thread dump or CPU flame graph first. If the consumer is in a downstream call, the timeout is too long (or missing). If the consumer is in GC, heap is too small. If the consumer is idle but not pulling messages, check the channel's prefetch and unacked counts.
+
+    **Follow-up 3: "Why is prefetch of 1 not always right?"**
+
+    Because it serializes work when the consumer could handle concurrency. Prefetch should roughly equal the consumer's internal concurrency limit. A prefetch of 1 with async I/O wastes throughput; a prefetch of 1000 with sync I/O creates head-of-line blocking.
+    </Note>
+
+    **Common Wrong Answers:**
+    - "Restart the broker to clear the queue." Fails because persistent messages survive restart and the root cause is not addressed.
+    - "Purge the queue." Fails because it loses real user work and does not diagnose the consumer problem.
+
+    **Further Reading:**
+    - RabbitMQ docs on consumer prefetch and flow control.
+    - "Reliable Messaging with RabbitMQ" by Alvaro Videla and Jason Williams.
+    - CloudAMQP's blog on diagnosing broker-side throttling.
+  </Accordion>
+</AccordionGroup>
+
 ---
 
 ## Apache Kafka Implementation
@@ -1629,6 +1747,103 @@ Second, note the in-memory `processedEvents` set in the consumer. This is a chea
   </Tab>
 </Tabs>
 
+<Warning>
+**Caveats & Common Pitfalls: Kafka in production**
+
+- **Consumer group lag as silent failure.** If nobody is alerting on lag, consumers can fall behind indefinitely while the topic looks healthy. By the time someone notices at 4 million messages, catching up takes days and the data is stale.
+- **Auto-commit at the wrong moment.** Default auto-commit ticks every 5 seconds whether you finished processing or not. A consumer crash mid-batch commits offsets for un-processed messages and you lose them silently.
+- **Partition rebalances as stop-the-world events.** A consumer join/leave triggers a rebalance. During a rebalance, every consumer in the group pauses. With naive settings, a single consumer restart can freeze the whole group for tens of seconds. Use cooperative rebalancing (`CooperativeStickyAssignor`).
+- **Retention assumptions that do not hold.** You assume Kafka keeps events for a week; retention is actually 24 hours in your config. Replay from three days ago and the events are gone. Always verify `log.retention.hours` and `log.retention.bytes` in production.
+</Warning>
+
+<Tip>
+**Solutions & Patterns: Manual commits, lag alerting, cooperative rebalance**
+
+Production-grade Kafka consumers disable auto-commit, batch-process a reasonable chunk (50-500 messages), commit offsets only after the business logic has durably succeeded, and handle the "processed but not committed" case with an idempotent consumer. Alert on lag per `(topic, partition, consumer_group)` with thresholds based on ingestion rate: if the topic gets 10K msgs/sec and your SLO is 30 seconds, alert at 300K messages of lag per partition.
+
+Decision rule for partition count: rough rule is `target_throughput / per_partition_throughput` with a floor of `max_consumers_you_expect`. You can add partitions later but it breaks ordering for in-flight events. Start generous -- 24 partitions is a reasonable default for a new topic that may need to scale.
+
+Before: Consumer group with auto-commit every 5 seconds, no lag alert. Consumer deadlocks on a slow downstream. Lag climbs to 12 million over a weekend. Monday morning, business reports missing data from Friday afternoon.
+After: Manual commit after batch success; alert on lag over 100K msgs/partition with 5 minute evaluation; cooperative rebalance keeps partition reassignment smooth during deploys. Outages are caught within minutes.
+</Tip>
+
+<AccordionGroup>
+  <Accordion title="Your Kafka consumer group is 2 million messages behind during Black Friday peak. Walk through the decision tree of what to do.">
+    **Strong Answer Framework:**
+
+    1. Classify the lag. Is it growing, steady, or shrinking? A growing lag means consumers cannot keep up with producers; steady means you are matching production rate; shrinking means you will eventually catch up on your own.
+    2. Triage consumer health. Is the consumer CPU-bound, I/O-bound on a downstream, or blocked on a lock? Profile before scaling, because adding consumers to a consumer group limited by a downstream just moves the bottleneck.
+    3. If consumers are under-provisioned and the topic has spare partitions: scale horizontally by adding consumer instances up to the partition count. Kafka rebalances automatically.
+    4. If all partitions are saturated: the topic is the bottleneck. You cannot add partitions mid-incident without breaking ordering. Options are (a) accept the delay, (b) spin up a separate consumer group that reads in parallel and commits to a different offset store for catch-up processing, or (c) drop non-critical processing temporarily.
+    5. Decide on the business trade-off. Is stale data acceptable for now and you backfill later? Or must you catch up in real time even at the cost of spending engineering effort?
+    6. Post-incident: raise partition count, alert on lag earlier, and profile the consumer for systemic slow paths.
+
+    **Real-World Example:** Shopify Black Friday 2019 writeup described exactly this pattern -- their order ingest Kafka consumers fell behind peak traffic; they had preemptively added partitions and autoscaling but still had to manually intervene on one stream that was bottlenecked on a downstream warehouse write. DoorDash's 2021 "Peak performance" engineering post covers similar scaling decisions around Kafka consumer capacity.
+
+    **Senior Follow-up Questions:**
+
+    <Note>
+    **Follow-up 1: "Why cannot you add consumers beyond the partition count?"**
+
+    Each partition is assigned to exactly one consumer in a group. Consumers beyond the partition count sit idle. The number of partitions is the upper bound on horizontal scaling for a consumer group.
+
+    **Follow-up 2: "What is cooperative rebalancing and why does it matter during an incident?"**
+
+    The default eager rebalance revokes every partition from every consumer, reassigns all, then resumes. During the rebalance, no consumer makes progress. Cooperative (`CooperativeStickyAssignor`) incrementally reassigns only the partitions that moved, so most consumers keep working. During a Black Friday incident, the difference is five seconds of downtime versus thirty.
+
+    **Follow-up 3: "How do you do 'parallel catchup' without breaking ordering guarantees?"**
+
+    Spin up a new consumer group that reads from the current lag position with relaxed ordering (or with a reshuffled partition key). Use it to process the backlog while the primary group continues to handle new events. Merge results carefully downstream. This is viable when you can tolerate temporary ordering relaxation for the backlog; it does not work for strict per-entity ordering.
+    </Note>
+
+    **Common Wrong Answers:**
+    - "Add more partitions right now." Fails because adding partitions changes the hash distribution and breaks ordering for in-flight events.
+    - "Reset the consumer offset to latest and skip the backlog." Fails because it silently drops real user data; only acceptable if the business confirms the data is not valuable.
+
+    **Further Reading:**
+    - Confluent's blog "Things You Should Know About Kafka Consumer Rebalancing."
+    - Shopify Engineering "Pipelines Meet Pipes: Shopify Black Friday" (2019).
+    - Kafka documentation on `CooperativeStickyAssignor`.
+  </Accordion>
+
+  <Accordion title="Your team wants 'exactly-once' semantics for a Kafka-to-database pipeline. The staff engineer pushes back. What is the honest answer and what pattern do you propose?">
+    **Strong Answer Framework:**
+
+    1. Clarify what exactly-once actually means. Kafka supports exactly-once *within* Kafka via transactions (produce + consume + commit offset atomically). It does not, and cannot, provide exactly-once across arbitrary side effects like "charge a credit card" or "write to Postgres."
+    2. Identify the real requirement. "Exactly-once" usually means "no duplicates visible to the consumer." This is achievable via at-least-once delivery plus idempotent processing -- a much simpler architecture with the same end-user semantics.
+    3. Propose the pattern: at-least-once Kafka consumption, plus a deduplication layer. Deduplication can be (a) an upsert in the target database keyed by event ID, (b) a Redis-based idempotency cache, or (c) a unique constraint that makes duplicate inserts fail harmlessly.
+    4. If strict exactly-once within Kafka is required (e.g., for financial transformations that do not leave Kafka), enable transactional producers with `isolation.level=read_committed` consumers and `enable.idempotence=true`.
+    5. Document the boundary clearly: "within Kafka, exactly-once. From Kafka to Postgres, at-least-once with idempotent writes."
+
+    **Real-World Example:** Confluent's own Kafka Streams documentation is careful to specify that exactly-once applies "for Kafka-to-Kafka workflows." Uber's Kafka-based financial pipelines explicitly use idempotent consumers with event-id dedup rather than relying on end-to-end exactly-once, because writing to non-Kafka systems breaks the guarantee.
+
+    **Senior Follow-up Questions:**
+
+    <Note>
+    **Follow-up 1: "How does Kafka transactions actually work?"**
+
+    A transaction groups produces to multiple partitions and topics, plus offset commits, into one atomic unit. The broker uses a transaction coordinator and a two-phase commit protocol. Consumers with `isolation.level=read_committed` skip aborted transactions' messages entirely.
+
+    **Follow-up 2: "What is the performance cost of enabling transactions?"**
+
+    Roughly 3-20% throughput reduction depending on transaction size and commit frequency. Small, frequent commits are worse than fewer, larger commits. For most non-financial workloads, the cost is not worth it because at-least-once plus idempotent consumer achieves the same user-visible semantics.
+
+    **Follow-up 3: "What makes a consumer idempotent in practice?"**
+
+    Every event has a unique ID, and the consumer either upserts by that ID (database), checks and sets an idempotency cache (Redis), or writes to a table with a unique constraint on event ID (fail silently on duplicate). The pattern is: "processing the same event twice produces the same state as processing it once."
+    </Note>
+
+    **Common Wrong Answers:**
+    - "Kafka has exactly-once, just enable it." Fails because it only applies within Kafka's own boundaries; any side effect outside Kafka (DB write, HTTP call, email send) breaks the guarantee.
+    - "Just deduplicate on the consumer side using timestamps." Fails because timestamps are not unique and can be rewritten; the dedup key must be a server-assigned event ID.
+
+    **Further Reading:**
+    - Jay Kreps's blog "Exactly-Once Support in Apache Kafka."
+    - Confluent's "Exactly-Once Semantics Are Possible: Here's How Kafka Does It."
+    - Tyler Akidau's "The world beyond batch: Streaming 101" (on consistency models).
+  </Accordion>
+</AccordionGroup>
+
 ---
 
 ## Event Design Best Practices
@@ -1909,6 +2124,65 @@ Use a **schema registry** (Confluent Schema Registry, AWS Glue Schema Registry, 
   ```
   </Tab>
 </Tabs>
+
+<Warning>
+**Caveats & Common Pitfalls: Event schema evolution**
+
+- **No version field on the envelope.** The first breaking change forces a migration across every consumer, because nobody can distinguish old events from new. Add `event_version` on day one even if it is always "1".
+- **Shipping a breaking change as a minor revision.** Renaming a required field or changing its type silently breaks every consumer that has not redeployed. Every change should be evaluated as backward-compatible (add a field, make optional) or breaking (rename, remove, change type).
+- **Fat events with full entity snapshots.** Event payloads grow to include every field in the entity "just in case." Storage and network costs climb, and evolving any one field breaks all consumers because they all depend on it.
+- **Events that describe state instead of change.** An `order.updated` event with a full object requires consumers to diff against previous state to know what actually changed. Prefer domain-specific events: `order.address_changed`, `order.shipped`, `order.refunded`.
+</Warning>
+
+<Tip>
+**Solutions & Patterns: Versioned envelopes, additive evolution, domain events**
+
+Every event has an envelope with `event_id`, `event_type`, `event_version`, `occurred_at`, `correlation_id`, and `data`. The envelope fields evolve rarely; the `data` payload is the place where schemas grow. Follow additive evolution: new fields are optional with defaults; deprecated fields are marked but left on the wire; breaking changes get a new `event_version` or a new topic.
+
+Decision rule: if a change removes or renames a field, it is breaking. Bump `event_version` and publish both shapes during migration; consumers switch on version. If a change adds an optional field or an enum value with a known default, it is backward-compatible. Ship it without a version bump.
+
+Before: `order.updated` events carry the full Order entity. When the team adds a `priority` field, every consumer must redeploy to handle the new key in their JSON schema, or their parsers break.
+After: `order.priority_set` is a new event with just `{order_id, priority, set_at}`. Consumers who care about priority subscribe; others do not. No one's parser breaks.
+</Tip>
+
+<AccordionGroup>
+  <Accordion title="Your team wants to 'just add a required field' to an existing event. The platform team says no. Explain why, and propose a migration plan.">
+    **Strong Answer Framework:**
+
+    1. Explain the blast radius. Every consumer of this event has a deserialization path that currently works without the field. Adding a required field will break them at deserialization or at validation, depending on the consumer's implementation.
+    2. Identify who consumes the event via the schema registry or the event catalog. If the registry is missing, that is a platform gap to address first.
+    3. Propose the migration: introduce the new field as optional with a documented default; instrument producer-side population so you can see all producers actually set it; once adoption is confirmed over a grace period (one or two release cycles), mark it required in the consumer-side contract test. No one was ever forced to deploy in lockstep.
+    4. Document the rule in the event governance guide: fields are optional at introduction; they become required only after telemetry confirms all producers populate them.
+    5. If the field is truly load-bearing and cannot be optional (e.g., a tenant ID for data segregation), treat it as a new event version, not a change to the existing one.
+
+    **Real-World Example:** Confluent's schema registry with BACKWARD compatibility mode enforces exactly this pattern: adding required fields is rejected by the registry itself at publish time. Shopify's "data platform playbook" talks describe the same policy -- events are additive-only, and breaking changes become new event types.
+
+    **Senior Follow-up Questions:**
+
+    <Note>
+    **Follow-up 1: "What does Avro's 'BACKWARD' compatibility mean exactly?"**
+
+    New schema can read data written by old schema. Achieved by making new fields optional with defaults, and never removing required fields. The alternatives are FORWARD (old schema can read new data) and FULL (both). Most teams default to BACKWARD because producers typically upgrade before consumers.
+
+    **Follow-up 2: "What if the schema registry is not in place and we have no idea who consumes the event?"**
+
+    Step zero is to establish visibility: log every consumer that parses the event (user-agent, service name, timestamp) into a central catalog. Wait one to two weeks of peak traffic to enumerate consumers. Only then change the schema.
+
+    **Follow-up 3: "How do you handle polyglot consumers where different languages enforce schema differently?"**
+
+    Pick a serialization format with cross-language contracts: Avro or Protobuf with a shared registry. JSON with Schema can work but enforcement varies widely by client library. Document the compatibility rule (BACKWARD or FULL) and gate changes on registry checks in CI.
+    </Note>
+
+    **Common Wrong Answers:**
+    - "Just ship it; consumers will upgrade when they break." Fails because production failures become your outage, not the consumer's.
+    - "Version the topic instead of the schema." Fails because now every consumer must subscribe to two topics forever; the versioning happens at the event-type level, not the topic level.
+
+    **Further Reading:**
+    - Confluent Schema Registry documentation on compatibility modes.
+    - Martin Kleppmann's *Designing Data-Intensive Applications*, chapter on encoding and evolution.
+    - Ben Stopford's *Designing Event-Driven Systems* (O'Reilly).
+  </Accordion>
+</AccordionGroup>
 
 ---
 
@@ -2217,6 +2491,65 @@ Practically: use Kafka transactions for stream-processing jobs that read from on
   </Tab>
 </Tabs>
 
+<Warning>
+**Caveats & Common Pitfalls: Delivery semantics**
+
+- **Believing in "exactly-once" across systems.** Kafka's exactly-once applies within Kafka. Once you write to Postgres or send an email, you are back to at-least-once. Treating the messaging layer's guarantee as end-to-end is a common source of phantom bugs.
+- **Idempotency that is not actually idempotent.** A handler that does `count += 1` is not idempotent. A handler that does `SET last_count = n` is. A handler that does `INSERT ... ON CONFLICT DO NOTHING` is. Review the handler with this lens before trusting at-least-once.
+- **Choosing at-most-once for convenience.** "We enabled auto-commit and forgot about it" is how at-most-once sneaks in. It silently loses data during crashes and is only acceptable when the data is genuinely ephemeral.
+- **Storing idempotency keys without a TTL.** After a year of operation, the idempotency table has hundreds of millions of keys and queries slow down. Keep TTLs reasonable (24 hours to 7 days for most use cases).
+</Warning>
+
+<Tip>
+**Solutions & Patterns: At-least-once plus idempotent consumers**
+
+The practical default: at-least-once delivery with idempotent consumers. Every event has a unique `event_id`. The consumer's first action is an upsert keyed by `event_id` into a `processed_events` table (or Redis with TTL). If the key already exists, skip processing. If not, process and commit.
+
+Decision rule for when to pay the exactly-once cost: only when the pipeline stays entirely within Kafka (Kafka Streams, Flink-to-Kafka), and only when the business semantics demand zero duplicates even in the face of consumer retries. Everywhere else, at-least-once plus idempotency is simpler, cheaper, and end-to-end equivalent.
+
+Before: Consumer increments a counter on every event. A single retry causes double-counting. Business metrics drift over time, and by the time anyone notices, the history is irreparable.
+After: Consumer checks `processed_events` table for the event ID before incrementing. Duplicates are safely no-ops. Counters match producer-side expected totals.
+</Tip>
+
+<AccordionGroup>
+  <Accordion title="A product manager asks you to guarantee 'zero duplicate emails' in your notification service. Walk through how you deliver on that, and the honest caveats.">
+    **Strong Answer Framework:**
+
+    1. Clarify the requirement. "Zero duplicates" at the user level is achievable; "zero duplicates" at the messaging layer is not, because at-least-once is the only robust delivery mode for a networked pipeline ending in an external email provider.
+    2. Design the pipeline for at-least-once delivery plus idempotent sending. Every email event has a unique ID; before calling the email provider, the consumer checks an idempotency store keyed by `(user_id, event_id)`. If present, skip. If absent, send, then record.
+    3. Handle the failure window. If the consumer crashes between "send" and "record," the retry will try to send again. The fix is to use the email provider's idempotency key feature (SendGrid, Postmark, and Amazon SES all support it) so the provider deduplicates on their end.
+    4. Document the edge cases: if the provider does not support idempotency keys, you cannot guarantee zero duplicates; you can only reduce probability. The honest answer is "we guarantee near-zero under all plausible failure modes, but not mathematical zero."
+    5. Add observability: duplicate-suppression metric, email-send latency, idempotency-store hit rate. If duplicates start appearing, you see it within minutes.
+
+    **Real-World Example:** Stripe's webhook delivery system explicitly uses at-least-once with idempotency keys on the receiver side; they state in their docs that webhooks can and do arrive multiple times. SendGrid's idempotency feature (introduced around 2019) was added precisely because every customer wanted "zero duplicates" and the honest architectural answer required provider-side dedup.
+
+    **Senior Follow-up Questions:**
+
+    <Note>
+    **Follow-up 1: "What is the retention policy for the idempotency store?"**
+
+    Long enough to cover the longest plausible retry window. For most email pipelines, 24-72 hours is sufficient because anything older is unlikely to retry. Keep TTLs tight to keep the store small and fast.
+
+    **Follow-up 2: "What if two different events should produce one email? (e.g., order confirmation and shipping confirmation combined)"**
+
+    That is a business logic problem, not an infrastructure problem. The application layer should decide when to send; the infrastructure layer should just ensure that once a decision is made, it is delivered at-least-once and idempotently. Mixing the two leads to confused architecture.
+
+    **Follow-up 3: "How do you handle the case where the email provider's idempotency store expires before our retry?"**
+
+    That is a real edge case: if we retry 72 hours later and the provider's key has expired, we may send twice. Pragmatic fix: track our own send state with a longer TTL, and only retry within the provider's idempotency window. After that, treat it as non-retryable and escalate to a human.
+    </Note>
+
+    **Common Wrong Answers:**
+    - "Use exactly-once Kafka transactions." Fails because exactly-once does not extend to the email provider, which is the actual source of duplicates.
+    - "Dedupe on our side using email subject and recipient." Fails because a user might legitimately receive two emails with the same subject (e.g., two separate orders), and subject-based dedup breaks that.
+
+    **Further Reading:**
+    - Stripe's docs on webhook idempotency.
+    - Amazon SES developer guide, "Duplicate suppression" section.
+    - Gregor Hohpe's *Enterprise Integration Patterns*, "Idempotent Receiver" chapter.
+  </Accordion>
+</AccordionGroup>
+
 ---
 
 ## Dead Letter Queues
@@ -2402,6 +2735,65 @@ Dead Letter Queues (DLQs) are the exception-handling mechanism of async systems.
   ```
   </Tab>
 </Tabs>
+
+<Warning>
+**Caveats & Common Pitfalls: Dead Letter Queues**
+
+- **DLQ exists, nobody looks at it.** Messages accumulate for weeks. When the business asks "why did order 42 never ship?", you find three months of unprocessed events in the DLQ. Always alert on DLQ depth and set up a scheduled review cadence.
+- **No context on why the message failed.** The DLQ message has just the payload, no stack trace, no retry count, no timing. Reprocessing blindly repeats the same error. Store failure context in message headers or a sidecar record.
+- **Poison-message storms.** A single malformed message fails forever, triggering retries that overwhelm the normal pipeline. The DLQ is supposed to quarantine poison; make sure max-retries is low (3-5) and DLQ routing is mandatory, not best-effort.
+- **Replaying DLQ in bulk without triage.** Someone kicks off "reprocess all 10,000 DLQ messages" and they fail again for the same reasons. Always triage and fix the underlying cause before bulk replay, and replay in small batches with monitoring.
+</Warning>
+
+<Tip>
+**Solutions & Patterns: DLQ as a first-class operational surface**
+
+Treat the DLQ as a production-critical subsystem. Every message that lands in the DLQ carries metadata: original topic/queue, retry count, last error (class and message), first-failed-at, last-failed-at. Build a simple admin UI (or at minimum, a CLI) that can list, inspect, reason about, and selectively replay messages. Alert on (a) DLQ depth over N, (b) new arrivals per hour, (c) oldest message age.
+
+Decision rule for reprocessing: triage first, fix the cause, then replay in small batches (100-1000 at a time). Never replay more than you can watch in real time. If the replay triggers new DLQ arrivals, stop and re-triage.
+
+Before: DLQ grows silently. One day a VP asks about missing revenue data, and you find 800K unprocessed payment-confirmation events from the past quarter.
+After: DLQ depth is on the oncall dashboard. Alert fires at over 100 messages. On-call reviews within the hour, identifies root cause, fixes, and replays. Mean time-to-drain is under two hours.
+</Tip>
+
+<AccordionGroup>
+  <Accordion title="You discover 1.2 million messages in your DLQ from the past 6 weeks. Walk through how you triage and safely drain it.">
+    **Strong Answer Framework:**
+
+    1. Stop the bleeding first. Identify if new messages are still flowing in. If yes, that means the underlying bug is still active; fix or disable the failing path before touching the backlog.
+    2. Classify the DLQ. Group messages by (failure reason, topic, time range). You will usually find a handful of distinct error classes accounting for most of the volume.
+    3. For each class, decide: is the root cause fixed? If not, fix it and deploy. Is the message still relevant to process, or has the underlying state moved on? Some events may be stale beyond usefulness (e.g., a "send shipping notification" event where the order was cancelled two weeks ago).
+    4. Replay in batches with monitoring. Start with a small batch (100 messages). Watch success rate. If healthy, ramp up. If failures resume, stop and investigate.
+    5. Document findings. If this DLQ buildup was a symptom of a monitoring gap, close the gap: add depth alerts, add age alerts, add a scheduled weekly review.
+
+    **Real-World Example:** The Pinterest engineering blog described a 2018 incident where their ads analytics DLQ accumulated tens of millions of messages during a multi-week downstream outage; the remediation involved building the "DLQ triage tool" that became a reusable platform capability. AWS's SQS team publicly advises treating DLQs as first-class operational surfaces, with specific CloudWatch metrics for DLQ depth.
+
+    **Senior Follow-up Questions:**
+
+    <Note>
+    **Follow-up 1: "How do you decide between replay to original topic vs side-processing?"**
+
+    Replay to the original topic preserves ordering and is simplest, but floods the consumer with old events mixed with new ones. Side-processing via a separate consumer group isolates the backlog from real-time traffic, at the cost of decoupling from the original ordering. For time-sensitive data, side-process. For ordering-sensitive data, replay carefully in small batches.
+
+    **Follow-up 2: "What if a message in the DLQ has a schema version that no consumer supports anymore?"**
+
+    Translate or drop. Build a translator that reads old-schema events and writes new-schema equivalents. Drop only with explicit business sign-off and a written record of what was dropped.
+
+    **Follow-up 3: "How do you prevent this from happening again?"**
+
+    Alerts on depth, age, and rate of new arrivals. Weekly review cadence during oncall rotation. A "DLQ budget" SLO like "less than 10 new DLQ messages per day" and if exceeded, a paging event.
+    </Note>
+
+    **Common Wrong Answers:**
+    - "Click 'replay all' and see what happens." Fails because the same errors will recur, doubling the DLQ and likely disrupting real traffic.
+    - "Delete the DLQ to clean up." Fails because it destroys evidence of real business events that may still need processing.
+
+    **Further Reading:**
+    - AWS SQS documentation on DLQ best practices.
+    - Pinterest Engineering's "Building a Real-Time User Action Counting System."
+    - Gregor Hohpe's *Enterprise Integration Patterns*, "Dead Letter Channel" chapter.
+  </Accordion>
+</AccordionGroup>
 
 ---
 
