@@ -137,6 +137,23 @@ Think of it like splitting a chocolate bar: you can break a 64-square bar into t
 
 **Practical tip**: You can see the buddy system's current state in `/proc/buddyinfo`. If the higher-order columns (Order 3+) are all zeros, the system is suffering from **external fragmentation** -- plenty of free memory, but no contiguous chunks large enough for hugepage allocations or DMA. Running `echo 1 > /proc/sys/vm/compact_memory` triggers the kernel's memory compaction to defragment physical memory.
 
+<Warning>
+**Caveat: Fragmentation vs. Free Memory -- the "Plenty of RAM but Allocation Fails" Trap**
+
+A classic production puzzle: `free -h` shows 12 GB available, but the kernel logs "page allocation failure: order:4". The system has memory but cannot find a contiguous 64 KB block. This is not a bug -- it is external fragmentation. Long-running servers with mixed allocation patterns (kernel slab objects scattered among user pages) accumulate fragmentation that the buddy allocator cannot satisfy for high-order requests.
+
+This bites drivers that need contiguous DMA buffers, jumbo-frame networking, and any code path that calls `kmalloc(GFP_KERNEL, order &gt; 3)`. The symptoms look like a memory leak, but the underlying memory accounting is fine.
+</Warning>
+
+<Tip>
+**Fix: Inspect, Compact, Reserve**
+
+1. Inspect: `cat /proc/buddyinfo` -- if Order 4 and above are all zeros, you have fragmentation, not exhaustion.
+2. Trigger compaction: `echo 1 > /proc/sys/vm/compact_memory`. This is synchronous and can stall the system briefly, so do it during a maintenance window the first time.
+3. Long-term: pre-allocate critical contiguous regions at boot using `hugepages=`, `cma=`, or `memmap=` boot parameters. CMA (Contiguous Memory Allocator) reserves a region that movable allocations can use opportunistically but that drivers can reclaim on demand.
+4. Tune `vm.extfrag_threshold` and enable proactive compaction with `vm.compaction_proactiveness` (kernel 5.8+). For long-uptime fleet machines, schedule periodic compaction during quiet hours.
+</Tip>
+
 ### 4.2. Fragmentation
 - **Internal**: Wasted space inside the $2^n$ block (e.g., requesting 17KB gets you 32KB).
 - **External**: Plenty of free memory, but none of it is contiguous enough for a large request.
@@ -154,6 +171,46 @@ A **Slab** is a set of one or more contiguous pages, partitioned into small, fix
 Instead of initializing memory every time, the Slab allocator keeps a pool of "constructed" objects. When you free an object, it remains initialized in the "free" pool, ready for the next request. This is a huge win for objects with expensive constructors -- for example, a `struct inode` requires setting up several internal locks and lists, so reusing a previously initialized inode is much faster than building one from scratch.
 
 **Practical tip**: Run `slabtop` to see which kernel object caches are consuming the most memory. On a system running many processes, `task_struct` and `mm_struct` caches will be large. On a file server, `dentry` and `inode_cache` will dominate. If `dentry` is consuming gigabytes, it means the kernel is caching directory entries for files that were accessed in the past -- this is usually beneficial (faster path lookups), but you can reclaim it with `echo 2 > /proc/sys/vm/drop_caches` if needed.
+
+<Warning>
+**Caveat: RSS, PSS, and USS -- Why "Memory Used" Has Three Different Answers**
+
+Ask `top` how much memory your process is using and you get RSS (Resident Set Size). RSS counts every page mapped into the process, including pages shared with other processes. If five workers each load the same 200 MB shared library, each one's RSS includes that 200 MB -- so naive sums report 1 GB of "memory used" when the actual physical footprint is around 200 MB shared plus per-process private data.
+
+The three values you actually need:
+- **RSS**: total resident pages, shared counted in full per process. Overcounts on shared memory.
+- **PSS** (Proportional Set Size): shared pages divided by the number of processes sharing them. Sum of PSS across the system equals real physical memory used. This is the right number for capacity planning.
+- **USS** (Unique Set Size): only private pages. The amount you would actually free by killing this one process.
+</Warning>
+
+<Tip>
+**Fix: Use `smem` and `/proc/[pid]/smaps_rollup`**
+
+`smem -t` gives you RSS, PSS, and USS in one view. For per-process kernel-side answers: `cat /proc/[pid]/smaps_rollup` reports `Rss`, `Pss`, `Private_Clean`, `Private_Dirty`, and `Shared_Clean`. When deciding whether killing process X will actually free 4 GB, look at USS, not RSS. When sizing instances for a fleet of identical workers, sum PSS across the fleet -- you will typically find you can pack 30-50 percent more workers per host than RSS-based sizing suggests, because the shared text segments and read-only mmaps double-count under RSS.
+
+Concrete example: on a server running 16 PHP-FPM workers, RSS sum was 12 GB. PSS sum was 4.2 GB. The other 7.8 GB was the same OPcache and shared libraries counted 16 times.
+</Tip>
+
+<Warning>
+**Caveat: Transparent Huge Pages Cause Latency Spikes -- Disable for Latency-Critical Services**
+
+THP sounds free: bigger pages, fewer TLB misses, faster lookups. In practice, the `khugepaged` kernel thread that promotes 4 KB pages to 2 MB hugepages does so by scanning, compacting, and migrating pages -- and on a fragmented system, that compaction issues TLB shootdowns across every CPU and can stall user threads for tens of milliseconds.
+
+Cassandra, MongoDB, Redis, PostgreSQL, Couchbase, and Oracle all explicitly recommend disabling THP. The MongoDB documentation calls it out as the single biggest cause of mysterious p99 latency spikes in production deployments. The pattern in dashboards: a periodic latency saw-tooth correlated with `khugepaged` CPU usage.
+</Warning>
+
+<Tip>
+**Fix: Disable THP, Use Explicit Hugepages**
+
+```bash
+echo never > /sys/kernel/mm/transparent_hugepage/enabled
+echo never > /sys/kernel/mm/transparent_hugepage/defrag
+```
+
+Make this persistent via tuned profile, GRUB cmdline (`transparent_hugepage=never`), or a systemd unit that runs before your service starts. If you want hugepage benefits without the compaction risk, allocate explicit hugepages at boot (`vm.nr_hugepages=N`) and have your service use them via `mmap(MAP_HUGETLB)` or `madvise(MADV_HUGEPAGE)` on a specific region only.
+
+Verify: after the change, `grep AnonHugePages /proc/meminfo` should drop toward zero, and your p99 saw-tooth should disappear within a deploy cycle.
+</Tip>
 
 ---
 
@@ -194,31 +251,208 @@ When you `fork()` a process, the kernel does not copy the memory. That would be 
 
 **Practical tip**: COW is why Redis can `BGSAVE` (background snapshot) without pausing -- it forks a child process that shares the parent's memory via COW. Only pages that the parent modifies during the snapshot get copied. However, if the parent is write-heavy, the COW copies can temporarily double memory usage. Monitor RSS of both parent and child during snapshotting.
 
+<Warning>
+**Caveat: OOM Killer Scoring -- Production Services Must Opt Out Carefully**
+
+The OOM killer scores every process via `oom_score`, weighted heavily by memory usage. Your beautifully tuned 32 GB Postgres process is, by definition, the highest-scoring victim on the box. When memory pressure spikes -- even briefly during a backup, a log rotation, or a runaway sidecar -- the kernel will kill your database before the noisy log shipper.
+
+Naive fix: set `oom_score_adj=-1000` on the database. This makes it un-killable. Now the OOM killer cannot find a victim large enough, the system enters a death spiral, and the kernel panics or hangs instead of recovering. You traded one failure mode for a worse one.
+</Warning>
+
+<Tip>
+**Fix: Tier the oom_score_adj Across Your Process Tree**
+
+Use a layered policy, not a binary one:
+
+```bash
+# Critical service: very strong protection but not absolute
+echo -900 > /proc/$(pgrep -f postgres)/oom_score_adj
+
+# Sidecars and agents: take the hit first
+echo  500 > /proc/$(pgrep -f filebeat)/oom_score_adj
+echo  500 > /proc/$(pgrep -f node_exporter)/oom_score_adj
+
+# Batch jobs: kill on sight
+echo 1000 > /proc/$(pgrep -f nightly_backup)/oom_score_adj
+```
+
+Then enforce a cgroup memory limit on the database with `memory.high` (soft pressure) below `memory.max` (hard cap). The cgroup OOM kicks in within the container, killing only the offender. systemd unit files support this via `OOMScoreAdjust=`. Combine with `vm.panic_on_oom=0` so the kernel kills rather than panics, and `kernel.softlockup_panic=0` during reclaim storms.
+
+Verify the policy works: `dmesg -T | grep -i "killed process"` after a stress test.
+</Tip>
+
 ---
 
 ## 8. Senior Interview Deep Dive
 
 <AccordionGroup>
-  <Accordion title="Q1: Walk through exactly what happens during a Page Fault.">
-    1.  **Hardware Trigger**: CPU tries to access a virtual address. The MMU finds the PTE (Page Table Entry) is either not present or the permissions (W/X) are violated.
-    2.  **Trap**: CPU generates an exception and jumps to the kernel's Page Fault Handler (e.g., `do_page_fault` in Linux).
-    3.  **Context Capture**: The CPU saves the faulting address in a control register (e.g., `CR2`).
-    4.  **VMA Lookup**: The kernel looks up the process's `vm_area_struct` to see if the address is valid (e.g., is it in a known segment like the heap?).
-    5.  **Allocation/Swap**: 
-        - If it's a new heap page: Find a free frame in the Buddy Allocator.
-        - If it's swapped: Issue I/O to read the page from disk.
-    6.  **PTE Update**: The kernel updates the page table with the new Physical Frame address and sets the "Present" bit.
-    7.  **Return**: The kernel returns from the trap, and the CPU **re-executes** the exact same instruction that faulted.
+  <Accordion title="Walk through exactly what happens during a Page Fault, from CR2 to instruction restart.">
+    **Strong Answer Framework:**
+
+    1. **Hardware trap.** The MMU finds the PTE is not present, or the access violates W/X permissions. The CPU writes the faulting virtual address into `CR2`, the error code into the stack frame, and vectors to interrupt 14 (#PF). Control transfers to the kernel via the IDT entry pointing at `do_page_fault` (Linux) -- the architecture-specific entry on x86 lives in `arch/x86/mm/fault.c`.
+    2. **Classify the fault.** The handler reads `CR2` and the error code (present/write/user/instruction bits). It distinguishes user-mode from kernel-mode faults, and read from write from execute.
+    3. **VMA lookup.** Walk `current-&gt;mm-&gt;mm_rb`, the red-black tree of `vm_area_struct` regions, to find the VMA covering the faulting address. No VMA means SIGSEGV. A VMA exists but the access violates its permissions also means SIGSEGV.
+    4. **Decide the fault type.** Inside `handle_mm_fault` and `handle_pte_fault`: anonymous page never touched (allocate zero page on demand), file-backed page not yet read (issue I/O via `filemap_fault`), copy-on-write fault (allocate a new frame and copy), or swap-in (read from swap device).
+    5. **Allocate or fetch.** New anon page calls into the buddy allocator. Swap-in waits for a block I/O to complete -- this is what makes major faults expensive. The page is then inserted into the LRU lists.
+    6. **Update the PTE.** Atomically install the new PTE with the present bit, write/execute bits, and dirty/accessed bits as appropriate. Flush the local TLB entry and, if the mapping is shared, send TLB shootdown IPIs.
+    7. **Return and restart.** `iret` returns to user mode and the CPU re-executes the faulting instruction. Critically, the instruction is restarted, not skipped -- the CPU has no idea anything happened.
+
+    **Real-World Example:** In 2015, the Linux kernel had a notorious performance regression on multi-threaded workloads where `do_page_fault` held `mmap_sem` (the mmap semaphore) as a writer during minor faults. Workloads like the Java GC, which generate millions of minor faults per second across many threads, serialized on this lock. The fix (kernel 5.8, 2020) introduced per-VMA locking (the "Speculative Page Fault" / "VMA-based locking" series by Suren Baghdasaryan), allowing concurrent faults in different VMAs without taking the global mmap_lock. Production fleets reported 10-30 percent throughput gains on highly multi-threaded workloads.
+
+    <Note>
+    **Senior follow-up: How is `mmap_sem` (now `mmap_lock`) involved during a fault, and why was it a scalability bottleneck?**
+
+    Until 5.8, `mmap_sem` was a per-process rw-semaphore. Page faults took it for read; `mmap`, `munmap`, and `mprotect` took it for write. On a process with hundreds of threads all generating faults, the cache-line bouncing of the semaphore counter alone became a bottleneck even when no writer was contending. The fix split locking to per-VMA, so two threads faulting in different VMAs no longer serialize.
+    </Note>
+
+    <Note>
+    **Senior follow-up: What is the difference between a minor fault and a major fault?**
+
+    Minor faults do not touch disk -- the page is already in memory (zero page, COW, page cache hit on a previously read file). Major faults require I/O (swap-in, first read of a file-backed page). Minor faults take microseconds; major faults take milliseconds on SSD, tens of milliseconds on HDD -- 10 to 100 times more expensive. `ps -o maj_flt,min_flt` shows the per-process counts. A high major-fault rate is a sign of memory pressure or thrashing.
+    </Note>
+
+    <Note>
+    **Senior follow-up: Can a page fault happen in the kernel itself, and what are the rules?**
+
+    Yes -- `vmalloc` regions and user-space accesses via `copy_from_user` can fault in kernel mode. The kernel uses an "extable" mechanism: on each `copy_from_user` call site, an entry in the exception table tells the fault handler "if this faults, jump to recovery label X." This lets the kernel catch faulting user pointers without crashing. What the kernel cannot do is fault while holding a spinlock or in interrupt context -- that is what `GFP_ATOMIC` and `pagefault_disable()` are for.
+    </Note>
+
+    **Common Wrong Answers:**
+
+    1. *"The page is just loaded from disk and the program continues."* Skips classification, VMA lookup, and the distinction between fault types. Most page faults never touch disk -- the majority are minor faults (anonymous zero pages or COW). Conflating "page fault" with "swap-in" is the single most common interview mistake.
+    2. *"The kernel allocates memory and the CPU jumps past the faulting instruction."* The CPU restarts, it does not skip. The whole point is that the user code is unaware of the fault. Skipping would corrupt program state.
+    3. *"Page faults are only a problem when you run out of RAM."* Misses major vs minor distinction. A healthy program generates millions of minor faults per second and they are essentially free; major faults are the expensive ones.
+
+    **Further Reading:**
+    - Linux kernel source: `arch/x86/mm/fault.c` and `mm/memory.c` -- the canonical implementation, surprisingly readable.
+    - LWN: "Per-VMA locking" series by Jonathan Corbet (2022-2023) -- explains the mmap_lock scalability fix in depth.
+    - "Understanding the Linux Virtual Memory Manager" by Mel Gorman -- chapter 4 covers fault handling end-to-end.
   </Accordion>
 
-  <Accordion title="Q2: What is a TLB Shootdown?">
-    When a kernel changes a page table mapping on a multi-core system (e.g., unmapping memory or changing permissions), it must ensure that other CPUs don't have the *old* mapping cached in their local TLBs.
-    
-    The kernel sends an **Inter-Processor Interrupt (IPI)** to all other cores, forcing them to flush the specific entry from their TLBs. This is expensive and a major bottleneck for high-frequency mapping changes.
+  <Accordion title="Explain malloc -- from libc all the way to brk/mmap and the page allocator.">
+    **Strong Answer Framework:**
+
+    1. **User code calls `malloc(size)`.** This is a libc function (glibc's ptmalloc, jemalloc, tcmalloc, mimalloc -- behaviors differ but the layering is the same).
+    2. **Allocator picks a strategy by size.** Small allocations (under 128 KB in glibc by default, controlled by `M_MMAP_THRESHOLD`) come from a per-thread arena: a free-list of chunks carved out of a previously obtained heap region. Large allocations bypass the arena and call `mmap` directly.
+    3. **Arena exhausted -- grow the heap.** When the arena needs more, it calls `brk` or `sbrk` (extend the data segment) for the main arena, or `mmap(MAP_ANONYMOUS)` for thread arenas. `brk` is contiguous and historically simpler; `mmap` regions can live anywhere in the address space.
+    4. **Kernel: VMA bookkeeping only.** `brk`/`mmap` updates `vm_area_struct` records but does not allocate physical pages. The memory is reserved virtually. Returning success does not mean a single byte of RAM was committed.
+    5. **First write triggers a page fault.** Lazy allocation: the first store to each new page faults, and `do_anonymous_page` allocates a zero-filled frame from the buddy allocator (or maps the shared zero page if read-only). This is why a process can `malloc(1 GB)` instantly even on a 512 MB box -- nothing has been physically allocated yet.
+    6. **Buddy allocator hands out frames.** The buddy walks free-lists by order; small allocations come from Order 0. NUMA policies decide which node.
+    7. **Free path mirrors allocate.** `free` returns the chunk to the arena. Large mmap chunks are unmapped immediately. Small chunks are coalesced with neighbors and returned to the free-list, but `brk`-based heap is typically not shrunk because of fragmentation -- pages near the top of the heap that are still in use prevent shrinking.
+
+    **Real-World Example:** In 2018, Facebook's mcrouter team measured a 30 percent reduction in resident memory by switching from glibc's ptmalloc to jemalloc. The reason was not the speed of the fast path -- it was that ptmalloc's per-thread arenas in a 200-thread process held large unreturned pools. jemalloc's arena sizing and `madvise(MADV_DONTNEED)` policies returned freed pages to the kernel more aggressively. The general lesson: glibc malloc holds onto memory longer than you think; for long-running multi-threaded servers, an alternative allocator can dramatically cut RSS.
+
+    <Note>
+    **Senior follow-up: What is `M_MMAP_THRESHOLD` and why does it default to 128 KB?**
+
+    Below 128 KB, glibc uses the brk-based arena: cheap to carve, easy to coalesce, but never returned to the OS until the heap top can shrink. Above 128 KB, each allocation gets its own mmap region: more expensive (one syscall, one VMA per chunk), but `free` immediately unmaps and returns memory to the OS. The 128 KB threshold balances syscall overhead against memory return aggressiveness. Tuning it down via `mallopt(M_MMAP_THRESHOLD, ...)` makes large workloads release memory faster at the cost of more syscalls.
+    </Note>
+
+    <Note>
+    **Senior follow-up: Why does RSS not drop after I `free` a big buffer?**
+
+    Two reasons. First, glibc may have kept the pages in its arena instead of returning them to the kernel. Second, even when glibc calls `madvise(MADV_DONTNEED)`, the kernel may not reclaim the page until pressure builds; and `MADV_DONTNEED` only zeros the page on next access -- it does not free the VMA, so virtual size stays the same. Use `malloc_trim(0)` to force glibc to return what it can. Use jemalloc's `mallctl("arena.X.purge")` for finer control.
+    </Note>
+
+    <Note>
+    **Senior follow-up: What happens if two threads call `malloc` simultaneously?**
+
+    glibc maintains multiple arenas (`M_ARENA_MAX`, defaults to 8 times the CPU count). Each thread is sticky-bound to an arena via TLS to avoid contention. The arena itself has a mutex. Under high concurrency on small allocations, you can still see `pthread_mutex_lock` near the top of `perf` profiles -- which is one reason high-throughput servers reach for jemalloc or tcmalloc, both of which use thread-local caches that bypass the arena lock for the fast path.
+    </Note>
+
+    **Common Wrong Answers:**
+
+    1. *"`malloc` calls `brk`, which allocates memory in the kernel."* Conflates virtual reservation with physical allocation. `brk` only extends the VMA; the physical pages come on first write via page fault.
+    2. *"The kernel always uses `mmap` for allocations now."* Glibc still uses `brk` for the main arena under the threshold. Other allocators (jemalloc) use only `mmap`, but that is implementation-specific.
+    3. *"`free` returns memory to the OS."* Almost never true for small allocations. Memory stays in the user-space allocator's free-list. Only large `mmap`-backed allocations return immediately.
+
+    **Further Reading:**
+    - "ptmalloc" original paper by Wolfram Gloger -- the design glibc inherited.
+    - jemalloc design documents on jemalloc.net -- contrast with ptmalloc on arena and purge policy.
+    - LWN: "Memory management for embedded systems" -- explains overcommit and lazy allocation in production context.
   </Accordion>
 
-  <Accordion title="Q3: Why do we use 4-level or 5-level page tables instead of 2?">
-    A 2-level table for a 64-bit space would still require a massive top-level directory. Multi-level tables allow for **sparsity**. We only allocate the lower-level tables for address ranges that the process is actually using. If a process only uses 1MB of memory, we only need one PML4 entry, one PDPT entry, one PD entry, and one PT entry.
+  <Accordion title="A service reports it is using 4 GB but `free` shows 12 GB available. Diagnose.">
+    **Strong Answer Framework:**
+
+    1. **First, define "using".** Which tool reports 4 GB? `top` RSS, cgroup `memory.current`, application-reported heap, or container metrics? They measure different things.
+    2. **Compare RSS to PSS.** `cat /proc/[pid]/smaps_rollup`. If RSS is 4 GB but PSS is 1.2 GB, most of the apparent memory is shared (libraries, OPcache, mmap'd files). The "actual" private cost is 1.2 GB.
+    3. **Check page cache attribution.** `free` reports "available" by including reclaimable page cache. If the process mmap'd a 4 GB file, those pages count toward the process's RSS but are also reclaimable by the kernel under pressure -- so they appear in both columns.
+    4. **Look at anon vs file-backed memory.** `grep -E "Anonymous|Mapped" /proc/[pid]/status` (or smaps_rollup). Anonymous pages are private heap/stack; file-backed pages are mmap'd files and shared libraries. A process with 3.5 GB of anon and 0.5 GB file-backed has very different scaling behavior than one that is mostly file-backed.
+    5. **Verify with cgroup accounting.** If running in a container, `cat /sys/fs/cgroup/memory.current` (v2) shows the cgroup's total, including kernel memory and page cache attributed to the container. This is what triggers OOM kills.
+    6. **Check for kernel-side memory.** `cat /proc/meminfo` -- look at Slab, KernelStack, PageTables. A multi-million-thread process can have gigabytes in PageTables alone.
+
+    **Real-World Example:** In 2020, a Discord post-mortem on their voice service described exactly this confusion: container metrics reported 8 GB used, the JVM heap reported 2 GB, and the kernel reported 12 GB free. The gap was JVM off-heap direct buffers (NIO) plus tcmalloc retaining freed memory in its thread caches. The fix involved bounding `MaxDirectMemorySize`, switching to G1 GC's String Deduplication, and forcing periodic `tcmalloc::MallocExtension::ReleaseFreeMemory()`. Lesson: a single "memory used" number is meaningless without knowing what is being counted.
+
+    <Note>
+    **Senior follow-up: What does `MemAvailable` in `/proc/meminfo` actually compute?**
+
+    It is an estimate of how much memory is available for new allocations without swapping. The formula (since kernel 3.14): MemFree plus reclaimable page cache minus low watermark, plus reclaimable slab. It tries to answer "how much can I allocate before the system pages?" `MemFree` alone is misleading because the kernel deliberately uses spare RAM for page cache; `MemAvailable` is the metric to alert on.
+    </Note>
+
+    <Note>
+    **Senior follow-up: Why might `RSS` differ from the cgroup's `memory.current`?**
+
+    Cgroup accounts for the whole hierarchy: anon pages, file-backed pages mapped by processes in the cgroup, kernel memory (slab) charged to the cgroup, and tmpfs usage. RSS is per-process and ignores tmpfs and kernel memory. A container with a heavy tmpfs (`/dev/shm`) will see cgroup memory much higher than the sum of process RSSes.
+    </Note>
+
+    <Note>
+    **Senior follow-up: How do you find which file is consuming the page cache?**
+
+    `vmtouch -v /path` reports per-file resident pages. For system-wide, `pcstat` (Brendan Gregg's tool) lists files with their cached fraction. `lsof -nP` plus `/proc/[pid]/maps` correlates open files to processes. Useful when you suspect a misbehaving process is filling page cache with throwaway data and evicting hot pages of another service.
+    </Note>
+
+    **Common Wrong Answers:**
+
+    1. *"The metrics are wrong, restart the service."* Treats the diagnostic as broken without investigating. The metrics are usually right; the model is incomplete.
+    2. *"It's a memory leak."* Possible, but you have not gathered enough data. RSS-PSS mismatch and shared library counting often explain the apparent gap without any leak.
+    3. *"`free` is showing buffers/cache as available, so there is no problem."* Sometimes true, but ignores the case where the process has mmap'd a file and the page cache is being attributed to it on one tool and not another.
+
+    **Further Reading:**
+    - "Linux Memory Statistics" by Brendan Gregg -- distinguishes RSS, PSS, USS, and the cache attribution rules.
+    - kernel.org Documentation/filesystems/proc.rst -- the canonical reference for `/proc/meminfo` and `/proc/[pid]/smaps`.
+    - Discord engineering blog: "Why Discord is switching from Go to Rust" -- not directly about this but discusses memory accounting under heavy concurrency.
+  </Accordion>
+
+  <Accordion title="What is a TLB Shootdown, and how do you mitigate them in a hot path?">
+    **Strong Answer Framework:**
+
+    1. **Why shootdowns exist.** Each CPU has its own TLB. When a page-table mapping changes (`munmap`, `mprotect`, `madvise(MADV_DONTNEED)`, COW break, swap-in invalidation), the kernel must invalidate the now-stale TLB entries on every CPU that may have cached them.
+    2. **The mechanism.** The initiating CPU calls `flush_tlb_mm` or `flush_tlb_range`, which sends an IPI (inter-processor interrupt) to the target CPUs. Each target enters an interrupt handler, executes `INVLPG` (invalidate one page) or a full TLB flush, and acknowledges. The initiating CPU spins until all acks come in.
+    3. **Why it hurts.** IPIs are tens of microseconds round-trip. If a server with 96 cores does an `munmap` that invalidates all of them, you stall 96 cores for 30+ microseconds and the initiator waits for all of them. At high frequency (concurrent `madvise` calls, tight `mmap`/`munmap` loops), shootdowns can dominate runtime.
+    4. **Tracking it.** Look at `/proc/interrupts` for the `TLB` line, or `perf stat -e tlb:tlb_flush`. On a busy box you might see millions of TLB shootdowns per second.
+    5. **Mitigations.** Batch unmaps, prefer per-VMA scope over full-mm flushes, use lazy TLB invalidation for kernel threads, exploit PCID/ASID tagging so that user-mode entries from one process do not need to be flushed when switching to another. Modern kernels skip shootdowns for CPUs known not to have run the affected mm recently.
+
+    **Real-World Example:** In 2018, Cloudflare published a deep-dive ("Speeding up Linux disk encryption") where they found a single core's `dm-crypt` workqueue was getting saturated with TLB shootdowns triggered by per-block memory remapping. Switching from per-block to bulk processing reduced shootdowns by 95 percent and unlocked roughly 2x throughput. The general pattern: anywhere you see frequent map-unmap cycles in a hot path, shootdowns are a likely cost driver.
+
+    <Note>
+    **Senior follow-up: What is PCID/ASID and how does it reduce flush cost?**
+
+    PCID (Intel) and ASID (ARM) tag TLB entries with a process context ID. When the kernel switches mm (process switch or KPTI swap), it changes the active PCID instead of flushing the TLB. Entries from the old context remain in the TLB, tagged with the old PCID, ignored for current lookups. On return to the previous context, those entries are valid again. This is what made KPTI tolerable: without PCID, every syscall would require a TLB flush. With PCID, the cost dropped from 30+ percent to 2-5 percent on most workloads.
+    </Note>
+
+    <Note>
+    **Senior follow-up: Are there workloads where shootdowns are more expensive than the mapping change itself?**
+
+    Yes. Tight `mmap`/`munmap` of small regions in a loop, COW pages on a write-heavy fork-then-mutate pattern, and heavy `madvise(MADV_DONTNEED)` usage all spend more cycles in shootdown coordination than in the actual page table edit. The fix is either to batch (one large `munmap` instead of many small ones) or to use mechanisms that avoid invalidation entirely (e.g., `MADV_FREE` instead of `MADV_DONTNEED`, which does not flush until reclaim).
+    </Note>
+
+    <Note>
+    **Senior follow-up: How does the kernel know which CPUs to send the IPI to?**
+
+    Each `mm_struct` has a `cpu_bitmap` of CPUs that have ever run with this mm active. The shootdown IPI targets only those CPUs. This is critical on big machines: shooting down only the 4 CPUs that actually ran your process is much cheaper than shooting all 128 cores. The bitmap is updated lazily during context switches.
+    </Note>
+
+    **Common Wrong Answers:**
+
+    1. *"Shootdowns only happen when you `munmap`."* Plenty of other operations trigger them: `mprotect`, `mremap`, swap-out, page migration (NUMA balancing), THP collapse, `madvise(MADV_DONTNEED)`. The `munmap` answer is incomplete.
+    2. *"Just disable preemption around critical sections to avoid shootdowns."* Misunderstands the problem. Shootdowns happen across CPUs, not within a single CPU's preemption window. Disabling preemption helps with lock acquisition order but does nothing for inter-CPU IPIs.
+    3. *"Big TLBs eliminate shootdowns."* Bigger TLBs reduce miss rates but every modification still requires invalidation. The shootdown cost scales with CPU count, not TLB size.
+
+    **Further Reading:**
+    - LWN: "TLB flushing for the sloppy" by Jonathan Corbet -- covers lazy invalidation and the cpu_bitmap optimization.
+    - Intel Software Developer's Manual, Volume 3, chapter on paging -- canonical reference for PCID and INVPCID semantics.
+    - "Latency-Tolerant Software for High-Throughput Servers" -- ACM article on minimizing shootdowns in network code.
   </Accordion>
 </AccordionGroup>
 

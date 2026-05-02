@@ -300,4 +300,197 @@ printf("Received signal %d from PID %d\n", info.ssi_signo, info.ssi_pid);
 
 ---
 
-Next: [Debugging & Performance Observability](/operating-systems/debugging-performance) →
+## Production Caveats &amp; Common Pitfalls
+
+Signals are deceptively simple to call but treacherous to use correctly. Here are four traps senior engineers must internalize.
+
+<Warning>
+**Caveat 1: The async-signal-safe function list is tiny -- printf is NOT safe**
+
+POSIX defines exactly which functions can be safely called from a signal handler. The list (`man 7 signal-safety`) has about 120 functions. `printf`, `fprintf`, `malloc`, `free`, `syslog`, `dlopen`, almost every standard library function -- none are on it. The reason: these functions hold internal locks. If a signal arrives while the main thread holds the malloc lock, and the handler calls printf (which calls malloc internally to grow stdio buffers), the thread deadlocks against itself. This is the most common signal bug in production C code.
+</Warning>
+
+<Tip>
+**The fix:** Do the absolute minimum in the handler. The "self-pipe trick" is canonical: write a single byte to a pipe FD, return. The main loop's epoll/select reads the pipe and does real work. Even better: use `signalfd` so signals come through your event loop directly, eliminating async-signal concerns entirely. If you must format output from a handler, use `write(2)` with a pre-formatted buffer -- never printf. For numeric formatting in the handler, write your own minimal int-to-string routine (it is 10 lines) rather than calling snprintf.
+</Tip>
+
+<Warning>
+**Caveat 2: EINTR -- most syscalls return early on signal, must retry**
+
+When a signal arrives during a slow syscall (read, write, accept, connect, select), most syscalls return -1 with errno = EINTR. This is the kernel saying "I interrupted your syscall to deliver a signal; you decide whether to retry." Naive code that doesn't check for EINTR sees random failures whenever a signal fires. The classic example: a server that runs fine until SIGCHLD arrives (because a child exited), at which point its `accept()` returns EINTR and the server thinks the listening socket failed.
+</Warning>
+
+<Tip>
+**The fix:** Wrap blocking syscalls in a retry loop: `while ((n = read(fd, buf, len)) == -1 &amp;&amp; errno == EINTR) {}`. Or, register handlers with `SA_RESTART` flag in `sigaction` -- the kernel will automatically restart most syscalls (read, write, accept). Some syscalls (`select`, `pselect`, `nanosleep`) cannot be auto-restarted because they have a timeout that would be wrong; for these, always handle EINTR explicitly. In Go and Rust, the runtime handles EINTR for you. In Python, the interpreter retries until 3.5 -- after which signal-handling was reformed and most stdlib I/O is EINTR-safe.
+</Tip>
+
+<Warning>
+**Caveat 3: Signal masks inherited by threads -- pthread_sigmask vs sigprocmask**
+
+In a multi-threaded program, each thread has its own signal mask. `sigprocmask` is undefined behavior in multi-threaded code -- you must use `pthread_sigmask`. Worse, when you create threads, they inherit the signal mask from the *creating* thread. If your main thread blocks SIGTERM at startup before creating workers, all workers inherit the block, and your sigwait/signalfd thread receives SIGTERM correctly. But if you create threads first and block SIGTERM later, the workers have an inconsistent mask and SIGTERM may be delivered to a worker that does not expect it.
+</Warning>
+
+<Tip>
+**The fix:** Block all signals in `main()` before creating any threads: `sigfillset(&amp;all); pthread_sigmask(SIG_BLOCK, &amp;all, NULL);`. Then create a dedicated signal-handling thread that calls `sigwait()` or reads from a `signalfd`. All worker threads inherit the "everything blocked" mask. Synchronous signals (SIGSEGV, SIGFPE, SIGBUS) cannot be blocked meaningfully -- they are delivered to the thread that caused the fault regardless of mask. Always use `pthread_sigmask` in multi-threaded code; `sigprocmask` works in single-threaded code only.
+</Tip>
+
+<Warning>
+**Caveat 4: signalfd / sigwait for synchronous handling**
+
+Traditional signal handlers run at unpredictable times in the middle of arbitrary code. They are async-signal-restricted. They can interrupt syscalls. They may be delivered to any thread. signalfd flips this: signals become readable events on a file descriptor. sigwait blocks one thread waiting for a signal. Both convert async signals into synchronous events you can handle with normal code -- no async-signal restrictions, no EINTR, no thread targeting surprises.
+</Warning>
+
+<Tip>
+**The fix:** For new code, prefer `signalfd` integrated with your event loop. Block signals globally, create a signalfd for the signals you care about, add it to epoll. When a signal arrives, epoll wakes up, you read the signalfd, and dispatch synchronously. For sigwait, dedicate one thread that calls `sigwait` in a loop and dispatches into normal code. Both approaches eliminate async-signal-safety as a concern. Caveat: synchronous signals (SIGSEGV) cannot be handled this way -- the faulting thread has no way to proceed past the fault, so you still need a traditional handler with `sigaltstack` for crash reporting.
+</Tip>
+
+---
+
+## Senior-Level Interview Questions
+
+<AccordionGroup>
+  <Accordion title="Implement a signal-safe logger. What can you call inside the handler, and how do you format output?">
+    **Strong Answer Framework:**
+
+    1. **State the constraint**: Inside a signal handler, you can only call async-signal-safe functions. The list excludes printf, malloc, snprintf, and most stdio. The safe set includes: write, read, _exit, sigaction, kill, getpid, time, localtime_r is NOT safe (it touches locale state); only `time()` itself is.
+    2. **Sketch the design**: Pre-allocate a fixed-size buffer at process start (no malloc in handler). Write a tiny format function that handles only the formatters you need (typically %s, %d, %x). Use `write(STDERR_FILENO, buf, len)` for output. For timestamps, use `time(NULL)` and a hand-coded epoch-to-string conversion.
+    3. **Implement the int-to-string**: Standard C trick -- write digits backwards into a buffer, then reverse. About 10 lines. Handles negatives by checking sign first.
+    4. **Discuss alternatives**: For most use cases, the better answer is "don't log from a signal handler." Use the self-pipe trick: handler writes one byte to a pipe; main loop reads the pipe and uses normal logging. signalfd is the cleanest -- signals become a normal event source, you log normally from your event handler. The "implement signal-safe logger" exercise is worth doing once for understanding, then never again.
+
+    **Real-World Example:**
+
+    Google's Breakpad and Sentry's native crash handler both implement signal-safe stack capture. Breakpad's `LinuxDumper` pre-allocates a buffer at startup, uses `getcontext()` (one of the few safe context-snapshot functions), and writes the minidump via direct write(2) calls. They explicitly avoid malloc by using a pre-allocated arena. The code (`src/client/linux/handler/exception_handler.cc` in the Breakpad repo) is a fascinating read on what async-signal-safe code looks like in production.
+
+    <Note>
+    **Senior follow-up 1:** Can you call write() to a pipe in a handler if the pipe might be full? Yes, write is async-signal-safe -- but it can return EAGAIN if the pipe is non-blocking and full, or it can return early with EINTR. You must check the return value. For a self-pipe, set it non-blocking and ignore EAGAIN; the byte just signals "something happened" so a missed byte is fine if there are already pending notifications.
+    </Note>
+
+    <Note>
+    **Senior follow-up 2:** What about logging from a SIGSEGV handler when the stack itself may be corrupted? Two things: register the handler with `SA_ONSTACK` and provide a separate stack via `sigaltstack`. The handler runs on the alternate stack, not the corrupted main stack. This is how crash reporters survive stack overflow -- `SIGSEGV` due to stack overflow normally cannot be handled because there is no stack space for the frame; with sigaltstack, there is.
+    </Note>
+
+    <Note>
+    **Senior follow-up 3:** Why is `localtime_r` not async-signal-safe even though it has _r in the name? The _r means thread-safe (reentrant), not async-signal-safe. localtime_r reads timezone state which may be modified by `setenv("TZ", ...)`. If a signal arrives during setenv, localtime_r in the handler sees inconsistent state. For signal-safe time formatting, use only `time()` plus your own arithmetic, or pre-compute the offset at startup.
+    </Note>
+
+    **Common Wrong Answers:**
+    - "Use snprintf with a fixed buffer in the handler." Wrong: snprintf is not async-signal-safe.
+    - "Lock a mutex around the logger." Wrong: mutex acquisition is not async-signal-safe; you can deadlock.
+    - "It is fine because it is a 'simple' printf." Wrong: stdio holds a lock that the main thread may be holding.
+
+    **Further Reading:**
+    - `man 7 signal-safety` -- the canonical list.
+    - "Signal Safety: AS-Safe" in glibc manual -- gnu.org/software/libc/manual/.
+    - Breakpad source -- chromium.googlesource.com/breakpad/.
+  </Accordion>
+
+  <Accordion title="What does SIGKILL do that SIGTERM doesn't? Why is SIGKILL uncatchable?">
+    **Strong Answer Framework:**
+
+    1. **State the difference**: SIGTERM (signal 15) is the standard "please terminate" -- it can be caught, blocked, or ignored. The application can do graceful cleanup. SIGKILL (signal 9) is the kernel's nuclear option -- it cannot be caught, blocked, or ignored. The kernel terminates the process immediately without giving it a chance to run any code.
+    2. **Explain why SIGKILL is uncatchable**: The kernel enforces this in `do_signal()`. When SIGKILL is pending, the kernel calls `do_group_exit(SIGKILL)` directly without checking for installed handlers. If userspace could catch SIGKILL, there would be no way to forcibly terminate a stuck process. This is an OS-level guarantee, not a userspace policy.
+    3. **State the limit of SIGKILL**: SIGKILL kills the *process* immediately, but the kernel still has to wait for any in-progress system calls to complete. A process stuck in TASK_UNINTERRUPTIBLE (D state) does not die from SIGKILL -- the kernel waits for the I/O to complete first. This is why "kill -9 a stuck NFS process" doesn't work.
+    4. **Discuss the graceful shutdown pattern**: Standard practice: send SIGTERM first, wait a grace period (e.g., 30 seconds), then SIGKILL if the process is still running. Kubernetes does this with `terminationGracePeriodSeconds`. systemd does the same with `TimeoutStopSec`.
+
+    **Real-World Example:**
+
+    Kubernetes' default `terminationGracePeriodSeconds` is 30. When a pod is deleted, the kubelet sends SIGTERM, waits 30s, then sends SIGKILL. In 2018, a high-profile incident at HBO during the Game of Thrones finale: a database container was stuck in D state due to a slow EBS volume, SIGTERM did nothing, SIGKILL did nothing (D state ignored signals), and the kubelet logged "container failed to stop" while the database held a critical lock. The fix was to fail over to a healthy node; the underlying issue was the EBS volume's I/O credit exhaustion.
+
+    <Note>
+    **Senior follow-up 1:** What is SIGSTOP and how is it different from SIGKILL? SIGSTOP also cannot be caught/blocked/ignored, but instead of terminating, it pauses the process indefinitely. It is what `Ctrl+Z` (technically SIGTSTP) escalates to. The process stays in TASK_STOPPED state until SIGCONT resumes it. This is what `kill -STOP` does. Useful for debugging or pausing rogue processes without killing them.
+    </Note>
+
+    <Note>
+    **Senior follow-up 2:** A process is in TASK_UNINTERRUPTIBLE waiting for an NFS server. SIGKILL does nothing. What changed in modern kernels? Linux 2.6.25 (2008) added `TASK_KILLABLE` -- like TASK_UNINTERRUPTIBLE but allows SIGKILL specifically to break the sleep. NFS code path was migrated to use TASK_KILLABLE, so on modern kernels you can SIGKILL a stuck NFS process. There are still some kernel paths using pure TASK_UNINTERRUPTIBLE (e.g., critical journal flushes), but they should be brief.
+    </Note>
+
+    <Note>
+    **Senior follow-up 3:** What signal does `docker stop` use? `docker stop` sends SIGTERM to PID 1 of the container, waits 10 seconds (configurable with `--time`), then sends SIGKILL. The 10 second default has caught many people: web servers with long-running requests get killed mid-request. Either increase the timeout or implement faster shutdown. `docker kill` skips straight to SIGKILL.
+    </Note>
+
+    **Common Wrong Answers:**
+    - "SIGKILL is just a stronger SIGTERM." Wrong: SIGKILL is fundamentally different -- it bypasses userspace entirely.
+    - "You can catch SIGKILL with SA_NODEFER." Wrong: SIGKILL cannot be caught regardless of flags.
+    - "SIGKILL kills any process instantly." Wrong: D-state processes resist even SIGKILL on older kernels.
+
+    **Further Reading:**
+    - `man 7 signal` -- table of signals and which can be caught.
+    - "Killable system calls" on LWN -- lwn.net/Articles/288056/.
+    - Linux kernel `kernel/signal.c` -- read `do_signal()` for the SIGKILL fast path.
+  </Accordion>
+
+  <Accordion title="Why is printf() unsafe in a signal handler? What would you use instead, and why is the self-pipe trick the canonical solution?">
+    **Strong Answer Framework:**
+
+    1. **Identify the specific danger**: printf calls into stdio (`stdout` is a `FILE *`), which uses a mutex (`flockfile`) to serialize writes from multiple threads. Inside printf, there is also potentially a malloc to grow internal buffers, and locale lookups for formatting %d/%f. The mutex is the killer: if the main thread held the stdio lock when the signal arrived, and the handler calls printf, the handler tries to acquire a lock its own thread holds -- self-deadlock.
+    2. **Generalize the rule**: Any function that takes a lock or modifies global state may deadlock when called from a signal handler that interrupted code holding that lock. POSIX's async-signal-safe list defines exactly which functions are guaranteed not to do this.
+    3. **Introduce the self-pipe trick**: Create a pipe at startup (`pipe2(fd, O_NONBLOCK | O_CLOEXEC)`). Add the read end to your event loop (epoll/select). Install a signal handler that does only one thing: `write(pipe[1], "x", 1)` -- write is async-signal-safe. The main loop wakes up on the readable pipe, drains the byte, and dispatches the signal in normal code where any function is fair game.
+    4. **Mention the modern alternative**: signalfd (Linux 2.6.22+) skips the pipe entirely. signalfd creates an FD that becomes readable when a queued signal arrives. read(signalfd, &amp;info, sizeof(info)) returns siginfo_t with details. This is what Go's `signal.Notify` and Rust's `tokio::signal` use under the hood.
+
+    **Real-World Example:**
+
+    Nginx's signal handling, documented in `src/os/unix/ngx_process_cycle.c`, uses the self-pipe trick. A signal handler sets a `sig_atomic_t` flag and writes to a pipe. The master process's main loop polls the pipe; when readable, it checks the flag and dispatches to handler functions in normal context. This pattern was canonical Unix daemon code from the early 2000s; signalfd in 2007 made it obsolete on Linux but the pattern remains portable across BSDs and macOS.
+
+    <Note>
+    **Senior follow-up 1:** Why not just use a `volatile sig_atomic_t` flag and check it in the main loop without a pipe? You can, but the main loop would need to check the flag at every iteration of every blocking syscall, which is impractical. The pipe makes the signal *visible* to your event loop -- when a signal arrives, the pipe becomes readable and your epoll wakes up. Without a pipe, you would need to use pselect/ppoll which atomically apply a signal mask, but those are more complex.
+    </Note>
+
+    <Note>
+    **Senior follow-up 2:** Can a signal handler call write() on the same FD that the main thread is writing to? Yes, write is async-signal-safe. But the OUTPUT may be interleaved (the main thread's write to stderr and the handler's write to stderr can produce mixed output if they happen concurrently from different threads). For a single-threaded program, since the signal handler runs on the main thread, writes are serialized but the main thread's write may be partially complete -- so you can get incomplete lines. For human-readable logs from a handler, prefer all-at-once writes with a fixed-size buffer.
+    </Note>
+
+    <Note>
+    **Senior follow-up 3:** What is `sigsafe_printf` and where do you find it? There are several open-source implementations of an async-signal-safe printf-like function, but none are in stdlib. They typically reimplement format parsing, write digits manually, and use only write(2). Examples: glibc's `_dl_debug_printf` (used by the dynamic linker) and Postgres' `write_stderr`. If you need this functionality, take one of these as a reference rather than rolling your own.
+    </Note>
+
+    **Common Wrong Answers:**
+    - "printf is not signal-safe because it does I/O." Wrong: write() does I/O and is signal-safe. The issue is locks and global state.
+    - "Use sprintf instead of printf." Wrong: sprintf is also not async-signal-safe (it uses locale state).
+    - "Add a mutex to printf." Wrong: that is what makes it unsafe.
+
+    **Further Reading:**
+    - "The self-pipe trick" by D. J. Bernstein -- cr.yp.to/docs/selfpipe.html.
+    - "signalfd, eventfd, timerfd: New ways to handle async events" on LWN -- lwn.net/Articles/253793/.
+    - "Async-Signal-Safe Functions" in glibc manual.
+  </Accordion>
+
+  <Accordion title="Walk through the entire flow when a process accesses an unmapped address. What does the kernel do, and how does the application get SIGSEGV?">
+    **Strong Answer Framework:**
+
+    1. **The fault**: User code executes `mov rax, [rdi]` where rdi points to address 0x42 (unmapped). The CPU's MMU walks the page table, finds no entry, raises a #PF (page fault) exception. The CPU pushes the faulting RIP, RSP, error code, and CR2 (the faulting address) onto the kernel stack and jumps to the kernel's page fault handler.
+    2. **The kernel page fault handler**: `do_page_fault()` (arch/x86/mm/fault.c) reads CR2 to get the faulting address. It walks the process's VMAs (Virtual Memory Areas) -- the linked list of mapped regions in mm_struct. If no VMA contains the address, this is a true segfault.
+    3. **Sending the signal**: The kernel calls `force_sig_fault(SIGSEGV, SEGV_MAPERR, addr)`. This sets the SIGSEGV bit in the task's pending mask along with the siginfo_t describing the fault (signal number, fault address, fault type).
+    4. **Signal delivery**: On the way back to user space, `do_signal()` dequeues SIGSEGV. If a handler is installed (e.g., for crash reporting), the kernel sets up a signal frame on the user stack (or alt stack if SA_ONSTACK), modifies the saved RIP to point at the handler, and returns. The handler runs. When it returns, rt_sigreturn restores the original context. If no handler, default action is to terminate the process and (typically) write a core dump.
+    5. **The subtle bit**: If the handler returns normally (without exiting or longjmping), the kernel restores the original RIP and RSP -- which means the same instruction that faulted is re-executed. If the underlying condition hasn't changed (still unmapped), it faults again, the handler runs again, infinite loop. This is why crash handlers either exit or longjmp out, never return.
+
+    **Real-World Example:**
+
+    JIT compilers (V8, JVM) use a clever trick: they intentionally let SIGSEGV happen on a guard page, catch it in a handler, and use the fault as a signal that "this VM region needs to be allocated/extended now." The handler maps the missing memory via mmap and returns; the original instruction re-executes successfully. This is how Go's growable goroutine stacks work -- a guard page at the end of the current stack triggers a fault, the runtime grows the stack, and execution resumes. This requires SA_ONSTACK because the original stack is exactly what overflowed.
+
+    <Note>
+    **Senior follow-up 1:** What is `SEGV_MAPERR` vs `SEGV_ACCERR`? Both are SIGSEGV with different siginfo si_code. `SEGV_MAPERR` (1) means "the address is not mapped at all" (no VMA covers it). `SEGV_ACCERR` (2) means "the address is mapped but you don't have permission for this access type" -- e.g., writing to a read-only page. Crash handlers can read si_code to distinguish, useful for debugging vs intentional guard page faults.
+    </Note>
+
+    <Note>
+    **Senior follow-up 2:** Why does running out of stack cause SIGSEGV instead of SIGBUS or some other signal? On Linux, the stack is implemented as a VMA that grows automatically when accessed below the current stack pointer (within the rlimit). When you access an address below the rlimit-allowed stack, the kernel extends the VMA. Beyond the rlimit, no VMA covers the address, so it is SEGV_MAPERR. On some BSDs, stack-related faults are SIGBUS. POSIX is loose on this -- portable code should handle both.
+    </Note>
+
+    <Note>
+    **Senior follow-up 3:** Can a SIGSEGV handler safely call malloc to allocate a logging buffer? No. malloc is not async-signal-safe. If the SIGSEGV happened while the main thread held the malloc lock, the handler deadlocks. For crash reporters, allocate the buffer at startup (when the process is healthy) and use it from the handler.
+    </Note>
+
+    **Common Wrong Answers:**
+    - "The process exits immediately." Wrong: a handler can intervene.
+    - "SIGSEGV is delivered to all threads." Wrong: it is synchronous, delivered to the faulting thread only.
+    - "The kernel handles all page faults silently." Only "valid" faults (page-in, COW, stack growth) are silent; "invalid" faults become SIGSEGV.
+
+    **Further Reading:**
+    - `arch/x86/mm/fault.c` in the Linux kernel -- the actual page fault handler.
+    - "Page faults explained" by Mathieu Desnoyers -- LWN article on page fault paths.
+    - "How V8 handles guard pages" in the V8 design docs.
+  </Accordion>
+</AccordionGroup>
+
+---
+
+Next: [Debugging &amp; Performance Observability](/operating-systems/debugging-performance) →

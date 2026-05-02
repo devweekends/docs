@@ -145,6 +145,32 @@ Keep this lifecycle in mind when reading or writing real drivers; the concepts i
 
 ---
 
+## 6.5 Caveats and Common Pitfalls
+
+<Warning>
+**Production traps that surface as kernel panics, data corruption, or ABI breakage:**
+
+1. **Shared interrupts -- the handler must check it is its device.** On legacy PCI (and even some modern systems), an IRQ line is shared among multiple devices. Every shared handler runs on every interrupt; each must read its device's status register and return `IRQ_HANDLED` or `IRQ_NONE`. A handler that always returns `IRQ_HANDLED` "for safety" hides bugs in *other* drivers (the kernel thinks the IRQ was serviced when it was not) and can cause interrupt storms. A handler that does work without checking can corrupt state when another device's IRQ fires.
+
+2. **DMA coherence -- invalidate cache before/after transfer.** On x86 with cache-coherent DMA, the hardware handles this; you barely notice. On ARM, MIPS, and many embedded platforms, DMA is *not* coherent: the device writes to RAM but the CPU cache holds stale copies. You must call `dma_sync_single_for_cpu` (invalidate) before reading device-written data, and `dma_sync_single_for_device` (clean) after CPU writes the device will read. Forgetting these produces intermittent corruption that depends on cache pressure -- the worst class of bug.
+
+3. **`ioctl` is unstructured -- easy to introduce ABI bugs.** The `ioctl` interface is a giant typeless switch on integer commands. There is no schema, no versioning, no automatic backward compatibility. Common bugs: defining an ioctl with `_IOR(x, y, struct foo)` and later adding a field to `struct foo` -- old userspace passes the smaller struct, the kernel reads past the end, returns garbage or panics. Or using a `long` in a 32-bit-vs-64-bit struct, breaking ioctl on compat tasks. Modern alternatives: netlink, sysfs, character device with versioned binary protocols.
+
+4. **Module unload while in use -- refcounts must be tight.** If a driver's code is in use (a thread is executing in the module, an open fd references the device, a timer is queued) and the module is unloaded, the kernel jumps into freed memory -- instant panic. The fix is `try_module_get`/`module_put` plus reference counting on every entry point. Forgetting one path is enough. This is why `rmmod` typically fails for active drivers; some lazy authors paper over it with `MODULE_PUT_AND_RETURN_THREAD` instead of fixing the actual refcount path.
+</Warning>
+
+<Tip>
+**Solutions and patterns that prevent these failure modes:**
+
+- **Always read your device's status register at the top of the IRQ handler.** Return `IRQ_NONE` if the interrupt is not for you. This is a 5-line invariant that prevents most shared-IRQ misery. Modern kernels prefer MSI/MSI-X (per-device interrupts, no sharing) -- request them via `pci_alloc_irq_vectors` if your device supports it.
+- **Use the streaming DMA API correctly: `dma_map_single` plus `dma_sync_single_for_*` around touches.** Or use coherent allocations (`dma_alloc_coherent`) for descriptors and small buffers. Coherent DMA is more expensive (uncached memory on some platforms) but eliminates the synchronization burden. For per-transfer buffers, streaming DMA wins.
+- **Prefer netlink, sysfs, configfs, or a versioned character-device protocol over `ioctl` for new interfaces.** If you must use ioctl, define structs with explicit padding, version fields, and reserved bytes. Run `compat_ioctl` checks for 32-on-64 builds. Document the ABI in `Documentation/userspace-api/ioctl/` -- if you cannot write the spec, you cannot ship the interface.
+- **Use the device model's `kref` and module reference patterns; do not invent your own.** `request_module`, `try_module_get`, `module_put`, `kref_init`, `kref_get`, `kref_put` -- these are the building blocks. When a release function fires (refcount hits zero), you can finally tear down. Test by `rmmod` while a fuzzer or stress harness is hammering the device.
+- **Run KASAN, KCSAN, KFENCE, lockdep, and `slub_debug` on every driver in CI.** These sanitizers catch memory bugs, data races, lock inversions, and slab corruption before they hit production. They slow the kernel, but driver bugs caught at CI cost minutes; the same bugs in production cost weekend escalations.
+</Tip>
+
+---
+
 ## 7. Interview Deep Dive: Senior Level
 
 <AccordionGroup>
@@ -179,42 +205,191 @@ Next: [The Advanced Storage Stack](/operating-systems/storage-stack) →
 ## Interview Deep-Dive
 
 <AccordionGroup>
-  <Accordion title="Explain the split interrupt handling model (top half / bottom half). Why can't you just do all the work in the interrupt handler?">
-    **Strong Answer:**
+  <Accordion title="Walk me through writing a character device driver">
+    **Strong Answer Framework:**
 
-    - The top half runs with interrupts disabled on the current CPU. If it takes too long, it delays handling of other interrupts -- including timer interrupts, so the scheduler cannot preempt and the system appears frozen. At 100Gbps, packets arrive every ~6ns; spending even 1ms in a top half means thousands of dropped packets.
-    - The top half should do the minimum: acknowledge the hardware, save volatile data from registers, and schedule a bottom half. The bottom half comes in three flavors: Softirqs (per-CPU, interrupt context, cannot sleep -- used for networking and timers), Tasklets (serialized per-tasklet, simpler, also cannot sleep), and Workqueues (run as kernel threads, CAN sleep -- for anything needing memory allocation with GFP_KERNEL or I/O waits).
-    - A real-world war story: a driver that put a slow I2C bus transaction in the top half. On a single-core embedded system, this caused 500us latency spikes that triggered watchdog resets under heavy interrupt load. Moving the I2C read to a workqueue fixed it.
+    1. **Frame the interface contract.** A character device exposes byte-stream semantics through `open`, `read`, `write`, `release`, optionally `ioctl`, `mmap`, `poll`. Userspace sees a node in `/dev` (e.g., `/dev/mychar`); the kernel routes calls through the driver's `file_operations`.
+    2. **Allocate a major/minor number.** `alloc_chrdev_region(&dev, 0, 1, "mychar")` requests a dynamic major from the kernel. Hardcoding majors is fragile; let the kernel allocate.
+    3. **Initialize a `cdev` and add it.** `cdev_init(&my_cdev, &my_fops)` ties the cdev to the `file_operations` struct. `cdev_add(&my_cdev, dev, 1)` makes the device visible to the VFS.
+    4. **Create the device node.** Either udev rules + sysfs entry (production), or `device_create(class, NULL, dev, NULL, "mychar")` to spawn `/dev/mychar` automatically.
+    5. **Implement `file_operations`.**
+       - `open`: increment refcount, allocate per-fd state, return 0 or `-E*`.
+       - `read`: copy from internal buffer to user with `copy_to_user`. Handle EOF, partial reads, signal interruption.
+       - `write`: validate size, `copy_from_user`, push into hardware or buffer.
+       - `release`: free per-fd state, decrement refcount.
+       - `unlocked_ioctl`: switch on cmd codes; validate arg pointer; `copy_from_user`/`copy_to_user` for structured args.
+    6. **Handle concurrency.** Multiple processes can open the device simultaneously. Use a mutex for ordering, or per-fd state with no shared mutable data.
+    7. **Tear down on module exit.** `cdev_del`, `unregister_chrdev_region`, free buffers. Make sure no `release` paths can race with module unload.
+    8. **Add error paths.** Every `goto err_X` label, every refcount decrement on failure, every freed allocation.
 
-    **Follow-up: What is NAPI, and why does Linux switch from interrupts to polling under high load?**
+    **Real-World Example:** The misc device subsystem (`miscdevice`) exists precisely because character devices have so much boilerplate. Drivers like `/dev/null`, `/dev/random`, and `/dev/kvm` use `miscdevice` for a one-call registration. When studying real character drivers, read `drivers/char/misc.c` and `drivers/char/random.c` -- they show the full pattern in a few hundred lines. The 2017 `/dev/random` rewrite by Ted T'so is a great study in how a "simple" character driver hides deep semantics around blocking, entropy estimation, and security.
 
-    NAPI is a hybrid interrupt/polling mechanism. Under low load, one interrupt per packet. Under high load, the CPU would spend 100% of time in interrupt handlers (interrupt storm). After the first interrupt, NAPI disables further NIC interrupts and the kernel polls the device's receive ring buffer in a softirq. Once the ring is empty, interrupts are re-enabled. This provides low latency under light load and high throughput under heavy load.
+    <Note>
+    **Senior Follow-up 1:** "How does `mmap` change the picture?"
+
+    Implementing `mmap` lets userspace map device buffers directly. The driver provides a `vm_operations_struct` with `fault` (for demand-fill) or maps physical MMIO via `remap_pfn_range`. This is how high-perf drivers (VFIO, DRM, RDMA) avoid `read`/`write` syscalls entirely. The catch: lifecycle management gets harder -- you must keep mappings valid until userspace munmaps, even on driver shutdown.
+    </Note>
+
+    <Note>
+    **Senior Follow-up 2:** "How do you support `select`/`poll` on your character device?"
+
+    Implement `.poll = my_poll`. The handler calls `poll_wait(file, &my_waitqueue, wait)` to register the wait queue, then returns a bitmask: `EPOLLIN | EPOLLRDNORM` if readable, `EPOLLOUT` if writable, etc. When data arrives, your code calls `wake_up_interruptible(&my_waitqueue)` to wake all waiters. Without proper poll support, userspace must busy-loop, defeating the purpose of having a kernel driver.
+    </Note>
+
+    <Note>
+    **Senior Follow-up 3:** "What is the difference between `unlocked_ioctl` and the older `ioctl`?"
+
+    Pre-2.6.36, ioctl was called with the BKL (Big Kernel Lock) held -- a global mutex that serialized everything. `unlocked_ioctl` runs without BKL; the driver is responsible for its own locking. The old form is gone. For 32-bit userspace on 64-bit kernels, also implement `compat_ioctl` to translate struct layouts.
+    </Note>
+
+    **Common Wrong Answers:**
+
+    1. *"Just register the major and you are done."* Without `cdev_add`, the device exists in the table but VFS will not route to it.
+    2. *"Use `printk` to communicate with userspace."* That is a log, not an interface. Use the file_ops.
+    3. *"`copy_to_user` is just memcpy."* It is not. It handles user-page faults, validates the pointer is a valid user range, and may sleep. Inside an atomic context, you must use `copy_to_user_inatomic` or pre-fault.
+
+    **Further Reading:**
+    - Linux Device Drivers, 3rd ed (Corbet, Rubini, Kroah-Hartman) -- canonical, available free online
+    - `drivers/char/misc.c` and `drivers/char/random.c` in the kernel source
+    - "Writing your first character device driver" -- Greg Kroah-Hartman talks
   </Accordion>
 
-  <Accordion title="Walk me through how DMA descriptor rings work and what happens if you get the memory ordering wrong.">
-    **Strong Answer:**
+  <Accordion title="Top half vs bottom half -- why this split?">
+    **Strong Answer Framework:**
 
-    - A descriptor ring is a circular buffer in host RAM shared between the driver and device. The driver fills transmit descriptors (buffer address, length, flags), advances a tail pointer, and writes a doorbell register. The device reads descriptors from its head pointer, performs DMA, writes completion status, and advances head.
-    - The critical ordering issue: descriptor contents must be visible in memory BEFORE the device reads them. On x86 (TSO), stores are ordered, but the compiler can still reorder. On ARM (weak model), the CPU can reorder stores. If the device sees the updated tail pointer before descriptor data is written, it reads garbage and may DMA to a wrong address.
-    - Fix: `wmb()` after writing the descriptor but before the doorbell write. The doorbell itself uses `writel()` which includes an implicit barrier. For completions, `rmb()` after reading the completion flag before reading completion data.
-    - Another subtlety: DMA coherency. Without proper `dma_map_single()` / `dma_unmap_single()`, the device writes to DRAM but the CPU reads stale data from its cache. This manifests as intermittent data corruption depending on cache eviction timing.
+    1. **State the constraint.** When an interrupt fires, the kernel preempts whatever was running, masks further interrupts on the current CPU, and runs the handler. Until that handler returns, no other interrupt at the same or lower priority can be serviced -- including timer interrupts that drive scheduling. A long handler effectively freezes the CPU.
+    2. **Quantify the budget.** Target the top half at single-digit microseconds. At 100Gbps line rate, packets arrive every ~6ns; even a 100us top half means dropping 16,000 packets. Hard real-time systems demand even tighter budgets (sub-microsecond).
+    3. **Define the work split.**
+       - Top half: acknowledge hardware (clear interrupt status), copy minimal volatile state out of device registers, schedule a bottom half. Done.
+       - Bottom half: protocol parsing, packet routing, copy to user buffers, anything that needs memory allocation, anything that might sleep.
+    4. **Enumerate the bottom-half mechanisms.**
+       - **Softirqs:** statically defined (NET_RX, TIMER, BLOCK), per-CPU, run in interrupt context, cannot sleep. Highest priority.
+       - **Tasklets:** built on softirqs (HI_SOFTIRQ/TASKLET_SOFTIRQ). Same constraints, but a given tasklet runs on at most one CPU at a time -- simpler concurrency. Being deprecated in favor of...
+       - **Threaded IRQs:** `request_threaded_irq` lets the kernel run the handler in a kernel thread. Can sleep. Costs a context switch but trades off vs latency.
+       - **Workqueues:** run in kernel threads, can sleep, allocate with `GFP_KERNEL`, do I/O. The right choice when bottom-half work is heavy or needs memory.
+    5. **Show the war story.** A senior engineer once put a 50ms I2C bus transaction in the top half. The system survived in light load and crashed under high IRQ rate from another device because watchdog timer interrupts were starved. Moving the I2C read to a workqueue fixed it. The lesson: anything that can block, must not be in the top half.
 
-    **Follow-up: What is the IOMMU and how does it protect against a malicious device?**
+    **Real-World Example:** The 2014 introduction of NAPI on Linux explicitly addressed the top-half problem for high-rate NICs. Pre-NAPI, every packet caused an interrupt, and the top half plus softirq were per-packet. Under 10Gbps load this saturated the CPU before useful work could happen. NAPI reframes the problem: after the first interrupt, switch to polling in softirq context, drain the receive ring, and only re-arm interrupts when traffic subsides. The same pattern (the "deferred polling" model) is now in NVMe (CQs) and io_uring.
 
-    Without an IOMMU, any device with DMA can read or write arbitrary physical memory. The IOMMU translates Device Virtual Addresses to Host Physical Addresses. The OS configures per-device IOMMU page tables restricting which physical addresses each device can access. If a device tries to DMA outside its range, the IOMMU blocks it and raises a fault. This is also critical for VM device passthrough -- ensuring a passed-through PCIe device can only access the guest's memory.
+    <Note>
+    **Senior Follow-up 1:** "How do you choose between a tasklet and a workqueue?"
+
+    Tasklet: needs to run soon (next softirq), cannot sleep, small amount of work. Workqueue: long-running, may sleep, may allocate large buffers, may do I/O. Latency-critical and quick: tasklet. Heavy and async-friendly: workqueue. Rule of thumb: if the bottom half could ever take longer than 100us, use a workqueue or threaded IRQ.
+    </Note>
+
+    <Note>
+    **Senior Follow-up 2:** "What happens if a softirq runs too long?"
+
+    `ksoftirqd/N` (a per-CPU kernel thread) takes over. After a fixed number of softirq invocations from the IRQ exit path, the kernel defers remaining softirq work to ksoftirqd, which runs at normal priority and can be preempted. This prevents a runaway softirq from starving userland entirely. You can see this on heavy network systems -- `ksoftirqd` near top of `top`.
+    </Note>
+
+    <Note>
+    **Senior Follow-up 3:** "What is `request_threaded_irq` and when do you use it?"
+
+    `request_threaded_irq(irq, hard_handler, thread_handler, flags, name, dev)`. The hard handler runs in interrupt context (top half), returns `IRQ_WAKE_THREAD` to invoke the thread handler. The thread handler runs in a kernel thread, can sleep, can allocate. Use this when your driver needs to do meaningful work on every IRQ but cannot afford to block the CPU.
+    </Note>
+
+    **Common Wrong Answers:**
+
+    1. *"Just make the top half faster."* You can shave microseconds, but you cannot make `kmalloc(GFP_KERNEL)` non-sleeping. Some work belongs in a bottom half regardless.
+    2. *"Always use workqueues."* For latency-critical work (network RX), a workqueue's context-switch cost is too high. Use a softirq or threaded IRQ.
+    3. *"Bottom halves are slower."* They are deferred but may run nanoseconds later. The split is about *where* the work runs, not about speed.
+
+    **Further Reading:**
+    - "Linux Kernel Development" by Robert Love, ch. 8 (Bottom Halves and Deferring Work)
+    - LWN, "The new way of ignoring interrupts" -- the threaded IRQ history
+    - "NAPI: New API" -- Documentation/networking/napi.rst in the kernel source
   </Accordion>
 
-  <Accordion title="A kernel module you loaded causes random crashes only under memory pressure. How would you debug this?">
-    **Strong Answer:**
+  <Accordion title="DMA -- explain coherent vs streaming, with an example">
+    **Strong Answer Framework:**
 
-    - Likely causes: GFP_KERNEL allocations in atomic context (interrupt handler or spinlock held), unhandled allocation failures (kmalloc returns NULL under pressure), DMA memory leaks, or use-after-free that only manifests when slab recycling speeds up under pressure.
-    - Step 1: Enable KASAN (Address Sanitizer), KFENCE (lightweight use-after-free detection), and SLUB debugging (`slub_debug=FZPU`). KASAN catches out-of-bounds and use-after-free.
-    - Step 2: Check crash logs in `dmesg`. Cross-reference the faulting IP with module symbols using `addr2line` on the .ko file.
-    - Step 3: Enable `CONFIG_DEBUG_ATOMIC_SLEEP`. If the module calls `kmalloc(GFP_KERNEL)` in atomic context, the kernel prints a warning. Under pressure, GFP_KERNEL may trigger direct reclaim (sleep), which is illegal in atomic context.
-    - Step 4: Use fault injection (`/sys/kernel/debug/failslab/`) to deliberately fail allocations and exercise error paths.
+    1. **Establish the problem.** DMA lets a device read/write RAM directly, but the CPU has caches. Without coordination, the CPU sees stale cached data after a device write, or the device sees stale RAM after a CPU write. The DMA API exists to manage this.
+    2. **Coherent (consistent) DMA.** `dma_alloc_coherent(dev, size, &dma_handle, GFP_KERNEL)` returns a pair: a kernel virtual address and a DMA address. The memory is allocated such that CPU and device always see the same data -- on x86, this is normal cached memory plus snoop logic; on ARM/MIPS, it is uncached or specially mapped memory. Use for: descriptor rings, control structures, anything accessed concurrently by both CPU and device.
+    3. **Streaming DMA.** `dma_map_single(dev, ptr, size, direction)` takes existing memory and prepares it for one DMA transfer in one direction. After the transfer, `dma_unmap_single` releases. For partial syncs during the transfer (rare), `dma_sync_single_for_cpu` and `dma_sync_single_for_device`. Use for: per-packet network buffers, per-block disk buffers -- anything where the lifetime is bounded and direction is known.
+    4. **Pick the right one.**
+       - Long-lived, both-direction, small (under 1 page): coherent.
+       - Per-IO, one-direction, possibly large: streaming.
+       - Coherent is more expensive per access on non-x86 (uncached reads), so do not use it for bulk data.
+    5. **Concrete example: NVMe.** The SQ and CQ ring buffers are allocated coherent (driver and controller both poll them constantly). Each I/O's data buffer is mapped streaming -- direction known, lifetime bounded by the I/O.
+    6. **Misuse symptoms.** Skipping `dma_map_single`: device DMAs to physical address that may be a virtual page that has been swapped, freed, or remapped -- corruption or fault. Using coherent for a 1MB I/O buffer on ARM: 10x slower because of uncached reads. Forgetting `dma_unmap_single`: leaks IOMMU mappings, eventually exhausts the IOMMU page table.
 
-    **Follow-up: What is the difference between GFP_KERNEL and GFP_ATOMIC?**
+    **Real-World Example:** The Raspberry Pi 4 ships with a USB controller (the VLI VL805) that initially had a buggy DMA implementation -- on certain access patterns, it would fetch from cache instead of physical memory. The fix involved both firmware updates and Linux driver patches in 2020 to ensure coherent allocations were used in specific paths. This kind of subtle hardware/software co-bug is why driver authors must know the DMA API cold.
 
-    GFP_KERNEL allows sleeping (direct reclaim, OOM killer, writeback). Used in process context where sleeping is safe. GFP_ATOMIC cannot sleep -- only allocates from existing free pool and emergency reserves. Returns NULL immediately if unavailable. Must be used in interrupt context and with spinlocks held. Code using GFP_ATOMIC must always handle NULL returns. Common bug: code that works fine normally (GFP_ATOMIC always succeeds with plenty of free memory) but crashes under pressure when the allocation fails and the error path has a bug.
+    <Note>
+    **Senior Follow-up 1:** "What is the IOMMU and how does it interact with DMA mapping?"
+
+    The IOMMU is a hardware unit that translates device-issued DMA addresses to physical addresses, analogous to an MMU for the CPU. With an IOMMU, `dma_map_single` allocates an I/O virtual address and installs a translation. The device sees the I/OVA; the IOMMU translates to the actual physical page. Benefits: device can only DMA to memory the OS authorized, scattered physical pages can be presented contiguously to the device, and a malicious or buggy device cannot corrupt arbitrary memory.
+    </Note>
+
+    <Note>
+    **Senior Follow-up 2:** "What is `dma_sync_single_for_*` actually doing?"
+
+    Cache maintenance. `for_cpu` (after device write) invalidates the CPU cache line for the buffer so the next CPU read goes to RAM. `for_device` (after CPU write) flushes the cache line so the device reads the latest data. On coherent platforms (x86), these are no-ops. On non-coherent (ARM, MIPS), they are real cache maintenance instructions and matter for correctness.
+    </Note>
+
+    <Note>
+    **Senior Follow-up 3:** "What is bounce buffering and when does it kick in?"
+
+    If a device cannot DMA to certain physical addresses (e.g., a 32-bit device on a 64-bit machine with high memory), the kernel allocates a bounce buffer in addressable memory, copies to/from it around the DMA. Slow but transparent. Configurable via `dma_set_mask_and_coherent`. Modern devices (PCIe with 64-bit addressing) rarely need bouncing.
+    </Note>
+
+    **Common Wrong Answers:**
+
+    1. *"DMA is automatic; the kernel handles caching."* True on x86 if you use the API. On other architectures, you must call sync functions correctly. Always go through the DMA API.
+    2. *"Just always use coherent DMA."* Performance disaster on non-x86 platforms. Streaming is the right default for bulk per-IO buffers.
+    3. *"Skip `dma_unmap_single` to save time."* IOMMU mappings leak and IOMMU page tables fill, eventually halting the system.
+
+    **Further Reading:**
+    - `Documentation/core-api/dma-api.rst` and `dma-api-howto.rst` in the kernel source
+    - "DMA on Linux" -- LWN article series
+    - PCIe specification, ch. 2 (Transaction Layer) for the wire-level view of DMA
+  </Accordion>
+
+  <Accordion title="A kernel module causes random crashes only under memory pressure -- how would you debug?">
+    **Strong Answer Framework:**
+
+    1. **Form initial hypotheses.** Memory-pressure-only failures point at: GFP_KERNEL allocation in atomic context (direct reclaim attempts to sleep), unhandled `kmalloc` returning NULL, use-after-free that surfaces when slab recycling speeds up, DMA buffer leaks, or race conditions exposed under increased concurrency.
+    2. **Capture the crash.** Get a kernel panic log via netconsole, kdump, or serial console. `dmesg` shows the offending instruction pointer and stack. `addr2line` against the .ko file maps IP to source.
+    3. **Enable the sanitizers.**
+       - **KASAN:** detects out-of-bounds and use-after-free. Slows the kernel ~3x but invaluable.
+       - **KFENCE:** lightweight, production-friendly use-after-free detection (statistical sampling).
+       - **CONFIG_SLUB_DEBUG / `slub_debug=FZPU`:** poisons freed slab memory, validates redzones.
+       - **lockdep:** reveals deadlock-prone lock ordering.
+       - **CONFIG_DEBUG_ATOMIC_SLEEP:** warns when sleeping primitives are called in atomic context.
+    4. **Force the failing path.** Use `/sys/kernel/debug/failslab/` and `failpage_alloc` to inject allocation failures. If your error path has a bug, you reproduce in seconds instead of waiting for natural pressure.
+    5. **Bisect.** If the crash is regression-induced, `git bisect` between known good and bad kernels. Combine with KASAN to catch the actual bug, not just the symptom.
+    6. **Static analysis.** Run `sparse`, `smatch`, and `coccinelle` scripts against the driver. These catch missing error checks, double frees, and locking errors.
+
+    **Real-World Example:** In 2019, a series of crashes on Google's production fleet running a custom NIC driver were traced to a `GFP_KERNEL` allocation in a softirq path. The bug had been latent for months -- under normal load, the allocation always succeeded from the per-CPU cache. Under memory pressure, it triggered direct reclaim, which tried to sleep, which paniced. KASAN did not catch it (no memory corruption); `CONFIG_DEBUG_ATOMIC_SLEEP` would have. The post-incident playbook now requires both for all driver CI.
+
+    <Note>
+    **Senior Follow-up 1:** "What is the difference between GFP_KERNEL and GFP_ATOMIC?"
+
+    GFP_KERNEL allows sleeping: direct reclaim, OOM kill, writeback. Use in process context. GFP_ATOMIC cannot sleep -- pulls only from existing free pool plus emergency reserves. Returns NULL immediately on failure. Required in interrupt context and with spinlocks held. The bug that hides in plain sight: code uses GFP_KERNEL "because it usually works" until pressure makes it sleep at the wrong time.
+    </Note>
+
+    <Note>
+    **Senior Follow-up 2:** "How do you reproduce a memory-pressure bug in CI?"
+
+    `stress-ng --vm 4 --vm-bytes 95% --timeout 5m` saturates RAM. Inside the test container or VM, run your driver workload concurrently. Combine with `failslab` injection to fail allocations randomly. For tail-latency-sensitive paths, also force compaction via `/proc/sys/vm/compact_memory`.
+    </Note>
+
+    <Note>
+    **Senior Follow-up 3:** "What is the OOM killer's interaction with module memory?"
+
+    Module-allocated memory does not look like userspace memory -- it is kernel memory (slab/vmalloc) and is not directly reclaimable. If a driver leaks, the OOM killer cannot help; eventually the system locks up or panics. This is why driver leaks are uniquely dangerous and why every driver should expose its memory consumption via `/proc` or sysfs counters.
+    </Note>
+
+    **Common Wrong Answers:**
+
+    1. *"Add more RAM."* Treats the symptom; the bug recurs at higher scale.
+    2. *"Always use GFP_ATOMIC to be safe."* GFP_ATOMIC is for atomic context only; in process context it makes failures more likely (smaller pool to draw from).
+    3. *"Just check if `kmalloc` returned NULL."* Necessary but not sufficient -- the error path itself often has bugs (double free, missed unwind).
+
+    **Further Reading:**
+    - `Documentation/dev-tools/kasan.rst` and `kfence.rst`
+    - "Detecting Kernel Memory Corruption" -- Andrey Konovalov's talks
+    - `lib/test_*.c` in the kernel source -- examples of error-path stress tests
   </Accordion>
 </AccordionGroup>

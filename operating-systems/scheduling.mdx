@@ -200,7 +200,7 @@ Theory is useful, but scheduling only really “sticks” when you can picture c
 
 ### 8.1 Latency-Sensitive Web Service
 
-- **Scenario**: A multi-threaded HTTP API serving p95 < 100 ms.
+- **Scenario**: A multi-threaded HTTP API serving p95 under 100 ms.
 - **Workload**: Short CPU bursts, heavy I/O (database, caches), thousands of concurrent connections.
 - **Scheduling Implications**:
   - Favor **low latency** over maximum throughput.
@@ -341,7 +341,7 @@ int main() {
     CFS does not assign fixed time slices like Round Robin. Instead, it uses a dynamic approach based on two parameters: `sched_latency_ns` (default 6ms for up to 8 tasks) and `sched_min_granularity_ns` (default 0.75ms).
 
     The algorithm:
-    - **Few tasks (N <= sched_nr_latency, default 8)**: Each task gets `sched_latency_ns / N` weighted by its nice value. With 4 equal-weight tasks: each gets 6ms / 4 = 1.5ms per scheduling round. This means every task runs at least once every 6ms, giving good interactive responsiveness.
+    - **Few tasks (N is at most sched_nr_latency, default 8)**: Each task gets `sched_latency_ns / N` weighted by its nice value. With 4 equal-weight tasks: each gets 6ms / 4 = 1.5ms per scheduling round. This means every task runs at least once every 6ms, giving good interactive responsiveness.
     - **Many tasks (N > 8)**: The time slice would become `6ms / N`. For 1000 tasks, that is 6 microseconds -- less than the context switch cost. So CFS clamps at `sched_min_granularity_ns` (0.75ms). With 1000 tasks, the effective scheduling period becomes 1000 * 0.75ms = 750ms. This means a task might wait 750ms between runs. Interactive responsiveness degrades significantly.
 
     The vruntime mechanism:
@@ -373,6 +373,199 @@ int main() {
     **Follow-up: How does the Shortest Job First (SJF) algorithm solve the Convoy Effect, and why can it not be used in OS CPU scheduling?**
 
     SJF is provably optimal for minimizing average waiting time. By running the shortest job first, you minimize the waiting time for the majority (short jobs) at a small cost to the minority (long jobs). The problem is that in CPU scheduling, you do not know the length of the next CPU burst. SJF requires future knowledge. The best approximation is exponential averaging of past burst lengths, but this is inaccurate for processes with variable behavior. MLFQ solves this by using observed behavior: new processes start at high priority (assumed short) and get demoted if they use their full time slice (revealed as long). This approximates SJF without requiring predictions.
+  </Accordion>
+</AccordionGroup>
+
+---
+
+## Production Caveats &amp; Common Pitfalls
+
+The scheduler is a place where intuition fails badly. Here are four traps that have caused real outages.
+
+<Warning>
+**Caveat 1: CFS vs RT priorities -- RT can starve everything**
+
+`SCHED_FIFO` and `SCHED_RR` (real-time scheduling classes) sit *above* CFS in priority. A `SCHED_FIFO` task at any priority preempts every `SCHED_NORMAL` (CFS) task immediately, regardless of nice values. If a SCHED_FIFO task enters an infinite loop or just runs busy work, it can starve every other process on the system -- including kernel housekeeping threads. The system appears to hang. Even SSH may time out. This is not a bug; it is the design. RT scheduling is for hard real-time, where missing a deadline is worse than hanging the rest of the box.
+</Warning>
+
+<Tip>
+**The fix:** Always set `kernel.sched_rt_runtime_us` (default 950000 of 1000000us) so RT tasks cannot consume more than 95% of CPU per second -- the remaining 5% is reserved for non-RT work, ensuring you can SSH in and kill a runaway. For RT services, also set `RLIMIT_RTTIME` per process, which kills RT tasks that hold the CPU too long without blocking. In SystemD, use `LimitRTTIME=`. Audit any code that sets SCHED_FIFO -- ask whether it really needs hard real-time, or just lower latency. For lower latency without RT risks, use SCHED_NORMAL with a low nice value or use cgroup CPU bandwidth controls.
+</Tip>
+
+<Warning>
+**Caveat 2: CPU affinity vs NUMA placement -- the wrong choice tanks performance 2-3x**
+
+CPU pinning is a popular tuning knob. But pinning a thread to a CPU on a different NUMA node from its memory allocation is catastrophic. Memory access from the wrong NUMA node is ~2x slower, and on socket-to-socket access can be 3x. I once watched a JVM service degrade by 2.5x in p99 latency after a "performance tuning" change pinned all worker threads to CPU 0-15, but the heap had been allocated on the second NUMA node (CPUs 16-31). Every memory access crossed the QPI/UPI link.
+</Warning>
+
+<Tip>
+**The fix:** Use `numactl --cpunodebind=0 --membind=0` to pin both CPU and memory to the same NUMA node. For Java, also set `-XX:+UseNUMA`. Verify with `numastat -p PID` -- if the "Node" column shows mostly local-node access, you are good; if you see significant "other node" memory, you have a misalignment. For containers, set CPU affinity via cgroups (`cpuset.cpus`) and memory via `cpuset.mems`. For databases like Redis or PostgreSQL, run one process per NUMA node and shard data across them rather than one process spanning nodes.
+</Tip>
+
+<Warning>
+**Caveat 3: nice doesn't change RT scheduling class**
+
+A common misconception: "nice -20 is the highest priority." Wrong -- nice only affects `SCHED_NORMAL` (CFS). If your service runs CPU-bound batch jobs and you want them to yield to interactive work, setting `nice 19` on the batch jobs only helps among other CFS tasks. If anything on the system is using SCHED_FIFO or SCHED_RR, it preempts your nice 0 work just as easily as it preempts your nice 19 work. Conversely, nice -20 does nothing to give you priority over a real-time process.
+</Warning>
+
+<Tip>
+**The fix:** Understand the scheduling class hierarchy: `SCHED_DEADLINE` &gt; `SCHED_FIFO`/`SCHED_RR` &gt; `SCHED_NORMAL` (with nice) &gt; `SCHED_BATCH` &gt; `SCHED_IDLE`. To actually elevate priority, change scheduling class with `chrt -f 50 myprocess`. To deprioritize batch work effectively, use `chrt -b 0 myprocess` (SCHED_BATCH) or `chrt -i 0 myprocess` (SCHED_IDLE). Cgroups CPU controller (`cpu.weight` in cgroup v2) gives proportional shares within CFS and is what container orchestrators use.
+</Tip>
+
+<Warning>
+**Caveat 4: Load average is misleading on Linux (counts D-state)**
+
+Linux's load average counts both `R` (runnable) and `D` (uninterruptible sleep, usually I/O wait) states. On a system stuck waiting for a slow NFS server, you might see a load average of 50 with the CPUs nearly idle. Comparing this to BSD's load average (R-only) leads to wrong conclusions. I have seen ops teams add CPUs to "fix" a high load average, only to discover the real issue was a degraded SAN.
+</Warning>
+
+<Tip>
+**The fix:** Always cross-reference load average with CPU utilization (`top`, `mpstat`) and I/O wait (`iostat -x`). If load is high but CPUs idle, look at `iowait` and inspect `/proc/PID/stack` of D-state processes (`for p in $(ps -eo pid,stat | awk '$2 ~ /D/'); do echo $p; cat /proc/$p/stack; done`). For monitoring, prefer CPU runqueue length (`vmstat 1` "r" column) for "are we CPU-saturated?" and disk I/O wait for "are we I/O-bound?". Brendan Gregg has a great article: "Linux Load Averages: Solving the Mystery" (brendangregg.com).
+</Tip>
+
+---
+
+## Senior-Level Interview Questions
+
+<AccordionGroup>
+  <Accordion title="Explain CFS vruntime and how it converges to fairness. What happens when a process sleeps for 10 seconds and wakes up?">
+    **Strong Answer Framework:**
+
+    1. **Define vruntime**: Each task in CFS has a `vruntime` (virtual runtime) -- the amount of CPU time the task has consumed, scaled by the inverse of its weight (nice value). A nice 0 task's vruntime grows at 1.0x wall-clock seconds per CPU-second. A nice -20 task (weight ~88761) grows at ~0.012x. A nice +19 task (weight 15) grows at ~68x. CFS always picks the runnable task with the smallest vruntime.
+    2. **Explain convergence**: When the lowest-vruntime task runs, its vruntime increases until another task has lower vruntime; then the scheduler switches. Over time, tasks of equal weight accumulate vruntime at equal rates, getting equal CPU. Tasks with higher weight (lower nice) accumulate more slowly, so they get more CPU time per scheduling round.
+    3. **Address the wakeup case**: A task that sleeps for 10 seconds would have very low vruntime if we did nothing -- it would dominate the CPU upon waking, starving other tasks. CFS prevents this with `min_vruntime`: a per-runqueue counter that tracks the smallest vruntime of currently runnable tasks. When a task wakes up, its vruntime is set to `max(saved_vruntime, min_vruntime - sched_latency_ns/2)`. This gives the waking task a small "bonus" (it goes a bit before others) but caps how far behind it can be -- fairness is preserved.
+    4. **Highlight the latency target**: CFS does not use a fixed quantum. Instead, it uses `sched_latency_ns` (default 6ms with up to 8 tasks) -- the period in which every task should get a turn. With 4 tasks, each gets 1.5ms before the next switch. Combined with `sched_min_granularity_ns` (default 0.75ms), this prevents excessive switching when there are many tasks.
+
+    **Real-World Example:**
+
+    The CFS algorithm was introduced by Ingo Molnar in Linux 2.6.23 (October 2007), replacing the O(1) scheduler. The motivation was reduced jitter for interactive tasks. The famous benchmark was BFS (Brain Fuck Scheduler) by Con Kolivas, which beat CFS for desktop workloads up to 16 cores; this controversy led to the "200-line desktop interactivity patch" debate. CFS won the mainline because it scales to thousands of cores; BFS sacrificed scalability for desktop snappiness.
+
+    <Note>
+    **Senior follow-up 1:** Why a red-black tree and not a heap? Both can find the minimum efficiently. The reason is that CFS frequently *removes arbitrary nodes*, not just the minimum -- when a task blocks on I/O, the scheduler removes it from the tree. Heaps support O(log n) extract-min but O(n) deletion of arbitrary elements. Red-black trees support both in O(log n). The leftmost-node cache makes extract-min effectively O(1).
+    </Note>
+
+    <Note>
+    **Senior follow-up 2:** What is "vruntime overflow" and how is it handled? vruntime is a 64-bit unsigned integer counting nanoseconds. At 1 vruntime/second per task, it overflows after 584 years -- not a practical concern. But comparisons of vruntime use signed 64-bit difference, which means relative comparisons work even when individual values are huge. The key insight: CFS only cares about ordering, never absolute values.
+    </Note>
+
+    <Note>
+    **Senior follow-up 3:** Why is CFS being replaced by EEVDF in Linux 6.6+? CFS aims for fairness in the long run but has high "lag" -- short-term unfairness. A latency-sensitive task that sleeps and wakes up may wait many milliseconds. EEVDF (Earliest Eligible Virtual Deadline First) computes a virtual deadline for each task based on its weight and runs the task with the closest deadline that is "eligible" (has not exceeded its share). This gives much tighter latency bounds, useful for audio, gaming, and trading. The switch was largely transparent to userspace -- nice values and weights still work the same way.
+    </Note>
+
+    **Common Wrong Answers:**
+    - "CFS uses time slices like Round Robin." Wrong: CFS uses dynamic preemption based on vruntime, not fixed slices.
+    - "Higher nice = more CPU." Wrong: higher nice = lower priority. Nice -20 is the highest priority for CFS.
+    - "Sleeping tasks accumulate vruntime credit." Wrong: vruntime only grows when running; the wakeup adjustment is what prevents starvation of long-sleepers.
+
+    **Further Reading:**
+    - `Documentation/scheduler/sched-design-CFS.rst` in the Linux kernel.
+    - "Inside the Linux 2.6 Completely Fair Scheduler" by M. Tim Jones (IBM developerWorks, 2009).
+    - "An EEVDF CPU scheduler for Linux" -- LWN article on the EEVDF transition: lwn.net/Articles/925371/.
+  </Accordion>
+
+  <Accordion title="When does CPU pinning a hot path help, and when does it hurt?">
+    **Strong Answer Framework:**
+
+    1. **Define CPU pinning**: Setting CPU affinity (via `taskset`, `pthread_setaffinity_np`, or cgroup cpuset) restricts which cores a thread can run on. Pinning to one core: the thread always runs there, the cache stays warm, no migration cost.
+    2. **When pinning helps**: (a) Latency-sensitive workloads where TLB/cache warm-up cost dominates -- HFT, audio processing, packet processing. (b) NUMA-aware code that accesses node-local memory -- pin to a core on the same NUMA node as the data. (c) Workloads with large working sets that fit in L1/L2 -- avoiding cache invalidation matters more than load balancing. (d) Real-time systems where any migration is unacceptable jitter.
+    3. **When pinning hurts**: (a) Variable-load workloads -- if your pinned core is busy with another task, you queue behind it while other cores are idle. (b) Bursty workloads where the kernel scheduler's migration logic would naturally rebalance. (c) Multi-threaded workloads where threads sometimes need to run in parallel and sometimes serialize -- the kernel's load balancer is smarter than static pinning. (d) Hyper-threading: pinning to two SMT siblings on the same physical core means they share execution units; you don't actually get parallelism.
+    4. **The senior insight**: Pinning is a sledgehammer. The kernel's CFS scheduler is already cache-aware (`SD_BALANCE_EXEC`, `SD_SHARE_CPUCAPACITY`). It only migrates when there is a strong reason. Don't pin unless you have measured that the kernel's default behavior is hurting you. When you do pin, also pin memory (NUMA), isolate cores from kernel work (`isolcpus`, `nohz_full`), and disable IRQ steering on those cores.
+
+    **Real-World Example:**
+
+    DPDK (Data Plane Development Kit) for high-performance packet processing pins worker threads to dedicated cores and uses spin-polling instead of interrupts. A 10G NIC can deliver 14.88 million packets per second; processing each in 67ns requires zero scheduling jitter. DPDK reaches ~100x the throughput of standard kernel networking by combining pinning, huge pages, NUMA placement, and userland drivers. Conversely, Netflix found that pinning their video transcoding workers actually *hurt* throughput by 15% because variable encode complexity meant some cores idled while others queued -- they reverted to letting the scheduler migrate.
+
+    <Note>
+    **Senior follow-up 1:** What is `isolcpus` and why combine it with pinning? `isolcpus=2,3` (boot parameter) tells the kernel "these CPUs are not part of the default scheduler load balancing." Tasks won't be scheduled on them unless explicitly pinned. This eliminates background kernel work (kworkers, watchdogs) from interfering with your latency-critical thread. Combine with `nohz_full=2,3` to also disable the timer tick on those cores -- now there are no periodic interrupts at all when a single task runs there.
+    </Note>
+
+    <Note>
+    **Senior follow-up 2:** A thread is pinned to CPU 5, but `top` shows it occasionally running on CPU 6. Why? Several possibilities: (a) Someone called `taskset -p` to change the affinity. (b) The thread inherits affinity from its parent; if the parent's affinity changed after the child was created, behavior diverges. (c) Cgroup cpuset may override per-thread affinity. (d) The kernel's `sched_setaffinity` was called with a wider mask than expected. Always check `/proc/PID/status`'s `Cpus_allowed_list` for the actual mask.
+    </Note>
+
+    <Note>
+    **Senior follow-up 3:** How does Kubernetes handle CPU pinning? Kubernetes 1.8+ has the CPU Manager. With `cpu-manager-policy=static`, pods with integer CPU requests get exclusive CPU pinning. The kubelet manages the cpuset cgroup. This is essential for latency-sensitive workloads on shared nodes. The catch: it only works for "Guaranteed" QoS pods (limits == requests, integer CPUs). Burstable pods still float across cores.
+    </Note>
+
+    **Common Wrong Answers:**
+    - "Always pin for performance." Wrong: pinning often hurts because it disables load balancing.
+    - "Pinning is just hardware affinity." Misleading: it also affects how the kernel schedules and balances.
+    - "Pin to two SMT siblings for max throughput." Wrong: SMT siblings share execution resources, so you don't get true parallelism.
+
+    **Further Reading:**
+    - "Performance Analysis Methodology" by Brendan Gregg -- includes the USE method for CPU analysis.
+    - DPDK Programmer's Guide -- doc.dpdk.org/guides/prog_guide/.
+    - "Real-time Linux on ARM" -- article on isolcpus and nohz_full: lwn.net/Articles/549580/.
+  </Accordion>
+
+  <Accordion title="A process is stuck in D-state for 10 minutes. Walk me through diagnosis and recovery.">
+    **Strong Answer Framework:**
+
+    1. **Define D-state**: `TASK_UNINTERRUPTIBLE` -- the kernel has put the task to sleep waiting for something (typically I/O completion) and made it impossible to wake via signals. This is intentional: some kernel paths cannot tolerate being interrupted halfway (e.g., a journal commit). The downside is that even SIGKILL is ineffective -- the process literally cannot be killed.
+    2. **Diagnose what it's waiting on**: `cat /proc/PID/stack` shows the kernel call stack of the sleeping task. Read top-down to see what subsystem is waiting. Common patterns: `nfs_*` (NFS server unresponsive), `xfs_*` or `ext4_*` (local filesystem -- usually disk I/O hang), `__schedule -&gt; io_schedule -&gt; submit_bio` (block device hang), `mutex_lock_slowpath` (kernel mutex contention).
+    3. **Confirm the hardware/network path**: If NFS, ping the server, check `mount` for the offending mount, look at server logs. If local disk, check `dmesg` for I/O errors, `smartctl` for drive health, `iostat -x 1` for queue depths and service times. If block device, look for `nvme` or `ata` errors in dmesg.
+    4. **Recover**: For NFS hangs, you usually have to fix the network or remount with `umount -f -l` (force-lazy unmount) -- this releases waiters with EIO. For disk hangs, sometimes echoing to `/proc/PID/wchan` doesn't help; you may need to fail over the disk or reboot. For kernel mutex hangs (rare), inspect `/proc/PID/wchan` to identify which mutex, then look at who holds it via lockdep traces if available. Last resort: `echo b &gt; /proc/sysrq-trigger` for an immediate reboot if the system is unrecoverable.
+
+    **Real-World Example:**
+
+    In 2019, GitHub had a database incident where MySQL processes went into D-state due to a buggy storage controller. The processes were waiting in `submit_bio` -- the block layer had submitted I/O that the controller never completed. ps showed them as D, kill -9 did nothing, even kill -9 1 (init) couldn't help. They had to evacuate the host and force-reboot. The post-mortem (githubeng.com) recommended adding `/proc/PID/stack` collection to all alerts about long-running D-state processes.
+
+    <Note>
+    **Senior follow-up 1:** What is `TASK_KILLABLE` and why was it added? Linux 2.6.25 (2008) added `TASK_KILLABLE` -- like `TASK_UNINTERRUPTIBLE` but allows wakeup specifically by SIGKILL. NFS code was the main motivator: pre-2.6.25, an NFS server crash would create permanent D-state processes; post, you could SIGKILL them. Most uninterruptible sleeps in modern kernels use TASK_KILLABLE. If a process is stuck in TASK_KILLABLE, kill -9 works.
+    </Note>
+
+    <Note>
+    **Senior follow-up 2:** Can you ever see D-state in user space? No. D-state is by definition a kernel sleep. The user instruction that triggered the syscall has not yet returned. From the user's perspective, they called `read()` and it has not returned for 10 minutes. The kernel side is in `read_iter` or `submit_bio` waiting.
+    </Note>
+
+    <Note>
+    **Senior follow-up 3:** Why does load average count D-state processes? When Linux's load average was designed (early 1990s), the rationale was that D-state tasks are still "competing for CPU" once their I/O completes -- they will be runnable soon. In practice, this conflates CPU contention with I/O contention and confuses users. There has been advocacy (notably from Brendan Gregg) for separating the two metrics, but Linux preserves the original semantics for compatibility.
+    </Note>
+
+    **Common Wrong Answers:**
+    - "kill -9 to fix D-state." Wrong: D-state ignores all signals (unless TASK_KILLABLE).
+    - "Restart the process." Often impossible -- the process won't terminate.
+    - "Increase CPU." Doesn't help an I/O-bound D-state.
+
+    **Further Reading:**
+    - "What Is Disk I/O Wait?" -- Brendan Gregg blog.
+    - `Documentation/process-management/runaway-processes.rst` in the kernel tree.
+    - "Sysrq triggers" -- kernel.org/doc/Documentation/admin-guide/sysrq.rst -- emergency reboot mechanisms.
+  </Accordion>
+
+  <Accordion title="Design a scheduling policy for a system that runs both batch ML training and real-time video transcoding on the same nodes. What knobs do you turn?">
+    **Strong Answer Framework:**
+
+    1. **Identify the SLA**: Real-time transcoding has a deadline (frame must be encoded in 33ms for 30fps). Missing the deadline is a quality regression (dropped frame). Batch ML training has a throughput goal (utilize 100% of GPU/CPU when possible) but no per-task deadline.
+    2. **Use scheduling class separation**: Run transcoding under `SCHED_FIFO` priority 50 -- it preempts everything else. Run ML training under default `SCHED_NORMAL`. Set `kernel.sched_rt_runtime_us=950000` so RT cannot consume more than 95% per second; the remaining 5% lets ML make progress and lets you SSH in.
+    3. **Use cgroups for resource isolation**: Put transcoding in cgroup A with `cpu.weight=10000` (max). Put ML in cgroup B with `cpu.weight=100`. Set `cpu.max` on ML to limit its bursts. Use `memory.high` and `memory.max` to prevent ML from swapping out transcoding pages.
+    4. **NUMA placement and isolation**: On a 2-socket box, dedicate node 0 to transcoding (8 cores) and node 1 to ML (24 cores). Pin transcoding threads with `taskset` and use `numactl --membind=0` for memory. ML uses node 1 exclusively. This eliminates QPI/UPI cross-socket traffic. Use `isolcpus=0-7` on the transcoding cores so no kernel work runs there.
+    5. **Watchdog and observability**: Monitor transcoding p99 latency continuously. If it exceeds 30ms, page the on-call. Alert on RT throttling (`/proc/sched_debug` shows RT runtime exceeded). Track NUMA misses with `numastat`. Set up `bcc-tools/runqlat` to track scheduling latency per cgroup.
+
+    **Real-World Example:**
+
+    Netflix's encoding pipeline runs on dedicated nodes with this exact pattern: real-time live encoding for events (Super Bowl, Olympics) coexists with batch transcoding for VOD library updates. Their open-source post (netflixtechblog.com) describes using cgroups + SCHED_FIFO for the live path while VOD jobs run as containerized batch with priority-aware queuing. The split sounds elaborate but the alternative -- separate fleets -- is dramatically more expensive.
+
+    <Note>
+    **Senior follow-up 1:** What if you cannot use SCHED_FIFO (e.g., security policies)? Use cgroup `cpu.weight` with high asymmetry (10000 vs 100) and pin transcoding to dedicated cores via cpuset. With dedicated cores plus the weight, latency is usually within 5-10% of the SCHED_FIFO solution. The remaining gap comes from kernel preemption granularity.
+    </Note>
+
+    <Note>
+    **Senior follow-up 2:** How do you handle a transcoding task that occasionally needs more CPU than its allocation? Allow elastic scaling via cgroup `cpu.max` set generously (e.g., 200% of typical use). Under contention with ML, weights ensure transcoding wins. When ML is idle, transcoding can use spare capacity. The catch: transcoding's working set must fit in its dedicated cores' cache for predictability; bursting to other cores means cold cache.
+    </Note>
+
+    <Note>
+    **Senior follow-up 3:** How does this change with GPUs in the mix? GPUs don't have a kernel scheduler in the CPU sense. NVIDIA MIG (Multi-Instance GPU) partitions an A100 into isolated slices for different workloads. Without MIG, you typically dedicate whole GPUs to specific workloads via cgroups (`devices.allow`) or Kubernetes device plugins. Don't share a GPU between latency-sensitive and throughput-sensitive workloads -- there is no preemption guarantee.
+    </Note>
+
+    **Common Wrong Answers:**
+    - "Use nice -20 for transcoding." Wrong: nice doesn't preempt batch jobs strongly enough.
+    - "Just give transcoding more cores." Doesn't help if the cores are shared with ML.
+    - "Run them as separate Kubernetes priority classes and trust the scheduler." Pod-level scheduling doesn't address per-thread CPU contention within a node.
+
+    **Further Reading:**
+    - "Cgroup v2 documentation" -- kernel.org/doc/Documentation/admin-guide/cgroup-v2.rst.
+    - "Predictable Latency in Multi-tenant Systems" -- ACM Queue article on isolation techniques.
+    - Netflix Tech Blog: "Application data caching using SSDs" -- netflixtechblog.com -- discusses workload isolation patterns.
   </Accordion>
 </AccordionGroup>
 

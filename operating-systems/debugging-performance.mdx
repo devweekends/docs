@@ -227,7 +227,147 @@ Next: [Modern I/O: io_uring & Userfaultfd](/operating-systems/io-systems) →
 
 ---
 
+## Caveats and Common Pitfalls
+
+Performance tools lie in subtle ways. They lie when you sample without context, when you trace at the wrong layer, when overhead changes the thing you are measuring, and when visualizations hide the data they were built on. The traps below cause more wrong conclusions in production than any other category of debugging mistake.
+
+<Warning>
+**Performance investigation traps that produce confident wrong answers:**
+
+1. **`perf record` without `-g` loses callstacks.** A flame graph generated from a profile without callstacks shows only the leaf functions -- it looks like a thin, fragmented graph with no clear hot paths. Engineers see this and conclude "the workload is spread out" when really they have just lost the parent call context. Always use `-g` (or `--call-graph dwarf` / `--call-graph lbr`) for any profile you intend to analyze. The overhead is real but tolerable for diagnosis.
+2. **`ftrace` overhead in production can collapse the system you are trying to debug.** ftrace has near-zero idle overhead, but enabling high-frequency tracepoints (every syscall, every context switch, every block I/O) on a busy system can add 5-30% CPU overhead, and the trace ring buffer can fill in seconds, dropping events. Worse, on workloads with hot syscall paths (high QPS web servers), `function_graph` tracing of the syscall path can serialize on the trace lock and turn a healthy system into a slow one. Always start with the smallest filter, and prefer eBPF for production tracing -- it can do filtering in the kernel without crossing into user space.
+3. **`blktrace` and `iostat` measure different layers and tell different stories.** `iostat` shows aggregate disk metrics from the block layer (avg latency, util %, queue depth), seen *after* the I/O scheduler. `blktrace` shows individual I/O events at multiple layers (queued, dispatched, completed). A high `iostat await` could mean the disk is slow or that the scheduler is queuing -- only `blktrace` distinguishes them. NVMe with `none` scheduler is mostly straight-through; with `mq-deadline` or `kyber` the scheduler can dominate latency under contention.
+4. **Flame graphs lie if sampling is biased.** `perf record -F 99` samples at 99 Hz. If the workload has a regular periodic component at 100 Hz (timer ticks, audio buffer refills), the sampling will alias and show false hot paths. Worse, `perf record` only samples on-CPU work -- if your bottleneck is off-CPU (waiting on locks, I/O, network), it will not appear in a CPU flame graph at all. Always pair on-CPU and off-CPU flame graphs, and vary sampling frequency (97, 99, 101 Hz) if you suspect aliasing.
+</Warning>
+
+<Tip>
+**Solutions and patterns:**
+
+- **Default to LBR call stacks for production profiling.** `perf record --call-graph lbr` uses Last Branch Record -- a hardware feature with near-zero overhead and no need for frame pointers or DWARF unwinding. The only catch: LBR captures up to 32 entries deep, so very deep call stacks are truncated. For typical workloads, this is fine.
+- **Use eBPF (bpftrace, bcc) for production observability.** eBPF programs run in the kernel after a verifier checks they are safe. Overhead is generally less than 1% even for complex tracing, and the kernel never crashes from a malformed BPF program (it would be rejected at load). The bcc tools (offcputime, biolatency, runqlat, tcpconnlat) are battle-tested on Netflix and Meta production.
+- **Use the right tool for the right layer.** For application-level: `strace -c` (syscall counts), `perf stat` (PMU counters), language-specific profilers. For kernel: `ftrace` (function tracing), `perf record` (sampling), eBPF (production tracing). For storage: `biolatency`, `blktrace`, `nvme list` and `smartctl` for hardware. For network: `tcpdump`, `ss -i`, `tcptracer`. Mismatching layers is the most common mistake.
+- **Generate both on-CPU and off-CPU flame graphs.** On-CPU shows where you spend CPU; off-CPU shows where you wait. A service at 30% CPU with high p99 latency is almost certainly off-CPU bound -- generate the off-CPU graph first or you will waste hours looking in the wrong place.
+- **When in doubt, validate the tool against ground truth.** If `iostat` reports 95% util but `dd if=/dev/sda of=/dev/null` reads at full bandwidth, `iostat` is misleading you (often a queue-depth artifact on NVMe). Tools are heuristics; ground-truth benchmarks reveal when they are wrong.
+</Tip>
+
+---
+
 ## Interview Deep-Dive
+
+<AccordionGroup>
+  <Accordion title="Production p99 latency spiked from 50ms to 500ms 20 minutes ago. CPU is at 40%. Walk me through the tools you reach for, in order, and why.">
+    **Strong Answer Framework:**
+
+    1. **Confirm the symptom and scope.** First five minutes: is this real? Check the dashboard for the spike. Is it across all instances or just some? Is it correlated with a deploy, a traffic spike, or a downstream incident? If only some instances are affected, that points at hardware/local issues. If all are affected, it is environmental or systemic.
+    2. **Reach for the USE method on each instance.** `uptime` (load), `vmstat 1` (CPU breakdown -- user/sys/iowait/idle), `iostat -x 1` (disk -- look at await and util), `sar -n DEV 1` (network), `ss -tin` (TCP connection states and retransmits). 90% of "slow" issues show up in this 30-second drill.
+    3. **Check PSI immediately.** `cat /proc/pressure/{cpu,memory,io}`. If `io full avg10` is high, you are I/O bound regardless of what `iostat` shows. PSI measures stall time, which is what the user actually feels.
+    4. **If CPU is 40% but latency is up, suspect off-CPU.** That ratio screams "threads are waiting." Run `bpftrace -e 'kprobe:finish_task_switch { @[kstack] = count(); }'` for 10 seconds to see what is causing context switches. Or `offcputime -p <PID> 30 > out; flamegraph.pl --color=io < out > offcpu.svg` for a flame graph of where threads sleep.
+    5. **Check downstream dependencies.** `tcptracer` or `tcpconnlat` shows TCP connection latencies. If one downstream's p99 went from 5ms to 200ms, you found your culprit. Use the application's own tracing (Jaeger, Zipkin, OpenTelemetry) to confirm which span is slow.
+    6. **Check for new contention.** `perf lock record` for kernel locks. `mutexsnoop` (eBPF) for application mutexes. New code can introduce a global mutex that does not show up under low load but serializes under high load.
+    7. **Check for GC, JIT, or runtime pauses.** Language-specific: JVM GC logs, Go runtime traces, Python's `gc` module. A long stop-the-world pause does not show up in syscall traces but kills tail latency.
+    8. **Form and test a hypothesis.** Never just "look at metrics until you see something weird." State a hypothesis ("a downstream RPC is slow"), run the targeted tool that proves or disproves it, iterate. Random poking wastes hours.
+
+    **Real-World Example:** In 2016, Twitter had a famous incident where p99 latency spiked due to a JVM GC change. The on-CPU flame graph showed nothing unusual; the off-CPU flame graph showed long pauses in `safepoint_synchronize`. The fix was a JVM flag change (G1 region size). Reference: Twitter's engineering blog post on GC tuning. The lesson: on-CPU flame graphs are insufficient on their own -- always generate off-CPU graphs for tail-latency investigations.
+
+    <Note>
+    **Senior follow-up 1:** "What if `offcputime` shows your threads are blocked on `futex_wait` for 200ms? What does that mean and how do you investigate further?" `futex_wait` is the kernel side of pthread mutex / condvar / semaphore waits. To find which mutex, you need user-space stack traces -- enable frame pointers or use perf with DWARF. Then you can see which application-level lock is contended.
+    </Note>
+
+    <Note>
+    **Senior follow-up 2:** "How would you investigate if the latency is bursty -- not constant 500ms, but spikes every few seconds?" Bursty means averages hide it -- look at percentiles per second (`hdrhistogram` style), or per-request traces. eBPF with histogram aggregation: `bpftrace -e 'tracepoint:syscalls:sys_exit_read { @us = hist(elapsed/1000); }'` to see the latency distribution.
+    </Note>
+
+    <Note>
+    **Senior follow-up 3:** "What is the difference between latency and tail latency, and why does tail latency dominate user experience in distributed systems?" Median latency is the typical case; tail latency (p99, p999) is the worst case. In a fan-out architecture (one user request triggers 100 backend calls), the user-facing latency is roughly the slowest of those 100. So even 1% slow backends create 63% slow user requests. This is "the tail at scale" (Dean & Barroso, 2013) -- the canonical paper on this phenomenon.
+    </Note>
+
+    **Common Wrong Answers:**
+
+    1. *"Restart the service and see if it helps."* Sometimes works, never teaches you anything, and if the cause is environmental (slow downstream, network issue), it does not help. Senior engineers diagnose before mitigating.
+    2. *"Just look at the application logs."* Logs are great for known issues but useless for performance pathologies. A slow request typically logs as a successful request that just took longer. You need profiling tools.
+
+    **Further Reading:**
+    - Brendan Gregg, "Systems Performance" (2nd ed) -- the bible of Linux performance analysis.
+    - Dean & Barroso, "The Tail at Scale" (CACM 2013) -- canonical paper on tail latency.
+    - Netflix Tech Blog, "Linux Performance Analysis in 60,000 Milliseconds."
+  </Accordion>
+
+  <Accordion title="A long-running daemon shows steadily increasing memory over weeks. RSS grows ~50MB per day. Find the leak.">
+    **Strong Answer Framework:**
+
+    1. **Confirm it is a leak, not just cache growth.** Check `cat /proc/<pid>/smaps_rollup` for PSS over time. If anonymous memory grows but file-backed shrinks, it is application allocation. If the kernel's slab is growing, it is a kernel-side leak (rare but real).
+    2. **Identify the allocator.** Is the daemon C/C++ (malloc/jemalloc), Go (runtime allocator), Java (heap), Python (PyMalloc + reference counting)? Each has its own profiling tools. For C/C++ with glibc malloc, `MALLOC_TRACE` env var or `mtrace`. For jemalloc, `MALLOC_CONF=prof:true`. For Go, `pprof` heap profiles. For JVM, NMT (Native Memory Tracking) or heap dumps. For Python, `tracemalloc` module.
+    3. **For C/C++, use AddressSanitizer or Valgrind in a test environment.** ASan catches leaks at exit; Valgrind finds them but is 10-50x slower (not usable in production but fine for repro). LeakSanitizer is part of ASan and tracks long-running leaks if you can SIGUSR1 the process to emit a report.
+    4. **In production, capture heap profiles periodically.** With jemalloc, set `MALLOC_CONF=prof:true,prof_active:false,lg_prof_sample:19` and toggle profiling via `mallctl`. Take a heap profile at startup and another after a week of growth. Compare with `jeprof --base baseline.heap current.heap` -- this shows allocation sites that grew, not just total. The big winners by allocation count vs bytes tell you whether you have many small leaks or fewer large ones.
+    5. **Trace allocations with eBPF.** `bpftrace -e 'uprobe:/path/to/binary:malloc { @sizes[kstack] = sum(arg0); }'` aggregates by stack trace. Run for 10 minutes, see which call paths allocate most. For long-lived allocations, also instrument `free` and look for stacks that allocate but never appear in free.
+    6. **Common leak patterns.** Caches without bounds, event listeners that register but never deregister, pool objects that grow without compaction, error paths that allocate but skip cleanup, third-party libraries with known leaks. Look for these patterns in code review of recently-changed modules.
+    7. **If allocator is fine but RSS still grows, suspect fragmentation.** glibc malloc has known fragmentation issues with workloads that allocate many sizes. Switching to jemalloc or tcmalloc often fixes "leaks" that were really fragmentation. `MALLOC_ARENA_MAX=2` env var can help with glibc multithreaded fragmentation.
+
+    **Real-World Example:** In 2014, Facebook engineers found a slow leak in HHVM's JIT cache that took several days to manifest as RSS growth. They used jemalloc's heap profiling to find the leak was in opcode metadata not being freed when functions were redefined. Reference: Facebook engineering blog "Profiling Memory Allocations" (around 2014). The lesson: long-running services need built-in observability for memory growth, not just OOM reaction.
+
+    <Note>
+    **Senior follow-up 1:** "What is the difference between RSS, PSS, and USS, and which should you alert on?" RSS = pages mapped (counts shared pages multiple times). PSS = proportional share of shared pages (1/n of each shared page where n is users). USS = pages unique to this process. Alert on PSS for accurate per-process accounting; USS understates true cost; RSS overstates if many processes share libraries.
+    </Note>
+
+    <Note>
+    **Senior follow-up 2:** "How does jemalloc's heap profiling actually work?" jemalloc samples allocations at a configurable interval (e.g., every 512KB allocated). At each sample, it captures the call stack. The aggregation across samples gives a statistical profile of where memory is being held. The overhead is tiny (a few percent) and the profile quality is excellent for finding leaks.
+    </Note>
+
+    <Note>
+    **Senior follow-up 3:** "What if the leak is in a kernel module loaded on the system, not in your daemon?" Check `/proc/slabinfo` and `slabtop` -- shows kernel slab cache growth. If `dentry` or a specific cache is growing without bound, it is a kernel issue. Use `perf record -e kmem:kmalloc -g` to capture allocation stacks. Often a buggy module or a userspace pattern that creates many short-lived dentries.
+    </Note>
+
+    **Common Wrong Answers:**
+
+    1. *"Restart the service nightly to work around the leak."* This is a workaround, not a fix. Tells the interviewer you do not know how to find the actual leak. State it as last resort *after* describing the diagnostic process.
+    2. *"It must be the language runtime; nothing we can do."* Even when the leak is in the runtime (rare), you can usually work around it with allocator changes, GC tuning, or process recycling. Saying "nothing we can do" is a senior-level red flag.
+
+    **Further Reading:**
+    - jemalloc documentation, "Heap Profiling" section.
+    - Brendan Gregg, "Memory Leak (and Growth) Flame Graphs" blog post.
+    - Go pprof documentation -- runtime/pprof package, very well documented.
+  </Accordion>
+
+  <Accordion title="CPU is at 100%, but request throughput dropped by 50%. What is going on?">
+    **Strong Answer Framework:**
+
+    1. **High CPU + low throughput is a classic 'spinning' or 'cache thrashing' pattern.** The CPU is busy but not doing useful work. Three big buckets: lock contention (threads spinning on a mutex), cache thrashing (CPU waiting on memory), or pathological GC/JIT activity.
+    2. **Check IPC first.** `perf stat -p <PID> -- sleep 10`. IPC less than 0.5 means the CPU is mostly stalled, usually on memory. IPC near 1.0 with high CPU is normal. IPC less than 0.3 is severe stall -- almost always cache misses or branch mispredictions.
+    3. **Lock contention check.** `perf lock record -p <PID> -- sleep 10` then `perf lock report`. Or `bpftrace -e 'kprobe:mutex_lock { @[kstack] = count(); }'`. If 60% of context switches are on a single mutex, you found it.
+    4. **Cache miss check.** `perf stat -e cycles,instructions,cache-misses,cache-references,LLC-load-misses -p <PID>`. LLC miss rate above 10% of references is severe. `perf record -e LLC-load-misses -g` shows which functions cause the misses.
+    5. **GC/JIT check.** Java: enable GC logging, look at pause times and frequency. Go: `GODEBUG=gctrace=1` shows GC overhead. Python: GC pauses are usually short but reference cycle collection can be expensive. If GC eats 30% of CPU, throughput drops accordingly.
+    6. **Spinning/busy-loop check.** `perf top -p <PID>` -- if a tight loop in user code dominates, you have a busy-wait. Often introduced accidentally: `while (!ready) {}` instead of `pthread_cond_wait`, or a poll loop without sleep.
+    7. **Throughput/latency dependency.** If CPU is 100% and throughput is down, latency must be way up (Little's law). Confirm with the application's own metrics. This is the same problem as scenario 1 (the latency spike), just framed differently.
+
+    **Real-World Example:** In 2019, a large fintech had a payment-processing service hit 100% CPU with throughput cut in half. Profiling showed `_raw_spin_lock` dominating -- traced to a recently-merged feature that took a global mutex per transaction. Under high concurrency, the mutex serialized all work onto one CPU at a time, despite N cores being available. Fix: replace the global mutex with a per-shard mutex. CPU dropped to 30%, throughput tripled. Reference: pattern documented in "Lock contention in production" by various teams; specific incident details vary by company.
+
+    <Note>
+    **Senior follow-up 1:** "How do you detect CPU thermal throttling versus real load?" `cpupower frequency-info` and `/proc/cpuinfo` show current frequency. If actual frequency is well below max under high load, the CPU is throttling -- thermal, power-cap, or P-state misconfiguration. `turbostat` (intel) shows per-core frequency and C-states.
+    </Note>
+
+    <Note>
+    **Senior follow-up 2:** "Could 100% CPU + low throughput be a hyperthread pathology?" Yes -- two threads on sibling hyperthreads share L1/L2 cache and execution units. If both are cache-heavy, they thrash each other. `perf stat` will show high cache misses despite high CPU. Solution: pin work to physical cores only, or disable SMT for that workload (`echo 0 > /sys/devices/system/cpu/cpu<N>/online` for sibling cores).
+    </Note>
+
+    <Note>
+    **Senior follow-up 3:** "What is 'priority inversion' at the application level and how does it appear in this scenario?" Low-priority thread holds a lock; high-priority thread blocks waiting; medium-priority threads run and prevent the low-priority thread from making progress. The high-priority thread is starved. Looks like 100% CPU on low+medium with high-priority work stalled. Linux supports priority inheritance for futexes via `PTHREAD_PRIO_INHERIT` to mitigate.
+    </Note>
+
+    **Common Wrong Answers:**
+
+    1. *"Add more CPUs."* If the bottleneck is a global mutex, more CPUs makes it worse (more contention). Always understand the bottleneck before scaling.
+    2. *"The CPU is at 100% so the system is fully utilized -- nothing to fix."* CPU at 100% with low throughput is a smell, not a healthy state. Useful work per CPU-second is the real metric.
+
+    **Further Reading:**
+    - Intel "Top-down Microarchitecture Analysis Method" -- systematic approach to analyzing CPU stalls.
+    - Brendan Gregg, "CPU Flame Graphs" -- foundational for understanding CPU profiling.
+    - "What every programmer should know about memory" by Ulrich Drepper -- canonical reference on cache effects.
+  </Accordion>
+</AccordionGroup>
+
+---
+
+## Interview Deep-Dive (Original)
 
 <AccordionGroup>
   <Accordion title="A production web server's p99 latency spiked from 50ms to 500ms, but CPU utilization is only 30%. Walk me through your systematic investigation.">

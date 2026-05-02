@@ -1343,6 +1343,170 @@ dbslower mysql 100  # queries slower than 100ms
 
 ## 11. Common Pitfalls and Best Practices
 
+The verifier and the runtime each impose constraints that look pedantic in isolation but quickly compound when you scale a real eBPF program past a tutorial. Below are the four traps that keep showing up in production code reviews, paired with the patterns that get past them cleanly.
+
+<Warning>
+**Pitfall 1: Verifier complexity limits -- programs over roughly one million instructions get rejected**
+
+Older kernels capped verifier complexity at about 4,096 visited instructions; modern kernels (5.10+) raised it to one million. That sounds enormous until you write a real program. Each path the verifier explores counts independently. A nested loop with two branches doubles the path count per iteration. A switch statement over 16 protocols with two branches each adds 32 paths per visit. By the time you write a halfway-realistic packet parser, you can hit complexity limits even though the source code is small.
+
+The error message is unhelpful: "BPF program is too large. Processed 1000001 insn." It tells you the verifier gave up but not where. You then have hours of binary-bisection through your program trying to find the function or loop the verifier could not collapse.
+</Warning>
+
+<Tip>
+**Solution: tail calls, function-by-function verification, and inlining hints**
+
+Three techniques compose well. First, split logically distinct stages into separate eBPF programs and chain them with `bpf_tail_call`. Each program is verified independently, so the per-program complexity budget resets at the boundary. Second, use `__attribute__((noinline))` on helper functions so the verifier treats them as separate units (kernel 5.10+ supports per-function verification). Third, use `bpf_loop` (kernel 5.17+) for bounded iteration -- the verifier specially handles it and avoids unrolling.
+
+```c
+// Tail call pattern for staged processing
+SEC("xdp/parse_l2")
+int parse_l2(struct xdp_md *ctx) {
+    parse_ethernet(ctx);
+    bpf_tail_call(ctx, &prog_array, STAGE_PARSE_L3);
+    return XDP_PASS;  // fallthrough if tail call unavailable
+}
+
+SEC("xdp/parse_l3")
+int parse_l3(struct xdp_md *ctx) {
+    parse_ip(ctx);
+    bpf_tail_call(ctx, &prog_array, STAGE_PARSE_L4);
+    return XDP_PASS;
+}
+
+// bpf_loop pattern for bounded iteration without unrolling
+static long process_one(u32 i, void *ctx_ptr) {
+    struct my_ctx *c = ctx_ptr;
+    /* ... do the work ... */
+    return 0;
+}
+
+SEC("xdp")
+int main_prog(struct xdp_md *ctx) {
+    struct my_ctx c = { .ctx = ctx };
+    bpf_loop(64, process_one, &c, 0);  // iterate up to 64 times
+    return XDP_PASS;
+}
+```
+
+Diagnostic: when you hit the limit, run the loader with `BPF_F_LOG_LEVEL=2` to dump the verifier log. The verifier prints which instruction it was processing when complexity ran out -- that points you at the function to split.
+</Tip>
+
+<Warning>
+**Pitfall 2: 512 bytes of stack -- larger state belongs in maps, not locals**
+
+eBPF programs have exactly 512 bytes of stack. That is not a soft limit; the verifier rejects any allocation that would exceed it. The trap: you write a program that parses TCP options into a local struct, then add a few SACK blocks, then add timestamp captures, and quietly cross 512 bytes. The verifier rejects with "combined stack size exceeds 512 bytes" and your only fix is restructuring data flow.
+
+A second variant: large local arrays compiled with `-O0` or `-O1` end up on the stack instead of being optimized away. A 256-byte local string buffer for a packet payload, plus a 200-byte parsing context, plus your function's normal locals, and you are over budget. Optimization flags matter more than usual in eBPF because the compiler shapes what the verifier sees.
+</Warning>
+
+<Tip>
+**Solution: per-CPU array maps as scratch space**
+
+A single-entry per-CPU array map gives you a "thread-local" scratch buffer outside the stack. It costs one map lookup, but it has no size limit and is private to the executing CPU.
+
+```c
+struct {
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+    __type(key, u32);
+    __type(value, struct big_state);  // can be many KB
+    __uint(max_entries, 1);
+} scratch SEC(".maps");
+
+SEC("xdp")
+int handler(struct xdp_md *ctx) {
+    u32 key = 0;
+    struct big_state *state = bpf_map_lookup_elem(&scratch, &key);
+    if (!state) return XDP_PASS;  // verifier requires the NULL check
+
+    // Use state for parsing, accumulating, etc. -- no stack pressure
+    parse_packet(ctx, state);
+    return process(state);
+}
+```
+
+The pattern doubles as a way to share state between tail-called programs: each stage looks up the same per-CPU scratch entry, accumulates into it, and the next stage sees what the previous wrote. Always check the lookup result for NULL even if you know the key exists -- the verifier requires it because the map could in principle be empty.
+
+Always compile eBPF programs with `-O2`. Without it, the C compiler keeps locals the optimizer would have eliminated, and the verifier sees stack frames you did not intend.
+</Tip>
+
+<Warning>
+**Pitfall 3: Tail calls vs function calls -- the lifecycle semantics are not the same**
+
+`bpf_tail_call` and a regular function call look similar -- both transfer control to other code -- but they differ in fundamental ways that bite when you mix them. Tail calls do not return: the calling program's stack is replaced, not extended. Tail calls are limited (33 deep currently) and the limit is shared across the whole call chain, not per-program. Tail calls cannot pass arguments other than the original program context; everything else must go through maps.
+
+The trap: engineers treat tail calls like function calls and write recursive-looking code. Three layers in, they hit the tail call limit. Or they assume that registers persist across the boundary, write code that depends on a value, and the value silently zeroes. Or they tail-call into a program that has different attach-type expectations and the kernel rejects the call at runtime, returning 0 from `bpf_tail_call` -- which the calling program often does not check.
+</Warning>
+
+<Tip>
+**Solution: pick the right primitive, and check the return value**
+
+Use a regular function call for "split this code for verifier complexity reasons" -- the function returns and the calling stack continues. Use a tail call for "transition to a new program with a fresh complexity budget and possibly a different attach point." Treat tail calls as a one-way ticket: anything that needs to come back must go through a map.
+
+```c
+// Function call -- regular, returns, shares stack budget
+__attribute__((noinline))
+static int parse_tcp(struct xdp_md *ctx, struct flow *out) {
+    /* ... */
+    return 0;
+}
+
+// Tail call -- one-way, fresh program, must check failure
+SEC("xdp")
+int dispatcher(struct xdp_md *ctx) {
+    u8 protocol = sniff_protocol(ctx);
+    bpf_tail_call(ctx, &handlers, protocol);
+    // If we reach here, the tail call FAILED (no program registered, or limit hit).
+    // Always have a fallthrough.
+    return XDP_PASS;
+}
+```
+
+Check tail call depth with `bpf_get_current_task` plus instrumentation if you suspect chains are growing. For complex stage machines, a `BPF_MAP_TYPE_PROG_ARRAY` indexed by a state field gives you cleaner control flow than nested tail calls -- each stage tail-calls based on the state map, instead of each stage hardcoding the next.
+</Tip>
+
+<Warning>
+**Pitfall 4: bpf_probe_read for kernel pointers -- older kernels need exception handling**
+
+Reading kernel memory in eBPF is dangerous because the address could be invalid (NULL, freed, or otherwise unmapped). `bpf_probe_read` is the safe primitive: it uses kernel exception handling to catch faults and return an error rather than crash. This is essential because eBPF programs run in atomic context where a kernel oops would take down the host.
+
+The trap is version-specific. On kernels older than 5.5, there was a single `bpf_probe_read` for both user and kernel addresses, with the helper guessing which based on flags. This was fragile; a NULL kernel pointer dereference (which should return an error) sometimes accessed user memory at the same address (silently succeeding with garbage). Kernel 5.5 split it into `bpf_probe_read_kernel` and `bpf_probe_read_user`, removing the ambiguity. CO-RE programs that want to support old and new kernels need to handle this transition.
+
+Newer kernels also added `bpf_core_read` (the CO-RE-aware variant that handles BTF relocations) and direct kernel memory reads via `BPF_PROG_TYPE_TRACING` (with the verifier proving the access is safe). Each has subtly different semantics and error behavior.
+</Warning>
+
+<Tip>
+**Solution: use the right helper for the kernel version, default to BPF_CORE_READ for tracing**
+
+For modern code (kernel 5.5+), use `bpf_probe_read_kernel` and `bpf_probe_read_user` explicitly -- never the deprecated `bpf_probe_read`. For tracing programs that need to traverse kernel structures portably, use `BPF_CORE_READ` from libbpf, which combines safe access, type relocation via BTF, and helpful error returns:
+
+```c
+#include <bpf/bpf_core_read.h>
+
+SEC("kprobe/tcp_sendmsg")
+int trace_tcp_send(struct pt_regs *ctx) {
+    struct sock *sk = (struct sock *)PT_REGS_PARM1(ctx);
+
+    // Old way (works on 5.5+ but no CO-RE relocation)
+    u16 sport;
+    bpf_probe_read_kernel(&sport, sizeof(sport), &sk->sk_num);
+
+    // Modern, portable way: CO-RE handles field offset relocations
+    u16 sport_core = BPF_CORE_READ(sk, sk_num);
+    u32 saddr = BPF_CORE_READ(sk, sk_rcv_saddr);
+
+    bpf_printk("sport=%u saddr=%u\n", sport_core, saddr);
+    return 0;
+}
+```
+
+For supporting really old kernels (4.x), libbpf provides `bpf_core_read` that falls back to `bpf_probe_read` and runtime relocation. Check the loader output -- libbpf logs which probe variant it selected, and that tells you whether you are getting the modern path.
+
+Always check the return value of probe reads. A non-zero return means the read failed (page not mapped, address invalid). Most production bugs around `bpf_probe_read` are not crashes but silent data corruption from unchecked partial reads.
+</Tip>
+
+---
+
 ### 11.1 Verifier Rejection Issues
 
 **Problem: Unbounded loops**
@@ -1890,5 +2054,133 @@ Next: [The Linux VFS & Advanced File Systems](/operating-systems/file-systems) â
     **Follow-up: What is CO-RE (Compile Once, Run Everywhere) and how does it solve the eBPF portability problem?**
 
     Before CO-RE, eBPF programs that accessed kernel data structures needed to be compiled against the specific kernel headers of the target machine, because struct layouts change between kernel versions (field offsets move). CO-RE uses BTF (BPF Type Format) -- type information embedded in the kernel -- to relocate field accesses at load time. You compile your eBPF program once against any kernel's headers, and the loader (libbpf) reads the target kernel's BTF to adjust struct offsets before loading the program. This means a single compiled eBPF binary can run on kernels from 4.18 to 6.x without recompilation, as long as the fields it accesses exist (possibly at different offsets).
+  </Accordion>
+
+  <Accordion title="When does eBPF beat a kernel module, and when do you still reach for a kernel module?">
+    **Strong Answer Framework:**
+
+    1. **Safety profile.** Kernel modules can crash the kernel; eBPF cannot. The verifier rejects unsafe programs at load time -- no infinite loops, no out-of-bounds memory access, no uninitialized reads, no sleeping in atomic context. For any code path you do not personally trust to be bug-free, eBPF is the safer choice by construction.
+    2. **Deployment friction.** Kernel modules require matching the running kernel's symbol versions, often require signed-module enforcement to be temporarily relaxed, and may need a reboot to install (or unload-reload at minimum). eBPF programs are loaded into a running kernel via syscall, no reboot, no kernel rebuild, no symbol compatibility issues with CO-RE. For SaaS products that ship across hundreds of customer kernels, this difference is enormous.
+    3. **Capability surface.** Modules can do anything: register character devices, replace syscalls, allocate any kernel memory, sleep at will, hold spinlocks. eBPF programs are limited to predefined hook points (kprobes, tracepoints, XDP, tc, LSM hooks, etc.), bounded execution time, no sleeping, restricted memory access. If you need to extend kernel functionality outside those hooks -- a new filesystem, a new scheduler class, a new networking protocol -- you need a module.
+    4. **Performance profile.** eBPF programs are JIT-compiled to native code; the runtime overhead is comparable to native kernel code for the same logic. The pure-overhead delta vs a kernel module doing the same thing is typically under 10 percent and often unmeasurable. Performance is rarely the deciding factor.
+    5. **Choose a module when:** you are writing a device driver, you need to register a character device or kobject, you need to extend kernel functionality at a hook eBPF does not expose, you need long-running threads or sleepable code, or you are part of the upstream kernel community shipping a feature for everyone.
+    6. **Choose eBPF when:** you are tracing, profiling, monitoring, or filtering. You are implementing networking dataplane logic at XDP/tc speed. You are writing security policy that needs to evolve faster than kernel release cycles. You need to ship across many kernel versions without per-kernel builds.
+
+    **Real-World Example:** Cilium, the Kubernetes networking and security project, replaces kube-proxy and iptables with eBPF programs at the XDP and tc hooks. The 2021 announcement included specific numbers: at scale (10K+ services per cluster), eBPF replaced kube-proxy's iptables rules and reduced p99 connection setup latency from tens of milliseconds to single-digit milliseconds, and reduced CPU consumption per service-pod by an order of magnitude. The same project considered building a kernel module variant; they chose eBPF because Cilium ships into customer clusters running diverse kernel versions and could not realistically maintain modules per kernel. The project simply could not exist as a kernel module at the same fleet scale.
+
+    <Note>
+    **Senior follow-up 1: What does sched_ext bring to this comparison?**
+
+    `sched_ext` (kernel 6.12, 2024) lets you implement custom CPU schedulers as eBPF programs rather than as kernel modules. Before sched_ext, scheduler experimentation required patching the kernel and rebuilding -- an expensive iteration loop that meant only a few researchers and Google did it. With sched_ext, you can prototype a scheduler in C, load it into a running kernel, and measure on production-realistic workloads. Meta has used this to ship workload-specific schedulers (CFS-derived but optimized for their server fleet) without committing to upstream-merge timelines. This is the trend: more historically module-only kernel features become eBPF-extensible over time.
+    </Note>
+
+    <Note>
+    **Senior follow-up 2: Are there security cases where the kernel module is more secure than eBPF?**
+
+    Counterintuitively, yes. A signed kernel module is loaded once at boot by a trusted operator, with all its capabilities up front. An eBPF program is often loaded by less-privileged operators (admin processes, observability daemons) and can attach to a wider set of hooks. If your threat model is "admin user is malicious," eBPF actually expands the attack surface because more code can attach to more places. The mitigation is `kernel.unprivileged_bpf_disabled=1` (default on most distros now) which restricts BPF program loading to root, narrowing the surface back to "as restrictive as module loading." For high-security environments, you also want `kernel.kptr_restrict=2` and proper LSM policies on `BPF_PROG_LOAD`.
+    </Note>
+
+    <Note>
+    **Senior follow-up 3: Why does the Linux kernel community prefer eBPF over modules for new observability features?**
+
+    Three reasons. First, ABI stability: kernel modules are tightly coupled to internal kernel APIs that change every release; out-of-tree modules become a maintenance treadmill. eBPF programs use a stable ABI (the BPF helpers and stable hook points) that the kernel team commits to maintaining. Second, distribution: a kernel feature that requires an out-of-tree module never reaches the long tail of users who run distro kernels. eBPF features ship the day the kernel does. Third, accountability: an unsafe module crashes the host with no easy recovery; an unsafe eBPF program is rejected at load. The kernel team prefers mechanisms that fail safe.
+    </Note>
+
+    **Common Wrong Answers:**
+    - "eBPF is always faster than modules." It is not. JIT-compiled eBPF is comparable to native kernel C, sometimes a few percent slower because of the verifier-imposed code structure. Speed is rarely the discriminator.
+    - "Use eBPF for everything." Many kernel features cannot be expressed in eBPF: device drivers, new syscalls, new filesystem types. Knowing where the line is matters more than picking a side.
+    - "Kernel modules are dead." They are not. Every NIC driver, every storage driver, every kernel subsystem ships as a module. The honest framing is "eBPF replaces a particular subset of historical module use cases -- observability, networking dataplane, security policy -- not all of them."
+
+    **Further Reading:**
+    - "BPF: A New Type of Software" (Brendan Gregg) -- the definitive framing of where eBPF fits
+    - The eBPF.io documentation, particularly "What is eBPF?" overview
+    - Cilium architecture documents -- specifically the "Why eBPF" section explaining the kube-proxy replacement decision
+    - Linux source: `Documentation/bpf/` and `kernel/sched/ext.c` for the sched_ext example
+  </Accordion>
+
+  <Accordion title="Walk me through using bpftrace to diagnose a process that has gotten mysteriously slow. What probes do you reach for first, and how do you narrow it down?">
+    **Strong Answer Framework:**
+
+    1. **Define "slow" before you trace.** Is it CPU-bound, I/O-bound, or stalled? `top` shows CPU; `iotop` and `/proc/[pid]/io` show I/O bytes; off-CPU time (the time the thread spent not running) is what matters for stalls and is harder to see. The first measurement decides which family of probes to use.
+    2. **CPU-bound: profile on-CPU stacks.** `bpftrace -e 'profile:hz:99 /pid == $1/ { @[kstack, ustack] = count(); }' <pid>` samples the kernel and user stack at 99 Hz for the target PID. After 30 seconds, the most-frequent stacks tell you where the process is burning CPU. Pipe through `flamegraph.pl` for a visualization. This is the same data Brendan Gregg's CPU flame graphs are built from, just collected with one bpftrace one-liner instead of perf record + post-processing.
+    3. **I/O-bound: trace block layer.** `bpftrace -e 'tracepoint:block:block_rq_issue /pid == $1/ { @[comm] = count(); }' <pid>` counts block requests issued by the target. For latency, `tracepoint:block:block_rq_complete` minus `tracepoint:block:block_rq_issue` keyed by request gives per-IO duration histograms. This catches the case where a process is making lots of small synchronous reads against slow storage.
+    4. **Stalled (off-CPU): trace scheduler events.** `bpftrace -e 'kprobe:finish_task_switch /args->prev->pid == $1/ { @start[args->prev->pid] = nsecs; } kfunc:try_to_wake_up /args->p->pid == $1 && @start[$1]/ { @offcpu_us = hist((nsecs - @start[$1]) / 1000); delete(@start[$1]); }' <pid>` measures how long the process slept off-CPU each time. A histogram with a fat tail in milliseconds means the process is waiting on something -- a lock, an I/O, a network response.
+    5. **Narrow by syscall.** Once you know the family, `bpftrace -e 'tracepoint:syscalls:sys_enter_* /pid == $1/ { @[probe] = count(); }' <pid>` tells you which syscalls the process is making heaviest. Add latency tracking with `sys_exit` to find which syscalls are slow. Tools like `funclatency` and `syscount` from BCC do exactly this.
+    6. **Drill into the slow syscall.** If `read` is slow, you want filesystem-level traces: `vfs_read` latency, `ext4_file_read_iter` latency, page cache hit rate. If `futex` is slow, you have a lock contention issue and `bpftrace -e 'kprobe:futex_wait { @ustack[ustack] = count(); }'` shows which userspace stacks are waiting. If `connect` is slow, network latency or DNS.
+
+    **Real-World Example:** Netflix's published Performance team workflow (Brendan Gregg's blog from 2019-2020) walks through diagnosing a JVM that mysteriously slowed down. The first bpftrace pass showed off-CPU time clustered in `futex_wait`. The second pass captured user-space stacks and revealed the wait was inside JVM safepoint synchronization. The third pass showed safepoints were triggered by a frequent GC-related lock acquisition. Total diagnostic time: under 10 minutes of bpftrace on a production host, no JVM restart, no debug build. Without eBPF, the same investigation would have required a dev-environment reproduction with JVM flight recording, which Netflix had previously done -- and which took days.
+
+    <Note>
+    **Senior follow-up 1: What is the cost of running these probes in production, and how do you decide if it is acceptable?**
+
+    Profile probes at 99 Hz cost roughly 1-2 percent CPU per core sampled. Tracepoints that fire on every syscall cost 50-200 ns per syscall, which translates to 0.5-2 percent for typical workloads (10K-50K syscalls/sec) and 5-15 percent for syscall-heavy workloads. Block tracepoints are fine because block rate is low. The decision rule: short-duration profiling (under 60 seconds) is almost always acceptable in production. Long-duration always-on tracing needs careful attention to which probes are attached -- always-on `sys_enter_*` is a bad idea on a high-syscall service, but always-on `block:block_rq_complete` is fine. When in doubt, measure the overhead with the probe attached vs detached during a quiet window.
+    </Note>
+
+    <Note>
+    **Senior follow-up 2: When does perf still beat bpftrace, and vice versa?**
+
+    `perf record` excels at one-shot CPU profiling for offline flame graph generation -- it has decade-old optimizations for stack walking, symbol resolution, and the perf.data format integrates with mature post-processing. bpftrace excels at custom queries that combine multiple probes with custom aggregation. If you want "histogram of malloc sizes filtered by call site," perf cannot do that without significant scripting; bpftrace expresses it in one line. If you want a 10-minute CPU profile across the whole system, perf is more efficient and the post-processing tooling is richer. The honest answer in 2026: I use perf for CPU profiling and bpftrace for everything else.
+    </Note>
+
+    <Note>
+    **Senior follow-up 3: What is `retsnoop` and when do you reach for it over plain bpftrace?**
+
+    `retsnoop` is a tool that captures the full kernel call stack for any kernel function returning a specific error, with arguments and return values for each frame. It uses BPF kfuncs and BTF to walk stack frames programmatically -- something you cannot easily express in bpftrace. The use case: "this syscall returns -EINVAL sometimes; tell me exactly which kernel function originated the error." Plain bpftrace can attach to syscall entry and exit, but it cannot tell you the chain of internal calls between them. retsnoop fills that gap and is the right tool for "the kernel said no and I do not know why."
+    </Note>
+
+    **Common Wrong Answers:**
+    - "Just run strace." strace is fine for low-rate, single-process syscall tracing, but it serializes the target via ptrace, slowing it 10-100x and changing timing. Many bugs disappear under strace.
+    - "Use perf record for everything." perf record samples on-CPU stacks; it cannot trace off-CPU time, lock contention, or specific kernel events without additional tooling. It is one tool among several.
+    - "Reproduce it in dev with a debugger." Sometimes correct, often not -- production issues frequently depend on production traffic patterns or hardware. eBPF's value is that you do not have to reproduce; you can observe in place.
+
+    **Further Reading:**
+    - "BPF Performance Tools" by Brendan Gregg -- the definitive reference for production bpftrace and BCC workflows
+    - The bpftrace one-liners reference: github.com/iovisor/bpftrace/blob/master/docs/tutorial_one_liners.md
+    - Brendan Gregg's blog, especially "Linux Performance Analysis in 60 Seconds" and the off-CPU flame graph posts
+    - Andrii Nakryiko's `retsnoop` tool: github.com/anakryiko/retsnoop
+  </Accordion>
+
+  <Accordion title="The verifier just rejected my eBPF program. Walk me through the common reasons and how to fix each one.">
+    **Strong Answer Framework:**
+
+    1. **First, get the actual error.** The verifier prints a detailed log if you ask for it. With libbpf, set `BPF_F_LOG_LEVEL=2` or pass `log_level=2` to the loader. With bpftool, use `log_level 2`. The log shows the instruction the verifier was on, the register state at that point, and the specific safety property that failed. Reading verifier output is a learnable skill -- the format is consistent and the messages, once you have seen each one twice, become diagnostic.
+    2. **"R1 unbounded memory access" -- you read past a known-bounded buffer.** Common when parsing packets: you check `data + offset less than data_end`, then read more bytes than the check covered. Fix: re-check after every advance. The verifier requires the check to be visible in the register's known bounds at the read site; a check earlier in the function does not propagate if there is any branching between.
+    3. **"R3 type=map_value_or_null expected=map_value" -- you forgot the NULL check on a map lookup.** `bpf_map_lookup_elem` returns NULL when the key is missing. Fix: explicit `if (!value) return 0;` immediately after the lookup. The verifier tracks pointer types and refuses to dereference a value that could be NULL.
+    4. **"R5 type=inv expected=fp" -- you passed a non-stack pointer where a stack pointer was expected.** Helpers like `bpf_probe_read` require the destination to be on the stack so the verifier can prove the bounds. Fix: copy into a stack local first, or use a per-CPU map and read into the map value directly with helpers that accept map pointers.
+    5. **"BPF program is too large. Processed 1000001 insn" -- complexity limit hit.** The verifier explored too many paths. Fix: split into tail-called sub-programs, mark helper functions `__attribute__((noinline))` so the verifier handles them as separate units, replace unrolled loops with `bpf_loop` (kernel 5.17+), or simplify control flow to reduce the path explosion.
+    6. **"invalid bpf_context access" -- you accessed a field of the program context that is not allowed for this attach type.** XDP context exposes a different set of fields than tc context, even though they look similar. Fix: check the kernel's BTF for what is actually accessible at your attach point. Tools like `bpftool btf dump` show the accessible field set.
+    7. **"R0 has unknown scalar with mixed signed bounds" -- the verifier cannot prove a value is non-negative.** Common with arithmetic on values returned from helpers. Fix: explicit bounds checks (`if (val less than 0 || val greater than MAX) return 0;`) so the verifier's bound tracking narrows the value's possible range.
+    8. **"call to xxx is not allowed for program type yyy" -- the helper is not exposed for your program type.** Each program type (XDP, tc, kprobe, tracepoint, etc.) has its own set of allowed helpers. Fix: pick the right program type for the operation, or restructure to do the privileged operation in a different program connected via a map.
+
+    **Real-World Example:** Cloudflare's writeup on debugging eBPF programs (2021) describes a specific case where their L7 load balancer's XDP program started failing the verifier after a kernel upgrade. The error was "R6 invalid mem access" on a packet pointer dereference that had worked for years. Root cause: a kernel patch tightened the verifier's tracking of packet pointer arithmetic, requiring an additional bounds check after a specific advance pattern. Fix took 30 minutes once they read the verifier log carefully; without the log, they had to bisect kernel versions to find the change. The team's takeaway, which they shared publicly: always treat verifier output as the primary debugging signal, not source-level reasoning about whether the code "should be safe."
+
+    <Note>
+    **Senior follow-up 1: How does the verifier track register bounds, and what are the limits of its analysis?**
+
+    The verifier maintains per-register min and max bounds that narrow as the program executes through branches. After `if (x less than 100)`, the true branch knows `x` is in `[INT_MIN, 99]`. Bitwise ops like `x and 0xFF` collapse the bounds to `[0, 255]`. The limits show up around: arithmetic that could overflow (the verifier widens bounds to be conservative), values returned from helpers (often unbounded), and any operation the verifier's symbolic execution cannot model. Modern kernels have improved this -- the 5.4 kernel introduced "scalar precision tracking" which propagates exact values through more operations -- but pathologic cases still defeat analysis. The fix when you hit one is always the same: insert an explicit bounds check that narrows the value the verifier sees.
+    </Note>
+
+    <Note>
+    **Senior follow-up 2: Why do verifier rejections sometimes happen on a kernel upgrade for a program that worked previously?**
+
+    Two reasons, both legitimate. First, the verifier tightens checks over time as new bug classes are discovered. If the previous verifier was permissive in a way that allowed unsafe programs, the new verifier rejects programs that relied on that permissiveness -- even if those specific programs were not actually unsafe. Second, BTF and CO-RE rely on kernel data structure layout; if a struct field moves or changes type, a CO-RE program that used to relocate cleanly may fail. The fix is usually small (add a bounds check, update a CO-RE relocation hint), but it can be surprising. The lesson: pin your verifier-tested kernels in CI and run the verifier against them as a release-gate.
+    </Note>
+
+    <Note>
+    **Senior follow-up 3: What does `bpf_assume` or its modern equivalent give you, and when should you use it?**
+
+    On recent kernels, the `__builtin_assume` hint or libbpf's pattern of explicit `if (val greater than MAX) val = MAX;` (range narrowing) lets you give the verifier hints that an invariant holds. The verifier cannot prove arbitrary invariants on its own, but if you tell it "this value is at most 64," it will accept reads that depend on the bound. Use this when you genuinely have an out-of-band guarantee (a constant from a map you control, a value derived from kernel state with a known cap). Do not use it as a workaround -- if the assumption fails, you are back to the safety problems eBPF was supposed to prevent. The discipline: every assumption gets a comment explaining why it must hold.
+    </Note>
+
+    **Common Wrong Answers:**
+    - "Add `__attribute__((unused))` and the verifier will skip it." There is no such escape hatch. The verifier checks every instruction the program executes; you cannot annotate it away.
+    - "Just turn off the verifier." You cannot. The verifier is the safety boundary that lets eBPF run in the kernel at all. Disabling it would re-create the kernel-module risk profile without the kernel-module debugging tools.
+    - "Compile with `-O0` to make it simpler." Often makes things worse. `-O0` produces verbose code with redundant locals that exceed stack budget and confuse the verifier's bounds tracking. Always use `-O2` for eBPF.
+
+    **Further Reading:**
+    - The libbpf-bootstrap repository: github.com/libbpf/libbpf-bootstrap -- working examples that pass the verifier on modern kernels
+    - "BPF and the verifier" -- the LWN series by Jonathan Corbet, which walks through the verifier's design
+    - Kernel documentation: `Documentation/bpf/verifier.rst`
+    - Andrii Nakryiko's blog at nakryiko.com -- in-depth posts on CO-RE, BTF, and verifier internals
   </Accordion>
 </AccordionGroup>

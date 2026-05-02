@@ -207,6 +207,32 @@ zpool status                            # ZFS
 
 ---
 
+## 7.5 Caveats and Common Pitfalls
+
+<Warning>
+**Filesystem traps that bite even senior engineers:**
+
+1. **ext4 has metadata journaling, but data is NOT journaled by default.** The default mount option is `data=ordered`: the journal protects metadata (inodes, bitmaps, directory entries) but the file *contents* are written separately and can be lost on crash, even though the filesystem will be consistent. If you read "ext4 is journaled" and assumed your data is safe, you misread the contract. Only `data=journal` (the slow, double-write mode) journals data. Most production deployments accept the risk and rely on the application to handle crash consistency via fsync.
+
+2. **Atomic rename only works within the same filesystem.** `rename(2)` is atomic on POSIX -- but only if source and destination are on the same filesystem. Cross-filesystem `mv` becomes copy+delete: not atomic, can leave partial files, can fail halfway with the source gone and the destination incomplete. The infamous bug: a script does `mv /tmp/file /var/data/file` where `/tmp` is tmpfs and `/var/data` is ext4. Looks like a rename. Is actually copy+delete with no rollback.
+
+3. **Symlink races (TOCTOU).** Time-of-check to time-of-use bugs: you `lstat` a path, see it is a regular file, then `open` it -- but between those calls, an attacker swapped it for a symlink to `/etc/shadow`. Classic privilege escalation. Defenses: `O_NOFOLLOW` to refuse symlinks, `openat2` with `RESOLVE_NO_SYMLINKS`, opening the directory fd once and using `*at` syscalls thereafter. Most CTF-style local-privilege-escalation exploits are some flavor of this.
+
+4. **`inotify` watch limit (default 8192) bites large fleets.** `fs.inotify.max_user_watches` defaults to 8192 on many distros (newer kernels raise it). VS Code, webpack, file-syncing daemons, and Kubernetes kubelets all consume watches. On a node running 50 containers each watching `/etc/resolv.conf` plus a code editor, you blow past the limit and get cryptic `ENOSPC` errors that look like disk-full but are not. Bump `max_user_watches` to 524288 or more on dev machines and worker nodes.
+</Warning>
+
+<Tip>
+**Solutions and patterns:**
+
+- **For data durability, use `fsync` (or `fdatasync`) after every write you cannot afford to lose, plus `fsync` on the parent directory after creating or renaming a file.** ext4 with `data=ordered` is fine if you use fsync correctly; it is dangerous if you assume the filesystem will save you.
+- **Keep critical paths on a single filesystem and use `rename` for atomic publish-then-swap patterns.** Write to `foo.tmp`, fsync it, then `rename(foo.tmp, foo)` -- now any reader sees either the old version or the new, never a half-written one. Verify with `stat` that source and dest are on the same filesystem (same `st_dev`).
+- **Use `openat2` with `RESOLVE_NO_SYMLINKS` or `RESOLVE_BENEATH` for path-handling code that touches privileged data.** Older code can use `O_NOFOLLOW` plus directory-fd-based access. Avoid string manipulation of paths in code that runs with elevated privileges.
+- **Raise `fs.inotify.max_user_watches` and `max_user_instances` proactively on developer and worker machines.** Tools like `entr`, `watchman`, `fswatch`, and modern bundlers chew through watches. The default 8192 was set decades ago and has not aged well.
+- **Pick the filesystem from the workload, not the brand loyalty.** XFS for large files and high parallelism. ext4 for general-purpose and boot. ZFS or btrfs when you need checksums, snapshots, or send/receive replication. F2FS for raw flash. Each has well-known failure modes -- test them in your environment before committing.
+</Tip>
+
+---
+
 ## Summary for Senior Engineers
 -   **Filenames are just pointers**: A file can have multiple names (Hard Links) pointing to the same Inode.
 -   **Dentry Cache** is the bottleneck for cold-start performance (e.g., `npm install`).
@@ -220,41 +246,181 @@ Next: [I/O Systems & Modern I/O](/operating-systems/io-systems) →
 ## Interview Deep-Dive
 
 <AccordionGroup>
-  <Accordion title="Explain the relationship between inodes, dentries, and file descriptors. If I create a hard link, what changes and what stays the same?">
-    **Strong Answer:**
+  <Accordion title="ext4 vs XFS vs btrfs vs ZFS -- trade-offs">
+    **Strong Answer Framework:**
 
-    - An inode represents the file on disk -- metadata and block pointers. It does NOT store the filename. A dentry maps a filename to an inode number. A file descriptor is a per-process integer referencing an in-memory file object, which references the dentry and inode. The chain: fd -> file struct -> dentry -> inode -> disk blocks.
-    - A hard link creates a new dentry pointing to the SAME inode. The inode's link count increments. Data blocks, permissions, and all metadata are shared. Both names are equal.
-    - Deleting one name decrements the link count. The inode and data are freed only when link count reaches zero AND no process has the file open. This is why `rm` on a file still held open by a process does not free disk space until the fd is closed. Detect with `lsof +L1`.
+    1. **Frame each on the trinity: integrity, performance, flexibility.** No filesystem wins all three; the choice is workload-driven.
+    2. **ext4** is the boring, bulletproof default. Metadata journaling, extents, delayed allocation. Great for boot disks, mail spools, general Linux servers. Weak spots: no checksums (silent corruption invisible), max file size 16TB, scaling beyond ~50TB starts to feel sluggish.
+    3. **XFS** is the high-throughput parallel-IO workhorse. Allocation groups give you parallel writers without lock contention. Great for large files (analytics, video, scientific data), backup repositories, and database data files. Weak spots: shrinking is unsupported (you can grow but never shrink), small-file workloads are competitive but not dominant, no native snapshots.
+    4. **btrfs** is the Swiss army knife: copy-on-write, native snapshots, send/receive replication, integrated RAID, transparent compression. Excellent for development machines, container hosts, snapshot-based backups. Weak spots: RAID 5/6 is still buggy in 2025 ("do not use" in the kernel docs), performance can degrade with heavy fsync (Postgres), and large filesystems need careful balance management.
+    5. **ZFS** is the gold standard for data integrity: end-to-end checksums, RAIDZ (no write hole), compression, encryption, dedup, send/receive. Used by Netflix, iXsystems, dozens of NAS vendors. Weak spots: not in mainline Linux (CDDL license), eats RAM (rule of thumb: 1GB per TB plus extra for ARC), L2ARC and SLOG add operational complexity.
+    6. **Make a recommendation per workload.** Postgres on bare metal: ext4 or XFS with `noatime,data=ordered`. Backup target with corruption detection: ZFS RAIDZ2. Container host with snapshot rollback: btrfs subvolumes (or ZFS, on FreeBSD). Petabyte-scale media archive: XFS with allocation groups tuned to NUMA.
 
-    **Follow-up: Why can't you hard link to a directory?**
+    **Real-World Example:** Facebook published in 2019 that they had migrated significant fleet capacity from XFS to btrfs because btrfs's CoW and compression saved double-digit storage. They contributed many btrfs fixes upstream. Conversely, in 2021 the Fedora btrfs default decision provoked debate because consumer hardware (especially flash with poor flush behavior) exposed btrfs latency tails. Both can be true: btrfs is the right choice for some teams and the wrong choice for others. Pick from your workload, not from your peer group.
 
-    Hard links to directories would create cycles in the directory tree. Path resolution would loop infinitely. Recursive operations like `rm -rf` would loop or need complex cycle detection. Symlinks can point to directories but the kernel limits symlink traversals per path lookup (40 on Linux), returning ELOOP if exceeded.
+    <Note>
+    **Senior Follow-up 1:** "Why is btrfs RAID 5/6 still considered unstable?"
+
+    The "write hole" -- if power is lost between writing data and parity blocks, parity becomes inconsistent. Combined with btrfs's CoW data layout and metadata pinning bugs surfacing under recovery, you can lose data on reconstruct. ZFS RAIDZ avoids this with variable-stripe writes; mdadm RAID5 papers over it with a write-intent bitmap or a journal device. btrfs has had patches in flight for years; the kernel docs explicitly warn against RAID5/6 for important data.
+    </Note>
+
+    <Note>
+    **Senior Follow-up 2:** "Why does Postgres performance suffer on btrfs?"
+
+    Postgres calls fsync frequently (every WAL commit). On CoW filesystems, fsync forces a metadata transaction even when data did not change semantically -- because the *block locations* of the data changed. This amplifies write traffic and journal commits. Workarounds: `nodatacow` on the data directory (loses btrfs's data checksums), or use ext4/XFS for Postgres data and btrfs for everything else.
+    </Note>
+
+    <Note>
+    **Senior Follow-up 3:** "How do you decide between native ZFS RAID and hardware RAID?"
+
+    Hardware RAID hides the disks behind a single block device, defeating ZFS's ability to detect and repair corruption. Always give ZFS raw access (HBA mode / IT mode), let it manage redundancy. The argument "but hardware RAID has battery-backed cache" is solved by SLOG (a small fast SSD as ZFS's intent log device). Same for mdadm: if you are running ZFS, do not stack it on top of md.
+    </Note>
+
+    **Common Wrong Answers:**
+
+    1. *"ZFS is always best because of checksums."* True only when you can pay the RAM, complexity, and licensing cost. For a stateless container host with ephemeral storage, ext4 is fine.
+    2. *"btrfs is unstable; never use it."* The non-RAID-5/6 features are stable and used at major-vendor scale (SUSE, Synology, Facebook). Learn what is stable vs experimental.
+    3. *"XFS does not support journaling."* XFS has metadata journaling. It does not journal data, but neither does ext4 by default.
+
+    **Further Reading:**
+    - "ZFS: The Last Word in Filesystems" -- Jeff Bonwick's original Sun design papers
+    - "Btrfs: The Linux B-tree Filesystem" -- Mason et al., ACM TOS
+    - Dave Chinner's XFS articles on lwn.net
   </Accordion>
 
-  <Accordion title="A database engineer uses O_DIRECT for all database files. Explain what it does, why databases want it, and the trade-offs.">
-    **Strong Answer:**
+  <Accordion title="How does a journaling filesystem recover after a crash?">
+    **Strong Answer Framework:**
 
-    - O_DIRECT bypasses the kernel page cache. Writes go from user-space buffers directly to disk via DMA; reads go from disk directly to user-space.
-    - Databases want it because they implement their own buffer pool. Without O_DIRECT, the same data exists in both the database buffer pool and the kernel page cache -- double buffering that wastes RAM. On a 128GB server with a 96GB buffer pool, that is significant.
-    - Databases also need precise control over write durability. With O_DIRECT + fsync, the database controls exactly when data hits disk, which is critical for WAL (write-ahead log) guarantees.
-    - Trade-offs: requires aligned buffers and I/O sizes, no kernel read-ahead, small random reads are slower (no page cache). O_DIRECT alone does NOT guarantee durability -- the disk's volatile write cache may still hold data. Must also call fsync().
+    1. **Define the problem journaling solves.** A filesystem operation typically updates multiple on-disk structures: inode, block bitmap, directory entry, data blocks. A crash mid-update leaves the filesystem inconsistent. Pre-journal recovery (`fsck` on ext2) was a full scan -- minutes to hours on multi-TB volumes.
+    2. **Describe the journal as a write-ahead log.** Before mutating real on-disk structures, the filesystem writes the intended changes (the "transaction") to a circular journal area. The journal write completes, then the actual structures are updated, then the journal entry is marked committed.
+    3. **Walk through crash recovery.** On mount, the FS examines the journal. Entries marked committed but not fully applied are *replayed* (re-applied to the main structures). Entries not committed are *discarded* (the in-progress transaction never happened from the FS's view). Either way, the FS is consistent within seconds rather than hours.
+    4. **Distinguish modes.** ext4 has `data=writeback` (journal metadata only, no ordering between data and metadata -- fastest, can show stale data after crash), `data=ordered` (default; journal metadata, write data first then commit metadata -- consistent but data is not journaled), `data=journal` (journal both -- 2x write traffic but full crash protection). Most production picks ordered.
+    5. **State the limit.** Journaling protects the filesystem's *internal* consistency. It does NOT protect *application* data unless the app uses fsync correctly. A database that writes to a file without fsync, then crashes, can lose data even on a journaled filesystem.
+    6. **Note the alternatives.** Copy-on-write filesystems (btrfs, ZFS) do not need a separate journal -- they update by writing new blocks and atomically swinging a pointer. Crash recovery is implicit: either the new pointer is durable (new state) or it is not (old state).
 
-    **Follow-up: What is the difference between fsync, fdatasync, and O_DSYNC?**
+    **Real-World Example:** Stephen Tweedie's original ext3 paper (2000) makes the case for journaling in detail. The XFS team at SGI shipped journaling in production in 1994 for IRIX; their experience informed every Linux journaled FS that came after. A vivid case study: pre-journal Linux servers in the 90s would commonly take 30+ minutes to fsck a 100GB filesystem after a crash; ext3 cut that to seconds. Recoveries that used to require operator attention became boot-time invisible.
 
-    fsync flushes data and all metadata. fdatasync flushes data and only metadata necessary for correct reads (skips atime, etc.). O_DSYNC makes every write behave as fdatasync. For a database WAL, fdatasync is sufficient and faster because it avoids unnecessary metadata writes. PostgreSQL uses fdatasync by default.
+    <Note>
+    **Senior Follow-up 1:** "What does `data=ordered` actually order?"
+
+    Data writes for a transaction must complete before the transaction's metadata commit hits the journal. Without that ordering, the journal could record "block 12345 belongs to inode 99" before block 12345's content was written -- a crash leaves inode 99 pointing at stale or random data. Ordered mode prevents this by issuing data writes first and waiting for them, then committing metadata.
+    </Note>
+
+    <Note>
+    **Senior Follow-up 2:** "What is the journal commit interval and why does it matter?"
+
+    ext4 commits the journal every `commit=N` seconds (default 5). A crash within that window can lose recently written metadata even though the FS will be consistent. For latency-sensitive workloads, lower commit intervals reduce the loss window at the cost of more journal writes. For throughput-bound batch jobs, larger intervals amortize journal overhead.
+    </Note>
+
+    <Note>
+    **Senior Follow-up 3:** "How does a journal interact with barriers and write caches?"
+
+    The journal entry must be durable on disk before the corresponding metadata update is durable, otherwise crash recovery sees a half-written transaction. ext4 issues `REQ_PREFLUSH | REQ_FUA` around journal commits to force the device to flush volatile cache. If you mount with `barrier=0` (you should not, in production), you trade durability for throughput; on a power failure you can corrupt the FS.
+    </Note>
+
+    **Common Wrong Answers:**
+
+    1. *"Journaling protects my data."* It protects the filesystem's metadata consistency. For data, you still need fsync.
+    2. *"Replay just runs every transaction."* It runs only committed transactions. Non-committed (in-flight at crash) entries are discarded.
+    3. *"CoW filesystems still use a journal."* btrfs has a small log tree for fast fsync, but the main mechanism is CoW + atomic superblock pointer swing. ZFS uses a ZIL (intent log) for synchronous writes but relies on uberblock atomic update for consistency.
+
+    **Further Reading:**
+    - Stephen Tweedie, "EXT3, Journaling Filesystem" -- the canonical paper
+    - "The Linux ext3 filesystem -- Recovery and journaling" -- LWN
+    - Dave Chinner, "XFS Algorithms and Data Structures" (xfs.org)
+  </Accordion>
+
+  <Accordion title="Hard link vs symlink -- semantic differences">
+    **Strong Answer Framework:**
+
+    1. **Define each precisely.** A hard link is a directory entry mapping a name to an inode number. Two hard links pointing at the same inode are *equal* -- there is no "original" and "link." A symlink (symbolic link, soft link) is a tiny file whose contents are a path string. The OS resolves the path string at access time.
+    2. **State the consequences of each design.**
+       - Hard links share the inode. Same data, same metadata, same permissions, same link count (incremented).
+       - Symlinks point at a path. They can be relative or absolute. They can dangle (target deleted). They can cross filesystems. They can point at directories.
+    3. **Walk through cross-cutting concerns.**
+       - **Filesystem boundary:** Hard links must stay within one filesystem (the inode number is filesystem-local). Symlinks cross freely.
+       - **Directories:** Cannot hard link directories (cycles). Symlinks can point at directories.
+       - **Deletion:** `unlink` on a hard link decrements the link count; data freed only when count reaches 0 AND no fd is open. `unlink` on a symlink removes only the symlink; the target is untouched. `unlink` on a target leaves dangling symlinks.
+       - **Permissions:** Hard links share the inode, so chmod/chown affects all names. Symlinks have their own metadata but most ops follow them; `lchown`, `lstat`, and `O_NOFOLLOW` operate on the link itself.
+       - **Size:** Hard links cost one directory entry (~32 bytes). Symlinks cost a tiny file (often inlined in the inode if path is short).
+       - **Race conditions:** Symlinks enable TOCTOU attacks (`/tmp` symlink races). Hard links also have attacks (linking to files you cannot read to bypass permission checks on copy), which is why most distros enable `protected_hardlinks` sysctl.
+    4. **Provide a decision rubric.** Use hard links when you want true equivalence (e.g., backup tools deduplicating), within-filesystem aliases that should never break. Use symlinks when crossing filesystems, pointing at directories, exposing version aliases (`/usr/lib/libfoo.so` -> `libfoo.so.1.2.3`), or when the target may legitimately move.
+
+    **Real-World Example:** Time Machine on macOS originally used hard links to directories (a special HFS+ extension) to make space-efficient incremental backups. When Apple migrated to APFS, this required redesign because POSIX-correct hard links cannot point at directories. The new APFS-based snapshots replaced the hard-link trick with proper CoW snapshots. The git object store, conversely, lives or dies on hard-link sharing across worktrees -- which is why `git clone --reference` requires the source repo to be on the same filesystem.
+
+    <Note>
+    **Senior Follow-up 1:** "Why does the kernel limit symlink resolution depth?"
+
+    To prevent infinite loops (`a -> b -> a`) and absurdly deep chains. Linux's limit is 40 (`MAXSYMLINKS`). Exceeding it returns `ELOOP`. Per single component the limit is 8 (`SYMLOOP_MAX` semantically). This protects path resolution from blowing the kernel stack.
+    </Note>
+
+    <Note>
+    **Senior Follow-up 2:** "What is `protected_hardlinks` and what attack does it prevent?"
+
+    The sysctl `fs.protected_hardlinks=1` prevents users from hard-linking files they do not own and cannot read. The attack: a privileged process creates a temporary file with mode 0600. An unprivileged user hard-links it. Later, the temp file is unlinked but the user retains a hard link to its (now stable) inode. With race conditions on suid binaries, this can leak credentials.
+    </Note>
+
+    <Note>
+    **Senior Follow-up 3:** "What changes if I rename across hard links?"
+
+    `rename(a, b)` where both are hard links to the same inode is a no-op for the inode but removes one of the names if a different one was used. Tools like `git` rely on this for safe renames. A subtle gotcha: `rename` is atomic, but `rename` followed by `rename` is not -- backup tools that cycle through generations using rename trees need careful ordering.
+    </Note>
+
+    **Common Wrong Answers:**
+
+    1. *"A symlink is a faster hard link."* Different mechanism, different semantics. Symlinks are slower (extra path resolution) and weaker (target can vanish).
+    2. *"Hard links work across filesystems."* They do not. Inode numbers are filesystem-scoped.
+    3. *"Deleting the original breaks hard links."* There is no original. Both names are equal.
+
+    **Further Reading:**
+    - link(2), symlink(2), unlink(2) man pages -- read them carefully
+    - "The TOCTOU problem and how Linux solves it" -- LWN article on `openat2`
+    - "Apple File System Reference" -- the APFS chapters on snapshots illustrate why hard-linked directories needed to die
   </Accordion>
 
   <Accordion title="You delete large log files on a production server but disk usage does not decrease. What happened?">
-    **Strong Answer:**
+    **Strong Answer Framework:**
 
-    - A process still has the deleted files open. When you unlink a file, the dentry is removed but the inode and data blocks remain while any fd references them.
-    - Diagnosis: `lsof +L1` lists open files with zero link count. Common culprit: logging daemons still writing to the deleted file.
-    - Fix: restart the process, or truncate via `/proc/<PID>/fd/<FD>`, or send SIGHUP to tell the process to reopen log files.
-    - Prevention: use logrotate with `copytruncate`, or ensure applications handle SIGHUP for log rotation.
+    1. **Diagnose the symptom precisely.** `df` shows used space high, `du` on the directory shows nothing. Classic signature of unlinked-but-open files.
+    2. **Explain the mechanism.** When you `unlink` a file, the dentry is removed. The inode and data blocks remain allocated as long as any fd references them. Disk space returns only when the last fd is closed AND the link count is zero.
+    3. **Show how to confirm.** `lsof +L1` lists open files with link count zero. The output points at the holding process(es). On modern systems, `lsof -nP +L1 | grep deleted` is your friend.
+    4. **Explain the common culprit.** Logging daemons (rsyslogd, journald, application loggers) hold the file open for writes. Naive `rm` of `/var/log/big.log` followed by waiting -- forever. The process keeps writing to the now-orphan inode.
+    5. **Provide multiple fixes.**
+       - Restart the process holding the file. Kills the fd, releases the inode.
+       - Truncate via `/proc/<PID>/fd/<FD>` -- `: > /proc/12345/fd/3` zeros the file in place without the process noticing.
+       - Send SIGHUP to a daemon that handles log reopen on signal.
+       - Use logrotate's `copytruncate` for processes that cannot be signaled.
+    6. **Explain prevention.** Configure logrotate properly. Use `truncate(2)` rather than `unlink+create` if you need to keep the daemon writing. Monitor for unlinked-but-open files in your alerting (Datadog has a check, Prometheus exporters expose it).
 
-    **Follow-up: What is the dentry cache, and why is it critical for performance?**
+    **Real-World Example:** In 2017, GitLab's famous database incident included a moment where engineers `rm -rf`'d a wrong directory and disk usage looked like it had not changed. It was actually fine -- the inodes were freed -- but during incident response, several engineers mistook still-open log files for "the rm did not work" and tried to redo the operation on a different host. The post-mortem explicitly called out misunderstanding of unlink semantics under fd pressure as a cognitive failure during the incident.
 
-    The dcache stores recent filename-to-inode mappings in kernel memory. Without it, every path component requires reading directory blocks from disk. For `/var/log/nginx/access.log`, that is 4 directory lookups. On a busy server, dcache hit rate is typically 99%+. A cold dcache after reboot causes dramatic performance degradation -- the "cold start" problem. Inspect via `/proc/sys/fs/dentry-state`.
+    <Note>
+    **Senior Follow-up 1:** "Why does logrotate's `copytruncate` exist?"
+
+    For daemons that cannot be signaled to reopen log files (or for which reopening is unsafe). `copytruncate` copies the existing log to a backup, then truncates the original to zero in place. The daemon's fd still points at the same inode -- now empty -- and continues writing without disruption. Trade-off: a brief race window during which writes between the copy and truncate are lost.
+    </Note>
+
+    <Note>
+    **Senior Follow-up 2:** "What is the `dentry cache`, and why is it critical for performance?"
+
+    The dcache is the kernel's cache of recent name-to-inode lookups. Without it, every path component requires reading directory blocks. For `/var/log/nginx/access.log`, that is 5 lookups (root, var, log, nginx, access.log). A cold dcache after reboot is the real reason "the first request after deploy is slow" on many systems. Hit rate is typically 99 percent in steady state. Inspect with `/proc/sys/fs/dentry-state`.
+    </Note>
+
+    <Note>
+    **Senior Follow-up 3:** "How would you find unlinked-but-open files at scale across a fleet?"
+
+    Run `lsof +L1` periodically and ship to your observability stack. Or use eBPF: hook `do_unlinkat` and track inodes with non-zero open counts. The Datadog/Prometheus node-exporter `node_filesystem_files_free` versus `_files` ratio also surfaces inode pressure. Alerts on disk-vs-inode divergence catch this class of bug early.
+    </Note>
+
+    **Common Wrong Answers:**
+
+    1. *"`rm` did not actually delete it; try `sudo rm -f`."* The unlink succeeded; understanding why disk did not free is the actual lesson.
+    2. *"Reboot to fix it."* Works but masks the underlying logging configuration issue.
+    3. *"Use `shred` to scrub the file first."* Solves nothing about open fds. `shred` is for secure deletion of contents, not for freeing inodes.
+
+    **Further Reading:**
+    - "How Linux handles file deletion" -- LWN
+    - The lsof man page (especially `+L`)
+    - GitLab post-mortem of the 2017 database incident (a long read, worth it)
   </Accordion>
 </AccordionGroup>

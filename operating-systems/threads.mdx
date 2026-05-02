@@ -352,4 +352,197 @@ Signals are delivered to "any" thread that hasn't blocked them, causing unpredic
 Fix: Block all signals in worker threads; have one dedicated thread call `sigwait()`.
 
 ---
-Next: [IPC & Signals](/operating-systems/ipc) →
+
+## Production Caveats &amp; Common Pitfalls
+
+The pthread API looks deceptively simple. Production exposes its sharp edges. Here are four traps senior engineers must internalize.
+
+<Warning>
+**Caveat 1: Shared memory without synchronization is undefined behavior, not just slow**
+
+A common misconception: "two threads writing the same int without a lock will give wrong results, but the program will keep running." Wrong. The C11 and C++11 memory models classify this as a **data race**, which is undefined behavior. The compiler is permitted to optimize as if data races cannot happen. A famous example: a thread polling `while (!stop_flag) {}` may loop forever even after another thread writes `stop_flag = true`, because the compiler hoists the load out of the loop. This is not a theoretical concern -- it has been observed in production with GCC -O2.
+</Warning>
+
+<Tip>
+**The fix:** Use `_Atomic` (C11) or `std::atomic` (C++11) for shared variables, or wrap accesses in a mutex. Atomic loads/stores prevent the compiler from reordering or hoisting them. For multi-word state, use a mutex; atomic is only safe for word-sized data and only gives sequentially consistent semantics by default. Tools: ThreadSanitizer (TSan, `-fsanitize=thread`) catches data races at runtime with about 5-10x slowdown -- run your CI test suite under TSan and fix every report.
+</Tip>
+
+<Warning>
+**Caveat 2: Thread-local storage on glibc has destructor edge cases**
+
+C++ `thread_local` and pthread `pthread_key_create` destructors run when the thread exits -- but with subtle ordering rules. When a thread calls `pthread_exit()`, glibc walks the TLS keys and calls each destructor. If a destructor itself creates new TLS data (allocates a per-thread cache, for example), glibc loops up to PTHREAD_DESTRUCTOR_ITERATIONS times (default 4) before giving up. After that, the data leaks. Worse: if a destructor calls into another library that uses TLS, and that library has already been torn down for this thread, you get use-after-free in destructor code that runs at process exit. This caused mysterious crashes in glibc-based services that link against libstdc++ on shutdown.
+</Warning>
+
+<Tip>
+**The fix:** Keep TLS destructors trivial -- ideally just `free()` or close a handle. Do not call into other libraries from a TLS destructor. For C++, prefer RAII inside thread functions over `thread_local` with non-trivial destructors. If you must use complex destructors, register them with `atexit()` instead so they run at process exit when state is still consistent. Watch for the bug pattern where `glibc/nptl/pthread_create.c` issues "thread destruction loop" warnings -- it means you have hit the iteration limit.
+</Tip>
+
+<Warning>
+**Caveat 3: pthread_cancel is dangerous -- most modern code uses cooperative cancellation**
+
+`pthread_cancel(tid)` sends a cancellation request that takes effect at the next "cancellation point" -- a long list of functions like `read`, `write`, `sleep`, etc. Sounds simple. But cancellation runs C++ destructors via the same mechanism as exception unwinding. If your library was not compiled with `-fexceptions` (rare on libc, common on legacy code), unwinding fails and the process crashes. Even with proper unwinding, cancelling a thread that holds a mutex leaves the mutex locked forever -- there is no automatic release. Cancelling a thread doing I/O on a database connection can leave the connection in a half-baked state. The Boost.Thread documentation explicitly warns: "Cancellation should not be used in production code."
+</Warning>
+
+<Tip>
+**The fix:** Use cooperative cancellation. Maintain an `std::atomic&lt;bool&gt; stop_requested` flag. Workers check it at safe points and exit cleanly. For blocking I/O, use timeouts and check the flag after each timeout, or close the FD from another thread to wake up the blocked syscall (e.g., `shutdown()` on a socket causes the read to return 0). C++20 `std::jthread` and `std::stop_token` formalize this pattern. Go and Rust force cooperative cancellation by design (channels, `context.Context`, `tokio::CancellationToken`) -- there is no equivalent of pthread_cancel.
+</Tip>
+
+<Warning>
+**Caveat 4: fork() in a multi-threaded program is a minefield**
+
+POSIX says: after fork() in a multi-threaded program, the child may only call async-signal-safe functions until it calls exec(). The reason: only the calling thread survives in the child, but all mutexes, condition variables, and library state are duplicated -- including locks held by other threads at the moment of fork. A common manifestation: fork while another thread holds malloc's internal lock; the child inherits a locked lock with no owner thread to unlock it; the next malloc in the child deadlocks forever. This is why `system()` and `popen()` are unsafe in multi-threaded programs.
+</Warning>
+
+<Tip>
+**The fix:** Three options. (1) Replace fork+exec with `posix_spawn()`, which avoids the lock duplication problem by design. (2) Use `pthread_atfork()` to register handlers that acquire locks before fork (in the parent prepare handler) and release them in both parent and child after fork. This is what glibc does internally for malloc but you may need to do it for your own libraries. (3) Make sure no other threads are running when you fork -- fork in main() before creating any worker threads. The safest pattern in 2025 is "fork only at startup, never under load."
+</Tip>
+
+---
+
+## Senior-Level Interview Questions
+
+<AccordionGroup>
+  <Accordion title="Compare M:N threading vs 1:1 threading. Why did Linux NPTL adopt 1:1 while Solaris LWP started M:N? What does Go do and why?">
+    **Strong Answer Framework:**
+
+    1. **Define the models clearly**: 1:1 means every user thread is backed by exactly one kernel thread (kernel scheduler manages everything). M:N means a runtime maps M user threads onto N kernel threads (typically N = number of cores), with the runtime doing user-level scheduling. N:1 means all user threads on one kernel thread (legacy "green threads").
+    2. **Articulate the tradeoffs**: 1:1 wins on simplicity (kernel handles everything, blocking syscalls only block their thread), and on correctness (signals, ptrace, gdb all work as expected). M:N wins on overhead (millions of goroutines vs thousands of pthreads, ~2KB stack vs ~2MB) and on user-controllable scheduling (cooperative scheduling for predictable latency).
+    3. **The historical pivot**: Solaris had LWPs (M:N) in the 1990s. Linux had two competing 1:1 threading libraries (LinuxThreads and the IBM-driven NGPT). Around 2003, Ulrich Drepper and Ingo Molnar built NPTL based on 1:1, arguing that the M:N benefits did not outweigh the implementation complexity (e.g., signal-blocking-cooperation between userland and kernel). Solaris itself migrated to 1:1 in Solaris 9 (2002) for the same reasons. The lesson: M:N is hard to get right in a system that wasn't designed for it from day one.
+    4. **Why Go does M:N anyway**: Go was designed greenfield with the runtime in mind. The Go scheduler implements M:N with G (goroutines), M (OS threads), P (logical processors) abstractions. When a goroutine performs a syscall, the runtime detects it (via syscall wrappers) and parks the M, spinning up a new M to keep P scheduling other goroutines. This requires deep cooperation between runtime and stdlib -- something Linux/Solaris could not retrofit into POSIX libc.
+
+    **Real-World Example:**
+
+    Discord's 2020 migration from Go to Rust for one specific service involved an interesting twist on M:N tradeoffs. They cited Go's GC pauses (a runtime cost paid for all those goroutines) as the reason. Tokio in Rust offers a similar M:N model (tasks on worker threads) but without GC. The relevant blog post is "Why Discord is switching from Go to Rust" (2020). The takeaway: M:N gets you concurrency cheaply, but the runtime that makes M:N possible can become the bottleneck.
+
+    <Note>
+    **Senior follow-up 1:** What is "scheduler activation" and why did it fail? Scheduler activations were Anderson et al.'s 1991 proposal for kernel-userland cooperation in M:N: when a kernel thread is about to block, the kernel "upcalls" the runtime so it can schedule another userland thread on a different kernel thread. NetBSD shipped it briefly, then ripped it out. The complexity was overwhelming -- every blocking syscall needed runtime cooperation, and signal handling became byzantine. Linux deliberately avoided going down this path.
+    </Note>
+
+    <Note>
+    **Senior follow-up 2:** How does Go handle a goroutine that calls a blocking syscall? The Go runtime has two paths. For known blocking syscalls (e.g., file I/O), the runtime calls `entersyscall()` before the syscall and `exitsyscall()` after. entersyscall detaches the M from the P, allowing another M to pick up the P and run other goroutines. For network I/O, Go uses netpoll (epoll on Linux) under the hood -- the goroutine "blocks" but the M is never actually blocked; it returns to the scheduler. This is why Go can have millions of concurrent network connections with a handful of OS threads.
+    </Note>
+
+    <Note>
+    **Senior follow-up 3:** Java's Project Loom (virtual threads in JDK 21) -- is that M:N? Yes. Loom adds virtual threads that are scheduled by the JVM onto a pool of carrier (OS) threads. When a virtual thread does a blocking I/O call, the JVM unmounts it from the carrier, reschedules another virtual thread, and remounts the original when I/O completes. This is essentially Go's design retrofitted onto the JVM. The big challenge was handling synchronized blocks (which pin a virtual thread to its carrier) -- you have to use ReentrantLock instead for full Loom benefits.
+    </Note>
+
+    **Common Wrong Answers:**
+    - "1:1 is just slower because every thread is heavy." Wrong: 1:1 with 100 threads is comparable to M:N with 100 tasks. The advantage is at very high concurrency.
+    - "Go uses M:N because Linux doesn't support fast threads." Wrong: Linux thread creation is fast; Go uses M:N for memory efficiency at scale.
+    - "M:N is always better than 1:1." Wrong: for CPU-bound work with low concurrency, the runtime overhead of M:N is wasted.
+
+    **Further Reading:**
+    - "The Native POSIX Thread Library for Linux" by Drepper &amp; Molnar (2003) -- the NPTL design document.
+    - "Scalable Go Scheduler Design Doc" by Dmitry Vyukov -- golang.org/s/go11sched.
+    - "State of Loom" by Ron Pressler -- inside.java/2020/05/01/loom-state-of/.
+  </Accordion>
+
+  <Accordion title="Implement a thread pool. What knobs matter and why? How would you size it?">
+    **Strong Answer Framework:**
+
+    1. **Sketch the data structures**: A thread pool consists of (a) a queue of pending tasks, (b) a set of worker threads, (c) synchronization primitives. Workers loop: dequeue a task, run it, repeat. The queue typically uses a mutex + condition variable or a lock-free MPMC queue.
+    2. **Identify the knobs**: (a) Pool size (number of workers). (b) Queue size (bounded vs unbounded). (c) Rejection policy (block, drop, run-on-caller-thread). (d) Worker lifecycle (eager vs lazy creation, idle timeout). (e) Task isolation (does a panic kill the worker thread?).
+    3. **Size it correctly**: For CPU-bound work: `pool_size = number of cores`. More workers just thrash. For I/O-bound work: `pool_size = cores * (1 + wait_time/cpu_time)`. Little's Law gives the formula. For mixed workloads: separate pools per workload class to prevent CPU-bound tasks from monopolizing I/O capacity (this is the Bulkhead pattern from microservices).
+    4. **Bound the queue**: Unbounded queues are a latency disaster. Tasks pile up during a spike, consuming memory and degrading every task that arrives later. Bounded queues with a rejection policy let you fail fast and apply backpressure. Java's ThreadPoolExecutor lets you choose: AbortPolicy (throw), CallerRunsPolicy (execute on caller thread, providing natural backpressure), DiscardPolicy (drop silently), DiscardOldestPolicy (drop the oldest queued task).
+
+    **Real-World Example:**
+
+    The Tomcat/Servlet container uses a thread pool to handle HTTP requests. In 2017, Netflix discovered their Tomcat pools were sized at 200 (the default) on services that did heavy backend calls with 500ms latency. Little's law: at 1000 requests/sec, you need 1000 * 0.5 = 500 threads to keep up. With 200 threads, the queue grew unbounded and latency exploded. The fix was a combination of (1) increasing pool size to 800, (2) bounding the queue at 50, (3) failing fast with backpressure. This is documented in the Hystrix design rationale (github.com/Netflix/Hystrix/wiki/How-it-Works).
+
+    <Note>
+    **Senior follow-up 1:** Why is unbounded queue + small pool the worst combination? Because under load, requests arrive faster than the pool drains. The queue grows without limit. Memory usage explodes. Tasks at the back of the queue wait minutes. By the time they execute, the user has given up. You have built a system that fails slowly instead of failing fast. Always bound the queue.
+    </Note>
+
+    <Note>
+    **Senior follow-up 2:** What is a fork-join pool and when do you use it? Java's ForkJoinPool implements work-stealing: each worker has its own deque, tasks spawn subtasks that go on the local deque, and idle workers steal from busy workers' deques. This is excellent for divide-and-conquer algorithms (sorts, parallel stream operations). The key win: less contention than a single shared queue. Go's runtime uses the same idea -- each P has a local run queue, idle Ms steal from busy Ms. Use fork-join when tasks spawn subtasks; use a fixed pool with a shared queue for independent tasks.
+    </Note>
+
+    <Note>
+    **Senior follow-up 3:** A service has CPU-bound and I/O-bound tasks mixed together. Should they share a pool? No. Two pools, sized independently. If they share, an I/O-bound spike starves CPU-bound work (or vice versa). This is the Bulkhead pattern. Hystrix and Resilience4j both default to separate pools per dependency. The cost is a bit more memory and a bit of underutilization, but the isolation is worth it.
+    </Note>
+
+    **Common Wrong Answers:**
+    - "Pool size = number of cores * 2" as a universal rule. Wrong: depends entirely on the workload's I/O wait fraction.
+    - "Unbounded queue is fine if I have enough memory." Wrong: latency explodes long before memory does, and you cannot apply backpressure.
+    - "One global pool for all work." Wrong: head-of-line blocking destroys latency for one workload type when another type spikes.
+
+    **Further Reading:**
+    - "Java Concurrency in Practice" by Brian Goetz -- chapter 8 on thread pool sizing remains canonical.
+    - Hystrix design doc -- github.com/Netflix/Hystrix/wiki/How-it-Works.
+    - "The Tail at Scale" by Dean &amp; Barroso -- explains why latency-sensitive services need bounded queues and parallel redundant requests.
+  </Accordion>
+
+  <Accordion title="A multi-threaded program calls fork(). What locks are unsafe in the child, and how do you fix it?">
+    **Strong Answer Framework:**
+
+    1. **State the rule**: After fork() in a multi-threaded program, the child has only one thread (the one that called fork). All other threads are gone, but their state remains. Locks they held are still locked. Memory they were modifying is in whatever state it was in. POSIX says the child may only call async-signal-safe functions until exec().
+    2. **Enumerate the dangerous locks**: malloc's heap lock (every allocator has one). The libc stdio locks (printf, fprintf). DNS resolver locks. Locale locks. Random number generator state. Logger locks. Pretty much any libc function that is not on the async-signal-safe list.
+    3. **Walk through the deadlock scenario**: Thread A calls malloc, acquires the heap lock. While A holds the lock, thread B calls fork(). The child inherits the lock as locked, but A does not exist in the child. The child then calls printf, which calls malloc internally to allocate a stdio buffer, which tries to acquire the heap lock, which is locked forever. The child hangs.
+    4. **Provide the fixes**: (a) The textbook fix: pthread_atfork registers handlers. The "prepare" handler runs in the parent before fork and acquires all relevant locks. The "parent" handler releases them in the parent after fork. The "child" handler releases them in the child. This is what glibc does internally for malloc. (b) The pragmatic fix: just use posix_spawn instead of fork+exec. (c) The architectural fix: only fork from a single-threaded process (e.g., main(), before creating worker threads).
+
+    **Real-World Example:**
+
+    Apache HTTPD 2.4 had a long-standing bug where SSL initialization in worker children sometimes deadlocked because OpenSSL's locks were held by other threads at the moment of fork. The fix in OpenSSL 1.1.0 (2016) was to register pthread_atfork handlers to release all locks in the child. Before this, workarounds included disabling threading in the parent or using the prefork MPM (single-threaded process).
+
+    <Note>
+    **Senior follow-up 1:** Why does Python's multiprocessing module work despite all this? Python's `multiprocessing` library on Linux uses fork by default. Many users hit the deadlock issue, especially with libraries like grpc and urllib3. Python 3.14 changed the default start method to "spawn" on macOS (which uses posix_spawn) and is debating the same change for Linux. The "spawn" method does not have the lock inheritance problem because it starts a fresh interpreter.
+    </Note>
+
+    <Note>
+    **Senior follow-up 2:** Are atomics safe across fork? Atomics in shared memory are safe -- the values are preserved correctly. Atomics in private memory are also safe in the child because they are just memory locations; fork doesn't change their values. The danger is not atomics but mutexes and condition variables, which are stateful primitives that can be in the wrong state after fork.
+    </Note>
+
+    <Note>
+    **Senior follow-up 3:** What about glibc internal state like errno? errno is thread-local in glibc, so the child has the calling thread's errno value. That's fine. The bigger issue is shared library state initialized via __attribute__((constructor)) -- if a constructor used a thread to set up async I/O, that thread is gone in the child but its FD or memory may still be referenced by signal handlers or atexit handlers. This is why container runtimes like containerd are very careful about which libraries they link against.
+    </Note>
+
+    **Common Wrong Answers:**
+    - "It's fine as long as you exec quickly." Mostly fine but not guaranteed -- POSIX explicitly says only async-signal-safe functions are safe between fork and exec.
+    - "Use fork once, then call any function." Wrong if the program was multi-threaded at fork time.
+    - "pthread_atfork solves everything." Helps but does not solve everything -- third-party libraries you don't control may still hold locks.
+
+    **Further Reading:**
+    - `man 2 fork` -- the "Notes" section on multi-threaded behavior.
+    - "A fork() in the road" (HotOS 2019) -- Baumann et al. argue fork should not exist in modern OSes.
+    - Python 3.14 release notes on the spawn default change -- discuss.python.org for the relevant PEP discussions.
+  </Accordion>
+
+  <Accordion title="Explain how futexes work and why they're faster than traditional kernel mutexes.">
+    **Strong Answer Framework:**
+
+    1. **Define the problem**: Traditional mutexes always trap into the kernel for lock/unlock. Most of the time, the mutex is uncontended -- nobody else wants it. The kernel trap is wasted overhead.
+    2. **Introduce the futex insight**: A futex (Fast Userspace muTEX) is a 32-bit integer in shared memory, plus a kernel syscall (`futex(2)`) that is only invoked when contention happens. Lock fast path: atomic CAS in userspace from 0 to 1; if it succeeds, you have the lock with zero kernel calls. Unlock fast path: atomic store back to 0.
+    3. **Explain the slow path**: When CAS fails (someone else holds the lock), the thread calls `futex(addr, FUTEX_WAIT, expected_value)`. The kernel verifies the value at addr is still expected_value, then puts the thread to sleep on a wait queue keyed by the address. When the holder unlocks, if it sees waiters were registered, it calls `futex(addr, FUTEX_WAKE, 1)` to wake one. Without contention, neither path enters the kernel.
+    4. **State the win**: An uncontended pthread_mutex_lock on Linux is ~25 ns (one CAS). A traditional kernel mutex is 1000+ ns (syscall overhead). Under contention, futex still wins because the wait queue is keyed by user-space address -- no global lock contention.
+
+    **Real-World Example:**
+
+    Futexes were added to Linux in kernel 2.5.7 (2002) by Hubertus Franke and Rusty Russell, originally to support IBM's Java VM which had bottlenecks on traditional mutexes. The performance improvement was so dramatic that NPTL was redesigned around futexes. Every modern pthread_mutex_t on glibc is a futex underneath. Rust's `std::sync::Mutex` and Go's `sync.Mutex` also use futex on Linux.
+
+    <Note>
+    **Senior follow-up 1:** What is "lost wakeup" and how do futexes prevent it? A naive userland-only mutex has a race: thread A checks "is locked", sees yes, decides to sleep; meanwhile thread B unlocks; A then sleeps and never wakes. Futex prevents this with `FUTEX_WAIT`'s atomic compare-and-sleep: the kernel locks an internal queue, re-reads the value, and only sleeps if the value still matches expected. If the unlocker was about to wake, the queue lock serializes them.
+    </Note>
+
+    <Note>
+    **Senior follow-up 2:** Why does the kernel need to know the address rather than just sleeping on the value? Because multiple mutexes can have the same value (typically 0 or 1). The wait queue is keyed by the physical address (or memory object + offset for shared memory), so the kernel knows which set of waiters to wake. This is also why you can use futexes across processes via shared memory -- the kernel uses the underlying memory object, not a per-process address.
+    </Note>
+
+    <Note>
+    **Senior follow-up 3:** What is FUTEX_WAIT_BITSET and when do you use it? It is a variant where waiters and wakers each provide a bitmask. A wake call only wakes waiters whose bitmask has overlap. This is used to implement readers-writer locks efficiently: writers wait on bit 0, readers on bit 1, and a wake-readers operation only wakes the readers. glibc uses this for `pthread_rwlock_t`.
+    </Note>
+
+    **Common Wrong Answers:**
+    - "Futexes are kernel mutexes that are faster." Wrong: the whole point is that the fast path is in userland.
+    - "A futex is just an atomic int." Wrong: the syscall semantics are critical for correctness.
+    - "Futexes only work in one process." Wrong: with shared memory, they work across processes.
+
+    **Further Reading:**
+    - `man 2 futex` -- the official documentation.
+    - "Futexes are tricky" by Ulrich Drepper -- akkadia.org/drepper/futex.pdf -- the canonical paper on building correct mutexes from futexes.
+    - "A futex overview and update" on LWN -- lwn.net/Articles/360699/.
+  </Accordion>
+</AccordionGroup>
+
+---
+
+Next: [IPC &amp; Signals](/operating-systems/ipc) →

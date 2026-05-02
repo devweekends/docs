@@ -738,6 +738,44 @@ io_uring_enable_rings(ring);
 
 ---
 
+## Production Caveats and Patterns
+
+The features in this chapter are powerful and dangerous. They are powerful because they unlock performance and observability that were impossible a few years ago; dangerous because they expose new attack surfaces, lifecycle complexity, and footguns that production teams keep stepping on.
+
+<Warning>
+**Caveat 1: io_uring lifecycle bugs are subtle, and a misuse of submission/completion ring management can cause use-after-free, double-free, or silent data corruption.** Each SQE (submission queue entry) references user buffers and file descriptors; the kernel reads these asynchronously, often after the submitting code has moved on. If you free the buffer before the kernel completes the operation, you get a UAF. Multiple CVEs in 2021-2023 -- privilege escalation in registered buffers, race conditions in cancellation -- led Google's Android team to disable io_uring entirely in production Android kernels. Some container runtimes block `io_uring_setup` via seccomp by default for the same reason.
+</Warning>
+
+<Tip>
+**Pattern: Pre-register buffers and files; use linked SQEs for ordered work; treat io_uring as an ownership transfer.** When you submit an SQE, conceptually you hand the buffer and the FD to the kernel until the matching CQE arrives. Use `io_uring_register_buffers()` for fixed-buffer mode; lifetimes become explicit. For ordered work (read-then-write), use `IOSQE_IO_LINK` so the kernel chains them and you only see one completion. Audit your seccomp profile -- if you do not need io_uring for untrusted workloads, block `io_uring_setup` (syscall 425) and `io_uring_enter` (426). For Rust, use `io-uring` or `tokio-uring` crates with their lifetime checking; for C, add `valgrind`-style instrumented testing of the submission/completion paths.
+</Tip>
+
+<Warning>
+**Caveat 2: `userfaultfd` is a powerful primitive used by CRIU, Postgres, and some VMMs -- and a recurring kernel exploit primitive.** It lets a userspace process intercept page faults and supply pages on demand, enabling live migration, memory snapshotting, and fast clone. The flip side: it gives attackers fine-grained control over kernel memory access timing, which has been weaponized in dozens of exploits (Dirty Pipe variants, page-cache races, refcount bugs). Linux 5.11+ added the `unprivileged_userfaultfd` sysctl that defaults to `0` -- root-only -- specifically to limit attack surface.
+</Warning>
+
+<Tip>
+**Pattern: Disable `unprivileged_userfaultfd` unless you have a legitimate need; if you do, scope it tightly.** Check `/proc/sys/vm/unprivileged_userfaultfd`. The default of 0 is correct for most production servers. If you run software that requires userfaultfd (CRIU for container live migration, Postgres for some experimental features, some database engines for snapshotting), grant it via capability (`CAP_SYS_PTRACE`) or set the sysctl to `1` only on hosts running that software. Pair with seccomp policies that allow `userfaultfd` syscall only for the specific binary that needs it. Audit kernel security advisories quarterly -- this primitive resurfaces in CVE lists every year.
+</Tip>
+
+<Warning>
+**Caveat 3: `memfd_secret` (Linux 5.14+) creates memory invisible to root processes, but it does not protect against kernel exploits.** It maps anonymous memory that is not exposed in `/proc/<pid>/mem`, not visible to ptrace, not swappable, and not accessible to the kernel direct-map (so even kernel code cannot trivially read it). Used for secrets in cryptographic libraries that want strong defense against attacker-with-root scenarios. The catch: a kernel exploit that can call arbitrary kernel functions can still extract the memory, because the kernel itself can re-map the pages. It is a defense-in-depth feature, not an absolute guarantee.
+</Warning>
+
+<Tip>
+**Pattern: Use `memfd_secret` for short-lived, high-value secrets and pair with mlock + secure-erase.** Allocate via `memfd_secret()` (passing flags=`FD_CLOEXEC`), `ftruncate` to size, `mmap` to map, then write secret material directly. Before unmap, use `explicit_bzero()` (or volatile-write loop) to wipe. This stack is what modern crypto libraries (recent OpenSSL builds, libsodium) use for in-memory key material. Combine with hardware features (AMD SME, Intel TME) for memory encryption at rest in DRAM. Do not rely on `memfd_secret` alone for compliance scenarios -- it raises the bar for memory disclosure attacks but does not satisfy FIPS 140-3 by itself.
+</Tip>
+
+<Warning>
+**Caveat 4: BPF-LSM, SELinux, and AppArmor are all Linux Security Modules -- and you must understand which one you are betting on.** BPF-LSM lets you write LSM hooks in eBPF: fine-grained, dynamic, but new (Linux 5.7+) and less mature than the alternatives. SELinux is the heavyweight: comprehensive policy language, used in RHEL/Android, vast policy ecosystem, but notoriously hard to author correctly. AppArmor is path-based, simpler to write, used in Ubuntu/SUSE, but less expressive than SELinux. You can stack BPF-LSM with one of the others; you cannot stack SELinux and AppArmor.
+</Warning>
+
+<Tip>
+**Pattern: Pick one mainline LSM as your security baseline, add BPF-LSM for application-specific rules.** For Red Hat / OpenShift / Android: SELinux is the right default; the policy ecosystem and tooling are mature. For Ubuntu / SUSE / general distros: AppArmor is the practical default. For new hardening (your application has a small set of unusual constraints), use BPF-LSM to express them in code -- this is what tools like Tetragon and Inspektor Gadget do. Audit which LSM is enabled with `cat /sys/kernel/security/lsm`. Do not run with no LSM in production; the difference between "AppArmor in complain mode" and "no LSM" is observable in incident response timelines.
+</Tip>
+
+---
+
 ## Summary
 
 ```
@@ -863,5 +901,111 @@ io_uring_enable_rings(ring);
     **Follow-up: What is the performance cost of Landlock vs seccomp?**
 
     Seccomp-BPF runs a small BPF program on every syscall entry, which adds roughly 10-50ns per syscall depending on filter complexity. Landlock hooks into the VFS at specific operations (open, mkdir, etc.) and checks the rules only for filesystem operations, so its overhead is negligible for non-filesystem syscalls. For filesystem-heavy workloads, Landlock adds a small constant cost per VFS operation to walk the ruleset tree. In benchmarks, both are well under 1% overhead for typical workloads. The cost of not using them -- a privilege escalation vulnerability -- is infinitely more expensive.
+  </Accordion>
+
+  <Accordion title="io_uring vs epoll -- when does io_uring actually win, and where is epoll still the right answer?">
+    **Strong Answer Framework:**
+
+    1. **State the architectural difference.** epoll is an event-readiness API: you ask the kernel to notify you when an FD is ready for I/O, then you do a syscall (`read`, `write`) to actually transfer data. Two syscalls per I/O on the hot path. io_uring is a completion-based API: you submit the work (read this, write that) into a shared ring; the kernel performs the work asynchronously and posts a completion when done. With SQPOLL, zero syscalls per I/O.
+    2. **Identify where io_uring wins.** High-fanout, high-IOPS workloads where syscall overhead dominates. Storage servers handling 500k+ IOPS on NVMe see 4-10x improvement over epoll+pread. Network proxies handling millions of QPS see 2-5x. Workloads that batch many I/Os at once (read 100 files in parallel) -- io_uring lets you submit them all in one ring write, reducing context switches.
+    3. **Identify where epoll is fine or better.** Single-threaded servers with moderate concurrency (under 10k QPS): the syscall savings are not measurable. Workloads where I/O is dominated by network round-trip time, not local syscall cost (HTTP servers waiting on DNS, proxies behind slow upstreams). Workloads where you need cross-language portability or run on older kernels (epoll is universal; io_uring is Linux 5.1+, with usable network support more like 5.5+).
+    4. **Identify where io_uring is wrong.** Untrusted code execution -- io_uring has had multiple privilege-escalation CVEs and is blocked in some environments (Android, recent ChromeOS). Workloads with very few concurrent operations (a CLI tool sequentially reading files): the ring setup cost exceeds the syscall savings. Code where async lifecycle management would be a major architectural lift you cannot afford.
+    5. **State the crossover.** Roughly: queue depth 4-8 is the break-even point. Below that, epoll is comparable or better. Above that, io_uring's batching and zero-syscall properties dominate. Use latency targets and IOPS goals to pick the threshold. Always benchmark on your actual hardware and workload, not on synthetic numbers.
+
+    **Real-World Example:** ScyllaDB (a Cassandra-compatible NoSQL database written in Seastar) was an early io_uring adopter and reported 30-40% throughput improvements on NVMe-backed workloads vs their previous AIO + epoll implementation. The improvement came primarily from eliminating the per-IOP context switch -- at 200k+ IOPS per core, even 200ns of syscall overhead matters. By contrast, the Linux team at Cloudflare benchmarked io_uring for their HTTP edge proxy in 2022 and concluded that for their specific workload (TLS termination, then forward to upstream), the bottleneck was the upstream network round-trip, not the local I/O syscall path. They stayed on epoll, citing operational maturity and audit simplicity.
+
+    <Note>
+    **Senior follow-up: What is SQPOLL mode and when does it pay off?** SQPOLL has the kernel run a thread that polls the submission ring continuously, draining SQEs without any user-to-kernel transition. Zero syscalls per I/O. The cost is a kernel thread always running (or running while there is work, in newer kernels) -- effectively burning a core. SQPOLL pays off above some threshold (often 100k+ IOPS) where the saved syscall cost exceeds the dedicated-core cost. Below that, the dedicated thread is wasted.
+    </Note>
+
+    <Note>
+    **Senior follow-up: Why do some teams disable io_uring entirely?** Security. The interface is large, complex, and has had a steady stream of CVEs since 2020. Google's Android team disabled io_uring in production Android kernels (post-Pixel 7 era) because the attack surface in the kernel was unacceptable on devices that run untrusted apps. ChromeOS made similar decisions for renderer processes. For server workloads in trusted environments, the trade-off favors enabling io_uring; for edge/mobile/multi-tenant, it often does not.
+    </Note>
+
+    <Note>
+    **Senior follow-up: How does io_uring change the design of an async runtime like Tokio?** Tokio's main loop on Linux is built on epoll. Adding io_uring is non-trivial because the lifetime models are different: epoll lifetimes match the future's lifetime (you wake up, do `read`, return); io_uring requires the buffer to outlive the operation, which conflicts with borrow-based lifetime in Rust. `tokio-uring` uses owned buffers (Bytes) to side-step this. The result is a slightly different async API. Most apps stay on the epoll-backed Tokio for portability and simplicity; performance-critical apps reach for `tokio-uring` or `glommio` (an io_uring-native runtime).
+    </Note>
+
+    **Common Wrong Answers:**
+    1. *"io_uring is always faster than epoll."* Untrue at low queue depths and untrue for workloads where syscall cost is not the bottleneck.
+    2. *"io_uring replaces epoll entirely."* No -- they coexist on every modern Linux system. epoll is older and more universally supported; io_uring is newer and more capable for specific workloads.
+    3. *"io_uring is just async I/O."* It is more general -- io_uring supports network I/O, file I/O, opening/closing files, statx, and more. It is closer to "async syscall framework" than "async I/O."
+
+    **Further Reading:**
+    - Jens Axboe's "Efficient IO with io_uring" paper (2019) -- the canonical introduction by the author.
+    - Glauber Costa's posts on Seastar and io_uring -- design lessons from a real high-IOPS database.
+    - LWN.net articles "Ringing in a new asynchronous I/O API" and follow-ups -- evolution of the API and the security history.
+  </Accordion>
+
+  <Accordion title="What does eBPF unlock for observability that older tools (strace, ftrace, kprobes alone) couldn't do?">
+    **Strong Answer Framework:**
+
+    1. **State what older tools could and could not do.** strace traces syscalls one process at a time with high overhead (ptrace per call, often 10-100x slowdown). ftrace gives you static tracepoints with low overhead but limited filtering -- you typically capture a lot and filter offline. kprobes/uprobes let you attach to arbitrary kernel/user functions, but the actions are limited to "log this event" or "emit a counter." None of these support arbitrary in-kernel logic at the trace point.
+    2. **State what eBPF adds.** A safe, JIT-compiled, in-kernel program runs at the trace point. It can read function arguments and return values, walk kernel data structures, aggregate into BPF maps (per-CPU counters, histograms), and emit only the records you actually want. The result: you can answer questions like "what is the latency distribution of this syscall, broken down by process and bucket?" with ~1% overhead -- something that was previously impossible without instrumenting the application or running a sampling profiler.
+    3. **List the categories of new capability.** (a) Performance analysis at production load -- BCC's `biolatency` shows block-I/O latency histograms across the entire fleet without measurable overhead. (b) Security observability -- Falco and Tetragon attach to syscalls and report anomalies in real time. (c) Custom networking -- Cilium replaces iptables with eBPF for service-mesh-grade policy at line rate. (d) Programmatic profiling -- bpftrace one-liners replace what used to require kernel modules.
+    4. **Identify the limits.** eBPF programs have a 1M-instruction verifier limit, a 512-byte stack, no dynamic allocation, no floating point. They can only call helper functions, not arbitrary kernel functions. Some kernel data is invisible to BPF (encrypted memory regions, certain BPF-LSM hook contexts). The verifier rejects programs it cannot prove safe, so you sometimes have to refactor to help it.
+    5. **State the operational shift.** eBPF lets you ship observability tools as small, declarative programs (BCC, bpftrace, libbpf-tools) that run anywhere a recent kernel runs. You no longer need to wait for the next kernel release to add a new metric. Production diagnosis that took weeks (kernel module, peer review, deploy, monitor) now takes minutes (write a bpftrace one-liner, run, learn).
+
+    **Real-World Example:** Netflix uses eBPF extensively for production diagnosis. Brendan Gregg's `bcc` and `bpftrace` toolkits are the de facto standard for Linux performance debugging. A specific example from his book *BPF Performance Tools*: diagnosing a "tail latency anomaly" in a microservice. Old approach: enable detailed JVM logging, capture for hours, re-deploy with extra metrics, repeat. New approach: a 10-line bpftrace script attached to the JVM safepoint kprobes that aggregated stop-the-world pauses by stack trace, run for 5 minutes in production, root cause identified. The total time from "I noticed a problem" to "I have a fix" went from days to hours.
+
+    <Note>
+    **Senior follow-up: How does eBPF enable observability without code changes to the application?** Tools like USDT (User-Statically-Defined Tracing) markers exist in many runtimes (Java JDK, Python, Node, JVM, MySQL) and let eBPF attach without recompilation. uprobes go further -- attach to any user-space symbol, including third-party binaries. Cilium Hubble uses tc-bpf at the network device level to observe all traffic to/from a pod with no app awareness. The application is unaware it is being measured -- which is exactly what you want for production diagnosis.
+    </Note>
+
+    <Note>
+    **Senior follow-up: What is the difference between BCC and libbpf, and why does it matter operationally?** BCC compiles BPF programs at runtime using clang/LLVM in the target kernel. Pro: works with the running kernel's headers. Con: requires LLVM at runtime (~50 MB), slow startup, fragile across kernel versions. libbpf with CO-RE (Compile Once, Run Everywhere) compiles ahead-of-time using BTF (BPF Type Format) for kernel-version portability. Pro: small binaries, fast startup. Con: requires kernel BTF (mainline since 5.4 with CONFIG_DEBUG_INFO_BTF). For production fleet deployment, libbpf-CO-RE is now the standard.
+    </Note>
+
+    <Note>
+    **Senior follow-up: Where does eBPF fit relative to OpenTelemetry?** They are complementary. OpenTelemetry is a standardized observability data format (traces, metrics, logs) and SDK. eBPF is a mechanism for collecting data in the kernel and userspace. Tools like Pixie and Parca use eBPF to collect data and emit it in OTel-compatible formats. The eBPF layer answers "how do I observe without changing the app"; OTel answers "how do I make all my observability data interoperable across vendors."
+    </Note>
+
+    **Common Wrong Answers:**
+    1. *"eBPF is just a faster strace."* Massively understates it. eBPF lets you run arbitrary safe code at trace points -- aggregations, conditionals, data structure walks. strace is logging, eBPF is computation.
+    2. *"eBPF replaces all monitoring agents."* No -- agents (Datadog, Prometheus exporters) handle metric shipping, dashboarding, alerting. eBPF is a data source those agents can use. They coexist.
+    3. *"eBPF is unsafe because it runs kernel code."* The verifier exists specifically to make it safe. The class of safety properties eBPF guarantees (no kernel crashes, no infinite loops, no out-of-bounds memory access) is provable -- which is more than you can say for kernel modules.
+
+    **Further Reading:**
+    - Brendan Gregg, *BPF Performance Tools* (2019) -- comprehensive book on production performance analysis with eBPF.
+    - "Learning eBPF" by Liz Rice (O'Reilly, 2023) -- accessible introduction with practical examples.
+    - ebpf.io -- the canonical home for tooling, examples, and the eBPF Foundation's resources.
+  </Accordion>
+
+  <Accordion title="Confidential computing (Intel SGX, AMD SEV-SNP, Arm CCA) -- explain the threat model, what it actually protects, and where the gaps are.">
+    **Strong Answer Framework:**
+
+    1. **State the threat model precisely.** Confidential computing protects code and data from a privileged attacker on the same machine -- the cloud provider, the host OS, the hypervisor, a malicious admin. The trust boundary is the CPU package itself: you trust the hardware vendor and the silicon, and you do not trust anything outside the CPU (RAM, disk, BIOS, hypervisor, host kernel). The use case is: "I want to run my workload in someone else's cloud and not trust the cloud provider with my data."
+    2. **Explain Intel SGX (Software Guard Extensions).** Process-level enclaves: a process can carve out an enclave region, and only enclave code can read enclave memory. The CPU encrypts enclave memory with a hardware-derived key. Any access from outside the enclave (kernel, hypervisor, other processes) sees ciphertext. Limitation: enclave size historically capped at ~128 MB, with anything beyond paged in/out (slow). SGX2 (Ice Lake+) raised this to several GB but still has limits.
+    3. **Explain AMD SEV-SNP / Intel TDX.** VM-level confidential computing: an entire VM runs encrypted, with memory access from the hypervisor returning ciphertext. Larger blast radius (full VM, not just an enclave) but easier to retrofit existing applications -- you do not have to re-architect into "trusted enclave + untrusted host." SEV-SNP adds attestation and integrity protection. TDX is Intel's equivalent. AWS Nitro Enclaves, Azure DCsv3 / DCdsv3, GCP Confidential VM all use this layer.
+    4. **Explain Arm CCA (Confidential Compute Architecture).** Newer (rolling out in 2024-2025), Realm-based: a VM-style isolation backed by Arm's Realm Management Extension (RME). Conceptually similar to TDX/SEV-SNP but designed for Arm's heterogeneous compute model. Used for data-center deployments and increasingly for edge/AI inference workloads.
+    5. **Identify the gaps. This is where senior judgment shows.**
+       - *Side channels.* SGX has had repeated side-channel breaks: Foreshadow (2018), Plundervolt (2019), SGAxe / CrossTalk (2020). SEV-SNP and TDX have had cache-timing and speculative-execution attacks. The hardware vendors patch them, but new ones keep appearing. Confidential computing is robust against direct memory access and most direct attacks; it is fragile against microarchitectural side channels.
+       - *Attestation trust chain.* You must verify the attestation report comes from a genuine CPU running the firmware version you expect. This requires bootstrapping trust through the CPU vendor's PKI (Intel Attestation Service, AMD's KDS). If that PKI is compromised or the attestation library has bugs, the whole chain falls.
+       - *Software bugs in enclaves.* The enclave code itself can have bugs. Confidential computing protects from external attackers, not from a vulnerable implementation inside the enclave.
+       - *I/O.* Anything that leaves the enclave (network, disk) is not protected by these mechanisms. You need TLS for network, encrypted storage for disk, and careful design for any data crossing the boundary.
+
+    **Real-World Example:** Signal's "Private Contact Discovery" service used Intel SGX from 2017 to provide a server-side contact-discovery feature where the server provably could not see users' contact lists. The enclave hashed and matched contacts; the host OS saw only encrypted enclave memory. After several SGX side-channel breaks, Signal moved off SGX in 2022 in favor of Oblivious RAM techniques for stronger guarantees. The lesson: confidential computing is a meaningful defense, but it is not a substitute for cryptographic protocols that do not require trusting the hardware.
+
+    <Note>
+    **Senior follow-up: What is remote attestation, and why is it the linchpin of confidential computing?** Attestation is the process by which a verifier proves that the code running in an enclave/VM is what they expect. The CPU signs a quote containing a measurement (hash) of the enclave code, the enclave configuration, and a nonce from the verifier. The verifier checks the signature against the CPU vendor's PKI. Without attestation, you have isolated computation, but you do not know what code is running there -- a malicious operator could replace the binary. Most production confidential computing deployments tie attestation to key release: the secret keys are delivered to the enclave only after attestation succeeds.
+    </Note>
+
+    <Note>
+    **Senior follow-up: When should a team NOT use confidential computing?** When the threat model does not include the cloud provider or the host OS. If you trust your provider (most internal use cases) and your concern is application-layer attackers, confidential computing adds operational complexity (attestation infrastructure, debugging is harder, performance overhead is 10-30% in many workloads) without a corresponding security benefit. Use TLS, encryption-at-rest, strong access controls, and avoid the operational burden.
+    </Note>
+
+    <Note>
+    **Senior follow-up: How does confidential computing interact with confidential AI / private inference?** This is one of the fastest-growing use cases. ML inference on user data (medical, financial, legal) using a model running in a confidential VM lets you process sensitive data without the cloud operator seeing inputs or outputs. NVIDIA's H100 and H200 GPUs added confidential-computing support (NVIDIA Confidential Computing) so the entire CPU+GPU pipeline is protected. Watch for products from Apple, Google, Microsoft on confidential AI; this is the area where confidential computing is moving from niche to mainstream.
+    </Note>
+
+    **Common Wrong Answers:**
+    1. *"Confidential computing means encrypted data."* Encryption-at-rest exists everywhere. Confidential computing is encryption-during-use -- data is protected even while the CPU is operating on it. That is a much harder property.
+    2. *"SGX is dead because of side-channel attacks."* SGX is deprecated for client (consumer) CPUs but still actively developed for server. SGX2 with a larger enclave size and TDX as a successor are alive. The narrative "dead" is overstated; the narrative "fragile against side channels" is accurate.
+    3. *"Confidential computing replaces trust in the cloud provider."* It reduces trust scope to the CPU vendor, not eliminates trust. You now trust Intel/AMD/Arm. For some threat models that is a meaningful improvement; for others (state-level adversaries who might pressure the silicon vendor) it is not.
+
+    **Further Reading:**
+    - Confidential Computing Consortium whitepapers -- ccc.io has architectural overviews and threat-model docs.
+    - Costan and Devadas, "Intel SGX Explained" (2016) -- the most thorough public treatment of SGX internals.
+    - "AMD SEV-SNP: Strengthening VM Isolation with Integrity Protection and More" (AMD whitepaper, 2020) -- canonical reference for SEV-SNP design.
   </Accordion>
 </AccordionGroup>

@@ -9,6 +9,38 @@ icon: "message"
 
 In an operating system, processes are isolated by the Virtual Memory Manager to prevent one process from corrupting another. However, complex systems (like Chrome, Nginx, or a Database) require these isolated units to cooperate. **IPC** is the set of mechanisms provided by the kernel to bridge this isolation.
 
+<Warning>
+**Caveat 1: Pipes are unidirectional -- this trips up almost every newcomer.** A `pipe()` call gives you two file descriptors: `fd[0]` for reading and `fd[1]` for writing. The data flows in one direction only. If you want a parent and child to talk back and forth, you need TWO pipes (one parent-to-child, one child-to-parent) -- or you can use `socketpair(AF_UNIX, SOCK_STREAM, 0, fds)` which gives you a single bidirectional channel. This is why most modern code uses `socketpair` for parent-child IPC: half the file descriptors, no risk of crossing the streams. The pitfall: closing the write end of a pipe causes the reader to get EOF; closing the read end causes the writer to get SIGPIPE, which by default kills the process. Senior developers always install a `SIGPIPE` handler or set `MSG_NOSIGNAL` on every send.
+</Warning>
+
+<Tip>
+**Pattern: prefer `socketpair` for new bidirectional IPC.** It avoids the four-FD bookkeeping of dual pipes, supports `recvmsg`/`sendmsg` (so you can pass file descriptors via `SCM_RIGHTS`), and gives you `MSG_PEEK` and `MSG_NOSIGNAL`. Reserve raw `pipe()` for the unidirectional cases where it is the obvious primitive: shell pipelines, `popen`-style streaming, log forwarding.
+</Tip>
+
+<Warning>
+**Caveat 2: Shared memory races are the most subtle bug class in systems programming.** The kernel does ZERO synchronization for shared memory -- it just maps the same physical pages into two virtual address spaces. If both processes write to the same byte without coordination, the result is undefined (literally: torn writes, lost updates, silent corruption). Worse, on weakly-ordered architectures (ARM, POWER), even reads of correctly-aligned 64-bit values can return garbage if the writer and reader did not insert appropriate barriers. "It works on x86" is not a correctness proof; x86's TSO model accidentally papers over many missing barriers.
+</Warning>
+
+<Tip>
+**Pattern: pair shared memory with explicit synchronization.** The standard recipe is `shm_open` + `mmap` + a POSIX semaphore (`sem_open`) or a process-shared mutex (`pthread_mutexattr_setpshared(PTHREAD_PROCESS_SHARED)`). For producer/consumer, use a shared-memory ring buffer with `atomic` head and tail indices using `memory_order_release`/`memory_order_acquire`. Test on ARM (a Raspberry Pi works) -- if your code passes there, it almost certainly passes everywhere. Crash safety: if a process dies holding a shared mutex, use `PTHREAD_MUTEX_ROBUST` so the next acquirer gets `EOWNERDEAD` and can recover instead of deadlocking forever.
+</Tip>
+
+<Warning>
+**Caveat 3: Unix domain sockets vs. TCP loopback -- UDS is roughly 2x faster but local-only.** Engineers often default to `127.0.0.1:PORT` because it is portable. On the same host, this routes through the full TCP stack: socket buffers, sequence numbers, checksums (skipped on loopback in Linux but still memory-copied twice), congestion control state. A Unix domain socket bypasses all of that -- the kernel just hands the bytes from one process's socket buffer to another's. Benchmarks routinely show UDS at 2x-4x the throughput of TCP loopback for the same workload, with substantially lower CPU. The tradeoff: UDS only works for processes on the same kernel; you cannot transparently move them to different hosts.
+</Warning>
+
+<Tip>
+**Pattern: use UDS for sidecar / colocated IPC.** When you have a service mesh sidecar (Envoy, Linkerd) on the same host as your application, talk to it over UDS, not loopback TCP. Same for daemon-style architectures (`docker.sock`, `systemd` socket activation, `redis-cli` to a local Redis). For cross-host fallback, abstract the connection behind an interface that picks UDS for `unix://` URIs and TCP for `tcp://` URIs -- changing one config flag should be the only difference.
+</Tip>
+
+<Warning>
+**Caveat 4: POSIX message queues have hard size limits and can block silently.** The kernel default `mq_msgsize` is 8192 bytes; `mq_maxmsg` defaults to 10. A `mq_send` with a full queue blocks the sender by default -- and if the receiver crashes, the sender hangs forever. The system-wide limits in `/proc/sys/fs/mqueue/` are also low (256 queues, ~819200 total bytes by default), so you cannot scale message queues like you would scale a Kafka topic.
+</Warning>
+
+<Tip>
+**Pattern: open mqueues `O_NONBLOCK` and handle `EAGAIN` explicitly.** `mq_send` and `mq_receive` return `EAGAIN` when full/empty in non-blocking mode -- treat this as backpressure, not as an error. Pair with `mq_notify` or a `signalfd` so you can wait for queue events in your event loop. If you genuinely need durable, large-volume messaging across processes on one host, prefer a real broker (Redis Streams, NATS, Kafka) over POSIX mqueues -- mqueues are best for low-volume control plane messages, not data plane.
+</Tip>
+
 <Info>
 **Mastery Level**: Senior Systems Engineer  
 **Key Internals**: Kernel Ring Buffers, Page Table Aliasing, Signal Frames, `rt_sigreturn`  
@@ -3156,6 +3188,154 @@ Key difference: **FD passing** is possible, and you get stream/datagram semantic
 ## Interview Deep-Dive
 
 <AccordionGroup>
+  <Accordion title="Pick an IPC mechanism for a high-throughput producer/consumer on the same machine. Walk through your decision and tradeoffs.">
+    **Strong Answer Framework:**
+
+    1. **Define the workload first.** Throughput target (msgs/sec, bytes/sec), message size distribution, latency budget (p99), durability requirement, number of producers/consumers, crash semantics.
+    2. **Eliminate clearly-wrong choices.** If you need cross-host: UDS is out. If you need durability: shared memory and pipes are out (data is gone if either side crashes). If you need backpressure: signals are out (no flow control).
+    3. **Compare the survivors on the metric that dominates:**
+       - **Latency-sensitive, small messages, single producer/consumer**: shared memory ring buffer with futex notification. ~50-100 nanoseconds per message. Used by HFT systems, LMAX Disruptor.
+       - **High throughput, multiple producers, small/medium messages**: Unix domain sockets, SOCK_DGRAM. Each `sendmsg` is one atomic message. Kernel manages buffering and backpressure. ~1-3 microseconds per message. Used by `journald`, `rsyslog`.
+       - **Bulk transfer, large payloads, infrequent**: shared memory (mmap) with semaphore. Zero copy beats everything for big payloads. Used by databases (PostgreSQL `shared_buffers`), Wayland (pixel buffers).
+    4. **Address the specific question** -- a high-throughput producer/consumer on one machine usually wants Unix domain sockets unless you are above ~1M msgs/sec, at which point shared memory + ring buffer becomes worth the complexity.
+    5. **Sketch the chosen design:** `socket(AF_UNIX, SOCK_DGRAM, 0)`, `bind` to an abstract namespace path (`\0prodcons` -- no filesystem cleanup needed), producers connect with `connect()`, consumer uses `epoll` to multiplex, set `SO_RCVBUF` to 4MB or higher to avoid drops under burst.
+    6. **Mention the failure modes you have to handle:** consumer slow → `EAGAIN` on producer with non-blocking sockets → application-level backpressure. Producer crashes → kernel auto-closes the socket → consumer sees EOF on that connection, no orphan resources.
+
+    **Real-World Example:**
+    Facebook's **LogDevice** writes its inter-thread queue using a shared-memory ring buffer (their `MPMCQueue`) and then ships data to remote nodes over TCP -- they pick the right primitive at each layer. journald uses Unix domain sockets for log collection, with kernel buffering as the backpressure mechanism; in 2018 they added the journal-remote feature precisely because UDS does not cross hosts. The Aeron messaging framework (real-time finance) goes all-in on shared memory + busy-spin readers and hits ~10 million messages/second on a single core -- the cost is dedicating that core to nothing else.
+
+    <Note>
+    **Senior Follow-up 1: When does shared memory beat UDS by enough to justify the complexity?**
+    Above ~500K msgs/sec or below 1us p99 latency. Below that, UDS is "fast enough" and the synchronization complexity of shared memory (correct memory ordering, robust mutex handling, head/tail wraparound) is not worth it. Always benchmark before choosing -- measured numbers, not vibes.
+    </Note>
+
+    <Note>
+    **Senior Follow-up 2: Why use SOCK_DGRAM over SOCK_STREAM for log shipping?**
+    SOCK_DGRAM gives message boundaries -- one `sendmsg` = one `recvmsg` for the consumer, no framing protocol needed. For SOCK_STREAM you would have to add a length prefix or delimiter, which adds CPU on both sides. The cost: on Linux, SOCK_DGRAM on UDS is reliable (unlike UDP) but messages above `wmem_max` are dropped. Tune `net.core.wmem_max` if you have large messages.
+    </Note>
+
+    <Note>
+    **Senior Follow-up 3: How does io_uring change this picture?**
+    io_uring (Linux 5.1+) lets you batch syscalls and avoid the syscall overhead per message. For UDS, the win is moderate (~20-30%) because the syscall itself is cheap. For TCP loopback or shared-memory + futex_wake patterns, io_uring + IORING_OP_SEND with multi-shot recv can dramatically reduce CPU. As of 2024, frameworks like ScyllaDB's Seastar use io_uring extensively to cut IPC CPU overhead.
+    </Note>
+
+    **Common Wrong Answers:**
+    - "Always use shared memory because it is fastest" -- ignores synchronization complexity and crash semantics.
+    - "Use Kafka / Redis / RabbitMQ" -- adds a network hop and a separate process to manage; usually overkill for same-host IPC.
+    - "Pipes are the standard Unix way" -- pipes do not work for many-to-one without per-producer FIFOs and have PIPE_BUF atomicity limits.
+
+    **Further Reading:**
+    - LMAX Disruptor whitepaper -- the canonical shared-memory ring buffer design.
+    - Aeron architecture docs -- how a high-performance messaging system layers shared memory and UDP.
+    - Brendan Gregg, "Linux Performance" page -- has benchmarks of UDS vs. loopback TCP.
+  </Accordion>
+
+  <Accordion title="Implement a request-response protocol over a Unix domain socket. Walk through the API calls and the framing.">
+    **Strong Answer Framework:**
+
+    1. **Pick stream vs. datagram.** SOCK_STREAM if requests/responses can exceed a single datagram or need ordering across messages. SOCK_DGRAM if every message is small (under ~64KB) and self-contained -- you get message boundaries for free. For most RPC use cases, SOCK_STREAM with explicit framing is the standard.
+    2. **Server side setup:**
+       ```
+       fd = socket(AF_UNIX, SOCK_STREAM, 0)
+       bind(fd, sockaddr_un{sun_path = "/tmp/svc.sock"})  // or abstract: "\0svc"
+       listen(fd, backlog=128)
+       accept loop -> per-connection handler (thread, epoll, or io_uring)
+       ```
+    3. **Client side:**
+       ```
+       fd = socket(AF_UNIX, SOCK_STREAM, 0)
+       connect(fd, sockaddr_un{...})
+       send_request(); recv_response();
+       ```
+    4. **Framing -- the part candidates botch.** Streams have no message boundaries, so you MUST frame. Two standard options:
+       - **Length prefix**: 4-byte big-endian length, then `length` bytes of payload. Read exactly 4 bytes, then exactly N bytes. Simple, standard. Used by gRPC over UDS, Redis RESP.
+       - **Delimiter**: e.g., newline-terminated JSON. Easy to debug with `socat`, slow due to per-byte scanning. Used by HTTP/1.1.
+    5. **Request-response pairing.** For single-threaded clients, the next response on the wire matches the next request -- order is implicit. For pipelined clients (multiple in-flight requests), assign an integer request ID; server echoes it in the response.
+    6. **Timeouts and cancellation.** Set `SO_RCVTIMEO` so reads do not hang forever. For clean cancellation across both endpoints, signal via a separate "cancel" message or close the socket (the peer gets `EPIPE`/EOF).
+    7. **FD passing if needed.** Use `sendmsg` with `SCM_RIGHTS` cmsg to ship file descriptors -- this is what makes UDS uniquely powerful for local IPC. The receiving process gets a brand new FD pointing to the same kernel object.
+
+    **Real-World Example:**
+    The Docker daemon serves its REST API on `/var/run/docker.sock` (UDS, SOCK_STREAM) using HTTP/1.1 framing. `docker ps` is just an HTTP `GET /containers/json` over UDS. systemd's D-Bus broker also uses UDS with length-prefixed messages, and uses `SCM_CREDENTIALS` to authenticate the calling process by UID. Visual Studio Code's language server protocol (LSP) uses UDS or pipes with JSON-RPC framing (`Content-Length: N\r\n\r\n{...}`).
+
+    <Note>
+    **Senior Follow-up 1: How do you handle partial reads on SOCK_STREAM?**
+    `read(fd, buf, n)` can return any value from 1 to n. You must loop: `while (got < n) got += read(fd, buf+got, n-got);`. Wrappers like `recv_all()` or `read_exact()` (Rust) encode this. On non-blocking sockets, `EAGAIN` means "no more data available right now; come back later" -- combine with epoll edge-triggered mode for efficient event loops.
+    </Note>
+
+    <Note>
+    **Senior Follow-up 2: How do you authenticate the peer on a Unix socket?**
+    `getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &cred, &len)` returns `struct ucred` with the peer's PID, UID, GID. The kernel populated this at connect time, so it is unforgeable -- the peer cannot lie about who they are. This is how Polkit, D-Bus, and systemd authenticate clients without passwords. Linux-specific; BSD has `LOCAL_PEERCRED` or `getpeereid`.
+    </Note>
+
+    <Note>
+    **Senior Follow-up 3: Why do some systems use abstract namespace sockets (path starts with \0)?**
+    Abstract sockets (`sun_path[0] = '\0'`, then a name) live in a kernel namespace, not the filesystem. Advantages: no `unlink` needed at startup or shutdown (no stale socket files), no filesystem permission issues, automatically cleaned up when all FDs close. Disadvantage: Linux-only, and visible only within a network namespace (so containers each see their own).
+    </Note>
+
+    **Common Wrong Answers:**
+    - "Just `read()` once and process the buffer" -- ignores partial reads on streams; will randomly fail under load.
+    - "Use port 0 and let the kernel pick" -- that is a TCP concept; UDS uses paths.
+    - "TLS over Unix sockets for security" -- normally unnecessary; UDS is local-only and `SO_PEERCRED` is more useful than TLS for local auth. TLS adds CPU for no benefit on UDS.
+
+    **Further Reading:**
+    - Beej's Guide to Unix IPC -- the practical reference for socket programming with UDS.
+    - `unix(7)` man page on Linux -- definitive reference for UDS semantics.
+    - gRPC source code -- production-quality length-prefixed framing implementation.
+  </Accordion>
+
+  <Accordion title="Shared memory + semaphore vs. POSIX message queue -- when do you reach for each, and what are the tradeoffs?">
+    **Strong Answer Framework:**
+
+    1. **State the core difference.** Shared memory is "raw bytes you both can see, you handle synchronization." Message queues are "kernel-managed mailbox: structured messages, built-in priority, kernel handles synchronization."
+    2. **Shared memory wins on:**
+       - **Throughput**: zero copy. The kernel only does the page-table aliasing once at setup; all subsequent reads/writes are in-process.
+       - **Bulk transfers**: a 1GB shared region costs the same as a 1KB region.
+       - **Tight latency**: spin or futex_wait on a flag, ~50ns wakeup.
+    3. **Message queues win on:**
+       - **Simplicity**: kernel handles queueing, blocking, priority. No memory ordering bugs.
+       - **Discrete messages**: `mq_send` is atomic at the message level, no framing protocol needed.
+       - **Priority delivery**: messages are delivered in priority order (high priority first), useful for control-plane messages.
+       - **Crash safety**: if a sender dies, queued messages survive until consumed or until queue is unlinked.
+    4. **The honest tradeoff matrix:**
+       | Concern | Shared Mem | Message Queue |
+       |---------|-----------|----------------|
+       | Throughput | Best | Limited by per-message syscall overhead |
+       | Programming complexity | High (manual sync, ordering) | Low (just `mq_send`/`mq_receive`) |
+       | Crash recovery | Hard (dangling locks, robust mutexes) | Easy (queue persists) |
+       | Size limits | Limited only by RAM | Tight kernel defaults (`/proc/sys/fs/mqueue/`) |
+       | Cross-process? | Yes | Yes |
+       | Cross-host? | No | No |
+    5. **Pick by workload:** small structured messages, low frequency, need priority -> message queue. High-volume bulk data, single-digit microsecond latency required -> shared memory.
+
+    **Real-World Example:**
+    PostgreSQL uses **shared memory** for its buffer pool (`shared_buffers`) -- every backend process maps the same region, and access is coordinated by spinlocks and lwlocks in shared memory. This is why PostgreSQL can serve thousands of concurrent reads from cache without copying pages. Conversely, the Linux kernel's audit subsystem uses a **netlink socket** (similar to a message queue) to send audit events to userspace -- audit events are small, structured, and the kernel needs reliable delivery semantics that a shared ring buffer would not provide without complex coordination.
+
+    <Note>
+    **Senior Follow-up 1: Can you implement a "message queue" on top of shared memory?**
+    Yes -- a shared-memory ring buffer with head/tail indices and a fixed message size is exactly that. Aeron and the LMAX Disruptor are essentially user-space message queues built on shared memory. They get higher throughput than POSIX mqueues because they avoid the per-message syscall, but require careful memory ordering and offer no priority semantics.
+    </Note>
+
+    <Note>
+    **Senior Follow-up 2: What is `mq_notify` and when is it useful?**
+    `mq_notify` registers a one-shot notification: when a message arrives on a previously-empty queue, the kernel either sends a signal or spawns a thread (caller's choice). Useful for waking an idle reader without polling. The catch: it is one-shot per registration, so you must re-arm after every wakeup. Modern code prefers `mq_getattr` + `select`/`epoll` on the queue's FD (Linux only -- mqueues are FDs in Linux).
+    </Note>
+
+    <Note>
+    **Senior Follow-up 3: Why do most modern systems use neither, and prefer io_uring or eventfd-based protocols?**
+    POSIX mqueues have unfriendly limits, no batching, and no zero-copy. Shared memory has no kernel semantics for delivery. io_uring (Linux 5.1+) gives you submission queues + completion queues that ARE shared memory rings, but with kernel cooperation -- syscalls only when you choose to enter the kernel. eventfd is a simpler primitive when you just need a counter to wake a waiter. The 2020s default for high-performance Linux IPC is "shared memory ring + eventfd or io_uring for notification."
+    </Note>
+
+    **Common Wrong Answers:**
+    - "Shared memory is always better because it is faster" -- ignores complexity cost and that mqueues handle priority and crash safety automatically.
+    - "Message queues are deprecated" -- they are legacy but still useful for simple structured IPC; many embedded and POSIX-compliant systems still rely on them.
+    - "Use a database for IPC" -- adds disk I/O, transactions, and a separate process; vastly slower for short-lived inter-process signaling.
+
+    **Further Reading:**
+    - `mq_overview(7)` man page -- definitive reference for POSIX message queues.
+    - PostgreSQL `src/backend/storage/lmgr/` -- production-grade shared-memory locking.
+    - Martin Thompson, "Mechanical Sympathy" blog -- shared-memory design lessons from LMAX.
+  </Accordion>
+
   <Accordion title="Compare pipes, shared memory, and Unix domain sockets for IPC. Your team is building a high-throughput logging pipeline where multiple producer processes send log lines to a single aggregator. Which mechanism do you choose and why?">
     **Strong Answer:**
 

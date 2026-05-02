@@ -11,6 +11,38 @@ For high-concurrency systems, standard mutexes are often too slow. A "Senior" en
 
 The fundamental tension in synchronization is between **correctness** and **performance**. A single global lock guarantees correctness but serializes all work. No locks maximize parallelism but invite data corruption. Every technique in this chapter exists somewhere on that spectrum, trading complexity for throughput.
 
+<Warning>
+**Caveat 1: Spin vs. sleep is not "spin = fast, sleep = slow."** Spinning wastes CPU; sleeping wastes cycles via context switches and cache eviction. Pick wrong and your throughput collapses. A pthread mutex held for 100 nanoseconds should NEVER cause a sleep -- the wakeup path costs ~5 microseconds and trashes the cache. A pthread mutex held for 10 milliseconds should NEVER cause a spin -- you burn an entire core for nothing. Linux's **futex** ("fast userspace mutex") solves this with adaptive behavior: stay in userspace via atomic CAS for the uncontended case, only enter the kernel when the lock is actually contested. When designing your own primitive, the rule of thumb is: spin if the expected hold time is less than 2x the context-switch cost (roughly 1-2 microseconds on modern x86); otherwise sleep.
+</Warning>
+
+<Tip>
+**Pattern: prefer adaptive locks over hand-rolled spin/sleep choices.** Use `pthread_mutex_t` (which becomes a futex on Linux) and `std::shared_mutex` -- they already adapt. If you absolutely need a spinlock, bound the spin count: `for (int i = 0; i < 64; i++) if (try_lock()) return; futex_wait(...)`. The Linux kernel's adaptive spinning (`MUTEX_FLAG_WAITERS` + owner-on-CPU check) only spins if the lock holder is currently running on another core -- if the holder is descheduled, spinning is pointless and you sleep immediately.
+</Tip>
+
+<Warning>
+**Caveat 2: Lock-free is harder than it looks.** It is not "no locks = no bugs." Lock-free code has its own pantheon of failure modes: the **ABA problem** (covered in section 4), **memory ordering** bugs that work on x86 but corrupt data on ARM/POWER, and **retry storms** where N threads CAS-loop against each other and only one makes progress per cycle (lock-free guarantees system-wide progress, not per-thread fairness). A naive lock-free queue can be slower than a well-tuned mutex queue on contended workloads because every failed CAS invalidates the cache line on every other core.
+</Warning>
+
+<Tip>
+**Pattern: justify lock-free with a benchmark, not a vibe.** Before reaching for `std::atomic` or hazard pointers, prototype with a mutex and measure. If the mutex is `<5%` of total CPU under target load, lock-free is premature optimization. When you do go lock-free, use `perf c2c` to find cache-line contention, prefer **per-thread shards** with periodic aggregation (the LMAX Disruptor pattern), and use established libraries (Folly's `MPMCQueue`, Boost.Lockfree, Crossbeam in Rust) rather than rolling your own.
+</Tip>
+
+<Warning>
+**Caveat 3: Reader-writer locks are not always faster than plain mutexes.** Two failure modes bite teams: (1) **writer starvation** -- on a read-heavy workload with reader-preference rwlocks, writers can wait indefinitely as new readers keep arriving. (2) **Reader cache-line ping-pong** -- every reader must atomically increment a shared counter, which on a 32-core box causes more cache traffic than a plain mutex would. Below roughly a 10:1 read-to-write ratio, a regular mutex is often faster because it has half the bookkeeping.
+</Warning>
+
+<Tip>
+**Pattern: choose by read:write ratio.** Read:write under 10:1 use a plain mutex. Between 10:1 and 100:1 use a writer-preference rwlock (`PTHREAD_RWLOCK_PREFER_WRITER_NP` on glibc, but verify -- glibc treats this as a hint). Above 100:1 use **RCU** or **seqlocks** to eliminate reader-side atomics entirely. Always profile under your real read:write mix; synthetic benchmarks often pick rwlocks for workloads where they are a regression in production.
+</Tip>
+
+<Warning>
+**Caveat 4: Lock granularity (coarse vs. fine) -- measure before redesigning.** "Make the locks finer-grained" is the most common cargo-culted advice in concurrent programming, and it is often a regression. Each fine-grained lock adds: more cache lines bouncing between cores, more potential for **lock-ordering deadlocks** (now you have N locks to keep ordered instead of one), more overhead per critical section. A single coarse lock with a 50-nanosecond critical section is often faster than ten fine-grained locks with 20-nanosecond sections each, because you save eight lock acquisitions.
+</Warning>
+
+<Tip>
+**Pattern: profile, then split.** Use `perf lock contention` (Linux) or `mutex_profile` to find which mutex is hot. Split only that one. The Linux kernel scaled the dcache lock through ~15 years of incremental splits, each driven by a measured contention hotspot. Two heuristics: (1) if a single mutex is `<10%` of contended CPU time, leave it alone; (2) prefer "data sharding" (one lock per shard, threads pick a shard by hash) over "operation sharding" (separate locks for read path and write path) -- data sharding scales linearly with shard count, operation sharding usually does not.
+</Tip>
+
 <Info>
 **Mastery Level**: Senior Systems / Kernel Engineer  
 **Key Internals**: RCU grace periods, lockdep dependency graphs, CAS / CMPXCHG, memory barriers  
@@ -325,6 +357,123 @@ assert(data == 42); // Safe after the barrier
     **Follow-up: What are hazard pointers and when would you prefer them over epoch-based reclamation?**
 
     Hazard pointers bound unreclaimed memory to O(threads * pointers_per_thread) by having each thread publish addresses it is currently accessing. Before freeing, the reclaimer scans all hazard pointer lists. If the address appears, freeing is deferred. The advantage: bounded memory overhead even if one thread stalls. The disadvantage: scanning all hazard pointers on every free is expensive. Use hazard pointers for memory-constrained environments; use epoch-based for simpler code when temporary memory bloat is acceptable.
+  </Accordion>
+
+  <Accordion title="Implement a thread-safe singleton in C++ -- explain why double-checked locking (DCLP) was broken before C++11 and how the standard fixed it.">
+    **Strong Answer Framework:**
+
+    1. **Sketch the naive version** -- one mutex around `if (instance == nullptr) instance = new Foo();`. Correct but every call pays the lock cost. Senior interviewers want you to acknowledge that "correct and slow" is the default starting point.
+    2. **Show the DCLP attempt** and explain why it is broken: the second check appears to avoid the lock on the fast path, but the *publish* of `instance` is the bug.
+    3. **Explain the actual race**: thread A executes `instance = new Foo();`. The compiler/CPU is allowed to reorder this into roughly: (a) allocate memory, (b) assign pointer to `instance`, (c) run constructor. Thread B sees a non-null `instance`, skips the lock, and dereferences a half-constructed object.
+    4. **Show the C++11 fix**: `static Foo& get() { static Foo instance; return instance; }`. The standard guarantees thread-safe initialization of function-local statics ("magic statics"). Implementation: compilers emit a guard variable plus an acquire/release barrier so other threads either see fully constructed or block.
+    5. **Acknowledge the manual DCLP fix** if needed: use `std::atomic<Foo*>` with `memory_order_release` on the store and `memory_order_acquire` on the load. This makes the publish ordering explicit so the constructor cannot leak past the pointer assignment.
+
+    **Real-World Example:**
+    Scott Meyers and Andrei Alexandrescu's 2004 paper "C++ and the Perils of Double-Checked Locking" is the canonical reference -- it proved DCLP could not be implemented portably in C++03 because the language had no memory model. The fix landed with C++11's memory model (N2429, "Concurrency memory model compiler consequences"). LLVM and GCC both implement magic statics via `__cxa_guard_acquire` / `__cxa_guard_release`, which compile to a fast atomic load on the hot path.
+
+    <Note>
+    **Senior Follow-up 1: Why is `volatile` not enough to fix DCLP, and what does Java's `volatile` do differently?**
+    `volatile` in C/C++ prevents the compiler from caching reads in registers, but it does NOT emit memory barriers, so CPU reordering still happens. Java's `volatile` since JSR-133 (2004) is much stronger: it emits acquire/release barriers and prevents reordering of surrounding accesses. That is why DCLP with `volatile` works in Java 5+ but never works in C++ regardless of `volatile`.
+    </Note>
+
+    <Note>
+    **Senior Follow-up 2: When would a singleton be the wrong answer entirely?**
+    When unit testing -- singletons make tests order-dependent and hard to mock. Prefer dependency injection: pass the dependency in. Another case: per-thread state. A singleton serializes access; a `thread_local` instance gives each thread its own copy with zero contention.
+    </Note>
+
+    <Note>
+    **Senior Follow-up 3: How does `std::call_once` differ from magic statics?**
+    `std::call_once` lets you initialize state that is not a function-local static (e.g., a global pointer initialized lazily). It works with any callable, including lambdas with captures. Both compile to similar guard logic, but `call_once` uses an explicit `once_flag` which you can pass between functions. Performance is comparable.
+    </Note>
+
+    **Common Wrong Answers:**
+    - "Just use a mutex on every call" -- correct but the question is specifically about avoiding lock cost on the fast path, so this misses the point of the question.
+    - "Mark the pointer `volatile` and DCLP works" -- false in C++; conflates Java semantics with C++ semantics. A senior should know the language-specific rules.
+    - "Use std::shared_ptr with atomic store" -- overcomplicated and `std::atomic<std::shared_ptr<T>>` was only standardized in C++20. Magic statics or `call_once` are simpler and pre-date this.
+
+    **Further Reading:**
+    - Scott Meyers, Andrei Alexandrescu, "C++ and the Perils of Double-Checked Locking" (2004) -- the paper that ended DCLP in C++.
+    - Hans Boehm, "Threads Cannot be Implemented as a Library" (2005) -- argues why C++03 needed a memory model.
+    - cppreference.com, "Static local variables" -- documents the C++11 magic-statics guarantee.
+  </Accordion>
+
+  <Accordion title="Explain mutex vs. spinlock -- when is each the right choice, and how does Linux's futex blur the line?">
+    **Strong Answer Framework:**
+
+    1. **Define the contract**: a mutex parks waiters in the kernel (sleep + wake), a spinlock keeps waiters busy-waiting in userspace. Both serialize access; they differ in what waiters do.
+    2. **State the simple decision rule**: spinlock if the expected hold time is less than the context-switch cost (~1-2us on Linux x86). Mutex if longer or if the holder might be preempted.
+    3. **Walk through why context matters**: in the kernel, you cannot sleep while holding a spinlock (you would deadlock the scheduler). In userspace, you can but spinning while preempted means you spin uselessly.
+    4. **Introduce futex** as the adaptive answer: tries CAS in userspace (zero syscall on uncontended path), falls back to a kernel wait queue only when contended. `pthread_mutex_t` on glibc is a futex with adaptive spinning.
+    5. **Explain priority inversion implications**: a spinlock cannot inherit priority. A high-priority thread spinning for a low-priority holder that is preempted by a medium-priority thread spins forever. Real-time systems use priority-inheriting mutexes (`PTHREAD_PRIO_INHERIT`).
+
+    **Real-World Example:**
+    The Linux kernel switched many `spinlock_t` uses to `mutex` in the BKL (Big Kernel Lock) removal effort, finalized around 2011 (kernel 2.6.39). The lesson: hold times that grew past microseconds made spinning a measurable regression. Conversely, the `seqlock_t` (used in `jiffies` updates and routing tables) is a spin-based primitive that wins because the writer's critical section is single-digit nanoseconds.
+
+    <Note>
+    **Senior Follow-up 1: What is "ticket locks" and why did Linux replace them with qspinlock?**
+    Ticket locks (introduced in 2008 for x86) gave each waiter a number and spun until the "now serving" counter reached it -- FIFO fair, simple. But all CPUs spin on the same cache line, causing massive coherence traffic at high contention. Qspinlock (kernel 4.2, 2015) uses an MCS-style queue where each waiter spins on its own cache line, dramatically reducing bus traffic at scale (32+ cores).
+    </Note>
+
+    <Note>
+    **Senior Follow-up 2: Why does `pthread_mutex_lock` on glibc spin a few times before sleeping?**
+    Adaptive mutexes (`PTHREAD_MUTEX_ADAPTIVE_NP`) and the default mutex on modern glibc spin briefly because the wake-up path costs ~5us. If the lock is freed within ~1us, spinning is cheaper than the syscall round trip. The spin count is bounded (typically tens of iterations) so a long-held lock still parks the waiter.
+    </Note>
+
+    <Note>
+    **Senior Follow-up 3: When would you use a spinlock in userspace?**
+    Almost never in application code -- the OS preempts you arbitrarily and a preempted spinlock holder makes every spinner waste CPU. Exception: realtime threads pinned to dedicated cores (e.g., DPDK, Solarflare Onload, HFT engines) where you control scheduling and can guarantee the holder is never preempted.
+    </Note>
+
+    **Common Wrong Answers:**
+    - "Spinlocks are always faster because they avoid syscalls" -- wrong; only true for very short hold times. A spinlock held for 1ms on 8 cores wastes 7ms of CPU per acquisition.
+    - "Mutexes always sleep" -- wrong on Linux; futex-based mutexes spin briefly first.
+    - "Spinlocks cause deadlocks more easily" -- wrong; both can deadlock identically. They differ in what waiters do, not in deadlock semantics.
+
+    **Further Reading:**
+    - Ulrich Drepper, "Futexes Are Tricky" (2003, updated 2011) -- the canonical futex reference, available free.
+    - Linux kernel `Documentation/locking/spinlocks.rst` -- spinlock semantics and rules.
+    - Paul McKenney, "Is Parallel Programming Hard, And, If So, What Can You Do About It?" -- chapter on locking primitives, free PDF online.
+  </Accordion>
+
+  <Accordion title="Why is implementing a correct lock-free queue hard? Walk through the ABA problem with a real failure mode.">
+    **Strong Answer Framework:**
+
+    1. **Set up the naive lock-free queue**: Michael-Scott queue using CAS on head/tail pointers. Show the basic enqueue/dequeue.
+    2. **Trace ABA step by step** with a memory reuse scenario (the failure mode is concrete addresses, so use addresses).
+    3. **Explain why CAS does not catch it**: CAS compares the pointer value, not the object identity. If memory at address X is freed and a new object happens to land at X, CAS sees "still X" and proceeds.
+    4. **Walk through three solutions**:
+       - **Tagged pointers** (lower 16 bits store a counter, CAS sees version change). Caps you at 2^N reuses before wraparound.
+       - **Hazard pointers** (each thread publishes pointers it is using; reclamation scans all hazards before freeing). Bounds memory but adds per-access overhead.
+       - **Epoch-based reclamation** (defer freeing until all threads have left their entry epoch -- userspace RCU). Simpler but unbounded memory if a thread stalls.
+    5. **State the meta-lesson**: lock-free does not mean "no concurrency bugs." It means "no blocking." The data race surface area is just as large; you have moved the problem to memory reclamation.
+
+    **Real-World Example:**
+    The Linux kernel hit ABA bugs in the 2000s when implementing per-CPU lock-free structures. The fix was to adopt RCU widely. In userspace, the Crossbeam crate (Rust) implements epoch-based reclamation explicitly because Rust's memory safety does not protect against ABA -- the type system cannot reason about cross-thread pointer reuse. Folly's `UnboundedQueue` (Facebook, ~2017) uses hazard pointers for the same reason.
+
+    <Note>
+    **Senior Follow-up 1: Does ABA exist in garbage-collected languages?**
+    The classic pointer-recycling form does not -- the GC will not free an object while any thread holds a reference, so CAS on a reference pointer is safe. But a "logical ABA" can still happen with versioned state machines (e.g., a counter going A -> B -> A) where you need a separate version field regardless of language.
+    </Note>
+
+    <Note>
+    **Senior Follow-up 2: How does x86's `CMPXCHG16B` (double-width CAS) help?**
+    It enables tagged pointers without packing tags into the pointer's spare bits: store the pointer in 8 bytes, the version counter in another 8 bytes, and CAS both atomically. Useful on systems where the pointer uses all 64 bits. ARM equivalent is `CASP` (LSE extensions).
+    </Note>
+
+    <Note>
+    **Senior Follow-up 3: When is a lock-free queue actually slower than a mutex queue?**
+    Under high contention with short critical sections. Lock-free retry storms cause every contending CAS to invalidate the cache line on every other core. A mutex parks losers in a wait queue, so only one thread pounds the cache line per critical section. Folly's MPMCQueue benchmarks show mutex queues winning on contended SPSC at certain core counts.
+    </Note>
+
+    **Common Wrong Answers:**
+    - "Lock-free is always faster than mutex" -- false under contention with retry storms.
+    - "ABA only matters with manual memory management" -- also affects reference-counted structures and any state that recycles values.
+    - "Just use `std::atomic` and you are done" -- atomics give you the primitive, not the algorithm. You still must reason about memory reclamation.
+
+    **Further Reading:**
+    - Maged Michael, Michael Scott, "Simple, Fast, and Practical Non-Blocking and Blocking Concurrent Queue Algorithms" (1996) -- the foundational paper.
+    - Maged Michael, "Hazard Pointers: Safe Memory Reclamation for Lock-Free Objects" (2004).
+    - Crossbeam epoch crate documentation -- a clean modern implementation of EBR.
   </Accordion>
 
   <Accordion title="You have 64 cores incrementing a shared counter. The mutex-based approach is a bottleneck. Walk through progressively better solutions.">

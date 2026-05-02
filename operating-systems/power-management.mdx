@@ -1684,6 +1684,44 @@ Battery life (3000 mAh at 3.7V):
 
 ---
 
+## Production Caveats and Patterns
+
+Power management is full of knobs that interact in non-obvious ways. The four pitfalls below are the ones that consistently surface in incident reviews -- battery drain bugs that cost millions of cumulative user-hours, latency spikes that destroy SLOs, and "fixed" workloads that turn out to fix the wrong layer.
+
+<Warning>
+**Caveat 1: Wakelocks on Android (and `wake_lock` / `pm_qos` on Linux) leak silently and destroy battery life.** A wakelock prevents the system from suspending while held. A buggy app that grabs a wakelock and never releases it (because of an unhandled exception, a missing finally block, or a race with the user backgrounding the app) will drain the battery in hours instead of days. The user blames the device; the bug is in one specific app. This was the #1 source of "my phone battery is bad" complaints in the Android 4-7 era and remains a top-five issue in 2026.
+</Warning>
+
+<Tip>
+**Pattern: Use scoped wakelock APIs and audit holders aggressively.** On Android, prefer `WorkManager` and `JobScheduler` over manual `PowerManager.WakeLock` -- these are scoped and the system manages release. If you must use a manual wakelock, wrap it in try/finally and set an explicit timeout (`acquire(timeoutMillis)`). On Linux, `cat /sys/power/wake_lock` shows active sources and `cat /sys/kernel/debug/wakeup_sources` shows wake-event accounting. For diagnosis, Android's `dumpsys power` and `dumpsys batterystats --reset` followed by reproducing the issue gives you a per-app wakelock attribution.
+</Tip>
+
+<Warning>
+**Caveat 2: Deep C-states save power but increase wake-up latency, and the cost is paid every wake.** C6 on Intel idles at ~10% of C0 power but costs 100-200 us to wake. For a CPU that wakes 10,000 times per second (typical interrupt rate on a busy server), that is 1-2 seconds of wake-up time per second per core. Either you wake more often (bad latency) or you pay the wake-up tax constantly (bad power). The trade-off is fundamental, not a tuning question.
+</Warning>
+
+<Tip>
+**Pattern: Use PM_QOS to express latency requirements per-workload, not globally.** A latency-sensitive process can open `/dev/cpu_dma_latency` and write its tolerable wake-up latency in microseconds; the kernel cpuidle governor will avoid C-states with higher exit latencies on cores running that process. Other cores can still use deep C-states. This is how high-frequency-trading systems and audio software get sub-10us latency without disabling C-states fleet-wide. For coarser control, `cpupower idle-set -D 10` blocks states with exit latency over 10 us. The blanket `processor.max_cstate=1` boot parameter is the sledgehammer; PM_QOS is the scalpel.
+</Tip>
+
+<Warning>
+**Caveat 3: CPUFreq (frequency scaling) and CPUIdle (idle states) are orthogonal subsystems and tuning them in isolation often makes things worse.** CPUFreq controls P-states (active operating points: voltage/frequency pairs). CPUIdle controls C-states (idle states: how deep the CPU sleeps). A common mistake: setting the `performance` governor (max frequency always) and assuming you have eliminated power-management latency. You have not -- C-state wake-up latency is independent of frequency scaling. Conversely, setting `processor.max_cstate=1` does not stop the CPU from frequency-scaling.
+</Warning>
+
+<Tip>
+**Pattern: Tune both for latency-sensitive workloads, only one for power-sensitive workloads.** For HFT, real-time, or low-latency networking: use the `performance` governor (or set `min_perf_pct=100` for HWP) AND `processor.max_cstate=1`. For battery-powered devices: use `schedutil` (which integrates with the scheduler) and let CPUIdle pick deep states. For mixed workloads: per-cgroup or per-CPU policies via `cpupower`. The Intel `pstate` driver in HWP mode and the `schedutil` governor on AMD systems are typically the right defaults for general servers as of 2026.
+</Tip>
+
+<Warning>
+**Caveat 4: Race-to-idle versus balanced execution is workload-dependent and often counter-intuitive.** "Race-to-idle" runs the CPU at maximum frequency to finish work fast, then drops to a deep idle state. "Balanced" runs at a lower frequency that still meets deadlines, avoiding the cubic power cost of high voltage. Which wins depends on: (a) whether your workload can actually idle (a server with constant load cannot race-to-idle), (b) the C-state vs P-state power curve of your specific CPU, and (c) the wake-up latency cost when work arrives. The Intel/AMD literature alternates between favoring each strategy across CPU generations.
+</Warning>
+
+<Tip>
+**Pattern: Measure on your specific hardware and workload.** Use `turbostat` to log per-core C-state residency, package power (RAPL counters), and frequency. Run your workload under both `performance` (race-to-idle) and `powersave` (balanced) governors and compare total energy (joules) over equivalent work. The result varies wildly: laptop-class chips with deep C-states often favor race-to-idle; server chips under steady load often favor balanced. Modern HWP (Hardware P-States) on Intel and AMD's collaborative processor performance control (CPPC) effectively pick the right strategy automatically using OS hints and load history -- which is why "just use the default schedutil + HWP" wins for most workloads.
+</Tip>
+
+---
+
 ## 12. Advanced Practice
 
 <CardGroup cols={2}>
@@ -1921,6 +1959,111 @@ echo "   Run: sudo tlp start"
     **Follow-up: What is the interaction between NO_HZ_FULL and cgroup CPU accounting? Can it cause incorrect resource limits?**
 
     Yes, this is a real production gotcha. Cgroup CPU bandwidth enforcement (`cpu.max` in cgroups v2) relies on the periodic tick to check if a cgroup has exceeded its quota. With NO_HZ_FULL, the tick is suppressed, so the enforcement check does not fire at the expected rate. A task in a cgroup limited to 50% CPU could temporarily exceed that limit between tick events. The kernel partially addresses this by checking quota at context switch boundaries, but if a single task runs uninterrupted on an isolated core, enforcement can be delayed. The practical impact is small for most workloads, but for strict multi-tenant CPU isolation, you should not use NO_HZ_FULL on cores running cgroup-limited workloads.
+  </Accordion>
+
+  <Accordion title="Explain C-states and P-states from first principles, and why a server team might disable both for some workloads.">
+    **Strong Answer Framework:**
+
+    1. **Define the two axes.** P-states (performance states) describe the CPU when it is *executing* -- they are voltage/frequency pairs along the dynamic-frequency-scaling curve. P0 is highest frequency, P-N is lowest. Switching P-states takes microseconds and is driven by the cpufreq governor (or by hardware HWP/CPPC). C-states (CPU idle states) describe the CPU when it has *no work* -- C0 is "executing," C1 is "halt" (clock gated, ~1 us wake), C3 is "deep sleep" (caches flushed, ~50 us wake), C6 is "package off" (almost everything power-gated, ~150 us wake).
+    2. **Explain the orthogonality.** A core in C0 has a P-state. A core in C1+ has no P-state because it is not executing. They are managed by different kernel subsystems (cpufreq vs cpuidle) and tuned independently. This is why "I set the performance governor and still see latency spikes" is a common confusion -- the governor sets P-states, not C-states.
+    3. **Explain the cost of each transition.** P-state transitions cost a PLL re-lock (5-20 us on Intel, similar on AMD) and are typically invisible to user code unless you measure latency at microsecond granularity. C-state exits cost what the C-state cost to enter: shallow C1 is ~1 us, deep C6 is 100-200 us. Frequent C-state cycling means paying that exit cost per wake.
+    4. **Articulate the trade-off.** Power saved in C6 vs C1 is large -- a typical Xeon idles at 30 W in C1 vs 5 W in C6. Across 32 cores and 10,000 servers, that is megawatts. Versus the latency cost of 100-200 us per wake. For workloads where the CPU is idle 90%+ of the time and wakes infrequently (file servers, batch jobs), C6 is huge wins. For workloads with constant low-level activity (network proxies, message queues, low-latency databases), C6's wake-cost dominates and you want C1 only.
+    5. **Make the recommendation specific.** "For our trading system / real-time service / low-latency proxy, I would: (a) set `processor.max_cstate=1` to keep cores in C1 (1 us wake cost); (b) set `intel_pstate=disable` or use the `performance` governor to pin frequency; (c) use PM_QOS to make this per-core and per-process where possible. Total power cost: maybe 30-60W per server. Latency benefit: cyclictest p99.9 drops from 100us to 5us. Trade is correct for $1M+ revenue per ms but absurd for batch ETL."
+
+    **Real-World Example:** Cloudflare's 2017 blog post "How to receive a million packets per second" documented that for high-PPS UDP receivers, deep C-states caused per-packet latency variance that destroyed worst-case performance. They disabled C-states deeper than C1 fleet-wide on their edge servers. The power cost was meaningful (60 W per server, 60 kW per 1000 servers), but the consistent sub-100us p99 packet handling was worth it for their CDN's tail-latency SLO. Different teams at the same company use different settings: their batch ML training fleet uses default C-states, because end-to-end job time is what matters and per-wake latency is irrelevant.
+
+    <Note>
+    **Senior follow-up: Why is `intel_pstate=disable` sometimes preferred over the `performance` governor?** `intel_pstate` (the modern HWP-based driver) dynamically adjusts frequency in microseconds based on hardware monitoring -- even with the `performance` governor, it can still micro-adjust within a range. For absolute determinism, disabling `intel_pstate` and using the older `acpi-cpufreq` driver gives you direct OS control with predictable transitions. The trade-off is losing HWP's responsiveness benefits.
+    </Note>
+
+    <Note>
+    **Senior follow-up: How does AMD's CPPC differ from Intel's HWP, and does it matter?** Both expose hardware-managed P-states with OS hints (utilization targets, energy preference). AMD's CPPC uses different metric semantics and tends to be more conservative about ramping up. For tuning, the kernel's `amd-pstate` driver (introduced in Linux 5.17) is the modern equivalent of `intel_pstate`. For latency-sensitive work on AMD, you tune `amd-pstate` rather than the older `acpi-cpufreq` path. The end-user experience is similar; the kernel commands and sysfs paths differ.
+    </Note>
+
+    <Note>
+    **Senior follow-up: What is RAPL and why is it useful for power-management diagnosis?** RAPL (Running Average Power Limit) is Intel's hardware energy counter exposed via MSRs. Linux exposes RAPL through `/sys/class/powercap/intel-rapl/`. You can read joules consumed at package, DRAM, and core granularity. This is how you actually measure whether your tuning saved power or just reorganized when it was burned. AMD's equivalent is the energy counters on Zen 2+. Always measure energy, not just frequency, when validating power-management changes.
+    </Note>
+
+    **Common Wrong Answers:**
+    1. *"C-states and P-states are the same thing."* They are not. C-states are idle states; P-states are active operating points. Confusing them leads to incorrect tuning advice.
+    2. *"Always use `performance` governor for production."* Wastes 40%+ of power for workloads that do not need it. Costs add up at fleet scale. Use `schedutil` as default; reach for `performance` only when you have measured a latency need.
+    3. *"Disable all power management for performance."* Modern HWP is fast enough that the variance it adds is small relative to other sources of jitter. For most workloads, default settings beat hand-tuned. Tune only after measuring.
+
+    **Further Reading:**
+    - Intel SDM Vol 3, Chapter 14 -- the canonical reference for C-states and P-states architecture.
+    - Linux Kernel Documentation: `Documentation/admin-guide/pm/` -- covers cpufreq, cpuidle, and power_supply class.
+    - Brendan Gregg's posts on `turbostat` and RAPL counters -- practical guides to measuring power on Linux.
+  </Accordion>
+
+  <Accordion title="A user reports excessive battery drain on a Linux laptop. Walk me through your diagnostic toolset and approach.">
+    **Strong Answer Framework:**
+
+    1. **Establish a baseline.** Measure current draw with the laptop idle on AC and on battery. Use `upower -i /org/freedesktop/UPower/devices/battery_BAT0` for instantaneous power (W). A modern laptop should idle at 3-7 W on battery with screen on. If you see 15+ W, something is awake that should not be.
+    2. **Run powertop in monitoring mode.** `sudo powertop --calibrate` first (run on AC, screen off, measures device idle costs), then `sudo powertop --html=report.html` for a 60-minute run on battery. Powertop attributes power consumption to processes, devices, and tunables. The "Tunables" tab shows specific settings (PCI ASPM, USB autosuspend, audio codec power-save) that are off but should be on.
+    3. **Check wake events.** `cat /sys/kernel/debug/wakeup_sources` shows what is preventing the system from staying in deeper power states. If `processor` shows tens of thousands of wake events per second, something is generating spurious interrupts. Common culprits: a misbehaving USB device, ACPI interrupt storms (firmware bug), or a userspace app polling at high frequency.
+    4. **Audit wakelocks (Android-style on systems with PSCI).** Some Linux distros (especially Chromebook-derived) expose wakelocks. `cat /sys/power/wake_lock` and `cat /proc/wakelocks`. Most distros do not use wakelocks in this form; on those, focus on autosuspend and runtime PM.
+    5. **Profile per-process CPU and wakeup rate.** `pidstat -w 1` shows context-switches and wakeups per process. A process with 1000+ voluntary wakeups/sec is almost certainly polling badly -- typical culprits: Slack, Spotify, any web app via webview, sometimes systemd-journald with verbose logging.
+    6. **Check thermal envelope.** `sensors` or `turbostat` will show whether the CPU is staying in low-power C-states. `turbostat --interval 1 --quiet --show CPU,Busy%,Bzy_MHz,PkgWatt,CoreTmp` for one minute idle. If `Busy%` is more than ~3% with the laptop "idle," processes are running you do not know about.
+    7. **Apply tunables.** `powertop --auto-tune` applies all suggested tunables (USB autosuspend, PCIe ASPM, SATA ALPM, audio power-save). For laptops, install `tlp` or `auto-cpufreq` to manage these on AC/battery transitions automatically. Verify with another powertop run.
+    8. **The hardware suspect.** If everything looks correct in software but power is still high, the culprit may be hardware: a discrete GPU not entering D3, a Wi-Fi card with a buggy power-management driver, a Thunderbolt controller stuck in active mode, or a poorly-implemented S0ix (modern standby). `dmesg` and `journalctl -b` often show the smoking gun.
+
+    **Real-World Example:** In 2023, a ThinkPad X1 Carbon Gen 11 running Linux had a widely-reported battery drain bug -- system would burn ~12 W while "suspended" (S0ix). Root cause: the firmware's S0ix implementation required Intel CSME firmware updates AND specific driver versions; without both, the system never entered the deep idle state. Diagnosis required `turbostat -i 30 --pkg --debug` to observe that PC10 (the deepest package idle state) had 0% residency during suspend. Fix was a BIOS update plus kernel 6.5+. The lesson: modern standby is firmware/OS/driver tightly coupled; "Linux supports it" is not the same as "Linux works on this specific machine."
+
+    <Note>
+    **Senior follow-up: What is S0ix (modern standby) and why does it differ from old-style S3 suspend?** S3 suspend powers down everything except RAM (refresh only) -- about 0.1-0.5 W. S0ix is "system in S0 with low-power idle" -- the CPU is in deep package idle, devices in D3, but the system is technically still running and can wake instantly. S0ix can match S3 power IF the OS and firmware cooperate fully; S0ix can be much worse if anything keeps the system out of the deep states. Microsoft and Intel pushed S0ix because it allows instant-on and connected standby; Linux support has historically been spotty.
+    </Note>
+
+    <Note>
+    **Senior follow-up: Why does turbostat show non-zero `Busy%` even on a "idle" system?** Background services exist: timer fires, kernel housekeeping (RCU, kworkers), userspace daemons (NetworkManager, systemd, GNOME Tracker, Chrome's helper processes). 1-3% busy is normal; 10%+ idle indicates something is misbehaving. Use `pidstat -p ALL 1` to find the process consuming CPU.
+    </Note>
+
+    <Note>
+    **Senior follow-up: How do you distinguish between firmware-level wake events and software-driven wakes?** Firmware wakes show up as ACPI events without an obvious software trigger. Use `cat /sys/firmware/acpi/interrupts/*` to see interrupt counters per ACPI source. A high count on `gpe6F` (or similar) often points to a buggy ACPI table or a hardware quirk. The fix is usually a kernel parameter to disable that GPE or a BIOS update from the vendor.
+    </Note>
+
+    **Common Wrong Answers:**
+    1. *"Just install TLP and it will fix everything."* TLP applies sane defaults but does not diagnose the underlying issue. If a specific app is wakelocking the system, TLP will not help. Always diagnose first, tune second.
+    2. *"Disable Wi-Fi to save power."* Aggressive measure that breaks the laptop's purpose. Modern Wi-Fi cards have power-save modes that drop idle power to milliwatts. Diagnose whether the card is misbehaving rather than disabling it.
+    3. *"Compile a custom kernel."* Almost never the answer for laptop power management in 2026. Stock distribution kernels include all the right config options. Time better spent on userspace audit and BIOS updates.
+
+    **Further Reading:**
+    - PowerTop documentation -- the tool's man page and the wiki cover the tunables in detail.
+    - Linux PM Wiki at kernel.org -- canonical for cpufreq, cpuidle, and runtime PM.
+    - Lennart Poettering's blog posts on systemd's power management integration -- explains how systemd interacts with the inhibitor lock mechanism.
+  </Accordion>
+
+  <Accordion title="Race-to-idle versus balanced execution -- when does each strategy actually win, and how would you decide for a new workload?">
+    **Strong Answer Framework:**
+
+    1. **State the strategies.** Race-to-idle: run the CPU at maximum frequency until the work is done, then drop to deep idle. Balanced: run at the lowest frequency that still meets the deadline, avoiding the cubic power cost of high voltage. The intuition for race-to-idle is "high power for short time vs low power for long time -- you might as well finish fast and then sleep deep." The intuition for balanced is "voltage scales linearly with frequency, but power scales as voltage squared times frequency, so cubic in frequency."
+    2. **Identify the dominant factor: idle quality.** Race-to-idle wins when the CPU can actually idle deeply when not working. If the workload generates constant low-level activity (timer-driven tasks, periodic interrupts, memory bandwidth tests), the CPU never reaches deep C-states and race-to-idle just wastes the high-frequency portion. If the workload is bursty -- short bursts of work followed by long idle gaps -- race-to-idle wins because the deep C-state amortizes the high-power burst.
+    3. **Identify the secondary factor: the power curve of the specific CPU.** Modern Intel/AMD chips have very steep voltage-frequency curves at the top end -- the last 10% of frequency costs disproportionately more power. For these, balanced wins for non-bursty workloads. Mobile chips (ARM big.LITTLE, Apple M-series) have smoother curves and more aggressive deep idle, often favoring race-to-idle. The chip generation matters: a 2018 Skylake and a 2024 Granite Rapids behave differently.
+    4. **Identify the tertiary factor: scheduling latency.** Race-to-idle plays badly with latency-sensitive workloads -- the deep idle states have high wake-up cost, and the next interrupt suffers. So even if race-to-idle is energy-optimal, it can be latency-suboptimal. Balanced (medium frequency, shallow idle) often gives the best latency-energy product for serving traffic.
+    5. **Decide empirically.** "I would run the workload under both `performance` (race-to-idle proxy) and `powersave` (balanced proxy) governors, measure total energy consumed (RAPL counters in joules) over an equivalent unit of work (10k requests, 1 minute of trading), and pick the lower-energy option that meets latency SLOs. The default `schedutil` governor is usually within 5% of optimal for typical workloads -- I tune only when I measure a meaningful gap."
+
+    **Real-World Example:** Google's 2018 paper "Optimizing Google's Warehouse Scale Computers: The NUMA Experience" included data on race-to-idle vs balanced for production workloads. For latency-insensitive batch jobs on Skylake, balanced (cpufreq governor `powersave`) consumed 8% less energy than race-to-idle. For latency-sensitive serving workloads, race-to-idle (governor `performance`) was within 2% of balanced energy and had 30% better tail latency. Conclusion: workload class drives the choice, not a single fleet-wide policy. Google now uses different governor configurations on serving vs batch nodes.
+
+    <Note>
+    **Senior follow-up: Does race-to-idle still apply on modern hardware with HWP?** Less directly. HWP (Hardware P-States) lets the CPU autonomously pick frequencies based on monitoring, often making "race-to-idle vs balanced" a choice the hardware makes. The OS provides hints (energy_performance_preference) but the hardware acts on microsecond timescales. Setting the OS governor is now more like setting bounds than dictating behavior. This is also why the difference between governors has narrowed on modern Intel/AMD chips compared to older systems.
+    </Note>
+
+    <Note>
+    **Senior follow-up: How does big.LITTLE / heterogeneous compute change the strategy?** With efficiency cores (E-cores on Intel 12th gen+, LITTLE on ARM, M-series), you have a third option: put the work on a low-power core. The scheduler (with `EAS` -- Energy-Aware Scheduling -- on ARM and the Intel Thread Director on x86) decides core placement based on workload classification. Race-to-idle on an E-core is usually worse than just running on the E-core at moderate frequency; race-to-idle on a P-core is for latency-critical foreground work.
+    </Note>
+
+    <Note>
+    **Senior follow-up: When does turbo boost change the picture?** Turbo boost lets cores exceed nominal frequency briefly when thermal and power budget allows. Race-to-idle plus turbo can be very effective for short bursts -- finish 20% faster, idle deeper. But sustained turbo destroys the budget for the rest of the package; on a 32-core CPU, all 32 cores cannot turbo simultaneously for long. So turbo + race-to-idle works for desktop workloads (one core busy) but rarely helps server workloads (all cores busy).
+    </Note>
+
+    **Common Wrong Answers:**
+    1. *"Race-to-idle always wins because of the voltage-squared power law."* Confuses cause and effect. The voltage-squared rule applies during execution, but it ignores idle quality. If idle is shallow, race-to-idle loses.
+    2. *"Always use the powersave governor on servers."* Wastes performance for negligible energy savings on serving workloads. Modern HWP plus schedutil is usually better than fixed-bias governors.
+    3. *"Energy and latency are the same trade-off."* Sometimes correlated, often not. A serving workload might want race-to-idle for latency even if balanced is more energy-efficient. Pick the right axis for the workload.
+
+    **Further Reading:**
+    - Bircher and John, "Complete System Power Estimation Using Processor Performance Events" (HPCA 2007) -- foundational paper on power modeling for CPU workloads.
+    - Linux EAS documentation (`Documentation/scheduler/sched-energy.rst`) -- how the kernel's energy-aware scheduler picks cores.
+    - Krzysztof Kozlowski's talks on `cpufreq` and `cpuidle` -- maintainer-level context on Linux's power management subsystem.
   </Accordion>
 </AccordionGroup>
 

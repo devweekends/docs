@@ -1586,4 +1586,197 @@ This gives you a real measurement of fork overhead on your system.
 
 ---
 
-Next: [Threads & Concurrency](/operating-systems/threads) →
+## Production Caveats &amp; Common Pitfalls
+
+The textbook story of fork/exec/wait is clean. Production is messy. Here are the four traps that have caused real outages.
+
+<Warning>
+**Caveat 1: fork() copy-on-write surprises with memory overcommit**
+
+Fork is "free" because of COW -- until you actually write. On Linux with `vm.overcommit_memory=0` (default), the kernel allows fork even when the child theoretically needs more RAM than physically exists, betting that COW will save you. But if both parent and child start writing heavily, the OOM killer wakes up and starts killing processes -- often the largest one, which is exactly the parent that just forked. Redis hit this exact failure mode: BGSAVE forks a child to snapshot the dataset, and a write-heavy client workload triggers COW faults faster than the snapshot completes. The parent's memory grows, OOM killer fires, Redis dies. The post-mortem on Redis 2.6 (2013) recommended setting `vm.overcommit_memory=1` and sizing memory at 2x the dataset.
+</Warning>
+
+<Tip>
+**The fix:** For large-memory parents that fork, set `vm.overcommit_memory=1` so fork never fails on accounting alone, then watch RSS in monitoring and alert before OOM kills you. Better: avoid fork for snapshotting -- use `posix_spawn()` if you only need to launch a subprocess, or use `mmap`-based snapshots so the child shares pages without COW pressure. Redis 7.0+ uses `MADV_DONTNEED` after snapshot to release shared pages back to the kernel quickly.
+</Tip>
+
+<Warning>
+**Caveat 2: Zombies if the parent doesn't wait()**
+
+A zombie consumes only the PID slot and a tiny `task_struct` stub, so a single zombie is harmless. But a leak is fatal. The kernel's PID space defaults to 32,768 on Linux (`/proc/sys/kernel/pid_max`). Once exhausted, every `fork()` returns EAGAIN and your service can no longer spawn workers, run health checks, or even open new connections. I have personally seen a Python web service that used `subprocess.Popen` without ever calling `.wait()` accumulate ~30,000 zombies over 4 days, then suddenly stop accepting traffic because gunicorn could not fork new workers.
+</Warning>
+
+<Tip>
+**The fix:** Three options, in order of preference. (1) Always call `waitpid()` on children -- in Python, use `subprocess.run()` instead of bare `Popen`. (2) Install a `SIGCHLD` handler with `signal(SIGCHLD, SIG_IGN)` -- this tells the kernel to auto-reap. (3) In containers, run a real init like `tini` or use Docker's `--init` flag. The init reaps zombies in a tight loop. Without it, an app that is PID 1 inside a container becomes responsible for reaping every reparented orphan in the namespace, which most apps don't do.
+</Tip>
+
+<Warning>
+**Caveat 3: PID reuse races**
+
+PIDs are reused. After a process exits and its PID is reaped, the kernel can hand that PID to a new, unrelated process. If your code stored a PID and later sends a signal with `kill(pid, SIGTERM)`, you may signal a completely different process. This bug surfaces in supervisors, container runtimes, and process managers. systemd had a CVE in 2017 where a race between cgroup teardown and PID reuse let an attacker kill arbitrary processes.
+</Warning>
+
+<Tip>
+**The fix:** Never trust raw PIDs across time boundaries. Use `pidfd_open()` (Linux 5.3+) which gives you a file descriptor referring to a specific process; `pidfd_send_signal()` is race-free because the kernel holds the reference. For older kernels, hold a parent-child relationship and use `waitpid` -- the parent has authoritative knowledge of its children. In containers, prefer cgroup-based identity over PIDs (cgroups don't get reused).
+</Tip>
+
+<Warning>
+**Caveat 4: exec() resets signal handlers and easily loses the signal mask**
+
+When a process calls `execve()`, the kernel resets every signal handler that was set to a custom function back to `SIG_DFL` (default). Handlers set to `SIG_IGN` are preserved. The signal mask, however, is *inherited* unchanged. This is a frequent source of confusion: people assume "exec resets signals" and ship code that re-blocks signals after exec, only to find the signal was already blocked from the parent and is now double-blocked or, worse, that a critical signal handler in the new program never fires because the parent had it ignored.
+</Warning>
+
+<Tip>
+**The fix:** When writing a process launcher (shell, supervisor, container runtime), explicitly reset the signal mask to empty before exec: `sigemptyset(&mask); sigprocmask(SIG_SETMASK, &mask, NULL);`. Also call `signal(SIGPIPE, SIG_DFL)` and friends to undo any `SIG_IGN` settings the parent may have made. Docker had a famous bug where `SIGPIPE` was ignored in the daemon, and every container inherited that, breaking shell pipelines like `yes | head`.
+</Tip>
+
+---
+
+## Senior-Level Interview Questions
+
+<AccordionGroup>
+  <Accordion title="Explain fork() + exec() and how it differs from posix_spawn(). When would you choose one over the other?">
+    **Strong Answer Framework:**
+
+    1. **Define the classical model**: fork() duplicates the calling process via copy-on-write, returning twice -- once in parent (with child PID), once in child (with 0). exec() then replaces the child's memory image with a new program, preserving the PID and inherited file descriptors. Together they let you customize the child's environment (redirect FDs, change cwd, drop privileges) before starting the new program.
+    2. **Identify fork's hidden cost**: Even with COW, fork must duplicate the page table (millions of entries for a large process), copy the file descriptor table, the signal handler table, and the credentials structure. For a 100GB process, this can take 50-200ms. fork can also fail with ENOMEM under overcommit accounting even when COW would have saved you.
+    3. **Introduce posix_spawn**: posix_spawn is a single syscall (on Linux it uses CLONE_VFORK | CLONE_VM internally on glibc 2.24+) that combines fork+exec into one operation. It accepts file_actions and attributes structures that describe the FD setup and signal handling to perform between "fork" and "exec." Crucially, it does not duplicate the parent's address space -- the child borrows the parent's memory and is suspended until exec.
+    4. **State the decision rule**: Use fork+exec when you need arbitrary code to run in the child between fork and exec (e.g., complex setup logic that cannot be expressed as file_actions). Use posix_spawn for the common case of "launch program X with these FDs and arguments" -- it is faster, more memory-safe, and cannot fail from overcommit accounting.
+
+    **Real-World Example:**
+
+    In 2018, the Erlang/OTP team replaced their internal `os:cmd` implementation with posix_spawn because fork was failing on memory-pressured systems running large Erlang VMs. The Erlang VM commonly holds 50-200GB of heap. A simple `os:cmd("date")` would fork (succeeding due to COW) and then occasionally fail on subsequent allocations because the kernel committed memory for both copies. Switching to posix_spawn eliminated the issue because no memory was committed for the (immediately-replaced) child. See OTP commit `erlang/otp@4f4d9b3` for the rationale.
+
+    <Note>
+    **Senior follow-up 1:** The fork-then-exec pattern dates from PDP-11 Unix where address spaces were tiny. Why is it still the dominant model on modern systems despite the cost? The answer is composability: between fork and exec, the child can run arbitrary C code to set up its environment (close inherited FDs, dup2 to set up pipes, setrlimit, setuid, chroot). posix_spawn supports a fixed vocabulary of file_actions but cannot express "drop into a custom routine and do whatever." For shells implementing pipes and redirections, that flexibility is essential.
+    </Note>
+
+    <Note>
+    **Senior follow-up 2:** What is the difference between vfork() and posix_spawn()? vfork() shares the address space and suspends the parent until the child execs or _exits. It is a relic from before COW existed and is dangerous because the child runs with the parent's stack -- any function call that allocates a stack frame can corrupt the parent. posix_spawn is the safe, modern wrapper around the vfork+exec idea. POSIX deprecated vfork in 2008; new code should use posix_spawn.
+    </Note>
+
+    <Note>
+    **Senior follow-up 3:** How does the JVM start subprocesses? OpenJDK historically used fork+exec via `Runtime.exec`, which caused OOMs on large heaps. JEP 320 (Java 13) added a `jdk.lang.Process.launchMechanism` system property that switches between FORK, POSIX_SPAWN, and VFORK. On Linux, POSIX_SPAWN is now the default since JDK 11. The change reduced subprocess launch failures by 99% on memory-constrained services.
+    </Note>
+
+    **Common Wrong Answers:**
+    - "fork is slow because it copies memory." Wrong: COW means data pages are not copied. The cost is in page table duplication and metadata.
+    - "posix_spawn is just a wrapper around fork+exec." Wrong on modern glibc: it uses vfork-style semantics and avoids duplicating the address space entirely.
+    - "Always use posix_spawn." Wrong: when you need complex setup logic in the child, fork+exec is more expressive.
+
+    **Further Reading:**
+    - "Why GNU grep is fast" by Mike Haertel -- discusses fork/exec costs in pipelines.
+    - JEP 320: Use POSIX_SPAWN as Default Subprocess Launch Mechanism -- openjdk.org/jeps/320.
+    - "A fork() in the road" (HotOS 2019) by Baumann et al. -- a polemic arguing fork is fundamentally broken on modern systems.
+  </Accordion>
+
+  <Accordion title="You log into a server and `ps aux | grep Z | wc -l` returns 47,000. How do you diagnose and fix it without restarting the service?">
+    **Strong Answer Framework:**
+
+    1. **Identify the parent**: Zombies have a parent that is failing to call `wait()`. Run `ps -eo pid,ppid,state,comm | awk '$3=="Z"'` and look at the PPID column. All 47,000 will likely share a single PPID -- that is your culprit.
+    2. **Inspect the parent's behavior**: With the parent PID, check if it is stuck (`cat /proc/PPID/wchan` shows what kernel function it is sleeping in), if it is ignoring SIGCHLD (`grep SigIgn /proc/PPID/status` -- bit 17 is SIGCHLD), or if it simply never calls wait. Also check `/proc/PPID/status` for the threads count -- a deadlocked thread that was supposed to reap children would explain it.
+    3. **Trigger reaping without a restart**: You cannot kill a zombie directly (it is already dead). The standard trick: send `SIGCHLD` to the parent (`kill -CHLD PPID`). If the parent has a handler installed but is not calling wait inside it, this won't help. The nuclear option: kill the parent. Its zombies become orphans, get reparented to PID 1 (init/systemd), which reaps them in its standard loop.
+    4. **Permanent fix**: In code, install `signal(SIGCHLD, SIG_IGN)` (POSIX guarantees auto-reaping) or call `waitpid(-1, NULL, WNOHANG)` in a loop from a SIGCHLD handler. In containers, run with an init like tini so PID 1 reaps reparented orphans.
+
+    **Real-World Example:**
+
+    GitLab had a famous incident in 2017 where their sidekiq workers spawned PDF rendering subprocesses without proper waitpid handling. After 6 days of uptime, a single Sidekiq pod accumulated 28,000 zombies. New job execution started failing with `EAGAIN` (fork failed). The on-call team killed the affected pods, which freed the PIDs (zombies were reparented to init when the pod restarted). The fix was a one-line change adding `Process.detach(pid)` after every spawn -- this delegates reaping to a Ruby thread.
+
+    <Note>
+    **Senior follow-up 1:** What if the parent is itself PID 1 (the container's main process)? Killing PID 1 terminates the container. The fix is to add a real init process (`tini` or `dumb-init`) as the container's entrypoint and run your application as a child. The init reaps zombies and forwards signals. Docker's `--init` flag does this automatically.
+    </Note>
+
+    <Note>
+    **Senior follow-up 2:** Why doesn't `kill -9` work on a zombie? A zombie is not running -- it has already executed its exit code and released all resources except the task_struct stub. There is no thread to deliver the signal to. The only way to remove a zombie is for the parent (or init, after reparenting) to call wait() and read the exit status.
+    </Note>
+
+    <Note>
+    **Senior follow-up 3:** How does this interact with PID namespaces? Inside a PID namespace, only PID 1 can reap reparented orphans. If your container's PID 1 is a Node.js or Python app that doesn't know about reaping, every grandchild process that outlives its direct parent becomes a permanent zombie until the container dies. This is the entire reason Docker added `--init`: most application runtimes were never designed to be PID 1.
+    </Note>
+
+    **Common Wrong Answers:**
+    - "Send SIGKILL to the zombies." Wrong: zombies cannot receive signals; they are already dead.
+    - "Restart the service." This works but is not allowed by the question and treats the symptom.
+    - "Increase pid_max." Buys time but does not fix the leak.
+
+    **Further Reading:**
+    - "Docker and the PID 1 zombie reaping problem" by Phusion -- blog.phusion.nl/2015/01/20/.
+    - `man 2 waitpid` -- canonical reference on reaping semantics.
+    - GitLab postmortem: about.gitlab.com/blog/2017/02/01/postmortem-of-database-outage-of-january-31/ -- not zombies specifically but illustrates fork-exhaustion patterns.
+  </Accordion>
+
+  <Accordion title="What does vfork() do that fork() doesn't, and why is it considered dangerous? When would you still reach for it?">
+    **Strong Answer Framework:**
+
+    1. **Define vfork's contract**: vfork() creates a child that shares the parent's address space (no page table copy) and suspends the parent until the child either calls one of the exec family or `_exit()`. The child runs on the parent's stack until exec replaces the address space.
+    2. **State the win**: For large-memory parents, vfork is dramatically faster than fork. Skipping page table duplication can save 50-200ms on a 100GB process, and there is zero memory commit pressure.
+    3. **Explain the danger**: The child is running in the parent's address space. Any modification to memory persists when the parent resumes -- including stack frames. If the child returns from the function that called vfork, the stack is corrupted. If the child calls a function that allocates auto variables, those variables overwrite parts of the parent's stack. Even calling `printf` is unsafe because libc's stdio uses internal buffers that are now shared.
+    4. **State the modern position**: POSIX-2008 deprecated vfork. The recommended replacement is posix_spawn, which is implemented in terms of vfork-like semantics but exposes a safe, declarative API for the in-between work. Direct vfork should only be used by people who deeply understand what they are doing -- typically inside libc implementations.
+
+    **Real-World Example:**
+
+    Android's zygote process used a vfork-based "spawn" optimization for years to start app processes quickly. Each new app is forked from the zygote (which has the Android framework pre-loaded). In 2019, Google migrated to a custom posix_spawn-like helper after a series of bugs where post-vfork code in the child accidentally touched parent state. See AOSP commit 6e58d2d in `frameworks/base`.
+
+    <Note>
+    **Senior follow-up 1:** What exact operations are safe between vfork and exec? POSIX guarantees only: calling exec, calling _exit, modifying variables of type `pid_t` returned by vfork. Everything else is undefined behavior. In practice, glibc's posix_spawn implementation does much more (signal manipulation, fd manipulation) but it does so very carefully in assembly to avoid touching shared state.
+    </Note>
+
+    <Note>
+    **Senior follow-up 2:** Why does Linux's clone() with CLONE_VM | CLONE_VFORK behave like vfork? clone with these flags is exactly the syscall that posix_spawn uses. CLONE_VM means share memory, CLONE_VFORK means suspend parent until child execs. This is the kernel primitive; vfork() and posix_spawn are just different libc-level wrappers around the same kernel mechanism.
+    </Note>
+
+    <Note>
+    **Senior follow-up 3:** If I have a 200GB process and need to spawn a small helper, which should I use today? posix_spawn is the right answer in 2025+. fork would risk OOM-during-fork and waste 100ms on page table duplication. vfork would work but is fragile. posix_spawn is supported on every POSIX system, has the right performance profile, and exposes a safe API for FD manipulation between fork and exec.
+    </Note>
+
+    **Common Wrong Answers:**
+    - "vfork is just a faster fork." Wrong: it has fundamentally different semantics around address space sharing.
+    - "vfork is always safe if you call exec quickly." Wrong: even calling a non-trivial libc function before exec can corrupt the parent.
+    - "vfork has been removed from Linux." Wrong: it still exists for compatibility, just deprecated by POSIX.
+
+    **Further Reading:**
+    - `man 2 vfork` -- explicit list of undefined behaviors.
+    - Linux kernel `kernel/fork.c` -- look at `_do_fork` and how CLONE_VFORK is handled.
+    - "Bringing back vfork" -- LWN article on the history and the proposal to add safer variants: lwn.net/Articles/728347/.
+  </Accordion>
+
+  <Accordion title="Walk me through what happens at the kernel level from the moment you press Ctrl+C in a shell to when the child process actually dies.">
+    **Strong Answer Framework:**
+
+    1. **Terminal driver receives the keystroke**: Ctrl+C is the INTR character (configurable via `stty intr`). The kernel's terminal line discipline (n_tty) recognizes it and converts it into a signal: `SIGINT`.
+    2. **Signal sent to the foreground process group**: The terminal driver looks up the foreground process group ID (PGID) of the controlling terminal -- this is what `tcsetpgrp` configures. It sends SIGINT to every process in that group via `kill(-pgid, SIGINT)`.
+    3. **Signal becomes pending**: For each target process, the kernel sets the SIGINT bit in `task_struct->pending`. If the process is currently sleeping (e.g., in a read syscall), the kernel marks the task as runnable and may interrupt the syscall (returning EINTR) so it can handle the signal.
+    4. **Signal delivery on return to user**: The next time the kernel is about to return to user space (after a syscall or interrupt), it calls `do_signal()`. This examines the pending mask. If SIGINT is pending and not blocked, the kernel either (a) executes the default action (terminate the process) by calling `do_group_exit(SIGINT)`, or (b) hijacks the user RIP to point at the user's installed handler.
+    5. **Default action**: If no handler is installed, the kernel terminates the process via the same code path as `_exit(128 + SIGINT)`. It releases memory, closes FDs, sends SIGCHLD to the parent, and marks the task as a zombie. If the shell was waiting on the child, its `waitpid` returns with the exit status.
+
+    **Real-World Example:**
+
+    The Linux 2.6.32 kernel had a regression where Ctrl+C on a process stuck in `nfs_lookup` would not interrupt because NFS code path used `TASK_UNINTERRUPTIBLE`. This led to commit 9c4dadd "NFS: don't ignore signal during commit" which switched to `TASK_KILLABLE`. The lesson: signal delivery can be silently delayed when the target is in uninterruptible sleep, which is why "D" state processes don't die immediately on Ctrl+C.
+
+    <Note>
+    **Senior follow-up 1:** Why does Ctrl+C kill the entire pipeline `cat foo | grep bar | wc -l` and not just the last command? Because all three processes share a process group -- the shell put them in one when it set up the pipeline. The terminal sends SIGINT to the group, so all three receive it.
+    </Note>
+
+    <Note>
+    **Senior follow-up 2:** What if the process has installed a SIGINT handler that does cleanup? The handler runs first. The process can choose to ignore the signal, reset state and call `exit()` cleanly, or do nothing and let SIGINT terminate it later. This is how Python's KeyboardInterrupt works -- the C-level handler raises a Python-level exception inside the interpreter loop.
+    </Note>
+
+    <Note>
+    **Senior follow-up 3:** Why does Ctrl+Z (SIGTSTP) work differently? SIGTSTP is also sent to the foreground process group, but its default action is "stop" (TASK_STOPPED) rather than "terminate." The shell's job control then receives SIGCHLD with status indicating "stopped" rather than "exited" and updates its job table. This is how `bg` and `fg` work.
+    </Note>
+
+    **Common Wrong Answers:**
+    - "Ctrl+C kills only the running command." Wrong: it kills the entire foreground process group.
+    - "The shell catches Ctrl+C and forwards it." Wrong: the kernel's terminal driver sends the signal directly; the shell is bypassed.
+    - "SIGINT cannot be caught." Wrong: it can be caught or ignored. SIGKILL and SIGSTOP are the two that cannot.
+
+    **Further Reading:**
+    - `man 7 signal` -- canonical reference on signal semantics.
+    - "The TTY demystified" by Linus Akesson -- linusakesson.net/programming/tty/ -- the best deep dive into terminal handling and signals.
+    - Linux kernel `drivers/tty/n_tty.c` -- read `n_tty_receive_signal_char` for the actual implementation.
+  </Accordion>
+</AccordionGroup>
+
+---
+
+Next: [Threads &amp; Concurrency](/operating-systems/threads) →

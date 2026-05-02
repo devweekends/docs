@@ -89,6 +89,32 @@ For Persistent Memory (like Intel Optane), the kernel can map the physical stora
 
 ---
 
+## 5.5 Caveats and Common Pitfalls
+
+<Warning>
+**Production traps that bite even senior engineers:**
+
+1. **Blocking vs non-blocking vs async — pick by workload, not by fashion.** "Async everywhere" is a religion, not an engineering choice. A CLI tool processing one file does not need `io_uring`. A reverse proxy fielding 100K connections cannot survive on blocking threads. Mismatched primitives lead to either pointless complexity or catastrophic scaling cliffs. The lazy default of "let's just use async because it is modern" produces some of the worst code in our industry -- debuggers full of futures that never resolve, stack traces that show the executor instead of the actual call site.
+
+2. **`select` and `poll` do not scale; `epoll`/`kqueue`/`io_uring` do.** `select` has a hard limit of 1024 file descriptors (FD_SETSIZE) and is O(n) on every call. `poll` removes the FD limit but stays O(n). At 5,000 connections you start feeling it; at 50,000 you are dead. `epoll` (Linux) and `kqueue` (BSD/macOS) are O(active_fds) edge-triggered notifications. `io_uring` goes one step further: zero syscalls in the hot path. If your code still uses `select`, it was written for a world that no longer exists.
+
+3. **Buffered I/O vs `O_DIRECT` -- databases often want `O_DIRECT` to avoid double-buffering.** Without `O_DIRECT`, the kernel page cache holds a copy of every page the database also caches in its buffer pool. On a 256GB server with a 192GB Postgres `shared_buffers`, that is 192GB of pure waste, plus the cost of cache eviction races. But `O_DIRECT` is not free: it requires aligned buffers (typically 4KB), aligned offsets, and aligned sizes. Misalignment returns `EINVAL`. Apps that bypass the cache must implement their own read-ahead, write-back, and prefetching -- the database engineers know this; most app developers do not.
+
+4. **`fsync()` semantics differ across filesystems and even across kernels.** ext4 with `data=ordered` (the default) flushes the journal but not necessarily all data extents on fsync. XFS is more aggressive. ZFS treats fsync as a barrier into the ZIL. Worse: until Linux 4.13, an fsync that hit a writeback I/O error would *clear the error flag*, so a subsequent fsync from a different fd would return success even though the data was lost. This is the "fsync-gate" of 2018 -- Postgres almost rewrote its WAL handling because of it. Always read the man page for the kernel and filesystem you are actually deploying on.
+</Warning>
+
+<Tip>
+**Solutions and patterns that earn their keep:**
+
+- **Choose the I/O model from the workload, not the framework.** Few connections, mostly CPU-bound: blocking threads are simplest and fastest. Many connections, I/O-bound: `epoll`/`kqueue` with a small thread pool. Storage-throughput-critical or millions of IOPS: `io_uring` with fixed buffers. When in doubt, profile both with realistic load and pick the one whose code you can still understand at 3 AM.
+- **Migrate to `epoll`/`kqueue` (and consider `io_uring`) anywhere you find `select` or `poll` in a hot path.** The migration is mechanical and the wins are large. For new code targeting Linux 5.6 plus, prototype with `io_uring` directly -- the API is event-loop friendly and the perf headroom is enormous.
+- **For databases and write-heavy workloads, use `O_DIRECT` plus your own buffer pool, plus explicit `fsync`/`fdatasync`.** Verify alignment in tests with intentionally unaligned buffers -- these failures should not surface in production. Match your buffer pool size and replacement policy to the workload (LRU is fine for OLTP, ARC for mixed, MRU for sequential scans).
+- **Test fsync durability with crash injection, not faith.** Kill the VM mid-fsync, pull the power, simulate disk errors with `dm-error`. If your data survives, you have actually tested durability. If you only test "fsync returned 0," you have tested syscall semantics, not durability.
+- **Pin yourself to a specific kernel version in production.** I/O behavior changes between kernels -- `io_uring` security model in 5.x vs 6.x, fsync-on-error semantics pre/post 4.13, `O_DIRECT` alignment requirements on different filesystems. Treat the kernel as part of your dependency manifest.
+</Tip>
+
+---
+
 ## 6. I/O Patterns and Anti-patterns
 
 The same kernel mechanisms can be used **well** or **poorly**. This section gives you a mental catalog.
@@ -144,41 +170,174 @@ Next: [System Call Internals & vDSO](/operating-systems/os-fundamentals) →
 ## Interview Deep-Dive
 
 <AccordionGroup>
-  <Accordion title="How does io_uring achieve higher performance than epoll? What specific overheads does it eliminate?">
-    **Strong Answer:**
+  <Accordion title="Compare select / poll / epoll / io_uring -- performance and API tradeoffs">
+    **Strong Answer Framework:**
 
-    - epoll tells you WHEN a fd is ready, but you still make individual read()/write() syscalls. For 10,000 connections, that is 10,000 syscalls (~200ns each for user-kernel transition).
-    - io_uring uses shared-memory ring buffers. The application writes SQEs (submission queue entries) to shared memory and the kernel writes CQEs (completion queue entries) back. Hundreds of I/O requests can be submitted via ONE io_uring_enter() call, or zero syscalls with SQPOLL mode.
-    - Specific overheads eliminated: (1) syscall overhead via SQPOLL (kernel thread continuously polls the submission ring), (2) memory mapping via registered buffers (pre-pinned, no per-I/O get_user_pages), (3) fd overhead via registered files (cached references, no per-I/O fget/fput).
-    - Result: io_uring can saturate modern NVMe drives at millions of IOPS. epoll tops out much earlier because per-I/O syscall overhead becomes the bottleneck.
+    1. **Frame the historical arc.** `select` (1983) is the original POSIX multiplexer. `poll` (System V) removed the fd-set size limit. `epoll` (Linux 2.5.45, 2002) introduced O(active) notifications. `io_uring` (Linux 5.1, 2019) eliminated the syscall-per-I/O entirely. Each generation responded to a real bottleneck of its predecessor.
+    2. **Compare on three axes: scalability, API ergonomics, syscall cost.** `select` is O(n) per call, capped at 1024 fds, copies the fd_set into the kernel every time. `poll` is O(n) per call, no fd cap. `epoll` is O(1) per ready fd via interest list registration; supports edge-triggered semantics for further wakeup reduction. `io_uring` removes the "syscall to learn what is ready" step entirely -- you submit operations and reap results from shared memory rings.
+    3. **Anchor with numbers.** A `read()` syscall is ~100-200 ns user/kernel transition on x86_64 with mitigations. At 1M IOPS, that is 100-200ms of CPU per second per core wasted on transitions alone. `io_uring` with SQPOLL collapses that to zero.
+    4. **Make a workload-specific recommendation.** For a few hundred connections: `epoll` is fine and easier to reason about. For millions of IOPS on NVMe or millions of network connections: `io_uring` with fixed buffers and registered files. For portable code (BSD/macOS): `kqueue`.
+    5. **Acknowledge the cost.** `io_uring` is rapidly evolving and has had a string of CVEs (mostly in unprivileged use). Many container runtimes (Docker default seccomp) block it. Plan for the operational reality.
 
-    **Follow-up: What is SQPOLL mode and its trade-offs?**
+    **Real-World Example:** In 2020, Cloudflare's worker fleet replaced `epoll`-based proxying with `io_uring` for parts of their data plane. Their published benchmarks showed roughly 50 percent reduction in CPU usage at the same request rate. In 2023, Google disabled `io_uring` for unprivileged users on production due to repeated CVEs (CVE-2022-32250, CVE-2023-32233, etc.) -- a reminder that performance advantages come with security trade-offs that need explicit acceptance.
 
-    SQPOLL spawns a kernel thread that continuously polls the submission queue. The application never calls io_uring_enter(). Trade-off: the kernel thread consumes 100% of one CPU even with no I/O. Mitigated by an idle timeout -- after no submissions for a configurable period, the thread sleeps. Best for high-throughput scenarios where polling CPU cost is justified by eliminating syscall overhead.
+    <Note>
+    **Senior Follow-up 1:** "At what connection count does `epoll` start losing to `io_uring` and why?"
+
+    There is no single number, but rule of thumb: if you exceed ~200K syscalls per second, the syscall floor becomes the dominant cost. That happens around 100K active connections doing chatty work, or much earlier on storage I/O (50K IOPS hits 100K syscalls if you split read+write). Below that, the engineering complexity of `io_uring` rarely pays for itself.
+    </Note>
+
+    <Note>
+    **Senior Follow-up 2:** "What is edge-triggered vs level-triggered, and what bug does each enable?"
+
+    Level-triggered: notification fires while data remains. Edge-triggered: fires only on transition (no data to data). Edge-triggered scales better but enables a classic bug -- you read once, do not drain, and never get woken up again because no transition occurred. Always loop until `EAGAIN` with edge-triggered fds. With level-triggered, you can be lazy but pay in extra wakeups.
+    </Note>
+
+    <Note>
+    **Senior Follow-up 3:** "How does io_uring handle backpressure?"
+
+    The SQ has a fixed depth set at `io_uring_setup`. If you try to queue more than depth, `io_uring_submit` returns `-EBUSY` (or you wait). The CQ also has a fixed depth -- if you do not reap completions fast enough, the kernel can drop them (lossy mode) or stop submitting (lossless). Sizing the rings is application work; defaults are rarely right for high-throughput servers.
+    </Note>
+
+    **Common Wrong Answers:**
+
+    1. *"`epoll` and `io_uring` are basically the same, just different APIs."* No. `epoll` notifies you that I/O is ready; you still pay a syscall to do the I/O. `io_uring` has the kernel do the I/O on your behalf. The mental model is different: notification vs delegation.
+    2. *"Always use the latest, so always use `io_uring`."* `io_uring` adds complexity, has a moving security surface, and is poorly supported on macOS, Windows, and older Linux. For most apps, `epoll`/`kqueue` is the right answer for the next several years.
+    3. *"`select` is fine; the 1024 limit is per-process."* The 1024 limit is `FD_SETSIZE` and applies to the bitmap, not the process fd table. You can have 100K open fds but `select` cannot watch any beyond fd 1023.
+
+    **Further Reading:**
+    - "Efficient I/O event notification" (the libev documentation comparing select/poll/epoll/kqueue) -- Marc Lehmann
+    - "What is io_uring?" (kernel.org docs) and the lwn.net series on `io_uring` evolution
+    - Jens Axboe's "Faster IO through io_uring" presentation (FOSDEM 2020)
   </Accordion>
 
-  <Accordion title="What is zero-copy networking? Walk through how sendfile() avoids data copies compared to read+write.">
-    **Strong Answer:**
+  <Accordion title="Walk through a 1MB read() -- every layer it touches from userland to disk">
+    **Strong Answer Framework:**
 
-    - Naive read+write: data goes page cache -> user buffer (copy 1) -> socket buffer (copy 2) -> NIC DMA (copy 3). Three copies, four context switches.
-    - sendfile(): data goes page cache -> socket buffer (copy 1) -> NIC DMA (copy 2). No user-space buffer. Two copies, two context switches.
-    - With scatter-gather DMA on the NIC, the kernel sends a scatter-gather list pointing directly to page cache pages. The NIC DMAs from page cache -- effectively one copy (true zero-copy).
-    - This matters for file servers and CDNs. Nginx uses sendfile() by default. At 10Gbps, the difference is between saturating CPU at 5Gbps and pushing 10Gbps comfortably.
+    1. **Set the boundary conditions.** Buffered read of 1MB from a regular file on ext4, NVMe, no `O_DIRECT`, file not in page cache. The user buffer is 1MB heap, possibly straddling page boundaries.
+    2. **Userland to syscall.** The libc `read(3)` is a thin wrapper around the `read(2)` syscall. On Linux x86_64 the syscall vector is `__NR_read = 0`. The instruction is `syscall`, costing ~100-200ns of mode switch (more with retpoline mitigations).
+    3. **VFS dispatch.** `ksys_read` -> `vfs_read` -> file's `f_op->read_iter` (for ext4: `ext4_file_read_iter`). VFS validates fd, takes a reference on `struct file`, checks permissions, and resolves the position.
+    4. **Page cache lookup.** `generic_file_read_iter` walks the file's `address_space` radix tree page by page (256 pages for 1MB). For each page: hit means copy_to_user from cached page; miss means trigger readahead.
+    5. **Readahead.** The kernel detects sequential access and schedules ahead-of-need reads. For 1MB fresh, expect a single ~128KB readahead bio plus on-demand reads for the rest.
+    6. **Block layer.** Each cache miss creates a `bio` describing source disk sectors and target page-cache pages. `submit_bio` hands it to `blk-mq` which places it on the per-CPU software queue, applies the I/O scheduler (mq-deadline by default for SATA, "none" common for NVMe), and dispatches to a hardware queue.
+    7. **Driver.** `nvme_queue_rq` builds a 64-byte NVMe command, writes it into the SQ ring buffer, and rings the doorbell (single MMIO write).
+    8. **Hardware.** NVMe controller DMAs sectors directly into page-cache pages over PCIe (no CPU copy). On completion, posts to the CQ, raises an MSI-X interrupt.
+    9. **Completion path.** ISR runs, calls `bio_endio`, marks pages up-to-date. The original waiting task is woken.
+    10. **copy_to_user.** Once pages are present, kernel copies from page cache to user buffer. This is the one mandatory copy in buffered I/O. Returns to userland with bytes_read.
 
-    **Follow-up: When would sendfile() NOT help?**
+    **Real-World Example:** In 2018, Netflix Open Connect engineers documented their journey from `read()`+`write()` to `sendfile()` to kTLS+`sendfile()` on FreeBSD for video delivery. Each layer they removed (the user-space copy, then the encryption hop) shaved double-digit percentages off CPU per gigabit. The exact same path analysis applies to a `read()` -- every copy and every context switch is a knob you may eventually need to remove.
 
-    When the application must transform data (compress, encrypt, add headers). For TLS, kernel TLS (kTLS, Linux 4.13+) moves encryption into the kernel, allowing sendfile() with TLS sockets -- the kernel encrypts from page cache directly into the socket buffer. Nginx uses this for maximum HTTPS throughput.
+    <Note>
+    **Senior Follow-up 1:** "What changes if `O_DIRECT` is set?"
+
+    Page cache is bypassed entirely. The user buffer must be aligned to the device logical block size (often 4KB). The bio points directly at user pages (pinned via `get_user_pages`). No readahead. No copy_to_user (data is DMAed straight into user memory). Failure modes get harsher: misalignment returns `EINVAL`, partial reads are common, retries are your problem.
+    </Note>
+
+    <Note>
+    **Senior Follow-up 2:** "Where is the latency budget spent on a cold 1MB read from NVMe?"
+
+    Roughly: ~150ns syscall, ~1us VFS+block layer, ~80us NVMe command latency (typical p50 for random read), ~100us NAND access for first page, then sequential reads pipeline at near line rate. The tail is dominated by NAND access, not software. On a 7GB/s drive, 1MB transfer is ~140us of pure data motion.
+    </Note>
+
+    <Note>
+    **Senior Follow-up 3:** "How would `io_uring` change this trace?"
+
+    No syscall in the hot path with SQPOLL. Submission entry written directly to the shared SQ ring; kernel polling thread picks it up; bio submitted; completion posted to CQ ring; userland reaps with no syscall. With `IORING_REGISTER_BUFFERS`, user pages are pre-pinned so `get_user_pages` is amortized to setup time.
+    </Note>
+
+    **Common Wrong Answers:**
+
+    1. *"It just calls `read` and the OS handles it."* That is the abstraction; the question asks for the machinery. Be specific about VFS, page cache, blk-mq, driver.
+    2. *"It always reads from disk."* No -- if pages are cached, it never touches the device. This is why benchmarking I/O without flushing the page cache produces fictional numbers.
+    3. *"There is one DMA copy."* For buffered I/O there are TWO data motions: DMA into page cache, then CPU copy_to_user into the user buffer.
+
+    **Further Reading:**
+    - Robert Love, *Linux Kernel Development*, ch. 13 (VFS) and ch. 14 (Block Layer)
+    - "What every programmer should know about memory" -- Ulrich Drepper (memory hierarchy interactions matter for I/O)
+    - Brendan Gregg, *Systems Performance* -- the I/O chapters and `iolatency`/`biosnoop` walkthroughs
   </Accordion>
 
-  <Accordion title="Compare one-thread-per-connection with event-driven I/O (epoll). At what connection count does each break?">
-    **Strong Answer:**
+  <Accordion title="When does O_DIRECT help, when does it hurt?">
+    **Strong Answer Framework:**
 
-    - Thread-per-connection: simple synchronous code. Each thread consumes 1-8MB stack space. Breaks at 1000-5000 connections: stack memory exhaustion, context switch overhead dominates, L1/L2 cache thrashing.
-    - Event-driven (epoll): single thread or small pool monitors thousands of fds. Memory proportional to connection count, minimal context switches. Scales to hundreds of thousands of connections. Breaks when per-connection state exhausts memory or kernel socket buffer memory is the limit.
-    - Hybrid approach (Go, Erlang): small number of OS threads with user-space scheduler multiplexing many goroutines/green threads. Blocking I/O transparently converted to non-blocking. Programmer simplicity of synchronous code with event-driven scalability.
+    1. **State the mechanism first.** `O_DIRECT` bypasses the page cache; reads/writes go between user buffers and the block device via DMA, with alignment constraints (typically 4KB or device logical block size).
+    2. **Helps when you have a smarter cache than the kernel.** Databases (Postgres, MySQL/InnoDB, Oracle) maintain their own buffer pool with workload-aware replacement policies (clock-pro, ARC, custom). Letting the kernel page cache duplicate every cached page wastes RAM proportional to the buffer pool size.
+    3. **Helps for "read it once, throw it away" patterns.** A backup tool or full-table scan reading a 100GB file once would otherwise evict useful pages from the cache for the rest of the system. `O_DIRECT` (or `posix_fadvise(POSIX_FADV_DONTNEED)`) prevents this cache pollution.
+    4. **Hurts for small, random, latency-sensitive reads.** No readahead, no caching. Every miss is a real disk hit. A 4KB read in a hot path goes from "page cache hit at 100ns" to "NVMe read at 50us" -- a 500x slowdown.
+    5. **Hurts when alignment is fragile.** Apps that build buffers via `malloc` get arbitrary alignment. `O_DIRECT` requires `posix_memalign` or equivalent. A misaligned `pwrite` returns `EINVAL` and looks like a bug, not a constraint.
+    6. **Does NOT guarantee durability.** Common misconception: `O_DIRECT` is not `fsync`. The drive's volatile write cache may still hold data. You still need explicit `fsync`/`fdatasync` for durability barriers, plus the drive must respect cache flush commands (most do; some cheap consumer SSDs lie).
 
-    **Follow-up: What is the C10K problem, and is it still relevant?**
+    **Real-World Example:** In 2018-2019, the "fsync-gate" investigation by the Postgres community led to deeper scrutiny of `O_DIRECT` semantics across filesystems. Andres Freund's findings shaped Postgres 12's WAL handling. Around the same time, MySQL's `innodb_flush_method=O_DIRECT_NO_FSYNC` was reconsidered after engineers realized "no fsync" assumed the drive honored the FUA flag, which not all drives did. The takeaway: `O_DIRECT` is necessary but not sufficient for durability.
 
-    C10K (Dan Kegel, 1999) was the challenge of 10,000 concurrent connections. select() had a 1024 fd limit, thread-per-connection exhausted resources. Solution: epoll, kqueue, IOCP. Today C10K is solved. The modern equivalent is C10M (10 million connections), requiring kernel bypass (DPDK, XDP), zero-copy, and careful memory management. io_uring is pushing toward C10M without kernel bypass.
+    <Note>
+    **Senior Follow-up 1:** "How do you decide alignment requirements at runtime?"
+
+    `ioctl(fd, BLKSSZGET, &sector_size)` returns the device logical block size. `BLKPBSZGET` returns the physical block size. Allocate buffers with `posix_memalign(&buf, sector_size, len)` and ensure `len` and offset are multiples. Many apps just hardcode 4KB which works on common hardware but breaks on 4Kn drives or unusual configurations.
+    </Note>
+
+    <Note>
+    **Senior Follow-up 2:** "What is the difference between `O_DIRECT` and `O_SYNC`?"
+
+    `O_DIRECT` controls *how* I/O happens (bypass cache). `O_SYNC` controls *when* the syscall returns (after data is durable). They are orthogonal and often combined for WAL: `O_DIRECT | O_DSYNC` says "no kernel cache and do not return until durable." Note `O_DSYNC` is weaker than `O_SYNC` -- it elides metadata flushes that are not needed for read consistency.
+    </Note>
+
+    <Note>
+    **Senior Follow-up 3:** "Why does Linux have `posix_fadvise(POSIX_FADV_DONTNEED)` if we have `O_DIRECT`?"
+
+    `O_DIRECT` is all-or-nothing per file. `fadvise` lets you keep the page cache for normal reads but evict specific ranges after sequential scans. Useful for cron jobs, backups, and data migrations that want to leave the cache as they found it. It is also far simpler than alignment gymnastics.
+    </Note>
+
+    **Common Wrong Answers:**
+
+    1. *"`O_DIRECT` makes I/O faster."* It can; it can also be 100x slower. It removes a cache layer; whether that helps depends on whether the cache was useful.
+    2. *"`O_DIRECT` writes are durable."* No. Durability requires the drive to flush its write cache -- which `fsync` does, `O_DIRECT` does not.
+    3. *"Use `O_DIRECT` for all database files."* Indexes, temp files, sort spills, and small-config tables often benefit from page cache. Postgres has historically avoided `O_DIRECT` for exactly this reason; MySQL/InnoDB embraces it for the buffer pool but not the binlog. The right answer is per-file-class, not per-database.
+
+    **Further Reading:**
+    - Linus Torvalds, the famous LKML thread on `O_DIRECT` ("the right answer is not O_DIRECT, it is...") -- read for the philosophy debate
+    - PostgreSQL Wiki, "Fsync Errors" -- the canonical write-up of fsync-gate
+    - "Files are hard" -- Dan Luu's survey of crash-consistency papers including `O_DIRECT` interactions
+  </Accordion>
+
+  <Accordion title="What is zero-copy and walk through how sendfile() avoids data copies vs read+write">
+    **Strong Answer Framework:**
+
+    1. **Define zero-copy precisely.** Zero-copy means the data never crosses the user/kernel boundary as a CPU memory copy. The CPU may still touch metadata; the bulk data flows kernel-to-kernel or device-to-device via DMA.
+    2. **Establish the baseline cost.** Naive `read()`+`write()` from disk to socket: DMA disk -> page cache (1), copy page cache -> user buffer (2), copy user buffer -> socket buffer (3), DMA socket buffer -> NIC (4). Four data motions, two context switches per syscall pair.
+    3. **`sendfile(out_fd, in_fd, ...)` collapses the user roundtrip.** Data path: DMA disk -> page cache (1), copy page cache -> socket buffer (2), DMA socket buffer -> NIC (3). With NIC scatter-gather, the middle copy disappears and the NIC DMAs directly from page cache. True zero CPU copies in the bulk path.
+    4. **`splice()` generalizes via pipes.** `splice` moves pages between any two fds using a kernel pipe as the intermediate, by reference (page pointers, not copies). Useful for proxies (socket-to-socket), unlike `sendfile` which only goes file-to-socket.
+    5. **`io_uring` with fixed buffers** achieves the same result for general I/O: pre-registered user pages stay pinned, no per-I/O `get_user_pages`, kernel can DMA directly to/from them.
+    6. **The catch: zero-copy excludes transformation.** If you need to compress, encrypt at user-space, or modify headers, you must touch the bytes. kTLS (Linux 4.13+) brings TLS encryption into the kernel so `sendfile` can serve HTTPS without breaking the zero-copy chain.
+
+    **Real-World Example:** Kafka's persistent log uses `sendfile` end to end; brokers serve segments to consumers without ever touching the bytes in user space. Their original 2011 paper documents this as a primary reason Kafka can saturate NICs at low CPU. Nginx, HAProxy, and the Linux kernel's NFS server are all `sendfile`-first. Conversely, Envoy initially could not use `sendfile` because of L7 inspection -- they invest in user-space zero-copy via fixed buffers and io_uring instead.
+
+    <Note>
+    **Senior Follow-up 1:** "What breaks `sendfile`?"
+
+    TLS without kTLS (encryption needs the bytes). Compression (same). Application-level inspection or rewriting (any L7 proxy). Filesystems that do not implement the splice/sendfile path (some FUSE filesystems). When `sendfile` is unavailable, fall back to `splice` via a pipe or `read`+`write` with at least a user-side mmap to skip one copy.
+    </Note>
+
+    <Note>
+    **Senior Follow-up 2:** "How do you measure whether you are actually zero-copy?"
+
+    `perf trace -e read,write,sendfile,splice` shows syscall mix. `bpftrace` on `vfs_read`/`vfs_write` reveals copy paths. The smoking gun is high `system` CPU on a network-bound workload; that is `copy_to_user`/`copy_from_user` you should not be doing. Tools like `bcc`'s `funcslower` against `__copy_user_enhanced_fast_string` confirm where copies happen.
+    </Note>
+
+    <Note>
+    **Senior Follow-up 3:** "Does zero-copy help receive paths?"
+
+    Yes, but it is harder. `MSG_ZEROCOPY` (Linux 4.14+) lets `send` references user pages directly. Receive-side zero-copy (`SO_ZEROCOPY` is send-only; receive uses `mmap` ring with AF_XDP or io_uring's recv with fixed buffers) still has alignment and lifetime caveats. Most "zero-copy networking" wins are on the send side.
+    </Note>
+
+    **Common Wrong Answers:**
+
+    1. *"`sendfile` does not copy at all."* It still copies between page cache and socket buffer unless the NIC supports scatter-gather DMA. The "zero" is from the userland perspective.
+    2. *"Zero-copy is only relevant for tiny servers."* It is the difference between saturating a 100Gbps NIC at one CPU vs four. Critical for CDNs, video servers, message brokers.
+    3. *"`mmap` plus `write` is zero-copy."* It eliminates the user-side read copy, but `write` from the mmap region still copies into the socket buffer. Helpful, not zero.
+
+    **Further Reading:**
+    - "Efficient data transfer through zero copy" -- IBM developerWorks classic article
+    - Jens Axboe's "Zero-copy networking with io_uring" -- recent state of the art
+    - Kafka 2011 paper, "Kafka: a Distributed Messaging System for Log Processing" -- the canonical sendfile case study
   </Accordion>
 </AccordionGroup>
